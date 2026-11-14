@@ -1328,7 +1328,10 @@ fn transparent_trivial(prog: &Program, tcx: &Tcx, env: crate::tcx::TypingEnv, kr
                 };
                 if private { return false; }
             }
-            if adt.repr_c { return false; }
+            // `def.repr().c()`: `repr(C)` as written (AdtT::repr_c also holds for `repr(transparent)`)
+            let f = &prog.files[def.file as usize];
+            let repr_c = ast.list(item.attrs).iter().any(|at| at.toks.hi > at.toks.lo && f.tok_text(at.toks.lo) == "repr" && (at.toks.lo + 1..at.toks.hi).any(|i| f.tok_text(i) == "C"));
+            if repr_c { return false; }
             if path.contains(&ty) { return true; }
             path.push(ty);
             let args = tcx.tys.list(args).to_vec();
