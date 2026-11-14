@@ -958,6 +958,31 @@ fn warm_front(images: &crate::cache::FrontImages, sess: &std::sync::Arc<crate::S
 }
 
 
+/// std's folder in one spelling, its canonical one, set back at the loader's start, after the
+/// inherited mounts are installed and before any thread runs (a set_var races every thread that
+/// reads the environment; a run's compile thread runs beside its host's). std's source paths --
+/// what its panic locations and file!() hold -- are spelled from it, and a RELAX_STD through the
+/// workspace's own folder (`<workspace>/../../std`) put that folder's text in them, so the record
+/// of std's code refused each data object holding one (the checkout's path: cache data_entry) and
+/// every warm start built that code again. (Not lexically: past a symbolic link `..` names the
+/// link target's parent.) The canonical spelling is the VFS's: a std in a repository's mount
+/// (std_source::select's choice for a mounted workspace, which a build script's child inherits)
+/// is on no disk. One that is no folder stays as written: a run refuses it (cmd_run_inner).
+pub fn canonical_std_env() {
+    let Some(v) = std::env::var_os("RELAX_STD").filter(|v| !v.is_empty()) else { return };
+    let Ok(c) = crate::vfs::canonicalize(&v) else { return };
+    let c = c.to_string_lossy().into_owned();
+    // (Windows: the plain spelling of a drive path, not its \\?\ form)
+    let c = match c.strip_prefix(r"\\?\") { Some(p) if p.as_bytes().get(1) == Some(&b':') => p.to_string(), _ => c };
+    if v.as_os_str() != std::ffi::OsStr::new(&c) {
+        // (an automatic choice stays marked as one: std_source::select)
+        if std::env::var_os("RELAX_STD_AUTO").as_deref() == Some(v.as_os_str()) {
+            std::env::set_var("RELAX_STD_AUTO", &c);
+        }
+        std::env::set_var("RELAX_STD", &c);
+    }
+}
+
 fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session: Option<&mut Option<crate::serve::Session>>) -> i32 {
     // Restore before resolution so a failed replacement compile is a JIT verdict too.
     if crate::run_end::run_input("RELAX_JIT_RECOVERY").is_some() {
@@ -994,33 +1019,11 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
             return 2;
         }
     }
-    // std's folder in one spelling, its canonical one: std's source paths -- what its panic
-    // locations and file!() hold -- are spelled from it, and a RELAX_STD through the workspace's
-    // own folder (`<workspace>/../../std`) put that folder's text in them, so the record of std's
-    // code refused each data object holding one (the checkout's path: cache data_entry) and every
-    // warm start built that code again. (Not lexically: past a symbolic link `..` names the
-    // link target's parent.) Set back for every reader and the child runs. The canonical spelling
-    // is the VFS's: a std in a repository's mount (std_source::select's choice for a mounted
-    // workspace, which a build script's child inherits) is on no disk, and a disk canonicalize
-    // refused it there.
+    // (canonical_std_env spelled it at the loader's start)
     if let Some(v) = std::env::var_os("RELAX_STD").filter(|v| !v.is_empty()) {
-        match crate::vfs::canonicalize(&v) {
-            Ok(c) => {
-                let c = c.to_string_lossy().into_owned();
-                // (Windows: the plain spelling of a drive path, not its \\?\ form)
-                let c = match c.strip_prefix(r"\\?\") { Some(p) if p.as_bytes().get(1) == Some(&b':') => p.to_string(), _ => c };
-                if v.as_os_str() != std::ffi::OsStr::new(&c) {
-                    // (an automatic choice stays marked as one: std_source::select)
-                    if std::env::var_os("RELAX_STD_AUTO").as_deref() == Some(v.as_os_str()) {
-                        std::env::set_var("RELAX_STD_AUTO", &c);
-                    }
-                    std::env::set_var("RELAX_STD", &c);
-                }
-            }
-            Err(e) => {
-                eprintln!("relax: RELAX_STD={} is no folder ({e}): point it at std's sources (<checkout>/libs/relax/compiler/std)", v.to_string_lossy());
-                return 2;
-            }
+        if let Err(e) = crate::vfs::canonicalize(&v) {
+            eprintln!("relax: RELAX_STD={} is no folder ({e}): point it at std's sources (<checkout>/libs/relax/compiler/std)", v.to_string_lossy());
+            return 2;
         }
     }
     jit::set_ahead_level(sess.runtime.ahead);

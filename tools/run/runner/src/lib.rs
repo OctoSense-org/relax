@@ -330,6 +330,8 @@ fn run(raw_args: Vec<Vec<u8>>) {
         eprintln!("relax: RELAX_VFS: {e}");
         std::process::exit(2);
     }
+    // (before any thread: it sets RELAX_STD back)
+    relax_compiler::run::canonical_std_env();
     let mut raw_args = raw_args;
     if take_privileged(&mut raw_args) {
         PRIVILEGED.store(true, std::sync::atomic::Ordering::Relaxed);

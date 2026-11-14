@@ -332,7 +332,7 @@ pub fn relax_as_rustc() -> bool {
 pub fn rustc_answer(args: &[String], input: &[u8]) -> (i32, Vec<u8>, Vec<u8>) {
     // the session of this process's own options: a question's words are rustc's, never Relax's
     // (a script's `$RUSTC --allow-c` sets nothing of the run's)
-    let sess = &session_from_env(&[]);
+    let sess = answer_session();
     let out = match args.iter().map(String::as_str).collect::<Vec<_>>().as_slice() {
         ["--version"] | ["-V"] => format!("rustc {} (Relax {})\n", RUSTC_VERSION, PROVENANCE),
         ["-vV"] | ["--version", "--verbose"] | ["--verbose", "--version"] | ["-V", "--verbose"] | ["--verbose", "-V"] => format!(
@@ -524,6 +524,28 @@ fn drop_ambient_grants() {
     std::env::remove_var("RELAX_SELF_EXEC");
 }
 
+/// The session a build script's RUSTC questions are answered with (rustc_answer): this process's
+/// own options as its environment gives them, none of a command line's. Made once: at the process
+/// start (session_from_env), or at the first question of a loader started as RUSTC. An answer on
+/// a run thread (tool.rs, while the script's and the JIT's threads run) then reads and writes
+/// nothing of the process environment; it made a whole session there, whose start sets
+/// RUSTUP_HOME and CARGO_HOME (keep_toolchain_homes), a race with every thread that reads it.
+fn answer_session() -> &'static std::sync::Arc<crate::Session> {
+    static ANSWER: std::sync::OnceLock<std::sync::Arc<crate::Session>> = std::sync::OnceLock::new();
+    ANSWER.get_or_init(|| std::sync::Arc::new(session_of(crate::options::Options::from_env(), crate::options::RuntimeOptions::from_env())))
+}
+
+/// A session of these options: the machine's CPU, the target.
+fn session_of(mut options: crate::options::Options, runtime: crate::options::RuntimeOptions) -> crate::Session {
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        options.cpu = relax_backend::x64::detect_cpu(&options);
+    }
+    let mut session = crate::Session { options, runtime };
+    session.options.target = session.options.check_target.triple().to_string();
+    session
+}
+
 /// Construct the invocation inputs before parsing; CLI overrides replace environment values.
 /// rustc: compiler/rustc_session/src/config.rs:2428, session.rs:90-93.
 pub fn session_from_env(args: &[String]) -> std::sync::Arc<crate::Session> {
@@ -547,18 +569,15 @@ pub fn session_from_env(args: &[String]) -> std::sync::Arc<crate::Session> {
             std::process::exit(2);
         }
     }
+    // the RUSTC questions' session: the options a question read before, `--no-asm` included (it
+    // reaches them through the environment; the grants never do)
+    answer_session();
     options.live |= args.get(1).map(String::as_str) == Some("live");
     if args.get(1).map(String::as_str) == Some("fix") {
         options.relaxed = Some("all".to_string());
     }
-    #[cfg(not(target_arch = "aarch64"))]
-    {
-        options.cpu = relax_backend::x64::detect_cpu(&options);
-    }
     options.spec_hot = Some(options.spec_hot.unwrap_or_else(crate::jit::on_battery));
-    let mut session = crate::Session { options, runtime };
-    session.options.target = session.options.check_target.triple().to_string();
-    std::sync::Arc::new(session)
+    std::sync::Arc::new(session_of(options, runtime))
 }
 
 /// A `makepad run` host (Sandboxed) takes the grants from its words before `--` alone: their

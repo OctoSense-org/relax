@@ -189,16 +189,29 @@ pub extern "C" fn relax_tool_release(h: u64) {
 mod tests {
     /// A build script's question carries rustc's words only: Relax's own words among them
     /// (`--no-asm`, the grants of options.rs GRANTS) change nothing of the run that answers, and
-    /// one that is no grant does not end it (a parsed `--allow-nonsense` exits 2).
+    /// one that is no grant does not end it (a parsed `--allow-nonsense` exits 2). And no answer
+    /// writes the process environment: it runs on a run thread beside the script's and the JIT's
+    /// threads (a session's start sets RUSTUP_HOME and CARGO_HOME where rustup is in use).
     #[test]
-    fn a_rustc_question_never_sets_the_runs_flags() {
-        isolated_test!(a_rustc_question_never_sets_the_runs_flags);
-        for name in ["RELAX_NO_ASM", "RELAX_ALLOW_C"] {
-            assert_eq!(std::env::var_os(name), None, "{name} is set in the test's own environment");
+    fn a_rustc_question_never_touches_the_process_environment() {
+        isolated_test!(a_rustc_question_never_touches_the_process_environment);
+        // rustup in use, its homes unset: a session's start would set both
+        let home = std::env::temp_dir().join(format!("relax-answer-env-{}", std::process::id()));
+        std::fs::create_dir_all(home.join(".rustup")).unwrap();
+        std::env::set_var(if cfg!(windows) { "USERPROFILE" } else { "HOME" }, &home);
+        for name in ["RUSTUP_HOME", "CARGO_HOME", "RELAX_NO_ASM", "RELAX_ALLOW_C"] {
+            std::env::remove_var(name);
         }
-        let args: Vec<String> = ["--print", "cfg", "--no-asm", "--allow-c", "--allow-host-modules", "--allow-module-fuel=1", "--allow-nonsense"].iter().map(|s| s.to_string()).collect();
-        let _ = crate::rustc_answer(&args, b"");
-        assert_eq!(std::env::var_os("RELAX_NO_ASM"), None, "the question's --no-asm set RELAX_NO_ASM");
-        assert_eq!(std::env::var_os("RELAX_ALLOW_C"), None, "the question's --allow-c set RELAX_ALLOW_C");
+        let before: Vec<_> = std::env::vars_os().collect();
+        let questions: [&[&str]; 4] = [&["--version"], &["-vV"], &["--print", "sysroot"], &["--print", "cfg", "--no-asm", "--allow-c", "--allow-host-modules", "--allow-module-fuel=1", "--allow-nonsense"]];
+        for q in questions {
+            let args: Vec<String> = q.iter().map(|s| s.to_string()).collect();
+            let (status, out, _) = crate::rustc_answer(&args, b"");
+            if q.len() < 3 {
+                assert!(status == 0 && !out.is_empty(), "{q:?} is answered");
+            }
+            assert_eq!(std::env::vars_os().collect::<Vec<_>>(), before, "the answer to {q:?} changed the process environment");
+        }
+        let _ = std::fs::remove_dir_all(&home);
     }
 }
