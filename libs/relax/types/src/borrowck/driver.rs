@@ -710,7 +710,8 @@ pub fn check_anon_const(cx: &EvalCx<'_>, prog: &Program, tcx: &Tcx, body: &typec
 }
 
 /// rustc_borrowck lib.rs lint_unused_mut: a user binding or argument declared `mut` that no write or
-/// mutable borrow needed -- `unused_mut`. The pattern span of the binding says where the `mut` is.
+/// mutable borrow needed -- `unused_mut`. The lint points at the binding's own span (`local_decl.source_info.span`,
+/// lib.rs:2752): `mut v` in `Some(mut v)`, not the whole pattern; the whole pattern's span finds the attributes.
 fn lint_unused_mut(prog: &Program, owner: DefId, mir: &Body, used: &crate::mir::dataflow::BitSet) {
     use crate::mir::{BindingForm, ByRef, LocalInfo, LocalKind, Mutability, VarBindingForm};
     if crate::lint::generated(prog, owner) { return; }
@@ -720,10 +721,11 @@ fn lint_unused_mut(prog: &Program, owner: DefId, mir: &Body, used: &crate::mir::
         if decl.mutability != Mutability::Mut || used.contains(i) || !matches!(decl.kind, LocalKind::UserVar | LocalKind::Arg) { continue; }
         let LocalInfo::User(BindingForm::Var(VarBindingForm { binding_mode: crate::mir::BindingMode(ByRef::No, Mutability::Mut), pat_span, .. })) = &decl.local_info else { continue };
         let Some(name) = mir.var_debug_info.iter().find(|v| v.place.local.0 as usize == i && v.place.projection.is_empty()).map(|v| v.name.as_str()) else { continue };
-        if name.starts_with('_') || crate::lint::external(prog, pat_span.file, pat_span.lo) { continue; }
+        let span = decl.source_info.span;
+        if name.starts_with('_') || crate::lint::external(prog, span.file, span.lo) { continue; }
         // (under the attributes of the binding's statement, arm or parameter: its name is in the span)
         let around = crate::lint::attrs_at(prog, owner, pat_span.file, pat_span.lo, pat_span.hi);
-        crate::lint::emit_in(prog, owner, &around, &crate::lint::UNUSED_MUT, pat_span.file, pat_span.lo,
+        crate::lint::emit_in(prog, owner, &around, &crate::lint::UNUSED_MUT, span.file, span.lo,
             &format!("variable does not need to be mutable -- help: remove this `mut` (`{}`)", name));
     }
 }
