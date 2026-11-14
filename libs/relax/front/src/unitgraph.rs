@@ -1033,22 +1033,23 @@ fn relax_scripts(sess: &std::sync::Arc<crate::Session>, g: &Graph, target_dir: &
                 }
             }
             ScriptRole::SelfStamp => {
-                let text = self_stamp_text(dir, pname, &bs.features);
-                // (a shared workspace's checkouts have one run dir, vfs.rs SHARE: a stamp per
-                // content, where each checkout wrote its own over the other's)
-                let build_dir = match &text {
-                    Ok(text) if crate::vfs::in_folder(dir) => root.take(&format!("{}-answered-{:016x}", name, crate::sip::hash_bytes(text.as_bytes()) as u64)),
-                    _ => root.take(&format!("{}-answered", name)),
+                let text = self_stamp_text(pname, &bs.features);
+                // (a shared workspace's checkouts have one run dir, vfs.rs SHARE: a dir per stamp
+                // text, so checkouts building other features never write over each other's)
+                let build_dir = if crate::vfs::in_folder(dir) {
+                    root.take(&format!("{}-answered-{:016x}", name, crate::sip::hash_bytes(text.as_bytes()) as u64))
+                } else {
+                    root.take(&format!("{}-answered", name))
                 };
                 let out_dir = format!("{}/out", build_dir);
-                let r = text.and_then(|text| {
+                let r = (|| -> Result<String, String> {
                     std::fs::create_dir_all(&out_dir).map_err(|e| format!("{}: {}", out_dir, e))?;
                     let out = format!("{}/src_stamp.rs", out_dir);
                     if std::fs::read_to_string(&out).ok().as_deref() != Some(text.as_str()) {
-                        std::fs::write(&out, text).map_err(|e| format!("{}: {}", out, e))?;
+                        std::fs::write(&out, &text).map_err(|e| format!("{}: {}", out, e))?;
                     }
                     Ok(String::new())
-                });
+                })();
                 done(i, r, out_dir, false);
                 continue;
             }
@@ -2675,44 +2676,22 @@ fn path_lock(path: &str) -> relax_session::sync::MutexGuard<'static, ()> {
 }
 
 /// A Relax crate's build script (libs/relax/self_stamp.rs), answered without running it: the text
-/// of its OUT_DIR/src_stamp.rs. The stamp hashes what the script hashes of the package itself (its files,
-/// nested packages, `target`, hidden entries and its tests, benches and examples left out, read
-/// through the VFS; the enabled features), with this crate's own build in place of rustc's
-/// toolchain and flags. Only relax-compiler's codegen identity reads a stamp, from its native
-/// build: a program compiling these crates from source never compares it.
-fn self_stamp_text(dir: &str, pkg: &str, features: &[String]) -> Result<String, String> {
-    fn files(dir: &std::path::Path, rel: &str, out: &mut Vec<(String, std::path::PathBuf)>) {
-        let Ok(mut rd) = crate::vfs::read_dir(dir) else { return };
-        rd.sort();
-        for (name, is_dir) in rd {
-            if name.starts_with('.') {
-                continue;
-            }
-            let p = dir.join(&name);
-            let r = if rel.is_empty() { name.clone() } else { format!("{}/{}", rel, name) };
-            if is_dir {
-                if name == "target" || crate::vfs::is_file(p.join("Cargo.toml")) || (rel.is_empty() && matches!(name.as_str(), "tests" | "benches" | "examples")) {
-                    continue;
-                }
-                files(&p, &r, out);
-            } else {
-                out.push((r, p));
-            }
-        }
-    }
-    let mut list = Vec::new();
-    files(std::path::Path::new(dir), "", &mut list);
+/// of its OUT_DIR/src_stamp.rs. Only relax-compiler's codegen identity reads a stamp, from its
+/// native build, where cargo runs the script and the stamp hashes the package's files. A program
+/// compiling these crates from source never compares it, so here it names what tells this build
+/// apart and nothing that changes on a save: the package, its enabled features and this crate's
+/// own build in place of rustc's toolchain and flags. Hashing the package's files changed the
+/// included text on every save of the crate, and since its path is made by `env!` no item names
+/// the file: the JIT offered a restart for each body edit of relax-base and the others in place
+/// of a patch.
+fn self_stamp_text(pkg: &str, features: &[String]) -> String {
     let mut buf = Vec::new();
     let put = |b: &[u8], buf: &mut Vec<u8>| {
         buf.extend_from_slice(&(b.len() as u64).to_le_bytes());
         buf.extend_from_slice(b);
     };
-    put(b"relax-src-stamp 1", &mut buf);
+    put(b"relax-src-stamp 2", &mut buf);
     put(pkg.as_bytes(), &mut buf);
-    for (rel, p) in &list {
-        put(rel.as_bytes(), &mut buf);
-        put(&crate::vfs::read(p).map_err(|e| format!("{}: {}", p.display(), e))?, &mut buf);
-    }
     let mut fs: Vec<String> = features.iter().map(|f| format!("CARGO_FEATURE_{}", f.to_uppercase().replace('-', "_"))).collect();
     fs.sort();
     for f in &fs {
@@ -2722,7 +2701,7 @@ fn self_stamp_text(dir: &str, pkg: &str, features: &[String]) -> Result<String, 
     put(env!("CARGO_PKG_VERSION").as_bytes(), &mut buf);
     let d = relax_base::sha256::sha256(&buf);
     let stamp = u128::from_le_bytes(d[..16].try_into().unwrap());
-    Ok(format!("/// This crate's source stamp (libs/relax/self_stamp.rs).\npub const SRC_STAMP: u128 = 0x{:032x};\n", stamp))
+    format!("/// This crate's source stamp (libs/relax/self_stamp.rs).\npub const SRC_STAMP: u128 = 0x{:032x};\n", stamp)
 }
 
 static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
