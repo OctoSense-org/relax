@@ -1348,6 +1348,8 @@ pub struct CrateItems<'p> {
 /// reported an error of that never bind in rustc, besides the ones still open. `replayed`: the
 /// crates with bodies replayed from stored verdicts, whose import reports wait while one is a
 /// candidate (lint_imports::Judge): those crates come back, for `finish_imports`.
+/// The ADT late lints reuse this call's layout and Copy memos across crates, matching rustc's
+/// `layout_of` and `is_copy_raw` queries instead of rebuilding their answers per item.
 pub fn finish(prog: &Program, tcx: &Tcx, own: &[bool], root: u32, late: bool, erroneous: &[usize], replayed: &[bool]) -> Vec<Deferred> {
     if !lint::enabled() { return Vec::new(); }
     let mut pt = PartTimes::new("lint_dead::finish");
@@ -1360,11 +1362,15 @@ pub fn finish(prog: &Program, tcx: &Tcx, own: &[bool], root: u32, late: bool, er
     let traits: Vec<HashSet<DefId>> = crates.iter().map(|c| traits.remove(&c.krate).unwrap_or_default()).collect();
     let mut order: Vec<usize> = (0..crates.len()).collect();
     order.sort_by_key(|&i| (std::cmp::Reverse(crates[i].defs.len()), i));
+    // Like rustc's layout_of, cached cycle stand-ins suppress repeat E0391 reports from
+    // later items/lints; fresh per-item tables could report the same cycle again.
+    let lay = crate::layout::Layouts::new();
+    let copy_memo = crate::conc::MemoMap::default();
     let parts = crate::lint::par_each(&order, |&i| {
         let mut pt = PartTimes::new("lint_dead::finish");
         let c = &crates[i];
         let judge = if replayed.get(c.krate as usize).copied().unwrap_or(false) { Judge::Defer } else { Judge::Report };
-        let candidates = finish_crate(&CrateCx { prog, tcx, c, root, refs: &refs, children: &children }, &traits[i], late, judge, &mut pt);
+        let candidates = finish_crate(&CrateCx { prog, tcx, c, root, refs: &refs, children: &children, lay: &lay, copy_memo: &copy_memo }, &traits[i], late, judge, &mut pt);
         (pt, (judge == Judge::Defer && !candidates.is_empty()).then_some((i, candidates)))
     });
     let mut deferred = Vec::new();
@@ -1440,7 +1446,8 @@ fn crate_items<'p>(prog: &'p Program, own: &[bool], erroneous: &[usize], mut chi
     crates
 }
 
-/// The shared read-only context for one checked crate's lints.
+/// One checked crate's lint context; `finish` owns its layout and Copy memos so crate workers
+/// reuse answers as rustc's `layout_of` and `is_copy_raw` queries do.
 struct CrateCx<'a> {
     prog: &'a Program,
     tcx: &'a Tcx,
@@ -1448,6 +1455,10 @@ struct CrateCx<'a> {
     root: u32,
     refs: &'a HashMap<DefId, BodyInfo>,
     children: &'a HashMap<DefId, Vec<DefId>>,
+    /// `finish`'s `layout_of` memo, shared by the three ADT layout lints to reuse layouts.
+    lay: &'a crate::layout::Layouts,
+    /// `is_copy_raw` answers by crate, param env and erased type; non-body analysis mode is fixed.
+    copy_memo: &'a crate::conc::MemoMap<(u32, crate::tcx::ParamEnvId, crate::types::TyId), bool>,
 }
 
 /// One checked crate's dead code and reachability lints (`late`), and its unused imports as
@@ -1463,8 +1474,9 @@ fn finish_crate(cx: &CrateCx<'_>, traits: &HashSet<DefId>, late: bool, judge: Ju
 }
 
 /// misc_checking_3 of one checked crate: dead code, then the late lints of its items.
+/// The ADT lints share `finish`'s memos through `cx`, reusing rustc's `layout_of`/`is_copy_raw` answers.
 fn late_lints(cx: &CrateCx<'_>, reach: &Reach, pt: &mut PartTimes) {
-    let CrateCx { prog, tcx, c, root, refs, children } = *cx;
+    let CrateCx { prog, tcx, c, root, refs, children, lay, copy_memo } = *cx;
     let own = &c.own[..];
     let mut s = Dead { prog, tcx, own, refs, live: HashSet::new(), live_log: Vec::new(), live_fields: HashSet::new(), worklist: Vec::new(), scanned: HashSet::new(), propagated: false, ignored_derived: HashMap::new(), children };
     // seeds
@@ -1567,13 +1579,13 @@ fn late_lints(cx: &CrateCx<'_>, reach: &Reach, pt: &mut PartTimes) {
     if executable { rep.run(&DEAD_CODE_PUB_IN_BINARY, &pre_live, true, &all); }
     rep.run(&DEAD_CODE, &s.live, false, &all);
     pt.mark("report");
-    crate::lint_late::missing_copy_implementations(prog, tcx, &c.defs, reach);
+    crate::lint_late::missing_copy_implementations(prog, tcx, &c.defs, reach, lay, copy_memo);
     pt.mark("missing_copy_implementations");
-    crate::lint_late::variant_size_differences(prog, tcx, &c.defs);
+    crate::lint_late::variant_size_differences(prog, tcx, &c.defs, lay);
     pt.mark("variant_size_differences");
     crate::lint_late::async_fn_in_trait(prog, &c.defs, reach);
     pt.mark("async_fn_in_trait");
-    crate::lint_late::repr_transparent_fields(prog, tcx, &c.defs);
+    crate::lint_late::repr_transparent_fields(prog, tcx, &c.defs, lay);
     pt.mark("repr_transparent_fields");
     unnameable_types(prog, own, reach);
     pt.mark("unnameable_types");
