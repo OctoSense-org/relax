@@ -113,10 +113,11 @@ impl Cache {
         }
         // the data objects the symbols name (tag 2), and the ones those name in turn: the
         // prelink places them as one block (place_data) instead of a link_data per object
-        crate::run::yield_section("image data");
+        crate::run::yield_section("image data pending");
         let pend_data = self.pending_of(KIND_DATA, stop)?;
         let pend_const = self.pending_of(KIND_CONST, stop)?;
         let mut data = ImageData::default();
+        crate::run::yield_section("image data symbols");
         let mut i = 0;
         while i < tab.syms.list.len() {
             if i % 8 == 7 && stop() { return Err(()); }
@@ -141,6 +142,7 @@ impl Cache {
                 if m % 8 == 0 && stop() { return Err(()); }
             }
         }
+        crate::run::yield_section("image data settle");
         data.settle(stop).ok_or(())?;
         ph[1] = t0.elapsed().as_secs_f64() * 1e3;
         if stop() { return Err(()); }
@@ -217,6 +219,8 @@ impl Cache {
                 let (a, b) = pair.split_at(width.min(pair.len()));
                 let (mut i, mut j) = (0, 0);
                 while i < a.len() && j < b.len() {
+                    // (the last passes merge one or two pairs of the whole list: asked inside too)
+                    if (i + j) % 4096 == 4095 && stop() { return Err(()); }
                     if by_bytes(&b[j], &a[i]) == std::cmp::Ordering::Less { merged.push(b[j]); j += 1; } else { merged.push(a[i]); i += 1; }
                 }
                 merged.extend_from_slice(&a[i..]);
