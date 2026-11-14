@@ -176,6 +176,8 @@ extern "C" {
     // Darwin's futex since macOS 10.12 (libSystem, every macOS version Relax supports).
     fn __ulock_wait(operation: u32, addr: *mut c_void, value: u64, timeout_us: u32) -> c_int;
     fn __ulock_wake(operation: u32, addr: *mut c_void, wake_value: u64) -> c_int;
+    // the loader's: a signal ended a futex wait's system call (a test's watch may end the wait)
+    fn __relax_wait_interrupted();
 }
 
 const OS_CLOCK_MACH_ABSOLUTE_TIME: u32 = 32;
@@ -380,6 +382,7 @@ pub fn futex_wait(futex: &AtomicU32, expected: u32, timeout: Option<Duration>) -
                     continue;
                 }
                 if e == EINTR {
+                    unsafe { __relax_wait_interrupted() };
                     continue;
                 }
                 return true;

@@ -382,6 +382,7 @@ mod unix {
     }
     pub(crate) fn note_child(pid: i32) {
         if pid > 0 {
+            crate::jit::note_progress(crate::jit::PROGRESS_PROC);
             note(Res::Child { pid, told: false, detached: false });
         }
     }

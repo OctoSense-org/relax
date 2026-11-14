@@ -1299,7 +1299,8 @@ fn cmd_test(sess: &std::sync::Arc<crate::Session>, args: &[String]) -> i32 {
             u.entry(id)
         });
         let ts = Instant::now();
-        jit::watchdog(runtime.watchdog_ms);
+        // the test runs as long as it makes progress (jit.rs Stall), never against a wall clock
+        jit::watchdog_stall(runtime.watchdog_ms);
         let up: *mut jit::Unit = &mut *u;
         let r = if runtime.test_domains <= 1 {
             // the program's main on a program stack (large, lazily committed, guarded)

@@ -1618,8 +1618,122 @@ struct WatchdogCall {
     token: u64,
     target: u64,
     deadline: Option<std::time::Instant>,
+    /// a test's watch (`watchdog_stall`): it expires when the test made no progress for a while
+    stall: Option<Stall>,
     parent: Option<std::sync::Arc<WatchdogCall>>,
     hit: AtomicBool,
+}
+
+impl WatchdogCall {
+    /// When the call expires: its deadline, or a stall window after its last progress
+    /// (lock-free: the fault handler asks too).
+    fn expiry(&self) -> Option<std::time::Instant> {
+        match &self.stall {
+            Some(s) => {
+                let last = s.moved.iter().map(|m| m.load(Ordering::Relaxed)).max().unwrap_or(0);
+                s.start.checked_add(std::time::Duration::from_nanos(last)).and_then(|t| t.checked_add(s.window))
+            }
+            None => self.deadline,
+        }
+    }
+}
+
+/// What a test's watch counts as progress, process-wide: [0] a compile finished or a build was
+/// installed, [1] a process was spawned or a program thread started or ended (`note_progress`).
+static TEST_PROGRESS: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+pub(crate) const PROGRESS_JIT: usize = 0;
+pub(crate) const PROGRESS_PROC: usize = 1;
+
+#[inline]
+pub(crate) fn note_progress(k: usize) {
+    TEST_PROGRESS[k].fetch_add(1, Ordering::Relaxed);
+}
+
+/// A test's watch: it expires `window` after the last progress the watchdog's worker saw, however
+/// long the test runs while it progresses. Progress is the TEST_PROGRESS counts and, on Linux, the
+/// bytes the test's thread read or wrote (its /proc io rchar + wchar). A thread that only runs,
+/// sleeps, polls or waits on a lock (a sleep-poll loop, a spin on a flag, a deadlock) moves none
+/// of them; an expired watch unwinds it in JIT code (the kick) or at its wait (watchdog_at_wait).
+struct Stall {
+    window: std::time::Duration,
+    start: std::time::Instant,
+    /// per signal (PROGRESS_JIT, PROGRESS_PROC, the thread's bytes): the count last seen (u64::MAX:
+    /// not read yet), and when it last moved, in ns after `start` (the worker writes both)
+    seen: [AtomicU64; 3],
+    moved: [AtomicU64; 3],
+    /// Linux: the test thread's /proc/<pid>/task/<tid>/io, and when the worker reads it next
+    io: Option<String>,
+    io_next: AtomicU64,
+}
+
+/// How often the worker reads a test thread's /proc io (a file read per watched test).
+const STALL_IO_EVERY_NS: u64 = 100_000_000;
+
+impl Stall {
+    fn new(window_ms: u64) -> Stall {
+        #[cfg(target_os = "linux")]
+        let io = std::fs::read_link("/proc/thread-self").ok().map(|p| format!("/proc/{}/io", p.display()));
+        #[cfg(not(target_os = "linux"))]
+        let io = None;
+        Stall {
+            window: std::time::Duration::from_millis(window_ms),
+            start: std::time::Instant::now(),
+            seen: [AtomicU64::new(TEST_PROGRESS[0].load(Ordering::Relaxed)), AtomicU64::new(TEST_PROGRESS[1].load(Ordering::Relaxed)), AtomicU64::new(u64::MAX)],
+            moved: [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)],
+            io,
+            io_next: AtomicU64::new(0),
+        }
+    }
+
+    /// The worker's look: a signal that moved since its last look is the test's latest progress.
+    fn observe(&self, now: std::time::Instant) {
+        let at = now.saturating_duration_since(self.start).as_nanos() as u64;
+        for k in [PROGRESS_JIT, PROGRESS_PROC] {
+            let v = TEST_PROGRESS[k].load(Ordering::Relaxed);
+            if self.seen[k].swap(v, Ordering::Relaxed) != v {
+                self.moved[k].store(at, Ordering::Relaxed);
+            }
+        }
+        if let Some(path) = &self.io {
+            if at >= self.io_next.load(Ordering::Relaxed) {
+                self.io_next.store(at + STALL_IO_EVERY_NS, Ordering::Relaxed);
+                if let Some(v) = crate::zone_alloc::kept_with(|| thread_io_bytes(path)) {
+                    let was = self.seen[2].swap(v, Ordering::Relaxed);
+                    if was != u64::MAX && was != v {
+                        self.moved[2].store(at, Ordering::Relaxed);
+                    }
+                }
+            }
+        }
+    }
+
+    /// The hang's message: what stopped advancing, and for how long.
+    fn describe(&self) -> String {
+        let now = self.start.elapsed().as_nanos() as u64;
+        let ago = |k: usize| now.saturating_sub(self.moved[k].load(Ordering::Relaxed)) as f64 / 1e9;
+        let mut s = format!(
+            "watchdog: the test made no progress for {:.1} s (no compile finished or build installed for {:.1} s, no process spawned and no thread started or ended for {:.1} s",
+            self.window.as_secs_f64(), ago(PROGRESS_JIT), ago(PROGRESS_PROC));
+        if self.io.is_some() {
+            s += &format!(", nothing read or written on its thread for {:.1} s", ago(2));
+        }
+        s.push(')');
+        s
+    }
+}
+
+/// The bytes a thread read and wrote (`rchar` + `wchar` of its /proc io), or None once it is gone.
+fn thread_io_bytes(path: &str) -> Option<u64> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let field = |name: &str| text.lines().find_map(|l| l.strip_prefix(name)).and_then(|v| v.trim().parse::<u64>().ok());
+    Some(field("rchar:")?.wrapping_add(field("wchar:")?))
+}
+
+/// The message of the watch that expired on this thread: a test's stall, or a call's deadline.
+fn watchdog_message() -> String {
+    let token = WATCHDOG_EXPIRED.with(|t| t.get());
+    let stall = WATCHDOG_STACK.with(|s| s.borrow().iter().find(|c| c.token == token).and_then(|c| c.stall.as_ref().map(Stall::describe)));
+    stall.unwrap_or_else(|| "watchdog: the call did not return in time".to_string())
 }
 static WATCHDOG_CALLS: relax_session::sync::Mutex<Vec<std::sync::Arc<WatchdogCall>>> = relax_session::sync::Mutex::new(Vec::new());
 static WATCHDOG_WAKE: relax_session::sync::Condvar = relax_session::sync::Condvar::new();
@@ -4233,6 +4347,14 @@ fn fatal_compile_error(p: &PanicInfo, report: &str) {
 rt_fn! {
 pub(crate) fn rt_thread_run(entry: u64, arg: u64) -> u64 {
     ensure_altstack();
+    note_progress(PROGRESS_PROC);
+    struct Ended;
+    impl Drop for Ended {
+        fn drop(&mut self) {
+            note_progress(PROGRESS_PROC);
+        }
+    }
+    let _ended = Ended;
     let u = if AUX_UNITS_ANY.load(Ordering::Acquire) {
         let aux = AUX_UNITS.lock().unwrap_or_else(|e| e.into_inner());
         aux.iter()
@@ -4538,33 +4660,7 @@ unsafe fn on_fault_locked(f: &os::fault::Fault, hooks: &os::fault::Hooks) -> os:
         if cur_unit().is_null() || *ctx_ptr() == 0 || !in_jit_code(pc) {
             return Action::Ignore;
         }
-        // An enclosing timeout is already moving through inner guard cleanups. A
-        // second expired timer must not replace its ownership before it reaches home.
-        if WATCHDOG_EXPIRED.with(|t| t.get() != 0) {
-            return Action::Ignore;
-        }
-        // Kicks carry no token on Unix. Validate against this thread's live deadline
-        // chain, so a queued signal can never expire a later, still-in-budget call.
-        let expired = WATCHDOG_CURRENT.with(|current| {
-            let mut p = current.get();
-            let now = std::time::Instant::now();
-            let mut selected: *const WatchdogCall = std::ptr::null();
-            while !p.is_null() {
-                let call = &*p;
-                if call.deadline.is_some_and(|d| now >= d) && !call.hit.load(Ordering::Acquire)
-                    && (selected.is_null() || call.deadline < (*selected).deadline) {
-                    selected = p;
-                }
-                p = call.parent.as_ref().map_or(std::ptr::null(), std::sync::Arc::as_ptr);
-            }
-            if selected.is_null() {
-                return false;
-            }
-            (*selected).hit.store(true, Ordering::Release);
-            WATCHDOG_EXPIRED.with(|t| t.set((*selected).token));
-            true
-        });
-        if !expired {
+        if !take_expired_watch() {
             return Action::Ignore;
         }
         record_fault(f, 3);
@@ -4731,6 +4827,86 @@ unsafe fn record_fault(f: &os::fault::Fault, code: u8) {
     });
 }
 
+/// Takes this thread's expired watch, if one is due: marks it hit and owning the unwind
+/// (WATCHDOG_EXPIRED). Signal-safe: atomics, const thread-locals and the clock.
+unsafe fn take_expired_watch() -> bool {
+    // An enclosing timeout is already moving through inner guard cleanups. A
+    // second expired timer must not replace its ownership before it reaches home.
+    if WATCHDOG_EXPIRED.with(|t| t.get() != 0) {
+        return false;
+    }
+    // Kicks carry no token on Unix. Validate against this thread's live deadline
+    // chain, so a queued signal can never expire a later, still-in-budget call.
+    WATCHDOG_CURRENT.with(|current| {
+        let mut p = current.get();
+        let now = std::time::Instant::now();
+        let mut selected: *const WatchdogCall = std::ptr::null();
+        while !p.is_null() {
+            let call = &*p;
+            if call.expiry().is_some_and(|d| now >= d) && !call.hit.load(Ordering::Acquire)
+                && (selected.is_null() || call.expiry() < (*selected).expiry()) {
+                selected = p;
+            }
+            p = call.parent.as_ref().map_or(std::ptr::null(), std::sync::Arc::as_ptr);
+        }
+        if selected.is_null() {
+            return false;
+        }
+        (*selected).hit.store(true, Ordering::Release);
+        WATCHDOG_EXPIRED.with(|t| t.set((*selected).token));
+        true
+    })
+}
+
+/// A program wait's end or interruption (relax std's sync/raw.rs futex_wait and sleep, through
+/// inspect's wait hooks): a watch that expired while this thread waited unwinds here as a hang.
+/// Its kick lands in the wait, outside JIT code, where on_fault_locked ignores it, and ends the
+/// wait's system call with EINTR (the watchdog signal has no SA_RESTART): std's futex wait then
+/// calls relax_wait_interrupted, and a sleep soon reaches relax_wait_leave. So a test blocked on
+/// a lock no one releases, or polling with sleeps for something that never happens, is reported
+/// as surely as a spinning one. `leave_wait`: the wait's own leave, when the
+/// thread is still inside it (its EINTR, relax_wait_interrupted); it runs only before an unwind.
+pub(crate) fn watchdog_at_wait(leave_wait: impl FnOnce()) {
+    // (most waits: a thread no watch is armed on; a forked child: no worker keeps its watch current)
+    if WATCHDOG_CURRENT.with(|c| c.get().is_null()) || crate::owner::in_fork_child() {
+        return;
+    }
+    unsafe {
+        if cur_unit().is_null() || *ctx_ptr() == 0 || !take_expired_watch() {
+            return;
+        }
+        leave_wait();
+        record_hang_here();
+        let leave: rt_fn_ty!(fn(*mut u64, u64) -> !) = std::mem::transmute((&*cur_unit()).leave as usize);
+        leave(ctx_ptr(), 3)
+    }
+}
+
+/// record_fault of a hang taken at a runtime hook JIT code called: the frames are this thread's
+/// chain from here, from the first return address into JIT code on (the JIT frame is the pc).
+#[inline(never)]
+unsafe fn record_hang_here() {
+    let fp = own_frame_pointer();
+    let here = &fp as *const u64 as u64;
+    let _ = FAULT_REC.try_with(|r| {
+        let r = &mut *r.get();
+        let n = walk_fp_bounded(fp, here.min(fp), &mut r.raw);
+        let first = r.raw[..n].iter().position(|&ret| in_jit_code(ret.wrapping_sub(1))).unwrap_or(n);
+        r.pending = 3;
+        r.kind = os::fault::Kind::Watchdog;
+        r.sig = 0;
+        r.pc = if first < n { r.raw[first] } else { 0 };
+        r.sp = here;
+        r.fp = fp;
+        r.addr = 0;
+        r.guard_depth = GUARD_DEPTH.try_with(|g| g.get()).unwrap_or(0);
+        r.const_eval_depth = CONST_EVAL_DEPTH.try_with(|g| g.get()).unwrap_or(0);
+        let from = (first + 1).min(n);
+        r.raw.copy_within(from..n, 0);
+        r.n = n - from;
+    });
+}
+
 /// At the recovery point after `leave` (normal context, on the thread's own stack): the fault
 /// the handler recorded becomes the PanicInfo, with the policy applied here -- poisoned note,
 /// report, or the end of the process by the fault's signal.
@@ -4750,7 +4926,7 @@ unsafe fn materialize_fault() {
     }
     let frames = frames_from_raw(rec.pc, false, &rec.raw[..rec.n]);
     if rec.pending == 3 {
-        PANIC.with(|p| *p.borrow_mut() = Some(PanicInfo { kind: "hang".to_string(), message: "watchdog: the call did not return in time".to_string(), site: u64::MAX, frames, fault_addr: 0, location: String::new() }));
+        PANIC.with(|p| *p.borrow_mut() = Some(PanicInfo { kind: "hang".to_string(), message: watchdog_message(), site: u64::MAX, frames, fault_addr: 0, location: String::new() }));
         return;
     }
     let kind = match rec.kind {
@@ -8249,6 +8425,7 @@ impl Unit {
     /// Links `code` (emitted with its relocated fields zeroed) where it lands, then installs it.
     #[track_caller]
     pub fn install(&mut self, id: u32, code: &[u8], relocs: &[relax_backend::rir::RelocAt], pc_map: Vec<(u32, u64)>, gen: u32) -> Result<u64, String> {
+        note_progress(PROGRESS_JIT);
         // `makepad run --check-first`: a body's first code is installed only once its checker
         // accepts it (a live patch, gen > 0, passed reload's gate instead). Off by default:
         // Gandalf checks lazily in the background and the JIT never waits for it.
@@ -8966,9 +9143,20 @@ unsafe fn call_jit_inner(u: *mut Unit, entry: u64, arg: u64) -> Result<u64, Pani
     }
 }
 
-/// One worker serves all deadlines, including enclosing guards on the same thread.
-/// No thread creation per guard, and no polling instructions in compiled code.
+/// A call's deadline: the call is unwound as a hang `ms` after it started (0: none).
 pub fn watchdog(ms: u64) -> u64 {
+    watch(if ms == 0 { None } else { std::time::Instant::now().checked_add(std::time::Duration::from_millis(ms)) }, None)
+}
+
+/// A test's watch: the test is unwound as a hang once it made no progress for `ms` (Stall),
+/// however long it runs while it progresses (0: none).
+pub fn watchdog_stall(ms: u64) -> u64 {
+    watch(None, if ms == 0 { None } else { Some(crate::zone_alloc::kept_with(|| Stall::new(ms))) })
+}
+
+/// One worker serves all deadlines and stall watches, including enclosing guards on the same
+/// thread. No thread creation per guard, and no polling instructions in compiled code.
+fn watch(deadline: Option<std::time::Instant>, stall: Option<Stall>) -> u64 {
     static START: std::sync::Once = std::sync::Once::new();
     START.call_once(|| {
         { let _k = crate::zone_alloc::kept();
@@ -8982,7 +9170,10 @@ pub fn watchdog(ms: u64) -> u64 {
                 }
                 let now = std::time::Instant::now();
                 for call in calls.iter() {
-                    if call.deadline.is_some_and(|d| now >= d) && !call.hit.load(Ordering::Acquire) {
+                    if let Some(s) = &call.stall {
+                        s.observe(now);
+                    }
+                    if call.expiry().is_some_and(|d| now >= d) && !call.hit.load(Ordering::Acquire) {
                         os::thread::kick(call.target);
                     }
                 }
@@ -8994,14 +9185,15 @@ pub fn watchdog(ms: u64) -> u64 {
     let call = crate::zone_alloc::kept_with(|| std::sync::Arc::new(WatchdogCall {
         token: WATCHDOG_ID.fetch_add(1, Ordering::Relaxed),
         target: os::thread::current(),
-        deadline: if ms == 0 { None } else { std::time::Instant::now().checked_add(std::time::Duration::from_millis(ms)) },
+        deadline,
+        stall,
         parent: WATCHDOG_STACK.with(|s| s.borrow().last().cloned()),
         hit: AtomicBool::new(false),
     }));
     let token = call.token;
     WATCHDOG_STACK.with(|s| s.borrow_mut().push(call.clone()));
     WATCHDOG_CURRENT.with(|c| c.set(std::sync::Arc::as_ptr(&call)));
-    if call.deadline.is_some() {
+    if call.deadline.is_some() || call.stall.is_some() {
         crate::zone_alloc::kept_with(|| WATCHDOG_CALLS.lock().unwrap_or_else(|e| e.into_inner()).push(call));
         WATCHDOG_WAKE.notify_one();
     }
@@ -10051,6 +10243,7 @@ pub(crate) fn drain_records_bounded() {
 /// Links and installs a slot's code (`relocs` are the code's own; `record`: the disk cache
 /// stores it -- false for code that came from the cache).
 unsafe fn install_compiled(up: *mut Unit, id: u32, code: &[u8], map: Vec<(u32, u64)>, relocs: &[relax_backend::rir::RelocAt], record: bool) -> u64 {
+    note_progress(PROGRESS_JIT);
     let _cost_install = relax_codegen::fncost::phase(6);
     // made in this run (recorded or not) vs linked from the disk cache
     let fresh = record;
@@ -25380,6 +25573,7 @@ pub(crate) fn loader_symbol(name: &[u8]) -> Option<usize> {
         // makepad inspect's wait registry: program lock / condvar / park waits (Relax's std sync/raw.rs)
         b"__relax_wait_enter" => Some(crate::inspect::relax_wait_enter as *const () as usize),
         b"__relax_wait_leave" => Some(crate::inspect::relax_wait_leave as *const () as usize),
+        b"__relax_wait_interrupted" => Some(crate::inspect::relax_wait_interrupted as *const () as usize),
         // the domain a thread runs in (domain.rs): a thread std starts inherits its parent's
         b"__relax_domain_base" => Some(crate::domain::relax_domain_base as *const () as usize),
         b"__relax_domain_id" => Some(crate::domain::relax_domain_id as *const () as usize),
@@ -25554,7 +25748,7 @@ pub extern "C" fn __relax_guard_leave(token: u64) {
             // This uses the same contained exit as the watchdog, without skipping guard
             // bookkeeping or falsely returning an inner timeout to its caller.
             PANIC.with(|p| *p.borrow_mut() = Some(PanicInfo {
-                kind: "hang".to_string(), message: "watchdog: the call did not return in time".to_string(),
+                kind: "hang".to_string(), message: watchdog_message(),
                 site: u64::MAX, frames: Vec::new(), fault_addr: 0, location: String::new(),
             }));
             unsafe {

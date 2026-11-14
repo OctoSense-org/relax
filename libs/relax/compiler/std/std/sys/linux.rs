@@ -215,6 +215,8 @@ extern "C" {
     fn pthread_setname_np(thread: usize, name: *const c_char) -> c_int;
     fn pthread_self() -> usize;
     fn syscall(num: c_long, ...) -> c_long;
+    // the loader's: a signal ended a futex wait's system call (a test's watch may end the wait)
+    fn __relax_wait_interrupted();
     fn gettid() -> i32;
     fn getrandom(buf: *mut c_void, len: usize, flags: u32) -> isize;
     fn readlink(path: *const c_char, buf: *mut c_char, size: usize) -> isize;
@@ -455,6 +457,7 @@ pub fn futex_wait(futex: &AtomicU32, expected: u32, timeout: Option<Duration>) -
                 return false;
             }
             if e == EINTR {
+                unsafe { __relax_wait_interrupted() };
                 continue;
             }
         }

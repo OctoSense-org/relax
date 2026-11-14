@@ -1977,7 +1977,7 @@ fn c_policy(allow: Allow, name: &str) -> Option<Option<(&'static str, u64)>> {
         #[cfg(target_vendor = "apple")]
         "ulock_wake" => Some(("sb_ulock_wake", sb_ulock_wake as *const () as u64)),
         "dlsym" => Some(("sb_no_symbol", sb_no_symbol as *const () as u64)),
-        "relax_wait_enter" | "relax_wait_leave" | "relax_wake" => Some(("sb_unrecorded", sb_unrecorded as *const () as u64)),
+        "relax_wait_enter" | "relax_wait_leave" | "relax_wait_interrupted" | "relax_wake" => Some(("sb_unrecorded", sb_unrecorded as *const () as u64)),
         // std's runtime panic hook and payload end (sys/rt.rs install_core_hook): host code never
         // calls into twins; their panics record their payload through core's hook in the arena,
         // and a runtime check's failure in a twin is a contained fault

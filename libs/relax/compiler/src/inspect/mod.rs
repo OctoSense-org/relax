@@ -2030,6 +2030,20 @@ pub extern "C" fn relax_wait_enter(kind: u32, addr: usize, holder: usize) {
 }
 
 pub extern "C" fn relax_wait_leave() {
+    wait_left();
+    // a test's watch that expired while it waited: it unwinds from here as a hang
+    crate::jit::watchdog_at_wait(|| {});
+}
+
+/// Relax std's sys futex_wait: a signal ended the wait's system call (EINTR) and the wait goes
+/// on. A test's watch that expired meanwhile (its kick is that signal) leaves the wait here and
+/// unwinds it as a hang: a lock no one releases never brings the thread to relax_wait_leave.
+pub extern "C" fn relax_wait_interrupted() {
+    crate::jit::watchdog_at_wait(wait_left);
+}
+
+/// A wait's end in the registry, the CPU budget and the program heap.
+fn wait_left() {
     if !crate::owner::in_fork_child() {
         makepad_cpu_budget::take_back();
     }

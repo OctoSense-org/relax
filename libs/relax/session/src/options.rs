@@ -864,7 +864,9 @@ pub struct RuntimeOptions {
     /// `RELAX_TEST_DOMAINS`: `makepad test` runs each test at the same time in this many domains
     /// (each its own thread and static block); default `1`.
     pub test_domains: usize,
-    /// `RELAX_WATCHDOG_MS`; default `20_000`.
+    /// `RELAX_WATCHDOG_MS`: how long a `makepad test` test may make no progress (no compile,
+    /// install, spawn, thread start or end, no bytes read or written on its thread) before it is
+    /// reported as a hang; default `20_000`. A test that keeps progressing runs as long as it takes.
     pub watchdog_ms: u64,
     /// `RELAX_RESTORE`; default `None`.
     pub restore: Option<String>,
