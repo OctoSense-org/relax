@@ -7,7 +7,7 @@ use super::mir_nll::MirRegionResult;
 use super::path_utils::{each_borrow_involving_path, is_active};
 use super::places_conflict::{borrow_conflicts_with_place, AccessDepth, ArtificialField, PlaceConflictBias};
 use super::prefixes::{prefixes, PrefixSet};
-use crate::mir::dataflow::BitSet;
+use crate::mir::dataflow::{BitSet, EverInitializedPlaces};
 use crate::mir::move_paths::{InitKind, LookupResult, MoveData};
 use crate::mir::visit::Visitor;
 use crate::mir::*;
@@ -633,15 +633,17 @@ impl MirBorrowckCtxt<'_> {
         if borrow_conflicts_with_place(self.tcx, self.body, &borrow.borrowed_place, borrow.kind, &root,
             if thread_local { Deep } else { Shallow(None) }, PlaceConflictBias::Overlap) { self.lifetime_error(borrow, &root, at, span); }
     }
-    fn first_reaching_init(&self, local: Local, state: BorrowckDomain<'_>) -> Option<usize> {
+    /// rustc lib.rs:2528: the first init of `local` (in gather order) that may have executed on some
+    /// path reaching `at` without an intervening `StorageDead(local)`.
+    fn first_reaching_init(&self, local: Local, at: Location) -> Option<usize> {
         let path = self.moves.rev_lookup.find_local(local)?;
-        self.moves.init_path_map[path].iter().copied().find(|&i| state.ever_inits.contains(i))
+        self.moves.init_path_map[path].iter().copied().find(|&i| EverInitializedPlaces::init_reaches_location(self.body, local, &self.moves.inits[i], at))
     }
     fn add_used_mut(&mut self, root: &Place, allow: bool, state: BorrowckDomain<'_>) {
         if root.projection.is_empty() {
             // If the local may have been initialized and is now being mutated, the mutation may be a
             // reassignment, which justifies the `mut`.
-            if !allow && self.first_reaching_init(root.local, state).is_some() { self.result.used_mut.insert(root.local.0 as usize); }
+            if !allow && state.ever_inits.contains(root.local.0 as usize) { self.result.used_mut.insert(root.local.0 as usize); }
         } else if !allow {
             if let Some(field) = self.upvar_field(root) { self.note_used_mut_upvar(field); }
         }
@@ -699,7 +701,9 @@ impl MirBorrowckCtxt<'_> {
             Ok((root, allow)) => { self.add_used_mut(&root, allow, state); return false; }
             Err(the_place_err) => the_place_err,
         };
-        let Some(init) = self.first_reaching_init(place.local, state) else { return false; };
+        // rustc lib.rs:2506: only a local that may have been initialized reports an error.
+        if !state.ever_inits.contains(place.local.0 as usize) { return false; }
+        let init = self.first_reaching_init(place.local, at).expect("an ever-initialized local has a reaching init");
         let detail = Detail::Mutability { place: place.clone(), the_place_err: the_place_err.clone(), access: access.access_kind(), location: at, init: Some(init) };
         let code = if borrow { "E0596" } else if place.projection.is_empty() { "E0384" } else { "E0594" };
         if self.relaxed_mut(&the_place_err, span, code) { return false; }
