@@ -4833,6 +4833,17 @@ struct YieldProbe(std::sync::Mutex<(Option<Instant>, f64, &'static str, u32, &'s
 /// (YieldProbe) the section of a background owner request running now: a gap between two
 /// checks is reported by the section it began in
 pub(crate) static YIELD_SECTION: relax_session::sync::Mutex<&'static str> = relax_session::sync::Mutex::new("");
+/// What an owner-thread step made and no longer needs (an image build's working set), freed by the
+/// cache writer after it gave the owner back (drop_later_now): freeing it there held the owner
+/// ~30 ms past the step's last yield check.
+static DROP_LATER: std::sync::Mutex<Vec<Box<dyn std::any::Any + Send>>> = std::sync::Mutex::new(Vec::new());
+pub(crate) fn drop_later(b: Box<dyn std::any::Any + Send>) {
+    DROP_LATER.lock().unwrap_or_else(|e| e.into_inner()).push(b);
+}
+fn drop_later_now() {
+    let v = std::mem::take(&mut *DROP_LATER.lock().unwrap_or_else(|e| e.into_inner()));
+    drop(v);
+}
 pub(crate) fn yield_section(s: &'static str) { *YIELD_SECTION.lock().unwrap_or_else(|e| e.into_inner()) = s; }
 impl YieldProbe {
     fn new() -> Self { Self(std::sync::Mutex::new((None, 0.0, "", 0, ""))) }
@@ -4986,7 +4997,8 @@ fn mid_flush(quiet: bool, wait: bool) -> Option<(usize, usize)> {
     };
     yield_section("");
     Some((held, spill))
-    }) else { yield_section(""); return None };
+    }) else { yield_section(""); drop_later_now(); return None };
+    drop_later_now();
     probe.report("mid write");
     let held1 = held.elapsed().as_secs_f64() * 1e3;
     let n = match spill {
