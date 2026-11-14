@@ -424,8 +424,8 @@ fn check_group(g: &Group<'_, '_>, owners: &[CheckedBody], anon_const: bool, v: &
     let mut closure_sigs: crate::fxhash::HashMap<u32, SignatureRegions> = Default::default();
     for &c in closure_order.iter().rev() {
         let parent = match creator.get(&c).copied().flatten().and_then(|p| closure_sigs.get(&p)) {
-            Some(p) => p.clone(),
-            None => item_sig.clone(),
+            Some(p) => p,
+            None => &item_sig,
         };
         if let Some(&ty) = typeck.inline_const_types.get(&c).filter(|_| built.iter().any(|(o, _)| matches!(o.kind, OwnerKind::InlineConst(e) if e.0 == c))) {
             closure_sigs.insert(c, SignatureRegions::inline_const_in(tcx, prog, typeck.def, c, ty, parent));
@@ -452,20 +452,21 @@ fn check_group(g: &Group<'_, '_>, owners: &[CheckedBody], anon_const: bool, v: &
         };
         closure_sigs.insert(c, sig.with_closure_env(tcx, typeck.def, c, env_ty));
     }
+    let mut item_sig = Some(item_sig);
     for (owner, mut mir) in built {
         let (sig, key, nested) = match owner.kind {
             OwnerKind::Closure(e) => {
-                let Some(sig) = closure_sigs.get(&e.0).cloned() else { v.unchecked.push(format!("{name}: closure without a signature")); return; };
+                let Some(sig) = closure_sigs.remove(&e.0) else { v.unchecked.push(format!("{name}: closure without a signature")); return; };
                 let id = ClosureId { file: typeck.file, expr: e.0 };
                 let key = if mir.coroutine.is_some() { ClauseOwner::Coroutine(id) } else { ClauseOwner::Closure(id) };
                 (sig, key, true)
             }
             OwnerKind::InlineConst(e) => {
-                let Some(sig) = closure_sigs.get(&e.0).cloned() else { v.unchecked.push(format!("{name}: inline const without universal regions")); return; };
+                let Some(sig) = closure_sigs.remove(&e.0) else { v.unchecked.push(format!("{name}: inline const without universal regions")); return; };
                 let Some(&def) = prog.node_id_to_def_id.get(&(typeck.file, relax_front::def_collector::NodeId::InlineConst(e))) else { v.unchecked.push(format!("{name}: inline const definition")); return; };
                 (sig, ClauseOwner::Def(def), true)
             }
-            _ => (item_sig.clone(), ClauseOwner::Def(typeck.def), false),
+            _ => (item_sig.take().unwrap(), ClauseOwner::Def(typeck.def), false),
         };
         let moves = MoveData::gather_moves(&mir, prog, tcx, env, &|_| true);
         let mut infcx = BorrowckInferCtxt::new(tcx, prog, typeck.def, typeck.def, &typeck.args);
