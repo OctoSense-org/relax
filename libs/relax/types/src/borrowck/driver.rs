@@ -98,10 +98,19 @@ fn created_closures(mir: &Body, out: &mut Vec<u32>) {
     for p in &mir.promoted { created_closures(p, out); }
 }
 
+/// The root's path for the `unchecked` messages, made the first time one is written (most roots
+/// write none).
+struct RootName<'a> { prog: &'a Program, def: crate::program::DefId, text: std::cell::OnceCell<String> }
+impl std::fmt::Display for RootName<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.text.get_or_init(|| self.prog.def_path(self.def)))
+    }
+}
+
 /// Check one typeck root. See the module doc.
 pub fn check_root(cx: &EvalCx<'_>, prog: &Program, tcx: &Tcx, typeck: &typeck::Body, fv_cache: Option<&Rc<SummaryCx>>) -> Verdict {
     let mut v = Verdict { errors: Vec::new(), unchecked: Vec::new(), fv_only: Vec::new(), fv_records: Vec::new(), relaxed_records: Vec::new(), bodies: 0 };
-    let name = prog.def_path(typeck.def);
+    let name = RootName { prog, def: typeck.def, text: Default::default() };
     let env = TypingEnv {
         limit: crate::tcx::RecursionLimit::for_item(prog, typeck.def),
         param_env: typeck.param_env.unwrap_or_default(),
@@ -334,7 +343,7 @@ struct Group<'a, 'b> {
     typeck: &'a typeck::Body,
     env: TypingEnv,
     root: &'b BuildRoot<'b>,
-    name: &'a str,
+    name: &'b RootName<'b>,
     fv_cache: Option<&'a Rc<SummaryCx>>,
 }
 
@@ -383,7 +392,9 @@ fn check_group(g: &Group<'_, '_>, owners: &[CheckedBody], anon_const: bool, v: &
     // Nesting from the MIR itself (which body aggregates which closure), not from source extents: macro
     // expansions give nested closures equal spans. Inner bodies come first, as do_mir_borrowck requires.
     let mut creator: crate::fxhash::HashMap<u32, Option<u32>> = Default::default();
-    for (owner, mir) in &built {
+    // (a single built body is the group's only one: it creates no closure or inline constant to order)
+    let walked: &[(CheckedBody, Box<Body>)] = if built.len() > 1 { &built } else { &[] };
+    for (owner, mir) in walked {
         let by = match owner.kind { OwnerKind::Closure(e) | OwnerKind::InlineConst(e) => Some(e.0), _ => None };
         let mut created = vec![];
         created_closures(mir, &mut created);
@@ -483,13 +494,9 @@ fn check_group(g: &Group<'_, '_>, owners: &[CheckedBody], anon_const: bool, v: &
         for bug in std::mem::take(&mut tc.summary.mir_bugs) {
             v.unchecked.push(format!("{name}: MIR bug: {}", render_ids(prog, tcx, &bug.message)));
         }
-        let borrows = BorrowSet::build(tcx, &p.mir, false, &p.moves);
-        let regions_stub = None::<()>;
-        let _ = regions_stub;
         for e in errors {
             let d = diagnostics::Diag::new(e.code(), e.span, e.kind.note());
             v.errors.push(diagnostics::capture(prog, typeck.def, &d));
-            let _ = &borrows;
         }
         // E0320: the drop-check rules of a local's type overflowed the recursion limit
         // (DropckOutlivesResult::report_overflows)
@@ -537,19 +544,25 @@ fn check_group(g: &Group<'_, '_>, owners: &[CheckedBody], anon_const: bool, v: &
             v.unchecked.push(format!("{name}: {why}"));
             continue;
         }
-        let borrows = BorrowSet::build(tcx, &p.mir, matches!(p.mir.source.kind, BodyKind::Fn | BodyKind::Closure(_)), &p.moves);
-        let names = universal_names(tcx, prog, p);
-        let mut dcx = DiagCx::new(tcx, prog, p.owner.owner, &p.mir, &p.moves, &checked.regions, &borrows, &names);
-        dcx.coroutine_kinds = checked.coroutine_kinds.clone();
         if crate::lint::enabled() && checked.result.accepted() && matches!(p.owner.kind, OwnerKind::Function | OwnerKind::Closure(_)) {
             lint_unused_mut(prog, typeck.def, &p.mir, &checked.result.used_mut);
         }
-        v.errors.extend(diagnostics::render_errors(&dcx, &checked.result));
         // `report_opaque_type_errors`: only when the region inference found no error (those would explain them).
-        if checked.regions.regioncx.errors.is_empty() {
-            v.errors.extend(diagnostics::opaque_types::report_opaque_type_errors(&dcx, &checked.deferred_opaque_type_errors).iter().map(|d| diagnostics::capture(prog, p.owner.owner, d)));
+        let opaque_errors = checked.regions.regioncx.errors.is_empty() && !checked.deferred_opaque_type_errors.is_empty();
+        // The borrow set, region names and diagnostics context exist to render errors; rustc makes the
+        // names only when it reports one. A body with nothing to render builds none of them.
+        let r = &checked.result;
+        if !r.errors.is_empty() || !r.region_errors.is_empty() || !r.fv_only.is_empty() || opaque_errors {
+            let borrows = BorrowSet::build(tcx, &p.mir, matches!(p.mir.source.kind, BodyKind::Fn | BodyKind::Closure(_)), &p.moves);
+            let names = universal_names(tcx, prog, p);
+            let mut dcx = DiagCx::new(tcx, prog, p.owner.owner, &p.mir, &p.moves, &checked.regions, &borrows, &names);
+            dcx.coroutine_kinds = checked.coroutine_kinds.clone();
+            v.errors.extend(diagnostics::render_errors(&dcx, r));
+            if opaque_errors {
+                v.errors.extend(diagnostics::opaque_types::report_opaque_type_errors(&dcx, &checked.deferred_opaque_type_errors).iter().map(|d| diagnostics::capture(prog, p.owner.owner, d)));
+            }
+            v.fv_only.extend(diagnostics::render_fv_only(&dcx, r));
         }
-        v.fv_only.extend(diagnostics::render_fv_only(&dcx, &checked.result));
         v.fv_records.extend(checked.result.fv_records.iter().cloned());
         v.relaxed_records.extend(checked.result.relaxed_records.iter().cloned());
     }
