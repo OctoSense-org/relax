@@ -6992,6 +6992,8 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
     // app with nobody told, and a quit waited for the paused main forever, 11-08.)
     let breaking: Vec<DefId> = saved_adts.iter().filter(|(d, old)| old.is_enum || fresh_structs.iter().any(|x| x.0 == *d)).map(|(d, _)| *d).collect();
     let mut pre_paused = false;
+    // Keep the frame's reason for the report after hold_back has made its existing decision.
+    let mut frame_restart = None;
     if !breaking.is_empty() && errs.is_empty() {
         pre_paused = crate::inspect::instrument::pause_for_patch();
         let rebuilt: crate::fxhash::HashSet<u32> = slots.iter().copied().collect();
@@ -7005,6 +7007,7 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
             Err(e) => Some(format!("{pos}{what} `{}` changed its layout, and the program's stacks could not be read to see that no frame runs code built for the old one ({e}) -- restart the app", names.join("`, `"))),
         };
         if let Some(why) = why {
+            frame_restart = Some(why.clone());
             errs.push(why);
             as_restart = true;
         }
@@ -7099,6 +7102,19 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
         }
         if as_restart && hold {
             if let Some(r) = hold_back(up, &edits, &out.lines, t0, retries, base) { return r; }
+        }
+        if let Some(why) = frame_restart {
+            // These types cannot take their new layout while a frame holds one: layout_edit's
+            // "takes its new layout" notes (struct and enum) are no longer true. Done after
+            // hold_back, so its decision still sees the same reasons as before.
+            for &d in &breaking {
+                let p = u.prog.def_path(d);
+                let (s, e) = (format!("struct `{p}` takes its new layout:"), format!("enum `{p}` takes its new layout ("));
+                out.lines.retain(|l| !l.starts_with(&s) && !l.starts_with(&e));
+            }
+            // restart_for_edit uses the first line as its headline: name the holder there too.
+            out.lines.retain(|l| l != &why);
+            out.lines.insert(0, why);
         }
         // A complete item may still fail checking. Remove only items located by diagnostics,
         // restore their running identities, and retry through the same transaction gate.
@@ -8003,6 +8019,7 @@ pub(crate) fn settle_verdicts(up: *mut Unit, pending: &mut Vec<PendingPatch>, un
 }
 
 /// An edit the patcher cannot absorb waits for the person: a running app never restarts by itself.
+/// The first reason is the offer's headline, so a layout blocked by a frame names that holder first.
 fn restart_for_edit(what: &str, lines: &[String]) {
     SOURCES_WAIT.store(true, Ordering::Release);
     offer_restart(&format!("{}: {}", what, lines.first().cloned().unwrap_or_default()));
