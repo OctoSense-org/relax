@@ -1004,16 +1004,23 @@ pub struct Cache {
     /// the identities (identity_hash) of the startup manifest this run wrote: the quit's session
     /// tail is the install order past them
     written_ids: Option<HashSet<u128>>,
-    /// the replacements (rewrite_sum) when this run last built the startup image, and its slots:
-    /// an in-session rebuild is due once 5% of them were replaced since (image_refresh_due)
-    image_built: Option<(u64, usize)>,
+    /// this run's startup image: `replaced`'s length when it was built, its slots, and its slots
+    /// as a bit per slot id: an in-session rebuild is due once 5% of them were replaced since
+    /// (image_refresh_due)
+    image_built: Option<(usize, usize, Vec<u64>)>,
+    /// the slots whose code this run replaced (record: an entry without a recorded tier, and one
+    /// moved to a higher tier), in order: an image's stale slots are its own among them
+    /// (image_replaced; the replacements of every slot counted code that no image holds)
+    replaced: Vec<u32>,
+    /// the loaded image's slots, a bit per slot id (made at the first ask: image_ids)
+    loaded_bits: std::sync::OnceLock<Vec<u64>>,
     /// the identities (identity_hash) of the loaded manifest's slots before its first present,
     /// made at the first ask (cache/image.rs was_startup_slot)
     startup_ids: std::sync::OnceLock<HashSet<u128>>,
     /// a startup image built for a manifest whose later steps gave way (record_manifest): its
-    /// bytes and slots, the replacements (rewrite_sum) when it was built and the crates edited
-    /// live by then; the retry takes it while at most 1% of its slots were replaced since
-    image_kept: Option<(Vec<u8>, u32, u64, usize)>,
+    /// bytes and slots, `replaced`'s length when it was built, the crates edited live by then and
+    /// its slots' bits; the retry takes it while at most 1% of its slots were replaced since
+    image_kept: Option<(Vec<u8>, u32, usize, usize, Vec<u64>)>,
     /// the tier of each code entry this run recorded (by key), pending or written: a verified O1
     /// rebuild replaces only an entry below O1
     rec_tier: HashMap<u128, u8>,
@@ -1408,6 +1415,8 @@ impl Cache {
             manifest_main: 0,
             written_ids: None,
             image_built: None,
+            replaced: Vec::new(),
+            loaded_bits: std::sync::OnceLock::new(),
             startup_ids: std::sync::OnceLock::new(),
             image_kept: None,
             rec_tier: HashMap::new(),
@@ -4096,8 +4105,8 @@ impl Cache {
         // warm run rewrote the whole image)
         if replace && (existing || self.linked.contains(&id)) {
             match self.entry_tier(key) {
-                None => self.stats.rewrite_why[0] += 1,
-                Some(old) if payload_tier(&payload).is_some_and(|new| tier_rank(new) > tier_rank(old)) => self.stats.rewrite_why[1] += 1,
+                None => { self.stats.rewrite_why[0] += 1; self.replaced.push(id); }
+                Some(old) if payload_tier(&payload).is_some_and(|new| tier_rank(new) > tier_rank(old)) => { self.stats.rewrite_why[1] += 1; self.replaced.push(id); }
                 Some(_) => {}
             }
         }
@@ -4566,7 +4575,8 @@ impl Cache {
         self.manifest_done = old.manifest_done;
         self.manifest_len = old.manifest_len;
         self.written_ids = old.written_ids.clone();
-        self.image_built = old.image_built;
+        self.image_built = old.image_built.clone();
+        self.replaced = old.replaced.clone();
         self.collected_committed = true;
         self.stats = old.stats.clone();
         // the same program (settle_rebuild compares it): the same item graph and definitions
@@ -4689,7 +4699,7 @@ impl Cache {
             }
         }
         let _mem = crate::memstat::tag(crate::memstat::Tag::CacheStore);
-        if self.mode == Mode::ReadOnly || order.is_empty() || (self.manifest_done && order.len() <= self.manifest_len && !self.image_rewrite && (self.stats.rewrite_why[0] + self.stats.rewrite_why[1]) as usize * 50 <= self.image_slots) {
+        if self.mode == Mode::ReadOnly || order.is_empty() || (self.manifest_done && order.len() <= self.manifest_len && !self.image_rewrite && { let (r, n) = self.image_replaced(); r * 50 <= n }) {
             return true;
         }
         // at exit the slots' keys can no longer be made: after the mid-run manifest the exit
@@ -4740,10 +4750,11 @@ impl Cache {
         // the same start as before (within 2%), the loaded manifest still valid and its image
         // current (within 2%, covering all but 2% of its cached slots, and at most 2% of its slots
         // ones no call reached while its window was open: jit::startup_set_called): no new one
-        let image_current = !self.image_rewrite && match self.image_built {
+        let (replaced, _) = self.image_replaced();
+        let image_current = !self.image_rewrite && match &self.image_built {
             // this run's image: its slots replaced since it was built
-            Some((at, n)) => self.rewrite_sum().saturating_sub(at) as usize * 50 <= n,
-            None => self.image_slots == 0 || ((self.image_stale + self.rewrite_sum() as usize) * 50 <= self.image_slots && self.image_slots * 50 >= self.manifest_present_cached * 49 && crate::jit::not_called_at_present() * 50 <= self.image_slots),
+            Some((_, n, _)) => replaced * 50 <= *n,
+            None => self.image_slots == 0 || ((self.image_stale + replaced) * 50 <= self.image_slots && self.image_slots * 50 >= self.manifest_present_cached * 49 && crate::jit::not_called_at_present() * 50 <= self.image_slots),
         };
         if self.startup_manifest_valid() && new * 50 <= list.len() && image_current {
             self.manifest_done = true; self.manifest_len = order.len();
@@ -4751,21 +4762,21 @@ impl Cache {
             return true;
         }
         if self.verbose {
-            eprintln!("relax cache: startup manifest rewritten: valid {} (missing {}), {} new of {}, image rewrite {} (replacements without a stored entry {}, tier-ups {}), image slots {} stale {} cached at present {}",
-                self.startup_manifest_valid(), self.manifest_missing, new, list.len(), self.image_rewrite, self.stats.rewrite_why[0], self.stats.rewrite_why[1], self.image_slots, self.image_stale, self.manifest_present_cached);
+            eprintln!("relax cache: startup manifest rewritten: valid {} (missing {}), {} new of {}, image rewrite {} (replacements without a stored entry {}, tier-ups {}; of the image's own slots {}), image slots {} stale {} cached at present {}",
+                self.startup_manifest_valid(), self.manifest_missing, new, list.len(), self.image_rewrite, self.stats.rewrite_why[0], self.stats.rewrite_why[1], replaced, self.image_slots, self.image_stale, self.manifest_present_cached);
         }
         crate::run::yield_section("manifest image");
         // the image an earlier try built and then gave way after (a busy session's tries each
         // threw away 0.7-0.9 s of build, and some never finished before the quit)
         let edited = crate::reload::edited_crates().len();
-        let kept = self.image_kept.take().filter(|(_, n, at, ed)| *ed == edited && self.rewrite_sum().saturating_sub(*at) as usize * 100 <= *n as usize);
+        let kept = self.image_kept.take().filter(|(_, n, at, ed, bits)| *ed == edited && self.replaced_in(bits, *at) * 100 <= *n as usize);
         let (img, built_at) = match kept {
-            Some((b, n, at, _)) => {
-                if self.verbose { eprintln!("relax cache: startup image of {} slots kept from the try that gave way ({} replaced since)", n, self.rewrite_sum().saturating_sub(at)); }
-                (Some((b, n)), at)
+            Some((b, n, at, _, bits)) => {
+                if self.verbose { eprintln!("relax cache: startup image of {} slots kept from the try that gave way ({} of them replaced since)", n, self.replaced_in(&bits, at)); }
+                (Some((b, n, bits)), at)
             }
             None => {
-                let at = self.rewrite_sum();
+                let at = self.replaced.len();
                 let img = if self.mode != Mode::Verify {
                     match self.build_image(u, &present_ids, stop) { Err(()) => return false, Ok(img) => img }
                 } else { None };
@@ -4803,7 +4814,7 @@ impl Cache {
             e.bytes(b);
             e.u128(*entry);
         }
-        if let Some((img, _)) = &img {
+        if let Some((img, _, _)) = &img {
             e.u32(IMAGE_MAGIC);
             for part in img.chunks(1 << 20) {
                 e.0.extend_from_slice(part);
@@ -4835,15 +4846,15 @@ impl Cache {
         };
         if !made {
             // the retry takes this image while at most 1% of its slots were replaced since
-            if let Some((b, n)) = img { self.image_kept = Some((b, n, built_at, edited)); }
+            if let Some((b, n, bits)) = img { self.image_kept = Some((b, n, built_at, edited, bits)); }
             return false;
         }
         // (past the last yield check: this manifest is the run's)
         self.manifest_done = true; self.manifest_len = order.len();
         self.written_ids = Some(written);
-        if n_img > 0 {
+        if let Some((_, _, bits)) = img.filter(|_| n_img > 0) {
             // (as built: what was replaced since counts against it)
-            self.image_built = Some((built_at, n_img));
+            self.image_built = Some((built_at, n_img, bits));
         }
         let mut removed = 0;
         for o in gone {
@@ -4919,17 +4930,32 @@ impl Cache {
     /// slots had their code replaced since it was built or loaded (O2/O3 over the O1 code: the next
     /// start leaves those lazy). A cold run tiers up for minutes after its first write.
     pub fn image_refresh_due(&self) -> bool {
-        let (since, n) = match self.image_built {
-            Some((at, n)) => (self.rewrite_sum().saturating_sub(at) as usize, n),
-            None => (self.image_stale + self.rewrite_sum() as usize, self.image_slots),
-        };
+        let (replaced, n) = self.image_replaced();
+        let since = if self.image_built.is_some() { replaced } else { self.image_stale + replaced };
         self.manifest_done && self.mode == Mode::On && n > 0 && since * 20 > n
     }
 
-    /// Code entries replaced this run that may be image code (record: an entry without a recorded
-    /// tier, or one moved to a higher tier).
-    fn rewrite_sum(&self) -> u64 {
-        self.stats.rewrite_why[0] + self.stats.rewrite_why[1]
+    /// The startup image's slots replaced this run, and its slots: this run's image, those
+    /// replaced since it was built; else the loaded one, those replaced since its prelink.
+    fn image_replaced(&self) -> (usize, usize) {
+        match &self.image_built {
+            Some((at, n, bits)) => (self.replaced_in(bits, *at), *n),
+            None => (self.replaced_in(self.loaded_bits(), 0), self.image_slots),
+        }
+    }
+
+    /// How many of the slots in `bits` (a bit per slot id) `replaced[from..]` names, each once.
+    fn replaced_in(&self, bits: &[u64], from: usize) -> usize {
+        let mut seen = vec![0u64; bits.len()];
+        let mut n = 0;
+        for &id in &self.replaced[from.min(self.replaced.len())..] {
+            let (w, b) = ((id / 64) as usize, 1u64 << (id % 64));
+            if bits.get(w).is_some_and(|x| x & b != 0) && seen[w] & b == 0 {
+                seen[w] |= b;
+                n += 1;
+            }
+        }
+        n
     }
 
     pub fn flush_front_graphs() -> Result<(), String> {

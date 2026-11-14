@@ -28,7 +28,9 @@ impl Cache {
     /// Err: `stop` said yes; the caller drops the manifest for now. It is asked often enough that
     /// no step holds the owner for more than a few ms between two asks (a refresh in the session
     /// runs while the UI thread reaches new code: each of its first calls waits for the owner).
-    pub(super) fn build_image(&mut self, u: &Unit, ids: &[u32], stop: &dyn Fn() -> bool) -> Result<Option<(Vec<u8>, u32)>, ()> {
+    /// The image's bytes, its slots, and its slots as a bit per slot id (what counts as its own
+    /// when code is replaced later: image_replaced).
+    pub(super) fn build_image(&mut self, u: &Unit, ids: &[u32], stop: &dyn Fn() -> bool) -> Result<Option<(Vec<u8>, u32, Vec<u64>)>, ()> {
         // its working set (a large app's: ~600,000 allocations, ~30 ms to free) is freed by the
         // cache writer after it gave the owner back, also when the build gave way
         let mut work = Box::<ImageWork>::default();
@@ -37,7 +39,7 @@ impl Cache {
         r
     }
 
-    fn build_image_in(&mut self, u: &Unit, ids: &[u32], stop: &dyn Fn() -> bool, work: &mut ImageWork) -> Result<Option<(Vec<u8>, u32)>, ()> {
+    fn build_image_in(&mut self, u: &Unit, ids: &[u32], stop: &dyn Fn() -> bool, work: &mut ImageWork) -> Result<Option<(Vec<u8>, u32, Vec<u64>)>, ()> {
         let ImageWork { chosen, pend, by_bytes, in_image, tab, slots, blob, data, pend_data, pend_const, thunk_keys, key_crates } = work;
         let t0 = std::time::Instant::now();
         let mut ph = [0f64; 5];
@@ -99,6 +101,7 @@ impl Cache {
         }
         crate::run::yield_section("image slots");
         let mut n = 0u32;
+        let mut placed: Vec<u64> = Vec::new();
         for (i, (id, k, crates)) in chosen.iter().enumerate() {
             if i % 16 == 15 && stop() { return Err(()); }
             let Some(payload) = self.image_payload(*k, pend) else { continue };
@@ -111,6 +114,7 @@ impl Cache {
             let retarget = |t: &[u8]| -> bool { clean && t.first().copied().and_then(KeyKind::of) == Some(KeyKind::Twin) && in_image.contains(&t[1..]) };
             if image_slot(tab, slots, blob, *k, sum, bytes, payload, &mut cr, &self.crate_by_ident, &retarget).is_some() {
                 n += 1;
+                set_bit(&mut placed, *id);
             }
         }
         ph[0] = t0.elapsed().as_secs_f64() * 1e3;
@@ -272,7 +276,19 @@ impl Cache {
         if self.verbose {
             eprintln!("relax cache: startup image of {} slots ({} keys, {} symbols, {} crates, {} KB code); ms: slots to {:.1}, data to {:.1}, key crates to {:.1}, encoded {:.1}; {} bytes written, {} reserved, capacity {}", n, tab.keys.list.len(), tab.syms.list.len(), tab.crates.len(), blob.len() / 1024, ph[0], ph[1], ph[2], ph[3], e.0.len(), size, e.0.capacity());
         }
-        Ok(Some((e.0, n)))
+        Ok(Some((e.0, n, placed)))
+    }
+
+    /// The loaded image's slots, a bit per slot id (the first ask makes it: a replacement's
+    /// record, or a mid-run write's refresh check).
+    pub(super) fn loaded_bits(&self) -> &[u64] {
+        self.loaded_bits.get_or_init(|| {
+            let mut bits = Vec::new();
+            for &s in self.image_ids.as_ref().map_or(&[][..], |ids| &ids.slot[..]) {
+                if s != NO_SLOT { set_bit(&mut bits, s); }
+            }
+            bits
+        })
     }
 
     /// The crates (of this run) image key `b` names: the crates of the definitions it names and
@@ -1195,6 +1211,13 @@ struct ImgSlot {
 const REL_SIZE: usize = 10;
 /// No slot for an image key (not made: no installed slot names it; or its key did not decode).
 const NO_SLOT: u32 = u32::MAX;
+
+/// Sets slot `id`'s bit in `bits` (grown to hold it).
+fn set_bit(bits: &mut Vec<u64>, id: u32) {
+    let w = (id / 64) as usize;
+    if bits.len() <= w { bits.resize(w + 1, 0); }
+    bits[w] |= 1u64 << (id % 64);
+}
 
 /// A loaded startup image, read in place, and what this run resolved of it so far.
 struct Img {
