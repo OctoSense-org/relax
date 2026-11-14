@@ -5751,4 +5751,7 @@ pub(crate) unsafe fn reset_statics() {
     // extern blocks bound the ended run's C after an edit to a native package
     reset(&TESTS_NATIVE, std::sync::OnceLock::new());
     reset(&NATIVE_BUNDLES, std::sync::Mutex::new(Vec::new()));
+    // an image build's working set the cache writer had not freed yet (drop_later_now): the run's,
+    // freed here with the run's other statics (the owner thread has stopped)
+    reset(&DROP_LATER, std::sync::Mutex::new(Vec::new()));
 }
