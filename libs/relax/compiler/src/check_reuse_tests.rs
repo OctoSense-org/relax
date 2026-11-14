@@ -728,9 +728,9 @@ fn a_dependency_error_fails_the_check() {
     write("ws/app/lib.rs", &app(1));
     for (what, dep, code, named) in [
         ("an unresolved import", "use std::collections::NoSuchMap;\npub fn value() -> u32 { 7 }\n", "E0432", true),
-        ("a field type", "pub struct S { pub f: NoSuchType }\npub fn value() -> u32 { 7 }\n", "E0412", true),
+        ("a field type", "pub struct S { pub f: NoSuchType }\npub fn value() -> u32 { 7 }\n", "E0425", true),
         // (a fn signature is collected when a body reaches it)
-        ("a signature the app reaches", "pub fn value() -> NoSuchType { loop {} }\n", "E0412", true),
+        ("a signature the app reaches", "pub fn value() -> NoSuchType { loop {} }\n", "E0425", true),
     ] {
         write("dep/lib.rs", dep);
         fails(&format!("{what}, cold"), code, named, false);
@@ -744,7 +744,7 @@ fn a_dependency_error_fails_the_check() {
     write(&format!("{registry_dep}/Cargo.toml"), "[package]\nname = \"dep\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[lib]\npath = \"lib.rs\"\n");
     write(&format!("{registry_dep}/lib.rs"), "pub fn value() -> NoSuchType { loop {} }\n");
     write("ws/app/Cargo.toml", &app_toml(registry_dep));
-    fails("a published crate's signature the app reaches", "E0412", true, true);
+    fails("a published crate's signature the app reaches", "E0425", true, true);
     write("ws/app/Cargo.toml", &app_toml("dep"));
     write("dep/lib.rs", "pub fn value() -> u32 { 7 }\n");
     for what in ["fixed", "fixed, again"] {

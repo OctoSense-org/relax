@@ -297,7 +297,7 @@ pub struct Tcx {
     future_defs: std::sync::OnceLock<Option<(DefId, DefId)>>,
     /// Return-position `impl Trait` declarations keyed by their opaque DefId.
     pub opaques: crate::conc::ShardMap<DefId, OpaqueDecl>,
-    /// The errors of lowering an opaque's bounds where it is written (E0412 ..), reported again by
+    /// The errors of lowering an opaque's bounds where it is written (E0425 ..), reported again by
     /// every later lowering of it (`lower_opaque`).
     opaque_lowering_errors: crate::conc::ShardMap<DefId, Vec<String>>,
     /// rustc `inferred_outlives_of` (a query there): the outlives requirements an ADT's fields put on its own
@@ -3106,7 +3106,7 @@ impl Tcx {
                 } else {
                     String::new()
                 };
-                self.err(cx, prog, file, p.lo, format!("E0412: cannot find type `{}` in this scope{}", path_str(prog, file, p), help));
+                self.err(cx, prog, file, p.lo, format!("E0425: cannot find type `{}` in this scope{}", path_str(prog, file, p), help));
                 return self.tys.error;
             }
         };

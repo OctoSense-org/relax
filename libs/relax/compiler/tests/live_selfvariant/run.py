@@ -6,14 +6,14 @@ usage: run.py --makepad <makepad binary>   (RELAX_STD in the environment)
 Copies pkg/ to a temporary dir, runs it (a working tree: live) and edits src/main.rs while it runs.
 ease.rs (never edited) has `match self { Self::Pow { begin, end } => .. }`; makepad's
 animator.rx Ease::map has the same shape, and a Calculator layout edit was refused with
-"E0412: cannot find type `Self::ExpDecay`" from it.
+"E0412: cannot find type `Self::ExpDecay`" from it (E0425 since rustc 1.100).
   1. body edit of value()                               -> patched, new output (4)
   2. a field added to Pad and a fn added (in place)     -> patched, output 4 (the running Pad's
      new field reads its default)
   3. the field and helper are removed                 -> patched, output 5
   4. an invalid body edit is refused, then reverted   -> patched notification, output 5
   5. value() returns 999                              -> the program sees it and exits
-No step may report E0412. Prints PASS/FAIL per step; exit 1 on any FAIL.
+No step may report an unresolved type (E0425 `cannot find type`). Prints PASS/FAIL per step; exit 1 on any FAIL.
 """
 import os, shutil, subprocess, sys, tempfile, threading, time
 
@@ -63,8 +63,8 @@ def step(name, ok):
     if not ok:
         fails += 1
 
-def no_e0412(since):
-    return not any("E0412" in l for l in err[since:])
+def no_unresolved_type(since):
+    return not any("E0425: cannot find type" in l for l in err[since:])
 
 try:
     step("starts", wait(lambda: last_value() == 4 and os.path.exists(ready), 120))
@@ -72,19 +72,19 @@ try:
     body = base.replace("p.a + ease(", "p.a + 1 + ease(")
     save(body)
     ok = wait(lambda: last_value() == 5)
-    step("body edit applies", ok and no_e0412(n))
+    step("body edit applies", ok and no_unresolved_type(n))
     n = len(err)
-    # (an added item makes the reload collect it: the step that reported the earlier E0412s)
+    # (an added item makes the reload collect it: the step that reported the earlier unresolved types)
     layout = body.replace("    pub a: u64,\n", "    pub a: u64,\n    pub b: u64,\n").replace("Pad { a: 1 }", "Pad { a: 1, b: 8 }").replace("p.a + 1 + ease(", "p.a + p.b + extra() + ease(") + "\nfn extra() -> u64 {\n    0\n}\n"
     save(layout)
     # (the running Pad's new field reads its default 0: 1 + 0 + 0 + 3)
     ok = wait(lambda: any("relax live: main.rs" in l for l in err[n:]))
     time.sleep(0.5)
-    step("layout edit next to a Self::Variant match: applied, no E0412 (%s)" % (last_value(),), ok and last_value() == 4 and no_e0412(n))
+    step("layout edit next to a Self::Variant match: applied, no unresolved type (%s)" % (last_value(),), ok and last_value() == 4 and no_unresolved_type(n))
     n = len(err)
     save(body)
     ok = wait(lambda: last_value() == 5 and any("main.rs: patched" in l for l in err[n:]))
-    step("field and helper removal applies in the same process", ok and p.poll() is None and no_e0412(n))
+    step("field and helper removal applies in the same process", ok and p.poll() is None and no_unresolved_type(n))
     n = len(err)
     save(body.replace("p.a + 1 + ease(", 'p.a + "invalid" + ease('))
     ok = wait(lambda: any("NOT applied" in l for l in err[n:]))
@@ -96,7 +96,7 @@ try:
     n = len(err)
     save(body.replace("    p.a + 1 + ease(&Ease::Pow { begin: 2, end: 1 }, 1u32) as u64\n", "    999\n"))
     ok = wait(lambda: p.poll() is not None)
-    step("final edit applies, program exits", ok and last_value() == 999 and no_e0412(n))
+    step("final edit applies, program exits", ok and last_value() == 999 and no_unresolved_type(n))
 finally:
     if p.poll() is None:
         os.killpg(p.pid, 15)

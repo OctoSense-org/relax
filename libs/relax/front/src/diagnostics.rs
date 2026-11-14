@@ -31,7 +31,7 @@ impl Program {
         let f = &self.files[file as usize];
         let location = self.source_location(file, pos);
         let mut d = location.diagnostic(phase, msg);
-        if !matches!(d.code.as_str(), "E0412" | "E0425" | "E0432" | "E0433" | "RR0001" | "RM0001") { return d; }
+        if !matches!(d.code.as_str(), "E0425" | "E0432" | "E0433" | "RR0001" | "RM0001") { return d; }
         let module = self.defs.iter().filter(|d| d.file == file && d.item.0 != u32::MAX).filter_map(|d| {
             let it = f.ast.items.get(d.item.0 as usize)?;
             (it.lo <= pos && pos <= it.hi).then_some((it.hi.saturating_sub(it.lo), d.scope))
@@ -41,7 +41,7 @@ impl Program {
     }
 
     pub fn suggest(&self, d: &mut Diagnostic, location: &SourceLocation<'_>, module: u32) {
-        if !matches!(d.code.as_str(), "E0412" | "E0425" | "E0432" | "E0433" | "RR0001" | "RM0001") { return; }
+        if !matches!(d.code.as_str(), "E0425" | "E0432" | "E0433" | "RR0001" | "RM0001") { return; }
         let Some(name) = d.message.split('`').nth(1) else { return };
         // the candidates' lookups are no uses of the imports they go through
         let _quiet = crate::program::QuietLookups::begin();
@@ -58,14 +58,18 @@ impl Program {
             let root = self.crates[pc as usize].root_mod;
             if let Some(p) = self.syms.get("prelude").and_then(|s| self.mods[root as usize].types.get(&s)) { modules.push(self.def(*p).sub); }
         }
+        // the namespace of the unresolved name: E0425 is rustc's code for a value and, since
+        // rustc 1.100, for a type too (`cannot find type`; late.rs error_code), E0433 a path's module
+        let type_ns = d.code == "E0433" || (d.code == "E0425" && d.message.starts_with("cannot find type "));
+        let value_ns = d.code == "E0425" && !type_ns;
         let mut seen = crate::fxhash::HashSet::default();
         let mut names = Vec::new();
         while let Some(m) = modules.pop() {
             if !seen.insert(m) { continue; }
             let Some(m) = self.mods.get(m as usize) else { continue };
             let keys: Vec<_> = if d.code == "RM0001" { m.macros.keys().collect() }
-                else if d.code == "E0425" { m.values.keys().collect() }
-                else if d.code == "E0412" || d.code == "E0433" { m.types.keys().collect() }
+                else if value_ns { m.values.keys().collect() }
+                else if type_ns { m.types.keys().collect() }
                 else { m.types.keys().chain(m.values.keys()).collect() };
             names.extend(keys.into_iter().map(|s|self.syms.str(*s)));
             if let Some(p) = m.lexical_parent { modules.push(p); }
@@ -76,10 +80,10 @@ impl Program {
         }
         if d.code != "RM0001" {
             names.retain(|n| self.syms.get(n).is_some_and(|s| {
-                (d.code != "E0425" && self.lookup_in_scope(module,s,true).is_some()) ||
-                (!matches!(d.code.as_str(), "E0412" | "E0433") && self.lookup_in_scope(module,s,false).is_some())
+                (!value_ns && self.lookup_in_scope(module,s,true).is_some()) ||
+                (!type_ns && self.lookup_in_scope(module,s,false).is_some())
             }));
-            if d.code != "E0425" { names.extend(crate::program::PRIMS.iter().map(|(n,_)|*n)); }
+            if !value_ns { names.extend(crate::program::PRIMS.iter().map(|(n,_)|*n)); }
         }
         let Some(new) = crate::diag::closest(name, names.into_iter()) else { return };
         // Only offer an edit when the mapped source token really is the unresolved name.

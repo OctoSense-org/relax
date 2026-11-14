@@ -91,7 +91,7 @@ try:
     one, rows = cli('check', '--no-serve', '--json', 'serve_fixture')
     assert one.returncode == 1 and not one.stderr, one.stderr
     assert initial['diagnostics'] == rows[:-1], (initial, rows)
-    assert any(d['code'] == 'E0412' for d in initial['diagnostics'])
+    assert any(d['code'] == 'E0425' for d in initial['diagnostics'])
     auto, auto_rows = cli('check', '--json', 'serve_fixture')
     assert auto.returncode == one.returncode and stable(auto_rows) == stable(rows), (auto, rows)
     client.call('didChange', path=str(source), text=fixed)

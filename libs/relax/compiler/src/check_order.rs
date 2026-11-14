@@ -62,7 +62,7 @@ pub(crate) fn stage_of_code(code: &str) -> Option<Stage> {
         "E0252" | "E0254" | "E0255" | "E0259" | "E0260" | "E0430" | "E0431" | "E0432" => (Phase::Resolve, 1),
         "E0106" | "E0261" | "E0401" | "E0403" | "E0408" | "E0409" | "E0415" | "E0416" | "E0426" | "E0433" | "E0434" | "E0435" | "E0437" | "E0438" | "E0637" => (Phase::Resolve, 3),
         // (use_injections: the smart-resolve errors are reported once resolution is done)
-        "E0404" | "E0405" | "E0411" | "E0412" | "E0422" | "E0423" | "E0424" | "E0425" | "E0531" | "E0532" | "E0573" | "E0574" | "E0575" | "E0576" => (Phase::Resolve, 4),
+        "E0404" | "E0405" | "E0411" | "E0422" | "E0423" | "E0424" | "E0425" | "E0531" | "E0532" | "E0573" | "E0574" | "E0575" | "E0576" => (Phase::Resolve, 4),
         "E0659" => (Phase::Resolve, 5),
         "E0603" => (Phase::Resolve, 6),
         "E0446" => (Phase::Late, LATE_PRIVATE_IN_PUBLIC),

@@ -4988,7 +4988,7 @@ impl Program {
         self.glob_used.lock().unwrap_or_else(|e| e.into_inner()).contains(&(m, target))
     }
 
-    /// The paths a missing name could be imported by from module `from` (rustc's E0412/E0425
+    /// The paths a missing name could be imported by from module `from` (rustc's E0425
     /// "consider importing", but over the whole program: items that exist, not look-alikes): for
     /// each item named `name` in the namespace, the shortest path through public modules and
     /// public re-exports (globs included) from this crate (`crate::..`) or a dependency (by its
@@ -5099,7 +5099,7 @@ impl Program {
         let location = self.source_location(file, pos);
         let at = use_insert_pos(location.source.bytes());
         let (l, col) = location.source.line_col(location.span.lo);
-        let code = if ns_type { "E0412" } else { "E0425" };
+        let code = "E0425";
         crate::relaxed::note(crate::relaxed::Note {
             at: format!("{}:{}:{}", location.source.path(), l, col),
             feature: "imports",

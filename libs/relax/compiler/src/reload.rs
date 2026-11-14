@@ -1020,7 +1020,7 @@ fn ty_names_def(u: &Unit, t: TyId, ds: &[DefId], depth: u32) -> bool {
 /// The declarations of the current files the edit reaches (`visible` crates; `news`: the edit's
 /// new versions) that still name a type or trait the edit removed: a fn's signature or bounds,
 /// an impl's header or bounds, a field's, const's or static's type. They kept the removed def.
-/// Where a fresh build of the new text does not resolve the name: E0412 / E0405, one error each,
+/// Where a fresh build of the new text does not resolve the name: E0425 / E0405, one error each,
 /// at the name. Where every use of the name resolves now (the type moved: `use decode::Pic`), the
 /// declaration means the new type, which its collection from before the edit does not know: the
 /// second list, `(declaration, removed def)`.
@@ -1132,7 +1132,7 @@ fn decls_naming_removed(u: &Unit, removed: &[DefId], news: &[u32], visible: &[bo
             }
             let report = |g: DefId, at: u32| {
                 let name = def_name(prog, g);
-                let (code, what) = if prog.def(g).kind == DefKind::Trait { ("E0405", "trait") } else { ("E0412", "type") };
+                let (code, what) = if prog.def(g).kind == DefKind::Trait { ("E0405", "trait") } else { ("E0425", "type") };
                 format!("{}: {}: cannot find {} `{}` in this scope (this edit removes it)", u.pos_str(f, pf.call_site(at)), code, what, name)
             };
             let mut params: Vec<&[u8]> = Vec::new();
@@ -8564,10 +8564,10 @@ pub(crate) fn patch_refused_event(what: &str, refused: bool, lines: &[String]) {
     // before deciding whether a refusal is a failure of makepad itself.
 }
 
-/// The path an unresolved name's error names: a `use` (E0432), a value (E0425) or a type (E0412),
+/// The path an unresolved name's error names: a `use` (E0432), a value or a type (E0425),
 /// as the resolver and the type checker print them.
 fn unresolved_path(e: &str) -> Option<&str> {
-    let at = ["E0432: unresolved import `", "E0425: cannot find value `", "E0412: cannot find type `"].iter().find_map(|h| e.find(h).map(|i| i + h.len()))?;
+    let at = ["E0432: unresolved import `", "E0425: cannot find value `", "E0425: cannot find type `"].iter().find_map(|h| e.find(h).map(|i| i + h.len()))?;
     Some(&e[at..at + e[at..].find('`')?])
 }
 
@@ -10622,7 +10622,7 @@ mod moved_type_tests {
     }
 
     /// A signature collected before the edit names the removed type, though the name means the
-    /// moved one now: no E0412 for the name and no E0308 at the call. With no code built for the
+    /// moved one now: no E0425 for the name and no E0308 at the call. With no code built for the
     /// fn, it is declared again and the edit patches.
     #[test]
     fn a_signature_read_before_a_type_moved_is_declared_again() {
@@ -10639,7 +10639,7 @@ mod moved_type_tests {
         let (rung, lines) = move_type("built", true, true);
         assert_eq!(rung, Rung::Restart, "{lines:?}");
         assert!(lines.iter().any(|l| l.contains("names `Pic`, which this edit moves")), "{lines:?}");
-        assert!(!lines.iter().any(|l| l.contains("E0412") || l.contains("E0308")), "{lines:?}");
+        assert!(!lines.iter().any(|l| l.contains("E0425") || l.contains("E0308")), "{lines:?}");
     }
 }
 

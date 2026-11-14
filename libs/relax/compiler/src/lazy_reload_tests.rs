@@ -46,7 +46,7 @@ fn deferred_reexport_signatures() {
         let mut tcx = crate::tcx::Tcx::new();
         tcx.collect(&prog);
         let misses = crate::program::collect_misses_take();
-        assert!(tcx.errors.iter().any(|e| e.contains("E0412")), "{:?}", tcx.errors);
+        assert!(tcx.errors.iter().any(|e| e.contains("E0425: cannot find type")), "{:?}", tcx.errors);
         let modules = prog.misses_to_load(&misses);
         assert_eq!(modules.len(), 1, "{misses:?}");
         assert!(prog.skipped_files[&modules[0]].0.ends_with(suffix));

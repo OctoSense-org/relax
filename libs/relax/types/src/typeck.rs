@@ -2977,7 +2977,7 @@ impl<'a> Fcx<'a> {
         // a probe: `Self::Variant { .. }` is not a type (resolve_struct_path then finds the
         // variant), so its lowering errors are kept only when the path is a struct here. They
         // used to reach the shared error sink, where the next collection (a live edit adding
-        // items) returned them as that edit's errors: E0412 `cannot find type Self::ExpDecay`.
+        // items) returned them as that edit's errors: E0425 `cannot find type Self::ExpDecay`.
         let outer = self.tcx.begin_errors(&self.cx);
         let t = self.type_of_prefix(path, n);
         let errs = self.tcx.end_errors(&self.cx, outer);
@@ -4741,7 +4741,7 @@ impl<'a> Fcx<'a> {
             return self.fresh(0);
         }
         // (errors of the annotation itself belong to this body: `let m: HashMap<..>` without the
-        // import is E0412 here, not a later "type not fully known")
+        // import is E0425 here, not a later "type not fully known")
         let (lt, errs) = self.tcx.with_errors(&self.cx.with_infcx(&self.infcx), || self.tcx.lower_ty(&self.cx.with_infcx(&self.infcx), prog, self.file, self.module, &env, t));
         let lowered_clean = errs.is_empty();
         for e in errs {
