@@ -4847,7 +4847,17 @@ fn drop_later_now() {
     let v = std::mem::take(&mut *DROP_LATER.lock().unwrap_or_else(|e| e.into_inner()));
     drop(v);
 }
-pub(crate) fn yield_section(s: &'static str) { *YIELD_SECTION.lock().unwrap_or_else(|e| e.into_inner()) = s; }
+/// Names the section of a background owner request running now (YieldProbe); a recording
+/// timeline (`pf`, `timeline`) shows each section as a span inside the owner's service, so a
+/// frame that waited for the owner names the section that held it.
+pub(crate) fn yield_section(s: &'static str) {
+    let prev = std::mem::replace(&mut *YIELD_SECTION.lock().unwrap_or_else(|e| e.into_inner()), s);
+    // (on the owner thread, inside its service span: every section is set and cleared there)
+    if crate::owner::is_owner() && crate::inspect::timeline::recording() {
+        if !prev.is_empty() { crate::inspect::timeline::push(crate::inspect::timeline::Kind::SpanEnd, prev, 0, 0); }
+        if !s.is_empty() { crate::inspect::timeline::push(crate::inspect::timeline::Kind::SpanBegin, s, 0, 0); }
+    }
+}
 impl YieldProbe {
     fn new() -> Self { Self(std::sync::Mutex::new((None, 0.0, "", 0, ""))) }
     fn start(&self) { self.0.lock().unwrap_or_else(|e| e.into_inner()).0 = Some(Instant::now()); }
@@ -4971,6 +4981,7 @@ fn mid_flush(quiet: bool, wait: bool) -> Option<(usize, usize)> {
         IMAGE_REFRESH_WANTED.store(!quit && u.cache.as_ref().is_some_and(|c| c.image_refresh_due()), Ordering::Relaxed);
         parts[0] = held.elapsed().as_secs_f64() * 1e3;
         let Some(c) = u.cache.as_mut() else {
+            yield_section("");
             return None;
         };
         yield_section("borrowck keys");
