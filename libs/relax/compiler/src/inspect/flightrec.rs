@@ -593,6 +593,11 @@ pub(super) struct Cursors {
     app_ev: u64,
     input: u64,
     jit: u64,
+    /// the JIT installs ring's head at the attach: only those before it are sent (a backfill's
+    /// history). From the attach on each install reaches the stream once, as the viewer's own
+    /// record (pstream::jit_install, with its source line): sent from the ring too, every
+    /// install of a live recording counted twice, half of them as replacing the other half.
+    jit_end: u64,
     frames: u64,
     samples: u64,
     counters: u64,
@@ -606,13 +611,14 @@ impl Cursors {
     /// From the rings' start (`backfill`), else from now on.
     pub fn new(backfill: bool) -> Cursors {
         if backfill {
-            return Cursors { ev: 0, app_ev: 0, input: 0, jit: 0, frames: 0, samples: 0, counters: 0, prev_frame: None, run_sent: false };
+            return Cursors { ev: 0, app_ev: 0, input: 0, jit: 0, jit_end: jits().fill().0, frames: 0, samples: 0, counters: 0, prev_frame: None, run_sent: false };
         }
         Cursors {
             ev: events().fill().0,
             app_ev: app_events().fill().0,
             input: inputs().fill().0,
             jit: jits().fill().0,
+            jit_end: jits().fill().0,
             frames: frames().fill().0,
             samples: u64::MAX,
             counters: u64::MAX,
@@ -651,13 +657,16 @@ pub(super) fn encode(cur: &mut Cursors, enc: &mut super::pstream::StreamEnc, min
     }
     // JIT installs (names from the code tables, read now)
     let mut jit = Vec::new();
-    let (c, lost) = jits().read(cur.jit, &mut |_, j| {
-        if j.t >= min_t {
-            jit.push(j);
-        }
-    });
-    cur.jit = c;
-    lost_total += lost;
+    let end = cur.jit_end;
+    if cur.jit < end {
+        let (c, lost) = jits().read(cur.jit, &mut |n, j| {
+            if n < end && j.t >= min_t {
+                jit.push(j);
+            }
+        });
+        cur.jit = c;
+        lost_total += lost;
+    }
     let mut jrecs = Vec::with_capacity(jit.len());
     for j in jit {
         let tid = enc.known_tid(j.os_id).unwrap_or(0);
