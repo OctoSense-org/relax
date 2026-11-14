@@ -1585,8 +1585,6 @@ fn late_lints(cx: &CrateCx<'_>, reach: &Reach, pt: &mut PartTimes) {
     pt.mark("variant_size_differences");
     crate::lint_late::async_fn_in_trait(prog, &c.defs, reach);
     pt.mark("async_fn_in_trait");
-    crate::lint_late::repr_transparent_fields(prog, tcx, &c.defs, lay);
-    pt.mark("repr_transparent_fields");
     unnameable_types(prog, own, reach);
     pt.mark("unnameable_types");
 }

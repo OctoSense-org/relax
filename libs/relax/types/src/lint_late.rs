@@ -2553,62 +2553,6 @@ pub fn variant_size_differences(prog: &Program, tcx: &Tcx, defs: &[DefId], lay: 
     }
 }
 
-pub const REPR_TRANSPARENT_NON_ZST_FIELDS: Lint = lint::lint("repr_transparent_non_zst_fields");
-
-/// rustc_hir_analysis check.rs `check_transparent`, the lint half: a zero-sized field of a
-/// `repr(transparent)` struct that contains a `repr(C)` type, next to a non-zero-sized field.
-/// `defs`: one checked crate's definitions; `lay`: `lint_dead::finish`'s shared `layout_of` memo,
-/// reusing layouts across items and crates like rustc, with one caller-local `LayoutCx` here.
-pub fn repr_transparent_fields(prog: &Program, tcx: &Tcx, defs: &[DefId], lay: &crate::layout::Layouts) {
-    if !lint::enabled() { return; }
-    let lcx = crate::layout::LayoutCx::new(prog);
-    fn contains_repr_c(prog: &Program, tcx: &Tcx, t: TyId, depth: u32) -> bool {
-        if depth > 16 { return false; }
-        match *tcx.tys.kind(t) {
-            TyKind::Tuple(l) => tcx.tys.list(l).iter().any(|&x| contains_repr_c(prog, tcx, x, depth + 1)),
-            TyKind::Array(e, _) => contains_repr_c(prog, tcx, e, depth + 1),
-            TyKind::Adt(d, args, _) => {
-                let Some(adt) = tcx.adts.get(&d) else { return false };
-                if adt.repr_c { return true; }
-                adt.variants.iter().any(|v| v.fields.iter().any(|f| contains_repr_c(prog, tcx, tcx.tys.subst(f.ty, tcx.tys.list(args)), depth + 1)))
-            }
-            _ => false,
-        }
-    }
-    for &d in defs {
-        let def = prog.def(d);
-        if def.kind != DefKind::Struct || lint::generated(prog, d) { continue; }
-        let pf = &prog.files[def.file as usize];
-        let ast = &pf.ast;
-        let item = ast.item(def.item);
-        let transparent = ast.list(item.attrs).iter().any(|a| lint::attr_path(prog, def.file, a) == b"repr" && lint::attr_text(prog, def.file, a).contains("transparent"));
-        if !transparent { continue; }
-        let Some(adt) = tcx.adts.get(&d) else { continue };
-        let bad = crate::types::TypeFlags::HAS_PARAM | crate::types::TypeFlags::HAS_ALIAS | crate::types::TypeFlags::HAS_ERROR | crate::types::TypeFlags::HAS_INFER;
-        let Some(v) = adt.variants.first() else { continue };
-        if v.fields.iter().any(|f| tcx.tys.flags(f.ty).intersects(bad)) { continue; }
-        let ItemKind::Struct(r) = item.kind else { continue };
-        let fields: Vec<FieldDef> = match ast.row(r).data { VariantData::Unit => Vec::new(), VariantData::Tuple(l) | VariantData::Struct(l) => ast.list(l).to_vec() };
-        if fields.len() != v.fields.len() { continue; }
-        let trivial: Vec<bool> = v.fields.iter().map(|f| {
-            let l = lay.of(&lcx, tcx, f.ty);
-            !lay.is_unsized(&lcx, tcx, f.ty) && l.size == 0 && l.align == 1
-        }).collect();
-        let non_trivial = trivial.iter().filter(|t| !**t).count();
-        let mut prev = false;
-        for (k, f) in v.fields.iter().enumerate() {
-            if !trivial[k] || !contains_repr_c(prog, tcx, f.ty, 0) { continue; }
-            if non_trivial > 0 || prev {
-                let pos = fields[k].name.get().map_or(fields[k].ty_span.0, |n| n.lo);
-                if lint::external(prog, def.file, pos) { continue; }
-                lint::emit(prog, d, &REPR_TRANSPARENT_NON_ZST_FIELDS, def.file, pos, "zero-sized fields in `repr(transparent)` cannot contain `repr(C)` types");
-            } else {
-                prev = true;
-            }
-        }
-    }
-}
-
 pub const ASYNC_FN_IN_TRAIT: Lint = lint::lint("async_fn_in_trait");
 
 /// rustc_lint async_fn_in_trait.rs: an `async fn` in a publicly reachable trait.
