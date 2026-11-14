@@ -1010,6 +1010,10 @@ pub struct Cache {
     /// the identities (identity_hash) of the loaded manifest's slots before its first present,
     /// made at the first ask (cache/image.rs was_startup_slot)
     startup_ids: std::sync::OnceLock<HashSet<u128>>,
+    /// a startup image built for a manifest whose later steps gave way (record_manifest): its
+    /// bytes and slots, the replacements (rewrite_sum) when it was built and the crates edited
+    /// live by then; the retry takes it while at most 1% of its slots were replaced since
+    image_kept: Option<(Vec<u8>, u32, u64, usize)>,
     /// the tier of each code entry this run recorded (by key), pending or written: a verified O1
     /// rebuild replaces only an entry below O1
     rec_tier: HashMap<u128, u8>,
@@ -1405,6 +1409,7 @@ impl Cache {
             written_ids: None,
             image_built: None,
             startup_ids: std::sync::OnceLock::new(),
+            image_kept: None,
             rec_tier: HashMap::new(),
             manifest_root: None,
             linked_key: HashMap::new(),
@@ -4742,6 +4747,7 @@ impl Cache {
         };
         if self.startup_manifest_valid() && new * 50 <= list.len() && image_current {
             self.manifest_done = true; self.manifest_len = order.len();
+            self.image_kept = None;
             return true;
         }
         if self.verbose {
@@ -4749,16 +4755,34 @@ impl Cache {
                 self.startup_manifest_valid(), self.manifest_missing, new, list.len(), self.image_rewrite, self.stats.rewrite_why[0], self.stats.rewrite_why[1], self.image_slots, self.image_stale, self.manifest_present_cached);
         }
         crate::run::yield_section("manifest image");
-        let img = if self.mode != Mode::Verify {
-            match self.build_image(u, &present_ids, stop) { Err(()) => return false, Ok(img) => img }
-        } else { None };
+        // the image an earlier try built and then gave way after (a busy session's tries each
+        // threw away 0.7-0.9 s of build, and some never finished before the quit)
+        let edited = crate::reload::edited_crates().len();
+        let kept = self.image_kept.take().filter(|(_, n, at, ed)| *ed == edited && self.rewrite_sum().saturating_sub(*at) as usize * 100 <= *n as usize);
+        let (img, built_at) = match kept {
+            Some((b, n, at, _)) => {
+                if self.verbose { eprintln!("relax cache: startup image of {} slots kept from the try that gave way ({} replaced since)", n, self.rewrite_sum().saturating_sub(at)); }
+                (Some((b, n)), at)
+            }
+            None => {
+                let at = self.rewrite_sum();
+                let img = if self.mode != Mode::Verify {
+                    match self.build_image(u, &present_ids, stop) { Err(()) => return false, Ok(img) => img }
+                } else { None };
+                (img, at)
+            }
+        };
         // at exit no key can be made any more (slot_key): slots no lookup or record keyed this
         // run fall out of the image. A rewrite then (O2/O3 code replaced startup code since the
         // mid-run write) must not replace the loaded image with one covering fewer slots: the
         // next start would prelink a fraction of it (Calculator: 16,000 -> 2 slots)
-        crate::run::yield_section("manifest tail");
-        if stop() { return false; }
         let n_img = img.as_ref().map_or(0, |i| i.1 as usize);
+        let mut e = E::default();
+        let mut written: HashSet<u128> = HashSet::with_capacity(list.len());
+        let mut gone: Vec<u128> = Vec::new();
+        let made = 'steps: {
+        crate::run::yield_section("manifest tail");
+        if stop() { break 'steps false; }
         if crate::preempt::is_stopped() && self.image_slots > 0 && n_img * 50 < self.image_slots * 49 {
             if self.verbose {
                 eprintln!("relax cache: startup manifest kept: at exit the image would cover {} of the {} slots the loaded one has", n_img, self.image_slots);
@@ -4768,7 +4792,6 @@ impl Cache {
         }
         // the entry first (the yield checks: nothing is queued before the last of them)
         crate::run::yield_section("manifest entry");
-        let mut e = E::default();
         // (its whole size at once, as build_image's: the image copied below would grow it in steps
         // that each move all of it between two yield checks)
         e.0.reserve(img.as_ref().map_or(0, |i| i.0.len()) + list.iter().map(|(b, _)| b.len() + 20).sum::<usize>() + 16);
@@ -4776,15 +4799,15 @@ impl Cache {
         e.u32(list.len() as u32);
         e.u32(before_present as u32);
         for (i, (b, entry)) in list.iter().enumerate() {
-            if i % 1024 == 1023 && stop() { return false; }
+            if i % 1024 == 1023 && stop() { break 'steps false; }
             e.bytes(b);
             e.u128(*entry);
         }
-        if let Some((img, _)) = img {
+        if let Some((img, _)) = &img {
             e.u32(IMAGE_MAGIC);
             for part in img.chunks(1 << 20) {
                 e.0.extend_from_slice(part);
-                if stop() { return false; }
+                if stop() { break 'steps false; }
             }
         }
         // the code entries this manifest supersedes: a slot of the loaded manifest whose key
@@ -4793,25 +4816,34 @@ impl Cache {
         // keeps). Removed with this manifest's write, its bytes are dead space: the store
         // rewrite drops them once they outgrow a quarter of the live ones (store.rs append).
         crate::run::yield_section("manifest superseded");
-        let mut written: HashSet<u128> = HashSet::with_capacity(list.len());
         for (i, (b, _)) in list.iter().enumerate() {
-            if i % 1024 == 1023 && stop() { return false; }
+            if i % 1024 == 1023 && stop() { break 'steps false; }
             written.insert(identity_hash(b));
         }
-        let mut gone: Vec<u128> = Vec::new();
         if self.manifest.len() == self.manifest_old_keys.len() {
-            let old_keys: HashMap<&[u8], u128> = self.manifest.iter().zip(&self.manifest_old_keys)
-                .filter(|(_, k)| **k != 0).map(|(b, k)| (b.as_slice(), *k)).collect();
+            let mut old_keys: HashMap<&[u8], u128> = HashMap::with_capacity(self.manifest.len());
+            for (i, (b, k)) in self.manifest.iter().zip(&self.manifest_old_keys).enumerate() {
+                if i % 1024 == 1023 && stop() { break 'steps false; }
+                if *k != 0 { old_keys.insert(b.as_slice(), *k); }
+            }
             for (i, (b, k)) in list.iter().enumerate() {
-                if i % 1024 == 1023 && stop() { return false; }
+                if i % 1024 == 1023 && stop() { break 'steps false; }
                 if let Some(o) = old_keys.get(b.as_slice()).filter(|o| *k != 0 && **o != *k && !self.pending_keys.contains(o)) { gone.push(*o); }
             }
+        }
+        true
+        };
+        if !made {
+            // the retry takes this image while at most 1% of its slots were replaced since
+            if let Some((b, n)) = img { self.image_kept = Some((b, n, built_at, edited)); }
+            return false;
         }
         // (past the last yield check: this manifest is the run's)
         self.manifest_done = true; self.manifest_len = order.len();
         self.written_ids = Some(written);
         if n_img > 0 {
-            self.image_built = Some((self.rewrite_sum(), n_img));
+            // (as built: what was replaced since counts against it)
+            self.image_built = Some((built_at, n_img));
         }
         let mut removed = 0;
         for o in gone {
