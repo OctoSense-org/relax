@@ -2207,7 +2207,7 @@ impl<'a> Fcx<'a> {
         // expected type as it is, an ADT constructor peels references
         let mut pre_const = false;
         if let Pat::Path(path) = ast.pat(p) {
-            let (r, t) = self.resolve_value_path(path, p.0 | PAT_KEY, true);
+            let (r, t) = self.resolve_value_path(path, p.0 | PAT_KEY, true, false);
             pre_const = matches!(r, Res::Def(d) if matches!(self.prog.def(d).kind, DefKind::Const | DefKind::AssocConst));
             self.pat_path_pre = Some((r, t));
         }
@@ -2630,7 +2630,7 @@ impl<'a> Fcx<'a> {
             Pat::Path(path) => {
                 let (r, t) = match self.pat_path_pre.take() {
                     Some(x) => x,
-                    None => self.resolve_value_path(path, p.0 | PAT_KEY, true),
+                    None => self.resolve_value_path(path, p.0 | PAT_KEY, true, false),
                 };
                 self.b.pat_res.insert(p.0, r);
                 if let Res::Def(pd) = r {
@@ -2641,7 +2641,7 @@ impl<'a> Fcx<'a> {
                 self.coerce_or_unify(t, expected, None, path.lo);
             }
             Pat::TupleStruct(path, v) => {
-                let (r, _) = self.resolve_value_path(path, p.0 | PAT_KEY, true);
+                let (r, _) = self.resolve_value_path(path, p.0 | PAT_KEY, true, false);
                 self.b.pat_res.insert(p.0, r);
                 let fields = self.ctor_fields_with(r, expected, path.lo, Some(p.0 | PAT_KEY), None);
                 // check_pat_tuple_struct: the sub-patterns cover the fields exactly, or a `..`
@@ -2838,7 +2838,7 @@ impl<'a> Fcx<'a> {
                     _ => return,
                 };
                 // the path resolves like a tuple-struct pattern's (aliases keep their written arguments)
-                let (r, _) = self.resolve_value_path(&path, a.0 | PAT_KEY, true);
+                let (r, _) = self.resolve_value_path(&path, a.0 | PAT_KEY, true, false);
                 self.b.res.insert(a.0, r);
                 // the constructor path is pattern syntax: region analysis reads its resolution
                 self.b.res.insert(f.0, r);
@@ -3335,7 +3335,7 @@ impl<'a> Fcx<'a> {
                 }
             }
         }
-        let (r, _) = self.resolve_value_path(path, u32::MAX, false);
+        let (r, _) = self.resolve_value_path(path, u32::MAX, false, false);
         // rustc_resolve E0574: only a struct, variant or union names a struct literal / pattern
         if let Res::Def(d) = r {
             if !matches!(self.prog.def(d).kind, DefKind::Struct | DefKind::Union | DefKind::Variant) {
@@ -3591,6 +3591,9 @@ impl<'a> Fcx<'a> {
         if let Some(r) = self.scoped_assoc_const(st, name, key) {
             return r;
         }
+        // report_method_error, rustc_hir_typeck/src/method/suggest.rs:312-315:
+        // an error anywhere in the receiver already has its diagnostic.
+        if self.tcx.tys.has_error(self.infcx.deeply_resolve_ignoring_regions(st)) { return (Res::Err, error); }
         let ts = self.ty_str(st);
         let kind = self.ty_prefix(st);
         self.err(lo, format!("E0599: no function or associated item named `{}` found for {}`{}` in the current scope -- name the trait: `<{} as Trait>::{}`", self.prog.syms.str(name), kind, ts, ts, self.prog.syms.str(name)));
@@ -3633,8 +3636,8 @@ impl<'a> Fcx<'a> {
     }
 
     /// Resolves a value path. `key`: expr or pat id for recording generic args.
-    fn resolve_value_path(&mut self, path: &Path, key: u32, is_pat: bool) -> (Res, TyId) {
-        let r = self.resolve_value_path_inner(path, key, is_pat);
+    fn resolve_value_path(&mut self, path: &Path, key: u32, is_pat: bool, is_callee: bool) -> (Res, TyId) {
+        let r = self.resolve_value_path_inner(path, key, is_pat, is_callee);
         if let Res::Def(d) = r.0 {
             self.check_ctor_privacy(d, path.lo);
             if matches!(self.prog.def(d).kind, DefKind::AssocFn | DefKind::AssocConst) {
@@ -3675,7 +3678,7 @@ impl<'a> Fcx<'a> {
         }
     }
 
-    fn resolve_value_path_inner(&mut self, path: &Path, key: u32, is_pat: bool) -> (Res, TyId) {
+    fn resolve_value_path_inner(&mut self, path: &Path, key: u32, is_pat: bool, is_callee: bool) -> (Res, TyId) {
         let prog = self.prog;
         // hir_ty_lowering/generics.rs lower_generic_args: the item's own written
         // lifetime arguments (last segment).
@@ -3683,6 +3686,16 @@ impl<'a> Fcx<'a> {
         self.value_path_enum_lifetimes = self.seg_lifetimes(path, path.segs.len().wrapping_sub(2));
         let segs = crate::program::path_segs(prog, self.file, path);
         let error = self.tcx.tys.error;
+        // PathSource::descr_expected, rustc_resolve/src/late.rs:534-554:
+        // only a call's direct callee expects a function; its arguments still expect values.
+        let expected = if !is_callee { "value" }
+            else if path.global() && segs.len() == 1 { "external crate" }
+            else {
+                let name = self.text(self.ast().segs(path.segs).last().unwrap().name);
+                if name.strip_prefix("r#").unwrap_or(name).chars().next().is_some_and(|c| c.is_uppercase()) {
+                    "function, tuple struct or tuple variant"
+                } else { "function" }
+            };
         // an anonymous constant cannot name a generic `Self`
         if self.in_anon_const && self.tcx.validates(prog, self.file) && segs.first().is_some_and(|s| s.0 == SegKind::SelfType) {
             if let Some(st) = self.env.self_ty {
@@ -3870,7 +3883,8 @@ impl<'a> Fcx<'a> {
                 return (Res::Err, error);
             }
             let help = import_help(prog, self.module, s, false);
-            self.err(path.lo, format!("E0425: cannot find value `{}` in this scope{}", crate::tcx::path_str(prog, self.file, path), help));
+            let (at, message) = prog.unresolved_name_message(self.file, self.module, path, expected);
+            self.err(at, format!("E0425: {message}{help}"));
             return (Res::Err, error);
         }
         let n = segs.len();
@@ -3883,6 +3897,11 @@ impl<'a> Fcx<'a> {
                 let t = self.value_def_ty(d, explicit, key);
                 return (Res::Def(d), t);
             }
+        }
+        if n == 1 && path.global() {
+            let (at, message) = prog.unresolved_name_message(self.file, self.module, path, expected);
+            self.err(at, format!("E0425: {message}"));
+            return (Res::Err, error);
         }
         if self.tcx.validates(prog, self.file) && path.no_qself() {
             if let Some(e) = prog.path_privacy(self.module, path.global(), &segs, Some(false), false, false).filter(|_| path.lo < prog.files[self.file as usize].src_len) {
@@ -3943,7 +3962,8 @@ impl<'a> Fcx<'a> {
                 // (rustc_resolve late.rs resolve_qpath, "required for backward compatibility")
                 let prim_first = n == 2 && !path.global() && crate::program::PRIMS.iter().any(|(nm, _)| prog.syms.get(nm) == Some(segs[0].1));
                 if pk != DefKind::Enum && pk != DefKind::Trait && !prim_first {
-                    self.err(path.lo, format!("E0425: cannot find value `{}` in this scope", crate::tcx::path_str(prog, self.file, path)));
+                    let (at, message) = prog.unresolved_name_message(self.file, self.module, path, expected);
+                    self.err(at, format!("E0425: {message}"));
                     return (Res::Err, error);
                 }
             }
@@ -3952,11 +3972,21 @@ impl<'a> Fcx<'a> {
         let self_ty = match self.type_of_prefix(path, n - 1) {
             Some(t) => t,
             None => {
-                // a missing first segment: where it exists (E0433, rustc's "failed to resolve")
+                // report_path_resolution_error, rustc_resolve/src/diagnostics/impls.rs:3027-3400:
+                // identify the failed segment and its preceding scope, not the entire prefix.
                 let help = if n == 2 && !path.global() { import_help(prog, self.module, self.sym(self.ast().segs(path.segs)[0].name), true) } else { String::new() };
-                let first = crate::tcx::path_str(prog, self.file, path);
-                let first = first.rsplit_once("::").map_or(first.as_str(), |(a, _)| a).to_string();
-                self.err(path.lo, format!("E0433: failed to resolve: use of undeclared type `{}`{}", first, help));
+                let mut failed = n - 1;
+                let mut parent = None;
+                for k in 0..n - 1 {
+                    match prog.resolve_mod_path(self.module, path.global(), &segs[..=k], false, false) {
+                        Some(d) => parent = Some(d),
+                        None => { failed = k; break; }
+                    }
+                }
+                let written = self.ast().segs(path.segs);
+                let names: Vec<_> = written.iter().map(|s| self.text(s.name)).collect();
+                let message = prog.path_resolution_message(self.module, path.global(), &names, failed, parent);
+                self.err(written[failed].name.lo, format!("E0433: {message}{help}"));
                 return (Res::Err, error);
             }
         };
@@ -4069,6 +4099,8 @@ impl<'a> Fcx<'a> {
                 if let Some(r) = self.scoped_assoc_const(self_ty, name, key) {
                     return r;
                 }
+                // report_method_error, rustc_hir_typeck/src/method/suggest.rs:312-315.
+                if self.tcx.tys.has_error(self.infcx.deeply_resolve_ignoring_regions(self_ty)) { return (Res::Err, error); }
                 let ts = self.ty_str(self_ty);
                 let kind = self.ty_prefix(self_ty);
                 self.err(path.lo, format!("E0599: no function or associated item named `{}` found for {}`{}` in the current scope", prog.syms.str(name), kind, ts));
@@ -5121,12 +5153,18 @@ impl<'a> Fcx<'a> {
     }
 
     pub fn check_expr(&mut self, e: ExprId, expected: Option<TyId>) -> TyId {
+        self.check_expr_with_callee(e, expected, false)
+    }
+
+    /// Pass the direct call-callee context without a parent search, as `resolve_expr` does in
+    /// rustc_resolve/src/late.rs:5414-5431; arguments and nested expressions have no call parent.
+    fn check_expr_with_callee(&mut self, e: ExprId, expected: Option<TyId>, is_callee: bool) -> TyId {
         crate::preempt::point();
         let _why = crate::why::enabled().then(|| crate::why::enter(self.prog.why_expr(
             self.file, self.prog.files[self.file as usize].ast.expr(e).lo, self.b.def, "typeck-expression")));
         let save_div = self.diverges;
         self.diverges = false;
-        let t = crate::stack::ensure_sufficient_stack(|| self.check_expr_inner(e, expected));
+        let t = crate::stack::ensure_sufficient_stack(|| self.check_expr_inner(e, expected, is_callee));
         let ts = self.shallow(t);
         if ts == self.tcx.tys.never {
             self.diverges = true;
@@ -5136,7 +5174,7 @@ impl<'a> Fcx<'a> {
         t
     }
 
-    fn check_expr_inner(&mut self, e: ExprId, expected: Option<TyId>) -> TyId {
+    fn check_expr_inner(&mut self, e: ExprId, expected: Option<TyId>, is_callee: bool) -> TyId {
         let ast = self.ast();
         let ex = ast.expr(e);
         let lo = ex.lo;
@@ -5147,7 +5185,7 @@ impl<'a> Fcx<'a> {
         match &ex.kind {
             ExprKind::Lit(k) => self.check_lit(e, *k, expected),
             ExprKind::Path(path) => {
-                let (r, t) = self.resolve_value_path(path, e.0, false);
+                let (r, t) = self.resolve_value_path(path, e.0, false, is_callee);
                 self.b.res.insert(e.0, r);
                 // expr.rs check_expr_path: a struct-like variant is no value (E0533); a struct is one for resolve (E0423)
                 if let Res::Def(d) = r {
@@ -6988,7 +7026,7 @@ impl<'a> Fcx<'a> {
             self.b.res.insert(f.0, Res::Def(split.callee));
             self.set_ty(f, ty);
             ty
-        } else { self.check_expr(f, None) };
+        } else { self.check_expr_with_callee(f, None, true) };
         let mut fs = self.deeply_resolve_ignoring_regions_with_obligations(ft);
         // rustc_ast_lowering/src/expr.rs:594-679: collection already resolved
         // the callee and published the const/value argument split.
@@ -7459,9 +7497,13 @@ impl<'a> Fcx<'a> {
         let pick = match self.pick_all_method(e, rt, s, lo) {
             Ok(Some(pick)) => pick,
             Ok(None) => {
-                let ts = self.ty_str(rt);
-                let help = self.method_help(rt, s);
-                self.err(lo, format!("E0599: no method named `{}` found for `{}` in the current scope{}", self.prog.syms.str(s), ts, help));
+                // report_method_error, rustc_hir_typeck/src/method/suggest.rs:312-315:
+                // check through inference variables and generic arguments, not just TyKind::Error.
+                if !self.tcx.tys.has_error(self.infcx.deeply_resolve_ignoring_regions(rt)) {
+                    let ts = self.ty_str(rt);
+                    let help = self.method_help(rt, s);
+                    self.err(lo, format!("E0599: no method named `{}` found for `{}` in the current scope{}", self.prog.syms.str(s), ts, help));
+                }
                 for a in args { self.check_expr(*a, None); }
                 return error;
             }

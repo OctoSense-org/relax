@@ -535,6 +535,9 @@ impl Tcx {
                 // a trait impl whose trait did not resolve: reported there
                 None if is_trait_impl => {}
                 None => {
+                    // InherentCollect::check_item, rustc_hir_analysis/src/coherence/inherent_impls.rs:227:
+                    // an unresolved self type was diagnosed while lowering it, not an impl on a primitive.
+                    if matches!(self.tys.kind(st), TyKind::Error) { continue; }
                     if self.orphan_local(prog, st, krate) {
                         continue;
                     }
@@ -3106,7 +3109,8 @@ impl Tcx {
                 } else {
                     String::new()
                 };
-                self.err(cx, prog, file, p.lo, format!("E0425: cannot find type `{}` in this scope{}", path_str(prog, file, p), help));
+                let (at, message) = prog.unresolved_name_message(file, module, p, "type");
+                self.err(cx, prog, file, at, format!("E0425: {message}{help}"));
                 return self.tys.error;
             }
         };
@@ -3707,7 +3711,9 @@ impl Tcx {
                     let first = prog.files[file as usize].text(ast.segs(p.segs)[0].name);
                     let known = prog.syms.get(first).is_some_and(|s| env.names.contains(&s) || prog.lookup_in_scope(module, s, true).is_some() || prog.lookup_in_scope(module, s, false).is_some() || prog.crates[prog.mods[module as usize].krate as usize].deps.iter().any(|d| d.0 == s));
                     if !known {
-                        self.err(cx, prog, file, p.lo, format!("E0433: failed to resolve: use of unresolved module or unlinked crate `{}`", first));
+                        let names: Vec<_> = ast.segs(p.segs).iter().map(|s| prog.files[file as usize].text(s.name)).collect();
+                        let message = prog.path_resolution_message(module, false, &names, 0, None);
+                        self.err(cx, prog, file, ast.segs(p.segs)[0].name.lo, format!("E0433: {message}"));
                     }
                 }
             }

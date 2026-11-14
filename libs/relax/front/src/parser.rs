@@ -352,7 +352,7 @@ impl<'a> Parser<'a> {
     /// rustc_span `Ident::is_reserved` of a lifetime/label name (without its quote): the special
     /// identifiers (`_`), the keywords used always or reserved always, and the edition keywords
     /// (`async`/`await`/`dyn`/`try` from 2018, `gen` from 2024).
-    fn reserved_name(name: &[u8], edition: u16) -> bool {
+    pub(crate) fn reserved_name(name: &[u8], edition: u16) -> bool {
         match name {
             b"_" | b"as" | b"break" | b"const" | b"continue" | b"crate" | b"else" | b"enum" | b"extern" | b"false"
             | b"fn" | b"for" | b"if" | b"impl" | b"in" | b"let" | b"loop" | b"match" | b"mod" | b"move" | b"mut"

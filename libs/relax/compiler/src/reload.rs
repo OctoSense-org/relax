@@ -8581,11 +8581,25 @@ pub(crate) fn patch_refused_event(what: &str, refused: bool, lines: &[String]) {
     // before deciding whether a refusal is a failure of makepad itself.
 }
 
-/// The path an unresolved name's error names: a `use` (E0432), a value or a type (E0425),
-/// as the resolver and the type checker print them.
-fn unresolved_path(e: &str) -> Option<&str> {
-    let at = ["E0432: unresolved import `", "E0425: cannot find value `", "E0425: cannot find type `"].iter().find_map(|h| e.find(h).map(|i| i + h.len()))?;
-    Some(&e[at..at + e[at..].find('`')?])
+/// The path an unresolved name's error names: a `use` (E0432), or a value, function, type or
+/// crate (E0425), as the resolver and the type checker print them. An E0425 names the last
+/// segment and its scope apart (rustc_resolve late/diagnostics.rs make_base_error:
+/// "cannot find value `x` in module `a::b`"); the path is the scope's path and the name.
+fn unresolved_path(e: &str) -> Option<std::borrow::Cow<'_, str>> {
+    const HEADS: [&str; 7] = ["E0432: unresolved import `", "E0425: cannot find value `", "E0425: cannot find type `", "E0425: cannot find function `",
+        "E0425: cannot find function, tuple struct or tuple variant `", "E0425: cannot find external crate `", "E0425: cannot find crate `"];
+    let (head, at) = HEADS.iter().find_map(|h| e.find(h).map(|i| (*h, i + h.len())))?;
+    let name = &e[at..at + e[at..].find('`')?];
+    if head.starts_with("E0432") {
+        return Some(name.into());
+    }
+    // ` in this scope`, ` in the crate root`, ` in the list of imported crates`: the name alone;
+    // ` in module `a::b``, ` in crate `k``, ` in `a::b`` (a prefix that is no module; also
+    // enum and trait): the prefix's path, then the name
+    let scope = e[at + name.len() + 1..].strip_prefix(" in ")?;
+    let scope = ["module ", "crate ", "enum ", "trait "].iter().find_map(|d| scope.strip_prefix(d)).unwrap_or(scope);
+    let Some(prefix) = scope.strip_prefix('`') else { return Some(name.into()) };
+    Some(format!("{}::{name}", &prefix[..prefix.find('`')?]).into())
 }
 
 /// The type whose item an E0599 does not find (`no method named `m` found for `&T``, `no function
@@ -8635,13 +8649,13 @@ fn provided_lacks(prog: &Program, errs: &[String]) -> Option<Vec<String>> {
     let last = |p: &str| p.rsplit("::").next().unwrap_or(p).to_string();
     let lacked: Vec<(String, String)> = errs.iter().filter_map(|e| unresolved_path(e)).filter_map(|p| {
         let (krate, rest) = p.trim_start_matches("::").split_once("::")?;
-        (!rest.is_empty() && crate::provided::registered(krate)).then(|| (last(p), krate.to_string()))
+        (!rest.is_empty() && crate::provided::registered(krate)).then(|| (last(&p), krate.to_string()))
     }).collect();
     errs.iter().map(|e| {
         let krate = match missing_item_owner(e) {
             Some(owner) => provided_type_crate(prog, owner)?,
             None => {
-                let name = last(unresolved_path(e)?);
+                let name = last(&unresolved_path(e)?);
                 lacked.iter().find(|(n, _)| *n == name)?.1.clone()
             }
         };

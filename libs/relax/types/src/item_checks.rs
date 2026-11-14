@@ -290,7 +290,7 @@ pub fn super_paths(prog: &Program, own: &[bool]) -> Vec<String> {
             _ => false,
         };
         if too_many {
-            errors.push(prog.record_error(def.file, item.lo, "resolve", "E0433: failed to resolve: too many leading `super` keywords".to_string()));
+            errors.push(prog.record_error(def.file, item.lo, "resolve", format!("E0433: {}", prog.too_many_super_message(scope))));
         } else if let Vis::In(p) = item.vis {
             vis_path_segments(prog, def.file, scope, p, &mut errors);
         }
@@ -308,7 +308,9 @@ pub fn super_paths(prog: &Program, own: &[bool]) -> Vec<String> {
         }
         if im.ext || !im.global || im.segs.first().map(|s| s.0) != Some(SegKind::Super) { continue; }
         if im.pos >= prog.files[im.file as usize].src_len { continue; }
-        errors.push(prog.record_error(im.file, im.pos, "resolve", "E0433: failed to resolve: global paths cannot start with `super`".to_string()));
+        // resolve_path_with_ribs, rustc_resolve/src/ident.rs:1990-2000: this is the message;
+        // the former "failed to resolve" prefix belongs to neither the message nor the label.
+        errors.push(prog.record_error(im.file, im.pos, "resolve", "E0433: global paths cannot start with `super`".to_string()));
     }
     errors
 }
