@@ -971,6 +971,7 @@ pub fn start() {
         let _k = crate::zone_alloc::kept();
         crate::query::set_wait_hook(crate::query::WaitHook { on_owner: is_owner, pump: pump_latch, wake, me });
         makepad_cpu_budget::set_wait_hook(crate::waits::token_wait);
+        crate::pool::set_job_lift(crate::jit::job_lift, crate::jit::job_back);
         let (tx, rx) = std::sync::mpsc::channel();
         let thread = std::thread::Builder::new()
             .name("run-owner".into())

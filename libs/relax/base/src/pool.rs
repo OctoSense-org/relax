@@ -164,6 +164,40 @@ impl Drop for BudgetJob {
     }
 }
 
+/// The compiler's account of a compile job while it waits for a CPU token: `lift` says whether it
+/// lifted the thread's job (relax-compiler's JobIdle), `back` takes that.
+static JOB_LIFT: std::sync::OnceLock<(fn() -> bool, fn(bool))> = std::sync::OnceLock::new();
+
+pub fn set_job_lift(lift: fn() -> bool, back: fn(bool)) {
+    let _ = JOB_LIFT.set((lift, back));
+}
+
+/// A job lifted for a token wait; its drop takes it back.
+struct Lifted(Option<(fn(bool), bool)>);
+impl Drop for Lifted {
+    fn drop(&mut self) {
+        if let Some((back, lifted)) = self.0.take() { back(lifted); }
+    }
+}
+
+/// A job's wait for its token (`admission`: its place in the budget's queue), polled, with the
+/// budget's park between polls. From its first park to its readmission the job is lifted for the
+/// compiler: a pause the compiler makes (a fork, an allocator swap) waits for its running jobs, and
+/// the jobs it holds at their start keep their permits, so a job counted as running while it waited
+/// for one of those tokens kept the pause waiting for good (a teardown test's fork, 2026-11-14). A
+/// wait that never parks is not lifted. The caller drops the `Lifted` once the permit is the job's
+/// again: a job held at its return while a pause runs holds its permit, not a place in the queue.
+fn readmit(job: &JobClass, mut admission: budget::Admission) -> (u32, Lifted) {
+    let mut lifted = Lifted(None);
+    loop {
+        if let Some(p) = admission.poll(job.class(), budget::JIT, job.label) { return (p, lifted); }
+        if lifted.0.is_none() {
+            lifted = Lifted(JOB_LIFT.get().map(|&(lift, back)| (back, lift())));
+        }
+        budget::park_admission(job.class());
+    }
+}
+
 /// A pass boundary. UI-thread lazy builds have no pool permit and do nothing here.
 pub fn checkpoint(extra_locks: u32, extra_site: &str) {
     let job = CURRENT.try_with(|c| c.borrow().clone()).ok().flatten();
@@ -175,11 +209,17 @@ pub fn checkpoint(extra_locks: u32, extra_site: &str) {
     if let Some(p) = permit {
         budget::reclass(p, job.class());
         let site = if extra_locks != 0 { extra_site.to_owned() } else { site.map_or_else(String::new, |s| format!("{}:{}", s.file(), s.line())) };
-        let p = budget::checkpoint_following(p, held, &site, job.desired.as_ptr());
+        let mut admission = budget::Admission::default();
+        let (p, lifted) = match admission.checkpoint(p, held, &site) {
+            Some(p) => (p, Lifted(None)),
+            None => readmit(&job, admission),
+        };
         let mut slot = job.permit.lock().unwrap_or_else(|e| e.into_inner());
         budget::reclass(p, job.class());
         budget::set_thread_class(job.class());
         *slot = Some(p);
+        drop(slot);
+        drop(lifted);
     }
 }
 
@@ -234,11 +274,13 @@ impl Drop for BudgetWait {
         if self.lent { budget::take_back(); }
         if let Some(job) = &self.job {
             let _kept = zone_alloc::kept();
-            let p = budget::admit_following(job.desired.as_ptr(), budget::JIT, job.label);
+            let (p, lifted) = readmit(job, budget::Admission::default());
             let mut slot = job.permit.lock().unwrap_or_else(|e| e.into_inner());
             budget::reclass(p, job.class());
             budget::set_thread_class(job.class());
             *slot = Some(p);
+            drop(slot);
+            drop(lifted);
         }
     }
 }

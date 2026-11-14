@@ -25065,6 +25065,23 @@ impl Drop for JobIdle {
     }
 }
 
+/// A compile job's wait for a CPU token (relax-base pool: a readmission, a checkpoint that yields)
+/// lifts the job as a wait on the owner does (JobIdle): a pause (a fork, an allocator swap) waits
+/// for the running jobs, and the jobs it holds at their start keep their permits, so a job counted
+/// while it waited for one of those tokens kept the pause waiting, and the pause kept the tokens
+/// held (a fork in a teardown test waited for an O3 job's readmission after its poll's sleep for
+/// good, 2026-11-14). `job_lift` says whether it lifted the job; `job_back` takes that.
+pub(crate) fn job_lift() -> bool {
+    let idle = JobIdle::enter();
+    let lifted = idle.0;
+    std::mem::forget(idle);
+    lifted
+}
+
+pub(crate) fn job_back(lifted: bool) {
+    drop(JobIdle(lifted));
+}
+
 /// A compile job's sleep that waits for no owner request (a poll): the job is not running meanwhile
 /// (JobIdle), so an allocator swap or a fork never waits for it -- what the poll waits for may be
 /// held up by that very swap (a job polling for quiet compiles, while the jobs the swap parked keep
@@ -29808,6 +29825,112 @@ mod allocator_swap_tests {
         pauser.join().unwrap();
         wait_for(&served, "the nested job's request was never served after the pause");
         nested.join().unwrap();
+    }
+
+    /// A fork never waits for a compile job that waits for a CPU token. The jobs a pause holds at
+    /// their start keep their permits; a job that gave its token back for a poll's sleep and asks
+    /// for one again while those hold every token waits for them, and they for the pause: counted
+    /// as running there, it held a fork for good (a teardown test's fork, 10 min, 2026-11-14).
+    /// Here the held jobs take every token there is, and one more ask queued ahead of the job's
+    /// keeps it waiting whoever else in the process holds one.
+    #[cfg(unix)]
+    #[test]
+    fn a_fork_does_not_wait_for_a_job_waiting_for_a_token() {
+        isolated_test!(a_fork_does_not_wait_for_a_job_waiting_for_a_token, cores = 2);
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        use makepad_cpu_budget as budget;
+        use std::sync::Arc;
+        owner::start();
+        let wait_for = |f: &AtomicBool, what: &str| {
+            let t0 = std::time::Instant::now();
+            while !f.load(Ordering::SeqCst) {
+                assert!(t0.elapsed().as_secs() < 30, "{what}");
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+        };
+        let flag = || Arc::new(AtomicBool::new(false));
+        let (in_job, gave_back, asks, readmitted, release) = (flag(), flag(), flag(), flag(), flag());
+        // the job: admitted as the queue's workers are, counted, then a poll's sleep inside the pause
+        let (j, g, a, r) = (in_job.clone(), gave_back.clone(), asks.clone(), readmitted.clone());
+        let (id_tx, id_rx) = std::sync::mpsc::channel();
+        let job = std::thread::spawn(move || {
+            let permit = budget::admit(budget::BACKGROUND, budget::JIT, "job");
+            let _job = crate::pool::BudgetJob::from_permit(permit, budget::BACKGROUND, "job");
+            let _guard = compile_job();
+            id_tx.send(crate::waits::me()).unwrap();
+            j.store(true, Ordering::SeqCst);
+            while paused_for() == 0 {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            let sleeping = crate::pool::suspend();
+            g.store(true, Ordering::SeqCst);
+            while !a.load(Ordering::SeqCst) {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            // its readmission: behind every token's holder
+            drop(sleeping);
+            r.store(true, Ordering::SeqCst);
+        });
+        wait_for(&in_job, "the job never began");
+        let job_id = id_rx.recv().unwrap();
+        let fork: extern "C" fn() -> i32 = unsafe { std::mem::transmute(loader_symbol(b"fork").expect("the loader provides fork")) };
+        let (forked, child) = (flag(), Arc::new(std::sync::atomic::AtomicI32::new(0)));
+        let (f, c) = (forked.clone(), child.clone());
+        let pauser = std::thread::spawn(move || {
+            let pid = fork();
+            if pid == 0 {
+                os::thread::exit_now(0);
+            }
+            c.store(pid, Ordering::SeqCst);
+            f.store(true, Ordering::SeqCst);
+        });
+        wait_for(&gave_back, "the job never gave its token back");
+        // jobs that start inside the pause, each with a token it keeps at its start, until an ask
+        // finds none: that one waits, ahead of the job's
+        let mut held = Vec::new();
+        loop {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let go = release.clone();
+            held.push(std::thread::spawn(move || {
+                let mut admission = budget::Admission::default();
+                let permit = admission.poll(budget::BACKGROUND, budget::JIT, "held");
+                tx.send(permit.is_some()).unwrap();
+                let _job = permit.map(|p| crate::pool::BudgetJob::from_permit(p, budget::BACKGROUND, "held"));
+                let _guard = permit.map(|_| compile_job());
+                while !go.load(Ordering::SeqCst) {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+            }));
+            if !rx.recv().unwrap() {
+                break;
+            }
+        }
+        let holders = held.len() - 1;
+        asks.store(true, Ordering::SeqCst);
+        // the budget's table: the held jobs have their tokens, the job waits for one
+        let t0 = std::time::Instant::now();
+        while !budget::tokens().waiting.iter().any(|w| w.thread == job_id && w.class == budget::BACKGROUND && w.client == budget::JIT) {
+            assert!(t0.elapsed().as_secs() < 30 && !readmitted.load(Ordering::SeqCst), "the job's ask for a token never waited");
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        wait_for(&forked, "the fork waited for a job that waits for a CPU token");
+        assert!(child.load(Ordering::SeqCst) > 0, "fork failed");
+        assert!(!readmitted.load(Ordering::SeqCst), "the job got a token ahead of an earlier ask");
+        assert_eq!(budget::tokens().holders.iter().filter(|h| h.label == "held").count(), holders, "a held job gave its token up");
+        release.store(true, Ordering::SeqCst);
+        pauser.join().unwrap();
+        for h in held {
+            h.join().unwrap();
+        }
+        wait_for(&readmitted, "the job was never readmitted after the fork");
+        job.join().unwrap();
+        extern "C" {
+            fn waitpid(pid: i32, status: *mut i32, options: i32) -> i32;
+        }
+        let mut status = 0i32;
+        let pid = child.load(Ordering::SeqCst);
+        assert_eq!(unsafe { waitpid(pid, &mut status, 0) }, pid);
+        assert_eq!(status, 0, "the child did not exit cleanly");
     }
 
     /// A spawn's fork (Relax std's Command with pre_exec closures: `__relax_fork_exec`) goes ahead
