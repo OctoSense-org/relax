@@ -321,8 +321,14 @@ fn program_tls_fill() -> &'static DomainTls {
 /// Hands the thread's chunks back when it ends, however it was started (a thread without
 /// `compiler_thread()` that allocated in the compiler phase would otherwise keep them for good).
 struct ExitGuard;
+/// Threads whose exit destructor was armed (`register_exit`) and that ran it (`ExitGuard`): a
+/// test that finds chunks left after its threads ended says which of the two steps was missing.
+#[cfg(test)]
+pub static EXIT_COUNTS: [std::sync::atomic::AtomicUsize; 2] = [const { std::sync::atomic::AtomicUsize::new(0) }; 2];
 impl Drop for ExitGuard {
     fn drop(&mut self) {
+        #[cfg(test)]
+        EXIT_COUNTS[1].fetch_add(1, Ordering::Relaxed);
         DEFAULT.detach_thread();
         let _ = EXITED.try_with(|e| e.set(true));
     }
@@ -2111,6 +2117,8 @@ impl Arena {
     #[cold]
     fn register_exit(&self) {
         if !EXIT_REGISTERED.with(|r| r.replace(true)) {
+            #[cfg(test)]
+            EXIT_COUNTS[0].fetch_add(1, Ordering::Relaxed);
             // first access arms the destructor; it may allocate (the flag is set: no recursion)
             let _ = EXIT_GUARD.try_with(|_| {});
         }
