@@ -903,6 +903,9 @@ pub struct Cache {
     recording_pending: bool,
     /// front images (crate, key) reserved this run: an image is local to its crate's store
     front_reserved: HashSet<(u32, u128)>,
+    /// per program file: which of its images (1 the file's, 2 its part's) push_front_refs took
+    /// already, so a mid-run write passes over them without making their keys again
+    front_files: Vec<u8>,
     /// link name -> canonical foreign declaration (canon_foreign; built on first use)
     foreign_canon: Option<HashMap<String, DefId>>,
     /// per crate: definition key -> DefId (built on the first decode in that crate)
@@ -1377,6 +1380,7 @@ impl Cache {
             pending_keys: HashSet::new(),
             recording_pending: false,
             front_reserved: HashSet::new(),
+            front_files: Vec::new(),
             foreign_canon: None,
             def_maps: HashMap::new(),
             crate_defs: Vec::new(),
@@ -1802,6 +1806,18 @@ impl Cache {
             n += 1;
         }
         n
+    }
+
+    /// Which images of program file `file` push_front_refs took (`front_files`).
+    pub fn front_file_taken(&self, file: usize) -> u8 {
+        self.front_files.get(file).copied().unwrap_or(0)
+    }
+
+    pub fn set_front_file_taken(&mut self, file: usize, images: u8) {
+        if self.front_files.len() <= file {
+            self.front_files.resize(file + 1, 0);
+        }
+        self.front_files[file] |= images;
     }
 
     /// Warm-session diagnostics (`makepad inspect cache`): counts a fresh build of slot `id` (`base`: one of
@@ -4692,7 +4708,12 @@ impl Cache {
         }
         let t0 = std::time::Instant::now();
         if !crate::preempt::is_stopped() && relax_codegen::warm::enabled() {
+            // (every slot of the unit: a waiting request goes first, as in the steps below)
+            crate::run::yield_section("manifest outcomes");
             for (id, f) in u.fns.iter().enumerate() {
+                if id % 4096 == 4095 && stop() {
+                    return false;
+                }
                 if !f.compiled && !f.history().inlined_into.is_empty() {
                     self.remember_outcome(u, id as u32, None, "cold inlined-only; no standalone code entry");
                 }

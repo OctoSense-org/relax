@@ -4778,7 +4778,7 @@ fn record_check_front(u: &mut Unit, options: &crate::options::Options, boot: Opt
         Ok(c) => c,
         Err(e) => { verbose!("relax check: front images not written: {}", e); return; }
     };
-    let n = push_front_images(&u.prog, &mut c);
+    let (n, _) = push_front_images(&u.prog, &mut c, &|| false);
     c.record_front_crates(&u.prog);
     let written = match c.spill_take() {
         Some(s) => s.write().map(|_| ()),
@@ -4814,20 +4814,28 @@ fn record_early(prog: &crate::program::Program, reuse: &crate::check_reuse::Reus
 static CHECK_RECORDS_COLLECTED: AtomicBool = AtomicBool::new(false);
 
 /// References to the images of the program's files (and their parts) that their crate stores
-/// do not have yet (front.rs: each image was written when its file or part was published);
-/// the count queued.
-pub(crate) fn push_front_images(prog: &crate::program::Program, c: &mut crate::cache::Cache) -> usize {
+/// do not have yet (front.rs: each image was written when its file or part was published):
+/// the count queued, and whether every file's were taken. Each file's images are taken once
+/// (Cache::front_file_taken): a mid-run write made two keys for each of the program's files
+/// every time, 16-43 ms on the owner while a frame's install waited. `stop`: a waiting request
+/// goes first, and a later write takes the files left (false: not all were taken).
+pub(crate) fn push_front_images(prog: &crate::program::Program, c: &mut crate::cache::Cache, stop: &dyn Fn() -> bool) -> (usize, bool) {
     let mut n = 0;
+    let mut taken = 0u32;
     for i in 0..prog.files.len() {
         // (a live edit's version: an eager parse, whose ids are not a boot parse's -- cache enc_file)
         if prog.is_edit_version(i as u32) { continue; }
         let f = &prog.files[i];
         let (Some(path), Some(&krate)) = (prog.file_paths.get(i), prog.file_crate.get(i)) else { continue };
         let part = f.part.get().and_then(|p| p.image.as_ref());
-        if f.image.is_none() && part.is_none() { continue; }
+        let images = f.image.is_some() as u8 | (part.is_some() as u8) << 1;
+        if images == 0 || c.front_file_taken(i) & images == images { continue; }
+        if taken % 16 == 15 && stop() { return (n, false); }
+        taken += 1;
         n += c.push_front_refs(krate, path, f.source_hash(path), f.image.as_ref(), part);
+        c.set_front_file_taken(i, images);
     }
-    n
+    (n, true)
 }
 
 /// (verbose) a background owner request's longest stretch between two of its yield checks (the
@@ -4960,6 +4968,7 @@ fn mid_flush(quiet: bool, wait: bool) -> Option<(usize, usize)> {
         if u.cache.is_some() && jit::started() && jit::wall_ns() >= jit::ORDER_UNTIL_NS.load(Ordering::Relaxed) && (!done || tail || refresh) {
             MID_MANIFEST_DONE.store(true, Ordering::Relaxed);
             let len = u.start_order.len();
+            yield_section("manifest order");
             let (order, present) = jit::manifest_order(&*u, u.start_order.clone(), jit::ORDER_PRESENT_LEN.load(Ordering::Relaxed));
             let mut cache = u.cache.take();
             if let Some(c) = cache.as_mut() {
@@ -4992,12 +5001,15 @@ fn mid_flush(quiet: bool, wait: bool) -> Option<(usize, usize)> {
         probe.tick("borrowck keys");
         if front_recordable() {
             yield_section("front images");
-            n_imgs += push_front_images(&u.prog, c);
+            let stop = || { probe.tick("front images"); quit_write_gives_way() };
+            let (pushed, all_taken) = push_front_images(&u.prog, c, &stop);
+            n_imgs += pushed;
             parts[1] = held.elapsed().as_secs_f64() * 1e3;
             yield_section("crate records");
             probe.tick("front images");
             let stop = || { probe.tick("crate records"); quit_write_gives_way() };
-            let complete = c.record_front_crates_until(&u.prog, &stop);
+            // (front images left for a later write: a request waits, the crate records wait too)
+            let complete = all_taken && c.record_front_crates_until(&u.prog, &stop);
             parts[2] = held.elapsed().as_secs_f64() * 1e3;
             yield_section("spill take");
             probe.tick("crate records");
@@ -5071,8 +5083,8 @@ fn mid_flush(quiet: bool, wait: bool) -> Option<(usize, usize)> {
                 // write runs after the owner thread is released, before the record's commit)
                 if wait && u.prog.files.len() != imaged_files && front_recordable() {
                     if stop() { crates_left = true; mid_yielded(); } else if let Some(c) = u.cache.as_mut() {
-                        push_front_images(&u.prog, c);
-                        crates_left = !c.record_front_crates_until(&u.prog, &stop);
+                        let (_, all_taken) = push_front_images(&u.prog, c, &stop);
+                        crates_left = !(all_taken && c.record_front_crates_until(&u.prog, &stop));
                         late_spill = c.spill_take();
                         if !crates_left { imaged_files = u.prog.files.len(); }
                     }
@@ -5214,7 +5226,7 @@ fn summary_inner(why: &str) {
                 // front images of the files the store does not have yet (front.rs) and the crate
                 // records: a run quit before its first mid-run write has all of them left
                 if front_recordable() {
-                    push_front_images(&u.prog, c);
+                    push_front_images(&u.prog, c, &|| false);
                     c.record_front_crates(&u.prog);
                 }
                 exit_mark("front images");
