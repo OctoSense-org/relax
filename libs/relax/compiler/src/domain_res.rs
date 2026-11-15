@@ -115,7 +115,8 @@ type ForkFn = Option<unsafe extern "C" fn()>;
 static ATFORK: Mutex<Vec<(u64, ForkFn, ForkFn, ForkFn)>> = Mutex::new(Vec::new());
 
 /// `ATFORK` was used once: an exec child must not lock the registry it may have inherited locked.
-/// Conservative, never cleared, even when a domain's handlers go.
+/// Conservative, never cleared while the run lives, even when a domain's handlers go; a run started
+/// again in place clears it with the registry (reset_statics).
 #[cfg(unix)]
 static ATFORK_USED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -1059,4 +1060,6 @@ pub(crate) unsafe fn reset_statics() {
     reset(&OWNED, Mutex::new(Vec::new()));
     #[cfg(unix)]
     reset(&ATFORK, Mutex::new(Vec::new()));
+    #[cfg(unix)]
+    reset(&ATFORK_USED, std::sync::atomic::AtomicBool::new(false));
 }
