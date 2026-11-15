@@ -71,6 +71,12 @@ extern "C" fn payload_end() {
 /// Static message bytes are interned by the loader; formatted bytes live through this call.
 #[cfg(not(relax_web))]
 extern "C" fn runtime_panic_hook(msg: *const u8, len: usize, file: *const u8, file_len: usize, line: u32, col: u32, is_static: bool) {
+    // A catch point with no source location records the runtime's message as the payload.
+    if file.is_null() {
+        let msg = unsafe { core::str::from_utf8_unchecked(core::slice::from_raw_parts(msg, len)) };
+        crate::panic::record_payload(format_args!("{}", msg));
+        return;
+    }
     let depth = crate::panic::panic_depth_step(1);
     if depth > 2 {
         unsafe { core::intrinsics_rt::abort() };

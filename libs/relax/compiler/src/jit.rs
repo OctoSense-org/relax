@@ -1618,6 +1618,7 @@ struct WatchdogCall {
     token: u64,
     target: u64,
     deadline: Option<std::time::Instant>,
+    deadline_ms: u64,
     /// a test's watch (`watchdog_stall`): it expires when the test made no progress for a while
     stall: Option<Stall>,
     parent: Option<std::sync::Arc<WatchdogCall>>,
@@ -1732,8 +1733,13 @@ fn thread_io_bytes(path: &str) -> Option<u64> {
 /// The message of the watch that expired on this thread: a test's stall, or a call's deadline.
 fn watchdog_message() -> String {
     let token = WATCHDOG_EXPIRED.with(|t| t.get());
-    let stall = WATCHDOG_STACK.with(|s| s.borrow().iter().find(|c| c.token == token).and_then(|c| c.stall.as_ref().map(Stall::describe)));
-    stall.unwrap_or_else(|| "watchdog: the call did not return in time".to_string())
+    let message = WATCHDOG_STACK.with(|s| s.borrow().iter().find(|c| c.token == token).map(|c| {
+        match &c.stall {
+            Some(stall) => stall.describe(),
+            None => format!("watchdog: the call did not return within {} ms", c.deadline_ms),
+        }
+    }));
+    message.unwrap_or_else(|| "watchdog: the call did not return in time".to_string())
 }
 static WATCHDOG_CALLS: relax_session::sync::Mutex<Vec<std::sync::Arc<WatchdogCall>>> = relax_session::sync::Mutex::new(Vec::new());
 static WATCHDOG_WAKE: relax_session::sync::Condvar = relax_session::sync::Condvar::new();
@@ -4432,6 +4438,13 @@ pub(crate) fn rt_catch_panic(f: u64, data: u64) -> u64 {
             fatal_compile_error(&p, &r);
             // std's hook already printed the panic message (as rustc's does); add where
             eprintln!("  report{}: {}", if caught { " (caught)" } else { "" }, r);
+            // A contained hang or fault has no std payload. A null file asks std to record
+            // the message without running the user hook or replacing an existing payload.
+            let hook = unsafe { (*u).panic_hook.load(Ordering::Acquire) };
+            if hook != 0 {
+                let hook: RuntimePanicHook = unsafe { std::mem::transmute(hook) };
+                hook(p.message.as_ptr(), p.message.len(), std::ptr::null(), 0, 0, 0, false);
+            }
             1
         }
     }
@@ -9161,18 +9174,19 @@ unsafe fn call_jit_inner(u: *mut Unit, entry: u64, arg: u64) -> Result<u64, Pani
 
 /// A call's deadline: the call is unwound as a hang `ms` after it started (0: none).
 pub fn watchdog(ms: u64) -> u64 {
-    watch(if ms == 0 { None } else { std::time::Instant::now().checked_add(std::time::Duration::from_millis(ms)) }, None)
+    watch(ms, None)
 }
 
 /// A test's watch: the test is unwound as a hang once it made no progress for `ms` (Stall),
 /// however long it runs while it progresses (0: none).
 pub fn watchdog_stall(ms: u64) -> u64 {
-    watch(None, if ms == 0 { None } else { Some(crate::zone_alloc::kept_with(|| Stall::new(ms))) })
+    watch(0, if ms == 0 { None } else { Some(crate::zone_alloc::kept_with(|| Stall::new(ms))) })
 }
 
 /// One worker serves all deadlines and stall watches, including enclosing guards on the same
 /// thread. No thread creation per guard, and no polling instructions in compiled code.
-fn watch(deadline: Option<std::time::Instant>, stall: Option<Stall>) -> u64 {
+fn watch(deadline_ms: u64, stall: Option<Stall>) -> u64 {
+    let deadline = if deadline_ms == 0 { None } else { std::time::Instant::now().checked_add(std::time::Duration::from_millis(deadline_ms)) };
     WATCHDOG_START.call_once(|| {
         { let _k = crate::zone_alloc::kept();
         let _ = crate::run_threads::spawn("run-watchdog", || {
@@ -9201,6 +9215,7 @@ fn watch(deadline: Option<std::time::Instant>, stall: Option<Stall>) -> u64 {
         token: WATCHDOG_ID.fetch_add(1, Ordering::Relaxed),
         target: os::thread::current(),
         deadline,
+        deadline_ms,
         stall,
         parent: WATCHDOG_STACK.with(|s| s.borrow().last().cloned()),
         hit: AtomicBool::new(false),
