@@ -116,6 +116,14 @@ Shrink it to the smallest program that still differs from rustc. A counting `Dro
 drop-order and double-free bugs. An `eprintln!` in a vendored copy of the failing crate finds where
 the behaviour diverges. Put that small program in the PR as a test file.
 
+## Scope
+
+Relax is an experimental developer JIT: it runs, checks and tests Rust from source, in memory, for
+fast development iteration. It never writes executables, libraries or other build output, and it is
+not an ahead-of-time compiler. Release builds use rustc and cargo. Turning Relax into a compiler is
+permanently out of scope: a pull request that adds binary or library output, or a launcher that
+stands in for one, is closed. A test that needs a built binary runs under cargo, not Relax.
+
 ## Rules
 
 - Don't add third-party crates to Relax, and don't add regex/syn/quote. crates.io crates are
