@@ -322,7 +322,9 @@ struct Repr {
     reorder: bool,
 }
 
-/// rustc_abi Integer::for_align: the integer whose size is this alignment.
+/// rustc_abi Integer::for_align: the integer whose size and ABI alignment equal `a`.
+/// Every integer's ABI alignment equals its size on the JIT's aarch64 and x86_64 hosts
+/// (i128 has been 16-aligned on x86_64 since rustc 1.77).
 fn int_for_align(a: u32) -> Option<u32> {
     match a {
         1 | 2 | 4 | 8 | 16 => Some(a),
@@ -1283,7 +1285,6 @@ impl Layouts {
         if ity <= min_bytes {
             ity = min_bytes;
         } else {
-            ity = ity.min(8);
             for u in us.iter_mut() {
                 for o in u.offsets.iter_mut() {
                     if *o <= min_bytes {

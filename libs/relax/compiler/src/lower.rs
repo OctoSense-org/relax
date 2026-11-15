@@ -13511,7 +13511,7 @@ pub fn emit_decode_tag(u: &Unit, f: &mut Func, b: u32, pos: u64, raw: Vec<VReg>,
                 }
                 _ => raw,
             };
-            if !remap || adt.tag_pin.is_none() || tag.len() != 1 {
+            if !remap || adt.tag_pin.is_none() {
                 return Some(tag);
             }
             // a live edit kept the running values' tags (M10): each tag is mapped to its variant's
@@ -13521,7 +13521,8 @@ pub fn emit_decode_tag(u: &Unit, f: &mut Func, b: u32, pos: u64, raw: Vec<VReg>,
             push_at(f, b, pos, Inst::Iconst(d, variant_disc(u, adt, n.checked_sub(1)?)?));
             for v in (0..n - 1).rev() {
                 let c = f.vreg(Cls::I);
-                let tv = adt.tag_for_variant(&u.tcx, &u.prog, v)?.signed_value() as i64;
+                let pinned = adt.tag_for_variant(&u.tcx, &u.prog, v)?;
+                let tv = pinned.signed_value() as i64;
                 if tv == tv as i32 as i64 {
                     push_at(f, b, pos, Inst::ICmpI(Cond::Eq, false, c, tag[0], tv));
                 } else {
@@ -13530,6 +13531,16 @@ pub fn emit_decode_tag(u: &Unit, f: &mut Func, b: u32, pos: u64, raw: Vec<VReg>,
                     push_at(f, b, pos, Inst::Iconst(kr, tv));
                     push_at(f, b, pos, Inst::ICmp(Cond::Eq, false, c, tag[0], kr));
                 }
+                let c = if tag.len() == 2 {
+                    // Alignment widening can make a pinned repr(Rust) tag 16 bytes too.
+                    let kh = f.vreg(Cls::I);
+                    let hi = f.vreg(Cls::I);
+                    let both = f.vreg(Cls::I);
+                    push_at(f, b, pos, Inst::Iconst(kh, (pinned.val >> 64) as i64));
+                    push_at(f, b, pos, Inst::ICmp(Cond::Eq, false, hi, tag[1], kh));
+                    push_at(f, b, pos, Inst::IBin(IOp::And, U64, both, c, hi));
+                    both
+                } else { c };
                 let k = f.vreg(Cls::I);
                 push_at(f, b, pos, Inst::Iconst(k, variant_disc(u, adt, v)?));
                 let nd = f.vreg(Cls::I);
