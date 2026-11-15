@@ -157,7 +157,8 @@ pub const OPTION: u32 = 6;
 /// Generated host entries evaluate this in a const: reading rustc's tags proves the
 /// stated width is not too large, and matching images with poisoned padding proves
 /// it is not too small or at the wrong offset. A changed layout is a compile error.
-#[cfg(feature = "host-shims")]
+/// Always defined: a crate's own `host-shims` feature gates the entries that call it, and such
+/// a crate may be built without relax-api's feature (a check of the crate alone).
 pub const fn option_layout<X>() -> [u64; 6] {
     // Even a non-const caller must have rustc validate the raw reads and images.
     const {
