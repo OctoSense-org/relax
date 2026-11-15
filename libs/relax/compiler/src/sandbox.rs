@@ -245,6 +245,8 @@ struct Sb {
     arenas: Vec<Arc<Arena>>,
     /// twin -> slots its code refers to without a relocation (fn pointer constants)
     refs: HashMap<u32, Vec<u32>>,
+    /// twins that code linked from the disk cache names as fn values, until a module load follows them
+    linked: HashSet<u32>,
     /// host API fns checked at the boundary ((def, collect epoch) -> the refusal, None: allowed)
     api_checked: HashMap<(u32, u64), Option<String>>,
 }
@@ -359,6 +361,7 @@ unsafe fn sb_init(up: *mut Unit, domain: Domain) -> Result<(), String> {
         abs: Vec::new(),
         arenas: Vec::new(),
         refs: HashMap::new(),
+        linked: HashSet::new(),
         api_checked: HashMap::new(),
     }));
     u.sandbox.ready.store(true, std::sync::atomic::Ordering::Release);
@@ -538,6 +541,21 @@ unsafe fn sbthunk(up: *mut Unit, t: u32) -> Result<u64, String> {
 pub fn extra_refs(u: &Unit, t: u32) -> Vec<u32> {
     let g = u.sandbox.sb.lock().unwrap_or_else(|e| e.into_inner());
     g.as_ref().and_then(|s| s.refs.get(&t).cloned()).unwrap_or_default()
+}
+
+/// Code linked from the disk cache names twin `t` of unit `u` as a fn value: the next module
+/// load follows it, as it follows a built twin's own refs. No sandbox: nothing to record.
+pub(crate) fn note_linked_ref(u: &Unit, t: u32) {
+    let mut g = u.sandbox.sb.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(s) = g.as_mut() {
+        s.linked.insert(t);
+    }
+}
+
+/// Takes the twins linked code named as fn values for a module load to follow. No sandbox: empty.
+pub(crate) fn take_linked_refs(u: &Unit) -> Vec<u32> {
+    let mut g = u.sandbox.sb.lock().unwrap_or_else(|e| e.into_inner());
+    g.as_mut().map(|s| s.linked.drain().collect()).unwrap_or_default()
 }
 
 // ------------------------------------------------------------------ twin code's symbols

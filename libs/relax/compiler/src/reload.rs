@@ -2845,6 +2845,18 @@ fn ty_in_crates(u: &Unit, t: TyId, crates: &[u32], depth: u32) -> bool {
     }
 }
 
+/// Whether `key` is an instance of crates no edit touched, so the disk cache's code for it is
+/// this session's (its keys hold the crates' fingerprints from the run's start).
+fn unedited_inst(u: &Unit, key: &FnKey) -> bool {
+    match key {
+        FnKey::Inst(d, args) => {
+            let ed = edited_crates();
+            !ed.contains(&u.prog.def(*d).krate) && !args.iter().any(|a| ty_in_crates(u, *a, &ed, 0))
+        }
+        _ => false,
+    }
+}
+
 /// Whether type `t` names one of the ADTs `ds` (by value, through references, generics, tuples).
 fn ty_mentions(u: &Unit, t: TyId, ds: &[DefId], depth: u32) -> bool {
     use crate::types::TyKind::*;
@@ -4443,7 +4455,8 @@ unsafe fn compile_guarded(up: *mut Unit, id: u32) -> Result<Code, String> {
 }
 
 /// A run-time module's load: compiles `roots` (its wrappers), the module code they reach and the
-/// program functions that code calls directly, nothing installed. The program's own functions
+/// program functions that code calls directly, returning newly built code for install. Cached
+/// twins are installed as their first call would install them. The program's own functions
 /// beyond those compile as they always do (lazily, or already built): following them, or the
 /// slots other threads create meanwhile, made a load during a cold start compile the starting
 /// app's whole graph (17,317 slots, 1.6 s seen). Err: errors in functions `mine` claims; errors
@@ -4511,13 +4524,7 @@ unsafe fn compile_reachable_in(up: *mut Unit, roots: Vec<u32>, seeds: Vec<u32>, 
         for id in host {
             let cacheable = {
                 let u = &*up;
-                match &u.fns[id as usize].key {
-                    FnKey::Inst(d, args) => {
-                        let ed = edited_crates();
-                        !ed.contains(&u.prog.def(*d).krate) && !args.iter().any(|a| ty_in_crates(u, *a, &ed, 0))
-                    }
-                    _ => false,
-                }
+                unedited_inst(u, &u.fns[id as usize].key)
             };
             match if cacheable { jit::cache_lookup(up, id) } else { None } {
                 Some(c) => {
@@ -4529,8 +4536,28 @@ unsafe fn compile_reachable_in(up: *mut Unit, roots: Vec<u32>, seeds: Vec<u32>, 
         }
         built.extend(jit::compile_batch_off_lock(up, &to_compile, threads));
         for id in twins {
+            // a module load's twin of code no edit touched comes from the disk cache when it
+            // has it (an earlier run's build under this domain's policy), installed as its first
+            // call would install it and followed as a built one is
+            let cached = module.is_some() && {
+                let u = &*up;
+                match u.fns[id as usize].key {
+                    FnKey::Sandbox(b) if (b as usize) < u.fns.len() => edited_crates().is_empty() || unedited_inst(u, &u.fns[b as usize].key),
+                    _ => false,
+                }
+            };
+            if cached {
+                if let Some(refs) = jit::ready_twin(up, id) {
+                    jit::count_cache_ahead();
+                    frontier.extend(refs);
+                    continue;
+                }
+            }
             let r = compile_guarded(up, id);
             built.push((id, r));
+        }
+        if module.is_some() {
+            frontier.extend(crate::sandbox::take_linked_refs(&*up));
         }
         for (id, r) in built {
             if matches!((&*up).fns[id as usize].key, FnKey::Sandbox(_)) {

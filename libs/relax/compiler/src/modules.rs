@@ -1071,21 +1071,24 @@ unsafe fn load_sandboxed(up: *mut Unit, idx: u32, name: &str, path: &str, deps: 
     let u = &mut *up;
     let roots: Vec<u32> = root_fns(u, &wdefs).into_iter().map(|d| u.fn_id(FnKey::Inst(d, Vec::new()))).collect();
     let fns0 = u.fns.len();
+    let cached0 = jit::CACHE_AHEAD.load(std::sync::atomic::Ordering::Relaxed);
     if let Err(e) = compile_all(up, roots, &|_, _| true, &|u, id| crate::reload::module_own(u, id)) {
         drop_defs(up, &wdefs);
         crate::sandbox::free_arena(&*up, &arena);
         return Err(fail(up, &defs, e));
     }
+    let cached = jit::CACHE_AHEAD.load(std::sync::atomic::Ordering::Relaxed) - cached0;
     // RELAX_MODULE_TRACE=1: where a load's time goes
     if module_trace() {
         eprintln!(
-            "relax module: {} loaded in {:.2} ms: front {:.2} (parse, resolve, typeck, check), wrapper {:.2}, compile {:.2} ({} slots)",
+            "relax module: {} loaded in {:.2} ms: front {:.2} (parse, resolve, typeck, check), wrapper {:.2}, compile {:.2} ({} slots, {} linked from the disk cache)",
             name,
             t0.elapsed().as_secs_f64() * 1e3,
             t_front.as_secs_f64() * 1e3,
             t_wrap.as_secs_f64() * 1e3,
             t2.elapsed().as_secs_f64() * 1e3,
-            (*up).fns.len() - fns0
+            (*up).fns.len() - fns0,
+            cached
         );
     }
     defs.extend(wdefs);

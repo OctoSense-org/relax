@@ -10360,6 +10360,24 @@ unsafe fn ready_code_locked(up: *mut Unit, id: u32) -> Option<u64> {
     None
 }
 
+/// A module load's twin `id` (reload.rs compile_reachable_in, owner thread): installs the code
+/// its first call would find ready (ready_code_locked: the disk cache's), returning the slots
+/// that code calls or names for the load to follow. None: the load compiles it.
+/// Its calls count again unless an earlier run parked it: a cache link applies the stored
+/// verdict (stored_tier_verdict), and an entry without one is final there as code that counted
+/// and never turned hot. A load reaches every twin, run or not, and the run that stored it may
+/// never have called it; left final, a module's twins stayed at O1 in every later run.
+pub(crate) unsafe fn ready_twin(up: *mut Unit, id: u32) -> Option<Vec<u32>> {
+    let at = ready_code_locked(up, id)?;
+    let u = &*up;
+    if let Some(threshold) = u.tier1.as_ref().map(|t| t.threshold) {
+        if (*tier_rec(&u.slots, id).add(5)).load(Ordering::Relaxed) & STORED_PARKED == 0 {
+            settle_unfinal(u, id, threshold);
+        }
+    }
+    Some(u.code.read().unwrap_or_else(|e| e.into_inner()).refs_at(at).map_or_else(Vec::new, |r| r.slots().to_vec()))
+}
+
 /// A lazy compile's result: the code, or (outer and pipelined) the back end still to run off
 /// the unit, on the requesting thread.
 pub(crate) enum Compiled {
@@ -29037,7 +29055,7 @@ pub fn const_name(u: &Unit, d: DefId, args: &[TyId]) -> String {
     s
 }
 
-/// Live sessions: functions a patch reached and took from the disk cache instead of compiling.
+/// Functions a patch or module load reached and took from the disk cache instead of compiling.
 pub static CACHE_AHEAD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 pub fn count_cache_ahead() {
