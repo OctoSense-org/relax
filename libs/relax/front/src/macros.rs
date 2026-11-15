@@ -3465,8 +3465,9 @@ impl<'a> Parser<'a> {
         if t.kind != m.kind {
             return false;
         }
-        // a forwarded statement is one opaque nonterminal, not its first written token
-        if !self.stmt_frags.is_empty() && self.stmt_frags.contains(&{ t.lo }) {
+        // a forwarded fragment is one opaque nonterminal (rustc's invisible group), not its first
+        // written token; ident, lifetime and tt fragments forward as their tokens and still match
+        if self.forwarded_kind(t.lo).is_some() {
             return false;
         }
         match t.kind {
@@ -3643,6 +3644,10 @@ impl<'a> Parser<'a> {
     /// whatever its first token; None for written tokens and the kinds that forward as their
     /// tokens (ident, lifetime, tt).
     fn forwarded_kind(&self, lo: u32) -> Option<Frag> {
+        // nothing forwarded in this parse, or a written token: no per-kind lookups
+        if self.fwd_starts.is_empty() || !self.fwd_starts.contains(&lo) {
+            return None;
+        }
         // an outer statement stays a statement when it begins with a captured expression
         if !self.stmt_frags.is_empty() && self.stmt_frags.contains(&lo) {
             return Some(Frag::Stmt);

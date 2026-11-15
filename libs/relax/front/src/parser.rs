@@ -153,6 +153,9 @@ pub struct Parser<'a> {
     pub(crate) stmt_frags: crate::fxhash::HashSet<u32>,
     /// Offsets of the parens a transcription added around multi-token `$e:expr` fragments.
     pub(super) synth_parens: crate::fxhash::HashSet<u32>,
+    /// Every start the sets above ever held (never removed): one lookup that rules out a written
+    /// token before `forwarded_kind` looks at each kind, in the macro matcher's inner loop.
+    pub(super) fwd_starts: crate::fxhash::HashSet<u32>,
     /// file context for built-in macros (file!, module_path!, env!, cfg of derive inputs)
     pub bctx: Option<std::rc::Rc<crate::builtins::FileCtx>>,
     /// names of the inline `mod x { }` blocks being parsed (module_path!)
@@ -268,6 +271,7 @@ impl<'a> Parser<'a> {
             block_frags: Default::default(),
             stmt_frags: Default::default(),
             synth_parens: Default::default(),
+            fwd_starts: Default::default(),
             bctx: None,
             mod_stack: Vec::new(),
             scope_stack: Vec::new(),
@@ -2192,7 +2196,10 @@ impl<'a> Parser<'a> {
         let base = (self.src.len() + self.ext.len()) as u32;
         if crate::macros::uses::recording() {
             let offs = crate::macros::uses::synth_take();
-            for &off in &offs { self.synth_parens.insert(base + off); }
+            for &off in &offs {
+                self.synth_parens.insert(base + off);
+                self.fwd_starts.insert(base + off);
+            }
             crate::macros::uses::synth_flush(self.bctx.as_ref().map_or("", |c| c.path.as_str()), base, offs);
         }
         for (off, o, n) in origins {
@@ -2202,6 +2209,10 @@ impl<'a> Parser<'a> {
             if b & crate::macros::EMPTY_VIS != 0 {
                 *self.empty_vis.entry(base + a).or_insert(0) += 1;
                 continue;
+            }
+            const FORWARDED: u32 = crate::macros::TY_FRAG | crate::macros::PATH_FRAG | crate::macros::BLOCK_FRAG | crate::macros::STMT_FRAG | crate::macros::WRAP_PAREN;
+            if b & FORWARDED != 0 {
+                self.fwd_starts.insert(base + a);
             }
             // Nested groups with the same start are emitted inner first; keep the outer kind.
             if b & crate::macros::TY_FRAG != 0 {
@@ -2418,7 +2429,7 @@ impl<'a> Parser<'a> {
             rec_limit: _, import_summary: _,
             toks, pos, edition, ast, item_start, lazy_bodies, lazy_auto, lazy_part, hole_body, item_macro, lazy_mods, macros, krate,
             ext, exp_map, tok_origin, token_origins, token_input, exp_depth, rules_exp, body_origin,
-            pm_editions, tok_undo, frag_groups, empty_vis, ty_frags, path_frags, meta_frags, block_frags, stmt_frags, synth_parens,
+            pm_editions, tok_undo, frag_groups, empty_vis, ty_frags, path_frags, meta_frags, block_frags, stmt_frags, synth_parens, fwd_starts,
             mod_stack, scope_stack, no_prelude, range_dots, next_scope, rule_scopes, foreign_rules, interp, extra_items,
             extra_assoc_items, pending_inner, in_assoc, in_trait, stmt_ctx, cfg_select_rest,
             include_as_expr, foreign_abi, cfg_out, lit_errs, expansion_semi, list_elem_at, expn_attrs_ungated, pending_shape, macro_scope_miss,
@@ -2427,7 +2438,7 @@ impl<'a> Parser<'a> {
         fn sorted<T: Ord>(mut v: Vec<T>) -> Vec<T> { v.sort(); v }
         let toks: Vec<Tok> = (0..toks.len()).map(|i| toks.at(i)).collect();
         let frags = (sorted(frag_groups.iter().collect::<Vec<_>>()), sorted(ty_frags.iter().collect::<Vec<_>>()), sorted(path_frags.iter().collect::<Vec<_>>()),
-            sorted(meta_frags.iter().collect::<Vec<_>>()), sorted(block_frags.iter().collect::<Vec<_>>()), sorted(stmt_frags.iter().collect::<Vec<_>>()), sorted(synth_parens.iter().collect::<Vec<_>>()), sorted(empty_vis.iter().collect::<Vec<_>>()));
+            sorted(meta_frags.iter().collect::<Vec<_>>()), sorted(block_frags.iter().collect::<Vec<_>>()), sorted(stmt_frags.iter().collect::<Vec<_>>()), sorted(synth_parens.iter().collect::<Vec<_>>()), sorted(fwd_starts.iter().collect::<Vec<_>>()), sorted(empty_vis.iter().collect::<Vec<_>>()));
         let interp = sorted(interp.iter().map(|(k, e)| (*k, e.0)).collect::<Vec<_>>());
         let tables = (ext.len(), exp_map.len(), tok_origin.len(), token_origins.len(), rules_exp.len(), body_origin.len(), pm_editions.len(), foreign_rules.len());
         let shapes: Vec<_> = pending_shape.iter().map(|(r, e)| (*r, e.as_ref().map(|e| (e.pos, e.msg.clone())))).collect();
@@ -5144,7 +5155,7 @@ impl<'a> Parser<'a> {
         // rustc_parse parser/stmt.rs: parse_stmt_path_start accepts a struct
         // literal after a captured path here. In expression-fragment position
         // parse_expr_bottom returns the path alone instead.
-        let e = if self.path_frags.contains(&{ self.tok().lo }) {
+        let e = if self.at_path_frag() {
             let path = self.path(true)?;
             let e = if self.kind() == T::OpenBrace {
                 self.struct_expr(path, lo)?
@@ -5675,12 +5686,19 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// The cursor starts a forwarded `$p:path`. An expression a built-in macro spliced in
+    /// (`T::Interp`, e.g. an `assert_eq!` operand) keeps its authored span, which can be such a
+    /// start, but it is parsed already: it is no path syntax.
+    fn at_path_frag(&self) -> bool {
+        self.kind() != T::Interp && self.path_frags.contains(&{ self.tok().lo })
+    }
+
     fn primary(&mut self, r: u8) -> PResult<ExprId> {
         if self.at_stmt_frag() { return self.err("expected expression, found statement metavariable"); }
         let lo = self.lo();
         // rustc_parse parser/expr.rs: parse_expr_bottom returns a Path expression
         // for MetaVarKind::Path; calls follow, but `{ .. }` and `::` do not extend it.
-        if self.path_frags.contains(&{ self.tok().lo }) {
+        if self.at_path_frag() {
             let path = self.path(true)?;
             return Ok(self.mk_expr(ExprKind::Path(path), lo));
         }
