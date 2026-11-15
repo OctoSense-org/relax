@@ -2614,7 +2614,7 @@ fn item_cfg_on(trees: &[TokenTree], cfg: Option<&CfgSet>) -> bool {
     true
 }
 
-/// rustc's derive input: `cfg_attr` expanded, `#[cfg]`-false fields/variants removed (cfg_eval),
+/// rustc's derive input: `cfg_attr` expanded, `#[cfg]`-false generics/fields/variants removed (cfg_eval),
 /// the `#[derive]` attributes taken off. Returns all derive paths in order and the item.
 fn prepare_derive_input(input: TokenStream, cfg: Option<&CfgSet>) -> (Vec<String>, TokenStream) {
     let mut names = Vec::new();
@@ -2653,8 +2653,8 @@ fn prepare_derive_input(input: TokenStream, cfg: Option<&CfgSet>) -> (Vec<String
         out.push(trees[i].clone());
         i += 1;
     }
-    // cfg-strip fields / variants: the item's body groups
-    let out = strip_body(out, cfg);
+    // cfg-strip generic parameters, then fields / variants in the item's body groups
+    let out = strip_body(strip_generics(out, cfg), cfg);
     (names, TokenStream { trees: out })
 }
 
@@ -2742,6 +2742,38 @@ pub fn cfg_holds(pred: &[TokenTree], cfg: Option<&CfgSet>) -> bool {
         }
         _ => false,
     }
+}
+
+/// Generic parameters use the same cfg filtering and comma splitting as fields.
+fn strip_generics(mut trees: Vec<TokenTree>, cfg: Option<&CfgSet>) -> Vec<TokenTree> {
+    let Some(kw) = trees.iter().position(|t| matches!(t, TokenTree::Ident(i) if matches!(i.to_string().as_str(), "struct" | "enum" | "union"))) else {
+        return trees;
+    };
+    // The item name is followed immediately by its optional `<..>` list.
+    let start = kw + 2;
+    if !matches!(trees.get(start), Some(TokenTree::Punct(p)) if p.as_char() == '<') {
+        return trees;
+    }
+    let mut angle = 1i32;
+    for i in start + 1..trees.len() {
+        if let TokenTree::Punct(p) = &trees[i] {
+            match p.as_char() {
+                '<' => angle += 1,
+                '>' => {
+                    // `->` in a bound or default type is not a closing angle.
+                    let arrow = matches!(&trees[i - 1], TokenTree::Punct(q) if q.as_char() == '-' && q.spacing() == Spacing::Joint);
+                    if !arrow { angle -= 1; }
+                }
+                _ => {}
+            }
+        }
+        if angle == 0 {
+            let params = strip_elems(trees[start + 1..i].to_vec(), cfg, false);
+            trees.splice(start + 1..i, params);
+            break;
+        }
+    }
+    trees
 }
 
 /// Removes `#[cfg(false)]` elements from the item's body: struct fields, tuple fields, enum
