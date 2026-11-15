@@ -158,7 +158,18 @@ impl Drop for World {
                 crate::sandbox::free_arena(&*self.u, a);
             }
             crate::jit::retire_unit(self.u);
-            drop(Box::from_raw(self.u));
+            let mut u = Box::from_raw(self.u);
+            // what it compiled since the boot's flush (a world built again for a live edit or a
+            // run-time module): retire_unit encoded its last records, and the unit is this
+            // thread's alone now, so they are written here, off the owner (relax PR 222)
+            if let Some(spill) = u.cache.as_mut().and_then(|c| c.spill_take()) {
+                if let Err(e) = spill.write() {
+                    if crate::run::VERBOSE.load(std::sync::atomic::Ordering::Relaxed) {
+                        eprintln!("relax cache: the retired proc-macro world's write: {e}");
+                    }
+                }
+            }
+            drop(u);
         }
     }
 }
@@ -1043,8 +1054,9 @@ fn call_confined(w: &World, arena: &crate::sandbox::Arena, bridge_twin: u64, io:
     bytes.map(Ok).ok_or_else(|| "the proc macro's output lies outside its arena".to_string())
 }
 
-/// After the program's files are loaded (no more expansions): the world's newly compiled code
-/// goes to the disk cache.
+/// After the program's files are loaded (no more expansions), and in the quit write and the exit's
+/// write (a world alive then is never dropped, so its drop's write never runs): the world's newly
+/// compiled code goes to the disk cache.
 pub fn flush_cache() {
     let stages = BOOT_WORLDS.lock().unwrap_or_else(|e| e.into_inner()).clone();
     for w in stages.into_iter().map(Some).chain([world_now()]) {
@@ -1133,5 +1145,39 @@ mod tests {
         }
         assert!(super::free_world(), "the world goes after the build");
         assert!(!super::world_alive(), "and the stage world with it");
+    }
+
+    /// A world that goes (free_world after a module load or a run's end) writes the records its
+    /// unit still held: code a world built after the boot's flush compiled was lost, and compiled
+    /// again by the next run (relax PR 222). A second open of its cache reads the record back.
+    #[test]
+    fn a_retired_world_writes_its_last_cache_records() {
+        isolated_test!(a_retired_world_writes_its_last_cache_records);
+        let dir = std::env::temp_dir().join(format!("relax-world-retire-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let unit = || {
+            let source = dir.join("lib.rs");
+            std::fs::write(&source, "pub fn value() -> u32 { 42 }").unwrap();
+            let session = std::sync::Arc::new(crate::Session::default());
+            let mut prog = crate::program::Program::new(&session);
+            prog.load_crate("macro_body", source.to_str().unwrap(), 2021, crate::cfg::CfgSet::host(&session, &[]), Vec::new()).unwrap();
+            let mut tcx = crate::tcx::Tcx::new();
+            tcx.collect(&prog);
+            crate::jit::Unit::new(prog, tcx, 0)
+        };
+        let mut first = unit();
+        first.aux = true;
+        let mut cache = crate::cache::Cache::open_in(&first, crate::cache::Mode::On, dir.join("cache")).unwrap();
+        cache.record_test_warnings(&[7], &["a late macro record".into()]);
+        first.cache = Some(Box::new(crate::cache::CacheCell::new(cache)));
+        drop(std::sync::Arc::new(Ok::<_, String>(super::World {
+            u: Box::into_raw(first), bridge: 0, crate_of: vec![0], entries: Default::default(), broken: Default::default(),
+            confined: vec![false], sandbox: Err("no arena in this test".into()), failed: Vec::new(),
+        })));
+        let second = unit();
+        let cache = crate::cache::Cache::open_in(&second, crate::cache::Mode::On, dir.join("cache")).unwrap();
+        let back = cache.test_warnings(&[7]);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(back, Some(vec!["a late macro record".into()]), "the retired world's record is not on disk");
     }
 }

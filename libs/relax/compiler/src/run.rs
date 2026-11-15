@@ -4761,6 +4761,9 @@ fn quit_mark() {
             let ms = if QUIT_WRITE_FINISHING.load(Ordering::SeqCst) { 1 } else if r.is_some() { 100 } else { 10 };
             std::thread::sleep(std::time::Duration::from_millis(ms));
         }
+        // the macro world alive now (kept by a live session, or built again for an edit or a
+        // run-time module): what it compiled since the boot's flush (relax PR 222)
+        crate::pmhost::flush_cache();
         // the generations the write replaced go now: the exit summary may never run (a harness
         // kills the app, a framework ends the process)
         if r.is_some() { crate::cache::retire_replaced_in_use(); }
@@ -5304,6 +5307,10 @@ fn summary_inner(why: &str) {
                 // demand parts/graph and finally its collected image. Trying the
                 // graph first can fail on a missing crate store and skip the very
                 // flush that would make it recordable (also on boot-only exits).
+                // The macro world alive at the exit (a run-time module's load built it again and
+                // keeps it) is never dropped: what it compiled since the boot's flush is written
+                // here (relax PR 222; on the owner already, so its requests run inline).
+                crate::pmhost::flush_cache();
                 let r = c.flush().and_then(|written| {
                     crate::cache::Cache::flush_front_graphs()?;
                     Ok(written)
