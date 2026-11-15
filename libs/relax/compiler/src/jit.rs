@@ -31797,13 +31797,13 @@ fn provided_type_tables(prog: &Program, provided: &[(u32, crate::provided::Provi
         for (i, def) in prog.defs.iter().enumerate() {
             if def.krate == *k && matches!(def.kind, DefKind::Struct | DefKind::Enum) {
                 let path = crate::provided::norm(&prog.def_path(DefId(i as u32)));
-                if let Some((size, align, drop, offs)) = pc.types.get(path.as_str()) {
+                if let Some((size, align, drop, offs, _enum_layout)) = pc.types.get(path.as_str()) {
                     provided_types.insert(DefId(i as u32), drop.map_or(0, |f| f as usize as u64));
                     opaque_layouts.insert(DefId(i as u32), (*size as u32, *align as u32));
                     if !offs.is_empty() {
                         handles.push((DefId(i as u32), *size as u32, *align as u32, *offs));
                     }
-                } else if let Some((size, align, offs)) = pc.layouts.get(path.as_str()) {
+                } else if let Some((size, align, offs, _enum_layout)) = pc.layouts.get(path.as_str()) {
                     check_layouts.push((DefId(i as u32), *size as u32, *align as u32, path, *offs));
                 }
             }

@@ -165,6 +165,11 @@ pub struct Entry {
     pub align: u64,
     /// PLAIN / HANDLE struct: its fields' offsets in declaration order
     pub offsets: &'static [u64],
+    /// PLAIN / HANDLE primitive-repr enum: [tag_bytes, variant_count, then per variant in
+    /// declaration order: tag_value, field_count, field_offsets..]. Signed tags are cast
+    /// through their repr type and i64 to u64. Empty for structs and enums without a
+    /// primitive repr; independent of the struct-only `offsets` table.
+    pub enum_layout: &'static [u64],
     /// HANDLE: rustc's drop_in_place, when the type needs drop
     pub drop: Option<DropFn>,
 }
@@ -332,7 +337,7 @@ const fn anchor() -> Entry {
     fn none() -> &'static str {
         ""
     }
-    Entry { kind: 0, module: "", key: none, sig: none, shim: None, slots: &[], size: 0, align: 0, offsets: &[], drop: None }
+    Entry { kind: 0, module: "", key: none, sig: none, shim: None, slots: &[], size: 0, align: 0, offsets: &[], enum_layout: &[], drop: None }
 }
 
 #[allow(dead_code)]

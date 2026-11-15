@@ -240,6 +240,7 @@ fn loader_table(u: &mut Unit, d: DefId, p: usize) -> Option<bool> {
         std::mem::offset_of!(Entry, size),
         std::mem::offset_of!(Entry, align),
         std::mem::offset_of!(Entry, offsets),
+        std::mem::offset_of!(Entry, enum_layout),
         std::mem::offset_of!(Entry, drop),
     ];
     if l.size as usize == std::mem::size_of::<Entry>() && l.align as usize == std::mem::align_of::<Entry>() && l.fields.iter().map(|&f| f as usize).eq(rustc) {

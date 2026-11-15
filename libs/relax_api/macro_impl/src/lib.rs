@@ -21,7 +21,9 @@ pub fn relax_api_impl(attr: TokenStream, item: TokenStream) -> TokenStream {
             let mut tb = TokenBuilder::new();
             tb.stream(Some(item));
             if !extra.is_empty() {
-                tb.add(&extra);
+                // The generated mirrors copy user field types and discriminants. Parse
+                // them as Rust tokens: TokenBuilder::add suffixes hex literals with u64.
+                tb.stream(Some(extra.parse().expect("relax_api generated invalid tokens")));
             }
             tb.end()
         }
@@ -483,7 +485,7 @@ fn op_code(o: &Owner, s: &Sig, phase: &str) -> String {
   kind: ::relax_api::OP, module: module_path!(),
   key: {key},
   sig: {{ fn s() -> &'static str {{ ::core::any::type_name::<{fnptr}>() }} s }},
-  shim: Some({w}), slots: &[{slots}], size: 0, align: 0, offsets: &[], drop: None }};",
+  shim: Some({w}), slots: &[{slots}], size: 0, align: 0, offsets: &[], enum_layout: &[], drop: None }};",
         key = key_code(o, &s.name),
         slots = slots.join(", "),
     )
@@ -663,9 +665,176 @@ fn expand_static(toks: &[TokenTree], args: &[String]) -> Result<(TokenStream, St
     let extra = format!(
         "{CFG} {SECTION} #[doc(hidden)] #[allow(non_upper_case_globals)] static __relax_api_s{id:016x}: ::relax_api::Entry = ::relax_api::Entry {{
   kind: ::relax_api::PER_SIDE, module: module_path!(), key: {key}, sig: {none},
-  shim: None, slots: &[], size: 0, align: 0, offsets: &[], drop: None }};"
+  shim: None, slots: &[], size: 0, align: 0, offsets: &[], enum_layout: &[], drop: None }};"
     );
     Ok((toks.iter().cloned().collect(), extra))
+}
+
+/// Unlike `text`, keep named lifetimes and discriminant expressions as written.
+fn source(toks: &[TokenTree]) -> String {
+    toks.iter().cloned().collect::<TokenStream>().to_string()
+}
+
+/// The conditions under which an attribute leaves its item present. Normalise cfg_attr's
+/// cfg effects too, without copying unrelated derives/docs onto the layout mirrors.
+fn cfg_conditions(attr: &[TokenTree]) -> Vec<String> {
+    let Some(TokenTree::Group(g)) = attr.get(1) else { return Vec::new(); };
+    let inner: Vec<_> = g.stream().into_iter().collect();
+    if is_ident(attr.first(), "cfg") {
+        vec![source(&inner)]
+    } else if is_ident(attr.first(), "cfg_attr") {
+        let parts = split_commas(&inner);
+        let Some(condition) = parts.first() else { return Vec::new(); };
+        parts[1..].iter().flat_map(|a| cfg_conditions(a)).map(|c| format!("any(not({}), {c})", source(condition))).collect()
+    } else {
+        Vec::new()
+    }
+}
+
+fn layout_cfg(toks: &[TokenTree]) -> (String, String) {
+    let mut conditions = Vec::new();
+    for attr in toks[..skip_attrs(toks, 0)].chunks_exact(2) {
+        if let TokenTree::Group(g) = &attr[1] {
+            conditions.extend(cfg_conditions(&g.stream().into_iter().collect::<Vec<_>>()));
+        }
+    }
+    if conditions.is_empty() {
+        (String::new(), String::new())
+    } else {
+        let condition = format!("all({})", conditions.join(", "));
+        (format!("#[cfg({condition})]"), format!("#[cfg(not({condition}))]"))
+    }
+}
+
+/// Primitive repr uses RFC 2195's union of tag-prefixed structs. repr(C, int)
+/// instead has a common payload offset (a tag followed by a payload union).
+/// Explicit alignment belongs to the complete enum mirror, not to its tag/payloads.
+fn enum_repr(toks: &[TokenTree]) -> Option<(String, bool, String)> {
+    let mut tag = None;
+    let mut c = false;
+    let mut align = String::new();
+    for attr in toks[..skip_attrs(toks, 0)].chunks_exact(2) {
+        let TokenTree::Group(g) = &attr[1] else { continue; };
+        let a: Vec<_> = g.stream().into_iter().collect();
+        if !is_ident(a.first(), "repr") { continue; }
+        let Some(TokenTree::Group(g)) = a.get(1) else { continue; };
+        for part in split_commas(&g.stream().into_iter().collect::<Vec<_>>()) {
+            if let Some(TokenTree::Ident(i)) = part.first() {
+                match i.to_string().as_str() {
+                    "u8" | "u16" | "u32" | "u64" | "i8" | "i16" | "i32" | "i64" => tag = Some(i.to_string()),
+                    "C" => c = true,
+                    "align" => align.push_str(&format!(", {}", source(&part))),
+                    _ => {}
+                }
+            }
+        }
+    }
+    tag.map(|t| (t, c, align))
+}
+
+/// Variant payloads are groups. Discriminants can contain comparisons/shifts as well
+/// as turbofish/qualified paths, so `<` and `>` are not always generic delimiters here.
+fn enum_variants(toks: &[TokenTree]) -> Vec<Vec<TokenTree>> {
+    let mut parts = vec![Vec::new()];
+    let mut depth = 0usize;
+    for (i, t) in toks.iter().enumerate() {
+        if is_punct(Some(t), '<') && (depth > 0 || is_punct(i.checked_sub(1).and_then(|j| toks.get(j)), ':') || is_punct(i.checked_sub(1).and_then(|j| toks.get(j)), '=')) {
+            depth += 1;
+        } else if is_punct(Some(t), '>') && !is_punct(i.checked_sub(1).and_then(|j| toks.get(j)), '-') {
+            depth = depth.saturating_sub(1);
+        } else if is_punct(Some(t), ',') && depth == 0 {
+            parts.push(Vec::new());
+            continue;
+        }
+        parts.last_mut().unwrap().push(t.clone());
+    }
+    if parts.last().is_some_and(|p| p.is_empty()) { parts.pop(); }
+    parts
+}
+
+fn expand_enum_layout(
+    toks: &[TokenTree], name: &str, id: u64, generics: &str, lifetimes: &[String], body_start: usize,
+) -> Result<(String, String), String> {
+    let Some((tag, c_repr, align)) = enum_repr(toks) else { return Ok((String::new(), "&[]".to_string())); };
+    let body = toks[body_start..].iter().position(|t| matches!(t, TokenTree::Group(g) if g.delimiter() == Delimiter::Brace)).ok_or("cannot read enum body")? + body_start;
+    let TokenTree::Group(g) = &toks[body] else { unreachable!(); };
+    let where_clause = source(&toks[body_start..body]);
+    let arguments = if lifetimes.is_empty() { String::new() } else { format!("<{}>", lifetimes.join(", ")) };
+    let static_arguments = if lifetimes.is_empty() { String::new() } else { format!("<{}>", vec!["'static"; lifetimes.len()].join(", ")) };
+    let ty = format!("{name}{static_arguments}");
+    let self_ty = make(&format!("{name}{arguments}"));
+    // Always keep all lifetimes used, including when cfg removes the only field using one.
+    // This tail has size zero and alignment one and cannot change a repr(C) layout.
+    let phantom = if lifetimes.is_empty() { String::new() } else {
+        format!("::core::marker::PhantomData<({},)>,", lifetimes.iter().map(|l| format!("&{l} ()")).collect::<Vec<_>>().join(", "))
+    };
+    let prefix = format!("__relax_api_m{id:016x}");
+    let mirror = format!("{prefix}_{}", if c_repr { "layout" } else { "union" });
+    let tag_field = if c_repr { String::new() } else { format!("{tag},") };
+    let payload_offset = if c_repr { format!("::core::mem::offset_of!({mirror}{static_arguments}, 1) as u64 + ") } else { String::new() };
+    let attrs = format!("{CFG} #[doc(hidden)] #[allow(dead_code, non_camel_case_types, non_snake_case, non_upper_case_globals)]");
+    let mut extra = String::new();
+    let mut tags = String::new();
+    let mut union_fields = String::new();
+    let mut slices = String::new();
+    for (n, v) in enum_variants(&g.stream().into_iter().collect::<Vec<_>>()).iter().enumerate() {
+        let (cfg, _) = layout_cfg(v);
+        let mut at = skip_attrs(v, 0);
+        let Some(TokenTree::Ident(variant)) = v.get(at) else { return Err("cannot read enum variant".to_string()); };
+        at += 1;
+        let mut fields = String::new();
+        let mut offsets = String::new();
+        if let Some(TokenTree::Group(payload)) = v.get(at) {
+            if matches!(payload.delimiter(), Delimiter::Parenthesis | Delimiter::Brace) {
+                for (f, field) in split_commas(&payload.stream().into_iter().collect::<Vec<_>>()).iter().enumerate() {
+                    let (field_cfg, absent_cfg) = layout_cfg(field);
+                    let start = if payload.delimiter() == Delimiter::Brace {
+                        first_colon(&field[skip_attrs(field, 0)..]).ok_or("cannot read enum field")? + skip_attrs(field, 0) + 1
+                    } else { skip_attrs(field, 0) };
+                    fields.push_str(&format!("{field_cfg} {},", source(&subst_self(&field[start..], &self_ty))));
+                    // A disabled field is replaced by a zero-sized, align-one placeholder.
+                    // Only its tuple index remains; its type and offset are cfg'd out.
+                    // Consequently offset_of! uses literal indices even with cfg fields.
+                    if !absent_cfg.is_empty() {
+                        fields.push_str(&format!("{absent_cfg} ::core::marker::PhantomData<()>,"));
+                    }
+                    offsets.push_str(&format!("{field_cfg} {{ {payload_offset}::core::mem::offset_of!({prefix}_{n}{static_arguments}, {}) as u64 }},", f + usize::from(!c_repr)));
+                }
+                at += 1;
+            }
+        }
+        // Copy the entire `= expr`, if present, and leave implicit discriminants implicit.
+        if at < v.len() && !is_punct(v.get(at), '=') { return Err("cannot read enum discriminant".to_string()); }
+        tags.push_str(&format!("{cfg} {variant} {},", source(&v[at..])));
+        extra.push_str(&format!("{attrs} {cfg} #[repr(C)] struct {prefix}_{n}{generics}({tag_field} {fields} {phantom}) {where_clause};\n"));
+        union_fields.push_str(&format!("{cfg} v{n}: ::core::mem::ManuallyDrop<{prefix}_{n}{arguments}>,"));
+        let cast = if tag.starts_with('i') { "as i64 as u64" } else { "as u64" };
+        slices.push_str(&format!("{cfg} {{ const OFFSETS: &[u64] = &[{offsets}]; &[{prefix}_tag::{variant} as {tag} {cast}, OFFSETS.len() as u64, {offsets}] }},"));
+    }
+    let union_align = if c_repr { "" } else { align.as_str() };
+    extra.push_str(&format!("{attrs} #[repr({tag})] enum {prefix}_tag {{ {tags} }}\n\
+        {attrs} #[repr(C{union_align})] union {prefix}_union{generics} {where_clause} {{ {union_fields} }}\n"));
+    if c_repr {
+        // RFC 2195 repr(C, int): payload structs have no tag and start at the same
+        // offset in this wrapper, including a byte payload beside a wider variant.
+        extra.push_str(&format!("{attrs} #[repr(C{align})] struct {mirror}{generics}({tag}, {prefix}_union{arguments}) {where_clause};\n"));
+    }
+    extra.push_str(&format!("{attrs} const _: () = assert!(::core::mem::size_of::<{ty}>() == ::core::mem::size_of::<{mirror}{static_arguments}>()\
+            && ::core::mem::align_of::<{ty}>() == ::core::mem::align_of::<{mirror}{static_arguments}>());\n"));
+    // Attribute-bearing array elements let rustc prune variants and fields before const
+    // evaluation. Concatenate only the retained slices into one promoted static array.
+    let table = format!("{{
+        const VARIANTS: &[&[u64]] = &[{slices}];
+        const LEN: usize = {{ let mut len = 2; let mut v = 0; while v < VARIANTS.len() {{ len += VARIANTS[v].len(); v += 1; }} len }};
+        const TABLE: [u64; LEN] = {{
+            let mut table = [0; LEN]; table[0] = ::core::mem::size_of::<{tag}>() as u64; table[1] = VARIANTS.len() as u64;
+            let mut at = 2; let mut v = 0;
+            while v < VARIANTS.len() {{ let mut f = 0; while f < VARIANTS[v].len() {{ table[at] = VARIANTS[v][f]; at += 1; f += 1; }} v += 1; }}
+            table
+        }};
+        &TABLE
+    }}");
+    Ok((extra, table))
 }
 
 fn expand_type(toks: &[TokenTree], args: &[String]) -> Result<(TokenStream, String), String> {
@@ -678,6 +847,9 @@ fn expand_type(toks: &[TokenTree], args: &[String]) -> Result<(TokenStream, Stri
         Some(TokenTree::Ident(id)) => id.to_string(),
         _ => return Err("a type without a name".to_string()),
     };
+    let mut body_start = i + 2;
+    let mut generics = String::new();
+    let mut lifetimes = Vec::new();
     if is_punct(toks.get(i + 2), '<') {
         let lifetimes_only = {
             let mut k = i + 3;
@@ -695,8 +867,17 @@ fn expand_type(toks: &[TokenTree], args: &[String]) -> Result<(TokenStream, Stri
         if !lifetimes_only {
             return Err(format!("`{name}` is generic: mark it per instance through an op instead"));
         }
+        let end = toks[i + 3..].iter().position(|t| is_punct(Some(t), '>')).ok_or("cannot read lifetime parameters")? + i + 3;
+        generics = source(&toks[i + 2..=end]);
+        for param in split_commas(&toks[i + 3..end]) {
+            if !is_punct(param.first(), '\'') || !matches!(param.get(1), Some(TokenTree::Ident(_))) {
+                return Err("cannot read lifetime parameter".to_string());
+            }
+            lifetimes.push(source(&param[..2]));
+        }
+        body_start = end + 1;
     }
-    let ty = format!("{name}");
+    let ty = if lifetimes.is_empty() { name.clone() } else { format!("{name}<{}>", vec!["'static"; lifetimes.len()].join(", ")) };
     let id = fnv(&format!("type {name}"));
     let plain = args.iter().any(|a| a == "plain");
     let handle = args.iter().any(|a| a == "handle");
@@ -705,7 +886,11 @@ fn expand_type(toks: &[TokenTree], args: &[String]) -> Result<(TokenStream, Stri
     }
     let key = format!("{{ fn k() -> &'static str {{ concat!(module_path!(), \"::{name}\") }} k }}");
     let none = "{ fn s() -> &'static str { \"\" } s }";
-    let mut extra = String::new();
+    let (mut extra, enum_layout) = if is_struct {
+        (String::new(), "&[]".to_string())
+    } else {
+        expand_enum_layout(toks, &name, id, &generics, &lifetimes, body_start)?
+    };
     // field offsets of a struct, in declaration order: a plain type's are checked against
     // Relax's; a handle's let Relax use rustc's layout when it is its own (provided.rs verify)
     let mut offsets = Vec::new();
@@ -731,7 +916,7 @@ fn expand_type(toks: &[TokenTree], args: &[String]) -> Result<(TokenStream, Stri
             "{CFG} {SECTION} #[doc(hidden)] #[allow(non_upper_case_globals)] static __relax_api_t{id:016x}: ::relax_api::Entry = ::relax_api::Entry {{
   kind: ::relax_api::PLAIN, module: module_path!(), key: {key}, sig: {none},
   shim: None, slots: &[], size: ::core::mem::size_of::<{ty}>() as u64, align: ::core::mem::align_of::<{ty}>() as u64,
-  offsets: &[{}], drop: None }};",
+  offsets: &[{}], enum_layout: {enum_layout}, drop: None }};",
             offsets.join(", ")
         ));
     } else {
@@ -740,7 +925,7 @@ fn expand_type(toks: &[TokenTree], args: &[String]) -> Result<(TokenStream, Stri
 {CFG} {SECTION} #[doc(hidden)] #[allow(non_upper_case_globals)] static __relax_api_t{id:016x}: ::relax_api::Entry = ::relax_api::Entry {{
   kind: ::relax_api::HANDLE, module: module_path!(), key: {key}, sig: {none},
   shim: None, slots: &[], size: ::core::mem::size_of::<{ty}>() as u64, align: ::core::mem::align_of::<{ty}>() as u64,
-  offsets: &[{}], drop: if ::core::mem::needs_drop::<{ty}>() {{ Some(__relax_api_d{id:016x}) }} else {{ None }} }};",
+  offsets: &[{}], enum_layout: {enum_layout}, drop: if ::core::mem::needs_drop::<{ty}>() {{ Some(__relax_api_d{id:016x}) }} else {{ None }} }};",
             offsets.join(", ")
         ));
         if args.iter().any(|a| a == "default") {
@@ -753,7 +938,7 @@ fn expand_type(toks: &[TokenTree], args: &[String]) -> Result<(TokenStream, Stri
   kind: ::relax_api::OP, module: module_path!(),
   key: {{ fn k() -> &'static str {{ ::core::any::type_name_of_val(&<{ty} as ::core::default::Default>::default) }} k }},
   sig: {{ fn s() -> &'static str {{ ::core::any::type_name::<fn() -> {ty}>() }} s }},
-  shim: Some(__relax_api_h{h:016x}), slots: &[[::core::mem::size_of::<{ty}>() as u64, ::core::mem::align_of::<{ty}>() as u64, 0, 0]], size: 0, align: 0, offsets: &[], drop: None }};"
+  shim: Some(__relax_api_h{h:016x}), slots: &[[::core::mem::size_of::<{ty}>() as u64, ::core::mem::align_of::<{ty}>() as u64, 0, 0]], size: 0, align: 0, offsets: &[], enum_layout: &[], drop: None }};"
             ));
         }
         // the handle's trait ops, under the keys Relax's bridges look up
@@ -765,7 +950,7 @@ fn expand_type(toks: &[TokenTree], args: &[String]) -> Result<(TokenStream, Stri
 {CFG} {SECTION} #[doc(hidden)] #[allow(non_upper_case_globals)] static __relax_api_h{h:016x}_E: ::relax_api::Entry = ::relax_api::Entry {{
   kind: ::relax_api::OP, module: module_path!(),
   key: {{ fn k() -> &'static str {{ concat!(\"<\", module_path!(), \"::{name} as {trait_key}\") }} k }}, sig: {none},
-  shim: Some(__relax_api_h{h:016x}), slots: &[], size: 0, align: 0, offsets: &[], drop: None }};"
+  shim: Some(__relax_api_h{h:016x}), slots: &[], size: 0, align: 0, offsets: &[], enum_layout: &[], drop: None }};"
             ));
         };
         if args.iter().any(|a| a == "clone") {

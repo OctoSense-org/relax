@@ -56,11 +56,12 @@ pub struct ProvidedCrate {
     /// key (`type_name` of the fn item; a handle's trait ops `<path as Clone>::clone` ..) -> op
     pub shims: HashMap<String, Shim>,
     /// opaque handles by def path: (size, align, drop, a struct's field offsets in declaration
-    /// order: same_layout_handles)
-    pub types: HashMap<String, (u64, u64, Option<DropFn>, &'static [u64])>,
-    /// plain types by def path: rustc's (size, align, field offsets), checked against Relax's at
-    /// unit creation
-    pub layouts: HashMap<String, (u64, u64, &'static [u64])>,
+    /// order: same_layout_handles, primitive-repr enum layout table)
+    pub types: HashMap<String, (u64, u64, Option<DropFn>, &'static [u64], &'static [u64])>,
+    /// plain types by def path: rustc's (size, align, field offsets, enum layout table).
+    /// Size, align and struct field offsets are checked against Relax's at unit creation;
+    /// the enum layout table is carried for a future agreement check.
+    pub layouts: HashMap<String, (u64, u64, &'static [u64], &'static [u64])>,
     /// statics marked `#[relax_api(per_side)]`, by def path: JIT code keeps its own instance
     /// (lower.rs check_provided_static)
     pub per_side: std::collections::HashSet<String>,
@@ -98,8 +99,8 @@ pub(crate) fn registered(name: &str) -> bool {
 pub fn register(
     name: &str,
     shims: HashMap<String, Shim>,
-    types: HashMap<String, (u64, u64, Option<DropFn>, &'static [u64])>,
-    layouts: HashMap<String, (u64, u64, &'static [u64])>,
+    types: HashMap<String, (u64, u64, Option<DropFn>, &'static [u64], &'static [u64])>,
+    layouts: HashMap<String, (u64, u64, &'static [u64], &'static [u64])>,
     per_side: std::collections::HashSet<String>,
     last_panic: LastPanicFn,
     source: u64,
@@ -122,8 +123,8 @@ pub fn register(
 fn binding_identity(
     name: &str,
     shims: &HashMap<String, Shim>,
-    types: &HashMap<String, (u64, u64, Option<DropFn>, &'static [u64])>,
-    layouts: &HashMap<String, (u64, u64, &'static [u64])>,
+    types: &HashMap<String, (u64, u64, Option<DropFn>, &'static [u64], &'static [u64])>,
+    layouts: &HashMap<String, (u64, u64, &'static [u64], &'static [u64])>,
     per_side: &std::collections::HashSet<String>,
 ) -> u64 {
     let mut h = crate::sip::Sip128::new();
@@ -143,24 +144,28 @@ fn binding_identity(
     keys.sort_unstable();
     h.u32(keys.len() as u32);
     for k in keys {
-        let (size, align, drop, offsets) = &types[k];
+        let (size, align, drop, offsets, enum_layout) = &types[k];
         h.str(k);
         h.u64(*size);
         h.u64(*align);
         h.u8(drop.is_some() as u8);
         h.u32(offsets.len() as u32);
         for x in offsets.iter() { h.u64(*x); }
+        h.u32(enum_layout.len() as u32);
+        for x in enum_layout.iter() { h.u64(*x); }
     }
     let mut keys: Vec<&String> = layouts.keys().collect();
     keys.sort_unstable();
     h.u32(keys.len() as u32);
     for k in keys {
-        let (size, align, offsets) = &layouts[k];
+        let (size, align, offsets, enum_layout) = &layouts[k];
         h.str(k);
         h.u64(*size);
         h.u64(*align);
         h.u32(offsets.len() as u32);
         for x in offsets.iter() { h.u64(*x); }
+        h.u32(enum_layout.len() as u32);
+        for x in enum_layout.iter() { h.u64(*x); }
     }
     let mut keys: Vec<&String> = per_side.iter().collect();
     keys.sort_unstable();
