@@ -8219,6 +8219,16 @@ impl Unit {
     fn run_init(&mut self, d: DefId, args: Vec<TyId>, buf: u64) -> Option<u64> {
         owner::pure_note(owner::PURE_BG_EVAL);
         owner::forbid_in_publish("initializer", u32::MAX);
+        // a sandboxed module's initializer is evaluated (here, or as code: both run the host's
+        // way, outside the module's arena) only once the refusal and the const check passed it
+        if crate::modules::any_module_crate() || crate::modules::checking_front() {
+            if let Some(errs) = crate::modules::initializer_refusal(self, d, &args) {
+                for e in errs {
+                    if !self.errors.contains(&e) { self.note_error(e); }
+                }
+                return None;
+            }
+        }
         // `makepad check`: the check-mode interpreter first (rustc's CTFE undefined-behaviour,
         // mutable-global and final-value checks; diagnostics only). An evaluation it rejects is not
         // run here, as rustc stops at the error.

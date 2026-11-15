@@ -6557,7 +6557,14 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
         let mut todo: Vec<(DefId, Vec<TyId>)> = Vec::new();
         let added_code: Vec<DefId> = added_defs.iter().copied().filter(|d| matches!(u.prog.def(*d).kind, DefKind::Fn | DefKind::AssocFn | DefKind::Const | DefKind::AssocConst | DefKind::Static)).collect();
         for d in body_defs.iter().chain(const_defs.iter()).chain(added_code.iter()) {
-            if let Some(a) = crate::borrowck::identity_args(&u.tcx, &u.prog, *d) {
+            // a sandboxed module's consts, statics and associated consts too: the refusal below
+            // reads their bodies (they have no fn signature for identity_args)
+            let a = if crate::sandbox::is_sandboxed_crate_key(&u.sandbox, &u.prog, &FnKey::Inst(*d, Vec::new())) {
+                crate::modules::owner_identity_args(&u.prog, &u.tcx, *d)
+            } else {
+                crate::borrowck::identity_args(&u.tcx, &u.prog, *d)
+            };
+            if let Some(a) = a {
                 todo.push((*d, a));
             }
         }
@@ -6612,7 +6619,15 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
                 checked.push(krate);
                 let bodies: Vec<_> = checked_bodies.iter().filter(|b| u.prog.file_crate[b.file as usize] == krate
                     && crate::sandbox::is_sandboxed_crate_key(&u.sandbox, &u.prog, &FnKey::Inst(b.def, b.args.to_vec()))).collect();
-                let e = crate::modules::sandbox_check(&u.prog, &u.tcx, krate, &bodies);
+                let mut e = crate::modules::sandbox_check(&u.prog, &u.tcx, krate, &bodies);
+                // and the const check of its const-context bodies, before any of them runs
+                if e.is_empty() {
+                    for b in bodies.iter().filter(|b| matches!(u.prog.def(b.def).kind, DefKind::Const | DefKind::Static | DefKind::AssocConst)) {
+                        for x in crate::modules::const_body_refusal(&u.prog, &u.tcx, b.def, &b.args.to_vec()) {
+                            if !e.contains(&x) { e.push(x); }
+                        }
+                    }
+                }
                 real.extend(e.iter().cloned());
                 errs.extend(e);
             }
