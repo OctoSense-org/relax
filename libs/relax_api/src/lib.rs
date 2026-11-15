@@ -122,6 +122,21 @@ pub mod env {
             None => Err(std::env::VarError::NotPresent),
         }
     }
+
+    /// `std::env::current_exe` of the program. Under `makepad run`, a provided crate's
+    /// `std::env::current_exe` names the loader's own file, but the program has an executable of
+    /// its own: Relax's link of the loader, named as cargo names the program's binary (relax-compiler
+    /// selfexe.rs), the first word of the run's RELAX_SELF_EXEC, as Relax std's `current_exe` reads
+    /// it. Its file stem is the name a native build's executable has. Otherwise, the process's.
+    pub fn current_exe() -> std::io::Result<std::path::PathBuf> {
+        let run = std::env::var_os("RELAX_SELF_EXEC");
+        // (the run's command line, its words apart by 0x1f, an ASCII byte to split the encoding at)
+        let first = run.as_ref().and_then(|line| line.as_encoded_bytes().split(|&b| b == 0x1f).next()).filter(|w| !w.is_empty());
+        match first {
+            Some(exe) => Ok(std::path::PathBuf::from(unsafe { OsString::from_encoded_bytes_unchecked(exe.to_vec()) })),
+            None => std::env::current_exe(),
+        }
+    }
 }
 
 /// The locks a provided crate's process-lifetime data uses. On macOS std's lock allocates a block
