@@ -176,7 +176,6 @@ fn is_workspace_manifest(toml: &str) -> bool {
 
 impl FileCtx {
     pub fn new(krate: &str, path: &str, module_path: &str, cfg: &CfgSet) -> FileCtx {
-        crate::pm::set_lexer(lex_stream);
         let (manifest_dir, pkg_name, pkg_version, _ws) = crate_meta(path);
         let file_macro = file_macro_path(path);
         FileCtx {
