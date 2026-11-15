@@ -77,7 +77,8 @@ fn region_scope_remainders_and_parameters() {
     assert_eq!(t.scopes[a.0 as usize].data, ScopeData::Remainder(0));
     assert_eq!(t.scopes[bb.0 as usize].data, ScopeData::Remainder(1));
     assert!(t.is_subscope_of(c, bb)); assert!(t.is_subscope_of(bb, a)); assert!(!t.is_subscope_of(a, bb));
-    assert_eq!(t.var_scope(local(&b, &p, "arg")), Some(t.bodies[0].arguments));
+    let arguments = t.scope(Node::Block(b.body.unwrap().0), ScopeData::Arguments).unwrap();
+    assert_eq!(t.var_scope(local(&b, &p, "arg")), Some(arguments));
 }
 #[test]
 fn region_scope_tail_editions() {
@@ -136,39 +137,18 @@ fn region_scope_const_extension() {
     let t = region_scope_tree(&p, &b).unwrap();
     assert_eq!(t.temporary_scope(expr(&p, &b, "1")), None);
     assert!(t.temporary_scope(expr(&p, &b, "&1")).is_some());
-    assert_eq!(t.bodies[0].kind, BodyKind::Constant);
-}
-#[test]
-fn region_scope_nested_awaits_and_positions() {
-    let (p, _, b) = collect("fn probe() { let outer = 0; let future = async { let a = &1; { let ended = 2; } async {}.await; let later = 3; let nested = async { async {}.await; }; async {}.await; }; }", 2021);
-    let t = region_scope_tree(&p, &b).unwrap();
-    assert_eq!(t.yields.len(), 3);
-    let outer = t.var_scope(local(&b, &p, "outer")).unwrap();
-    let a = t.var_scope(local(&b, &p, "a")).unwrap();
-    let ended = t.var_scope(local(&b, &p, "ended")).unwrap();
-    let later = t.var_scope(local(&b, &p, "later")).unwrap();
-    assert_eq!(t.yields_in_scope(outer).len(), 0);
-    assert_eq!(t.yields_in_scope(a).len(), 2);
-    assert_eq!(t.yields_in_scope(ended).len(), 0);
-    assert_eq!(t.yields_in_scope(later).len(), 1);
-    assert_eq!(t.yields_in_scope(t.temporary_scope(expr(&p, &b, "1")).unwrap()).len(), 2);
-    for y in &t.yields {
-        let YieldKind::Await { operand, future_scope } = y.kind else { panic!() };
-        let pos = t.expression_position(operand).unwrap();
-        assert_eq!(pos.body, y.position.body); assert!(pos.count < y.position.count);
-        assert_eq!(t.yields_in_scope(future_scope).len(), 1);
-    }
 }
 #[test]
 fn region_scope_closure_body_is_separate() {
     let (p, _, b) = collect("fn probe() { let x = 0; let f = |p: u32| { let y = &1; p }; }", 2021);
     let t = region_scope_tree(&p, &b).unwrap();
-    assert_eq!(t.bodies.len(), 2);
-    assert_eq!(t.bodies[1].kind, BodyKind::Closure);
-    assert_eq!(t.var_scope(local(&b, &p, "p")), Some(t.bodies[1].arguments));
+    let closure_body = expr(&p, &b, "{ let y = &1; p }");
+    let arguments = t.scope(Node::Expr(closure_body.0), ScopeData::Arguments).unwrap();
+    assert_eq!(t.var_scope(local(&b, &p, "p")), Some(arguments));
     let x = t.var_scope(local(&b, &p, "x")).unwrap();
     let y = t.var_scope(local(&b, &p, "y")).unwrap();
-    assert_ne!(t.scopes[x.0 as usize].body, t.scopes[y.0 as usize].body);
+    assert!(!t.is_subscope_of(x, arguments));
+    assert!(t.is_subscope_of(y, arguments));
 }
 
 /// Compare the actual builder's StorageDead events, not a second copy of its scope rules.
@@ -298,37 +278,35 @@ fn region_scope_for_and_yield_syntax() {
     let p = Program::new(sess);
     let tcx = Tcx::new();
     let b = Body::empty(crate::program::NO_DEF, vec![], 0, tcx.tys.unit);
-    let mut v = Resolve { prog: &p, file: &pf, body: &b, tree: ScopeTree::default(), cx: Context { parent: None, var_parent: None, body: BodyId(0) } };
+    let mut v = Resolve { prog: &p, file: &pf, body: &b, tree: ScopeTree::default(), cx: Context { parent: None, var_parent: None } };
     let root = root.unwrap();
-    v.enter_body(Node::Block(root.0), BodyKind::Coroutine); v.block(root, true);
+    v.enter_body(Node::Block(root.0), false); v.block(root, true);
     let t = v.tree;
-    assert_eq!(t.yields.len(), 1);
-    assert_eq!(t.yields[0].kind, YieldKind::Yield);
     let mut head = None;
     for (i, e) in pf.ast.exprs.iter().enumerate() { if matches!(e.kind, ExprKind::Call(..)) { head = Some(ExprId(i as u32)); } }
     let scope = t.temporary_scope(head.unwrap()).unwrap();
     assert!(matches!(t.scopes[scope.0 as usize].node, Node::Synthetic(_, Synthetic::ForMatch)));
-    assert_eq!(t.yields_in_scope(scope).len(), 1);
-    assert!(t.expression_position(head.unwrap()).unwrap().count < t.yields[0].position.count);
 }
 #[test]
 fn region_scope_const_blocks_repeat_lengths_and_async_fn() {
     let (p, _, b) = collect("async fn probe() { let a = const { &1 }; let b = [0; 2]; async {}.await; }", 2024);
     let t = region_scope_tree(&p, &b).unwrap();
-    assert_eq!(t.bodies[0].kind, BodyKind::Coroutine);
     assert_eq!(t.temporary_scope(expr(&p, &b, "1")), None);
-    let count = t.expression_position(expr(&p, &b, "2")).unwrap();
-    assert_eq!(t.bodies[count.body.0 as usize].kind, BodyKind::Constant);
-    assert_eq!(t.yields.len(), 1);
-    assert_eq!(t.yields[0].position.body, BodyId(0));
+    let count = expr(&p, &b, "2");
+    assert_eq!(t.temporary_scope(count), t.scope(Node::Expr(count.0), ScopeData::Node));
+    assert!(t.scope(Node::Expr(count.0), ScopeData::Arguments).is_some());
 }
 #[test]
 fn region_scope_nonextended_temp_ends_before_await() {
     let (p, _, b) = collect("fn f() -> u32 { 1 } fn g(x: &u32) {} async fn probe() { g(&f()); async {}.await; }", 2021);
     let t = region_scope_tree(&p, &b).unwrap();
     let s = t.temporary_scope(expr(&p, &b, "f()")).unwrap();
-    assert_eq!(t.yields_in_scope(s).len(), 0);
-    assert_eq!(t.yields_in_scope(t.bodies[0].arguments).len(), 1);
+    let await_expr = expr(&p, &b, "async {}.await");
+    let await_scope = t.scope(Node::Expr(await_expr.0), ScopeData::Node).unwrap();
+    let arguments = t.scope(Node::Block(b.body.unwrap().0), ScopeData::Arguments).unwrap();
+    assert!(matches!(t.scopes[s.0 as usize].node, Node::Statement(_)));
+    assert!(!t.is_subscope_of(await_scope, s));
+    assert!(t.is_subscope_of(await_scope, arguments));
 }
 #[test]
 fn region_scope_match_let_guard_bindings() {

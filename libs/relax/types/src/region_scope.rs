@@ -9,7 +9,7 @@ use crate::typeck::{Body, Res};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Node {
-    Expr(u32), Block(u32), Statement(u32), Pattern(u32), Arm(u32),
+    Expr(u32), Block(u32), Statement(u32), Arm(u32),
     /// AST lowering's generated scopes have stable identities within their source expression.
     Synthetic(u32, Synthetic),
 }
@@ -19,26 +19,12 @@ pub enum Synthetic { Iteration, ForMatch, ForArm, ForBody, ForIntoIter, ForNext,
 pub enum ScopeData { Node, CallSite, Arguments, Destruction, IfThen, IfThenRescope, MatchGuard, Remainder(u32) }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct ScopeId(pub u32);
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct BodyId(pub u32);
 #[derive(Clone, Copy, Debug)]
-pub struct Scope { pub node: Node, pub data: ScopeData, pub parent: Option<ScopeId>, pub body: BodyId }
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum BodyKind { Function, Closure, Coroutine, Constant }
-#[derive(Debug)]
-pub struct BodyScope { pub root: Node, pub kind: BodyKind, pub arguments: ScopeId, pub body_expr_count: u32 }
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ExprPosition { pub body: BodyId, pub count: u32 }
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum YieldKind { Yield, Await { operand: ExprId, future_scope: ScopeId } }
-#[derive(Clone, Copy, Debug)]
-pub struct YieldPoint { pub expr: ExprId, pub position: ExprPosition, pub scope: ScopeId, pub kind: YieldKind }
+pub struct Scope { pub node: Node, pub data: ScopeData, pub parent: Option<ScopeId> }
 
 #[derive(Default, Debug)]
 pub struct ScopeTree {
     pub scopes: Vec<Scope>,
-    pub bodies: Vec<BodyScope>,
-    pub yields: Vec<YieldPoint>,
     nodes: HashMap<(Node, ScopeData), ScopeId>,
     var_map: HashMap<u32, ScopeId>,
     pub rvalue_scopes: HashMap<u32, Option<ScopeId>>,
@@ -46,19 +32,14 @@ pub struct ScopeTree {
     /// from edition 2024 (rustc `backwards_incompatible_scope`; recorded for the lint
     /// `tail_expr_drop_order`, which only `makepad check` runs).
     backwards_incompatible_nodes: crate::fxhash::HashSet<Node>,
-    positions: HashMap<u32, ExprPosition>,
-    yield_in_scope: Vec<Vec<u32>>,
 }
 impl ScopeTree {
     pub fn scope(&self, node: Node, data: ScopeData) -> Option<ScopeId> { self.nodes.get(&(node, data)).copied() }
     pub fn encl_scope(&self, scope: ScopeId) -> Option<ScopeId> { self.scopes[scope.0 as usize].parent }
     pub fn var_scope(&self, local: u32) -> Option<ScopeId> { self.var_map.get(&local).copied() }
-    pub fn expression_position(&self, expr: ExprId) -> Option<ExprPosition> { self.positions.get(&expr.0).copied() }
     pub fn is_subscope_of(&self, mut sub: ScopeId, sup: ScopeId) -> bool {
         loop { if sub == sup { return true; } match self.encl_scope(sub) { Some(p) => sub = p, None => return false } }
     }
-    /// Indices into `yields`, restricted to this scope's body, in visitation order.
-    pub fn yields_in_scope(&self, scope: ScopeId) -> &[u32] { &self.yield_in_scope[scope.0 as usize] }
     /// `None` is static extension, never an unknown expression (which is a caller error).
     /// rustc_middle/src/middle/region.rs:308,346: return the child of Destruction.
     pub fn temporary_scope(&self, expr: ExprId) -> Option<ScopeId> { self.temp_lifetime(expr).0 }
@@ -103,13 +84,13 @@ pub fn node_edition(file: &ParsedFile, node: Node) -> u16 {
 pub fn region_scope_tree(prog: &Program, body: &Body) -> Result<ScopeTree, String> {
     let d = prog.def(body.def);
     let file = &prog.files[body.file as usize];
-    let mut v = Resolve { prog, file, body, tree: ScopeTree::default(), cx: Context { parent: None, var_parent: None, body: BodyId(0) } };
+    let mut v = Resolve { prog, file, body, tree: ScopeTree::default(), cx: Context { parent: None, var_parent: None } };
     // an anonymous constant (array length, const argument or default in a signature or type) is a
     // body of its own, resolved as a constant initializer (rustc region.rs resolve_body: a body
     // owner that is not a fn or closure)
     if d.kind == DefKind::AnonConst {
         let Some((_, crate::def_collector::NodeId::AnonConst(e))) = prog.def_id_to_node_id.get(&body.def) else { return Err("anonymous constant without an expression".into()) };
-        v.enter_body(Node::Expr(e.0), BodyKind::Constant);
+        v.enter_body(Node::Expr(e.0), true);
         v.extend_borrows(*e, None);
         v.expr(*e, true);
         return Ok(v.tree);
@@ -118,8 +99,7 @@ pub fn region_scope_tree(prog: &Program, body: &Body) -> Result<ScopeTree, Strin
         ItemKind::Fn(sig, _, _) => {
             let block = prog.fn_body(body.file, d.item)?.ok_or("item has no body")?;
             let sig = file.ast.fn_sig(sig);
-            let kind = if sig.asyncness { BodyKind::Coroutine } else { BodyKind::Function };
-            v.enter_body(Node::Block(block.0), kind);
+            v.enter_body(Node::Block(block.0), false);
             for p in file.ast.list(sig.params) { v.pat(p.pat); }
             // `self` has no AST pattern; typeck represents it with the sentinel pattern ID.
             for (i, local) in body.locals.iter().enumerate() {
@@ -129,7 +109,7 @@ pub fn region_scope_tree(prog: &Program, body: &Body) -> Result<ScopeTree, Strin
         }
         ItemKind::Const(_, init) | ItemKind::Static(_, _, init) if init.is_some() => {
             let e = prog.const_body(d.file, d.item)?.ok_or("missing initializer")?;
-            v.enter_body(Node::Expr(e.0), BodyKind::Constant);
+            v.enter_body(Node::Expr(e.0), true);
             v.extend_borrows(e, None);
             v.expr(e, true);
         }
@@ -138,26 +118,23 @@ pub fn region_scope_tree(prog: &Program, body: &Body) -> Result<ScopeTree, Strin
     Ok(v.tree)
 }
 #[derive(Clone, Copy)]
-struct Context { parent: Option<ScopeId>, var_parent: Option<ScopeId>, body: BodyId }
+struct Context { parent: Option<ScopeId>, var_parent: Option<ScopeId> }
 struct Resolve<'a> { prog: &'a Program, file: &'a ParsedFile, body: &'a Body, tree: ScopeTree, cx: Context }
 impl Resolve<'_> {
     fn enter(&mut self, node: Node, data: ScopeData) -> ScopeId {
         let id = ScopeId(self.tree.scopes.len() as u32);
         assert!(self.tree.nodes.insert((node, data), id).is_none(), "duplicate scope: {node:?} {data:?}");
-        self.tree.scopes.push(Scope { node, data, parent: self.cx.parent, body: self.cx.body });
-        self.tree.yield_in_scope.push(Vec::new());
+        self.tree.scopes.push(Scope { node, data, parent: self.cx.parent });
         self.cx.parent = Some(id); id
     }
     fn node(&mut self, node: Node, terminating: bool) -> ScopeId {
         if terminating { self.enter(node, ScopeData::Destruction); }
         self.enter(node, ScopeData::Node)
     }
-    fn enter_body(&mut self, root: Node, kind: BodyKind) {
-        self.cx.body = BodyId(self.tree.bodies.len() as u32);
+    fn enter_body(&mut self, root: Node, is_const: bool) {
         self.enter(root, ScopeData::CallSite);
         let arguments = self.enter(root, ScopeData::Arguments);
-        self.tree.bodies.push(BodyScope { root, kind, arguments, body_expr_count: 0 });
-        self.cx.var_parent = if kind == BodyKind::Constant { None } else { Some(arguments) };
+        self.cx.var_parent = if is_const { None } else { Some(arguments) };
     }
     fn block_tail(&self, b: BlockId) -> Option<ExprId> {
         match self.file.ast.stmts(b).last().and_then(|s| self.file.ast.stmt_expr(s)) { Some((e, false)) => Some(e), _ => None }
@@ -194,7 +171,7 @@ impl Resolve<'_> {
                     return;
                 }
             }
-            if matches!(stmt, Stmt::Item(_)) { continue; }
+            if matches!(stmt, Stmt::Item(_) | Stmt::Empty) { continue; }
             let before = self.cx;
             if matches!(stmt, Stmt::Let(_)) {
                 self.enter(Node::Block(b.0), ScopeData::Remainder(i as u32));
@@ -234,22 +211,24 @@ impl Resolve<'_> {
         self.cx = saved;
     }
     fn pat(&mut self, p: PatId) {
-        let saved = self.cx;
-        self.node(Node::Pattern(p.0), false);
-        if let (Some(&local), Some(scope)) = (self.body.pat_local.get(&p.0), self.cx.var_parent) {
-            self.tree.var_map.insert(local, scope);
-        }
         let ast = &self.file.ast;
         match *ast.pat(p) {
-            Pat::Ident { sub, .. } if let Some(s) = sub.get() => self.pat(s),
+            // rustc check/region.rs:213-219: only bindings record a variable lifetime;
+            // patterns do not introduce scopes. `pat_local` distinguishes bindings from paths.
+            Pat::Ident { sub, .. } => {
+                if let (Some(&local), Some(scope)) = (self.body.pat_local.get(&p.0), self.cx.var_parent) {
+                    self.tree.var_map.insert(local, scope);
+                }
+                if let Some(s) = sub.get() { self.pat(s); }
+            }
             Pat::Ref(_, s) | Pat::Paren(s) | Pat::Box(s) => self.pat(s),
             Pat::Tuple(ps) | Pat::Slice(ps) | Pat::Or(ps) | Pat::TupleStruct(_, ps) => for p in ast.list(ps) { self.pat(*p); },
             Pat::Struct(_, _, fs) => for f in ast.list(fs) { self.pat(f.pat); },
-            Pat::Lit(e) => self.expr(e, false),
-            Pat::Range(a, b, _) => { if let Some(e) = a.get() { self.expr(e, false); } if let Some(e) = b.get() { self.expr(e, false); } }
+            // rustc_hir intravisit.rs:808-814 visits literal/path data, not expressions.
+            // Neither creates scopes in this pass, including a negated literal's operand.
+            Pat::Lit(_) | Pat::Range(..) => (),
             _ => (),
         }
-        self.cx = saved;
     }
     fn explicit_ref(&self, p: PatId) -> bool {
         let ast = &self.file.ast;
@@ -273,27 +252,6 @@ impl Resolve<'_> {
         self.cx.var_parent = self.cx.parent;
         self.condition(cond);
         self.block(then, true);
-    }
-    /// Postorder expression positions are body-local. Unlike a source-offset ordering they
-    /// distinguish operand evaluation from suspension; nested bodies have separate counters.
-    fn position(&mut self, e: ExprId) -> ExprPosition {
-        let b = &mut self.tree.bodies[self.cx.body.0 as usize];
-        b.body_expr_count += 1;
-        let p = ExprPosition { body: self.cx.body, count: b.body_expr_count };
-        self.tree.positions.insert(e.0, p); p
-    }
-    fn suspension(&mut self, e: ExprId, kind: YieldKind) {
-        let position = self.position(e);
-        let scope = self.cx.parent.unwrap();
-        let index = self.tree.yields.len() as u32;
-        self.tree.yields.push(YieldPoint { expr: e, position, scope, kind });
-        let mut s = Some(scope);
-        while let Some(id) = s {
-            let data = &self.tree.scopes[id.0 as usize];
-            if data.body != self.cx.body { break; }
-            self.tree.yield_in_scope[id.0 as usize].push(index);
-            s = data.parent;
-        }
     }
     fn expr(&mut self, e: ExprId, terminating: bool) {
         let saved = self.cx;
@@ -397,14 +355,14 @@ impl Resolve<'_> {
             ExprKind::Closure(row) => {
                 let crate::ast::ClosureRow { params, body, .. } = *ast.row(row);
                 let cx = self.cx;
-                self.enter_body(Node::Expr(body.0), BodyKind::Closure);
+                self.enter_body(Node::Expr(body.0), false);
                 for p in ast.list(params) { self.pat(p.pat); }
                 self.expr(body, true); self.cx = cx;
             }
             ExprKind::Async(_, b) | ExprKind::ConstBlock(b) => {
                 let cx = self.cx;
                 let konst = matches!(ast.expr(e).kind, ExprKind::ConstBlock(_));
-                self.enter_body(Node::Block(b.0), if konst { BodyKind::Constant } else { BodyKind::Coroutine });
+                self.enter_body(Node::Block(b.0), konst);
                 if konst { if let Some(t) = self.block_tail(b) { self.extend_borrows(t, None); } }
                 self.block(b, true); self.cx = cx;
             }
@@ -414,7 +372,7 @@ impl Resolve<'_> {
                 self.node(Node::Synthetic(e.0, Synthetic::AwaitIntoFuture), false);
                 self.expr(x, false);
                 self.cx = cx;
-                let future_scope = self.node(Node::Synthetic(e.0, Synthetic::AwaitArm), true);
+                self.node(Node::Synthetic(e.0, Synthetic::AwaitArm), true);
                 self.node(Node::Synthetic(e.0, Synthetic::AwaitLoop), true);
                 // loop { match poll(..) { Ready(result) => break result, Pending => {} } task_context = yield (); }
                 let loop_cx = self.cx;
@@ -435,15 +393,14 @@ impl Resolve<'_> {
                 }
                 self.cx = body_cx;
                 self.node(Node::Synthetic(e.0, Synthetic::AwaitYield), true);
-                self.suspension(e, YieldKind::Await { operand: x, future_scope });
                 self.cx = loop_cx;
             }
-            ExprKind::Yield(x) => { if let Some(x) = x.get() { self.expr(x, false); } self.suspension(e, YieldKind::Yield); }
+            ExprKind::Yield(x) => if let Some(x) = x.get() { self.expr(x, false); },
             ExprKind::Tuple(xs) | ExprKind::Array(xs) => for x in ast.list(xs) { self.expr(*x, false); },
             ExprKind::Repeat(x, count) => {
                 self.expr(x, false);
                 let cx = self.cx;
-                self.enter_body(Node::Expr(count.0), BodyKind::Constant);
+                self.enter_body(Node::Expr(count.0), true);
                 self.expr(count, true); self.cx = cx;
             }
             ExprKind::Struct(row) => {
@@ -456,7 +413,6 @@ impl Resolve<'_> {
             ExprKind::Mac(m) => self.mac(e, *ast.row(m)),
             ExprKind::Lit(_) | ExprKind::Path(_) | ExprKind::Continue(_) | ExprKind::Underscore => (),
         }
-        if !matches!(ast.expr(e).kind, ExprKind::Await(_) | ExprKind::Yield(_)) { self.position(e); }
         self.cx = saved;
     }
     fn destructuring(&self, e: ExprId) -> bool {
@@ -486,7 +442,6 @@ impl Resolve<'_> {
                 ExprKind::Paren(x) => self.assignee(x),
                 _ => (),
             }
-            self.position(e);
         } else {
             self.node(Node::Synthetic(e.0, Synthetic::Assignment), true);
             self.expr(e, false);
