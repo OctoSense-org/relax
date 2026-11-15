@@ -28,12 +28,21 @@ pub struct ScopeTree {
     nodes: HashMap<(Node, ScopeData), ScopeId>,
     var_map: HashMap<u32, ScopeId>,
     pub rvalue_scopes: HashMap<u32, Option<ScopeId>>,
+    /// rustc_ast_lowering/src/expr.rs:222-243: parentheses disappear, but their enclosing
+    /// span belongs to the lowered expression. Keep the AST intact for typeck and AST lints.
+    parenthesized_spans: HashMap<u32, (u32, u32)>,
     /// The tail expressions of blocks of editions before 2024, whose temporaries are dropped earlier
     /// from edition 2024 (rustc `backwards_incompatible_scope`; recorded for the lint
     /// `tail_expr_drop_order`, which only `makepad check` runs).
     backwards_incompatible_nodes: crate::fxhash::HashSet<Node>,
 }
 impl ScopeTree {
+    pub(crate) fn expr_span(&self, ast: &Ast, expr: ExprId) -> (u32, u32) {
+        match self.parenthesized_spans.get(&expr.0) {
+            Some(&span) => span,
+            None => { let e = ast.expr(expr); (e.lo, e.hi) }
+        }
+    }
     pub fn scope(&self, node: Node, data: ScopeData) -> Option<ScopeId> { self.nodes.get(&(node, data)).copied() }
     pub fn encl_scope(&self, scope: ScopeId) -> Option<ScopeId> { self.scopes[scope.0 as usize].parent }
     pub fn var_scope(&self, local: u32) -> Option<ScopeId> { self.var_map.get(&local).copied() }
@@ -121,6 +130,17 @@ pub fn region_scope_tree(prog: &Program, body: &Body) -> Result<ScopeTree, Strin
 struct Context { parent: Option<ScopeId>, var_parent: Option<ScopeId> }
 struct Resolve<'a> { prog: &'a Program, file: &'a ParsedFile, body: &'a Body, tree: ScopeTree, cx: Context }
 impl Resolve<'_> {
+    fn unparen(&mut self, e: ExprId) -> ExprId {
+        let ast = &self.file.ast;
+        let ExprKind::Paren(inner) = ast.expr(e).kind else { return e };
+        let inner = self.unparen(inner);
+        let (lo, hi) = self.tree.expr_span(ast, inner);
+        let outer = ast.expr(e);
+        if outer.lo <= lo && hi <= outer.hi {
+            self.tree.parenthesized_spans.insert(inner.0, (outer.lo, outer.hi));
+        }
+        inner
+    }
     fn enter(&mut self, node: Node, data: ScopeData) -> ScopeId {
         let id = ScopeId(self.tree.scopes.len() as u32);
         assert!(self.tree.nodes.insert((node, data), id).is_none(), "duplicate scope: {node:?} {data:?}");
@@ -132,6 +152,7 @@ impl Resolve<'_> {
         self.enter(node, ScopeData::Node)
     }
     fn enter_body(&mut self, root: Node, is_const: bool) {
+        let root = match root { Node::Expr(e) => Node::Expr(self.unparen(ExprId(e)).0), _ => root };
         self.enter(root, ScopeData::CallSite);
         let arguments = self.enter(root, ScopeData::Arguments);
         self.cx.var_parent = if is_const { None } else { Some(arguments) };
@@ -157,7 +178,7 @@ impl Resolve<'_> {
             if i + 1 == statements.len() {
                 if let Some((e, false)) = ast.stmt_expr(stmt) {
                     let terminating = node_edition(self.file, Node::Block(b.0)) >= 2024;
-                    let tail = match try_block { Some(t) => Node::Synthetic(t.0, Synthetic::TryFromOutput), None => Node::Expr(e.0) };
+                    let tail = match try_block { Some(t) => Node::Synthetic(t.0, Synthetic::TryFromOutput), None => Node::Expr(self.unparen(e).0) };
                     if !terminating && crate::lint::enabled() {
                         self.tree.backwards_incompatible_nodes.insert(tail);
                     }
@@ -243,6 +264,7 @@ impl Resolve<'_> {
         }
     }
     fn condition(&mut self, e: ExprId) {
+        let e = self.unparen(e);
         let terminating = !matches!(self.file.ast.expr(e).kind, ExprKind::Let(..) | ExprKind::Binary(BinOp::And | BinOp::Or, ..));
         self.expr(e, terminating);
     }
@@ -254,13 +276,14 @@ impl Resolve<'_> {
         self.block(then, true);
     }
     fn expr(&mut self, e: ExprId, terminating: bool) {
+        let e = self.unparen(e);
         let saved = self.cx;
         self.node(Node::Expr(e.0), terminating);
         let ast = &self.file.ast;
         match ast.expr(e).kind {
             ExprKind::Binary(BinOp::And | BinOp::Or, a, b) => {
                 self.condition(a);
-                self.expr(b, !matches!(ast.expr(b).kind, ExprKind::Let(..)));
+                self.expr(b, !matches!(ast.expr(crate::lit::strip_paren(ast, b)).kind, ExprKind::Let(..)));
             }
             ExprKind::Assign(a, b) if self.destructuring(a) => {
                 // rustc_ast_lowering/src/expr.rs:1199: a let followed by individual assignments.
@@ -283,7 +306,8 @@ impl Resolve<'_> {
             }
             ExprKind::Binary(_, a, b) | ExprKind::Index(a, b) => { self.expr(a, false); self.expr(b, false); }
             ExprKind::Unary(_, x) | ExprKind::AddrOf(_, _, x) | ExprKind::Cast(x, _) | ExprKind::Field(x, _) |
-            ExprKind::TupleField(x, _) | ExprKind::Paren(x) | ExprKind::Box(x) => self.expr(x, false),
+            ExprKind::TupleField(x, _) | ExprKind::Box(x) => self.expr(x, false),
+            ExprKind::Paren(_) => unreachable!("parentheses were removed before creating scopes"),
             ExprKind::Try(x) => {
                 // `match Try::branch(x) { .. }`: the call has its own scope
                 let cx = self.cx;
@@ -425,6 +449,7 @@ impl Resolve<'_> {
         }
     }
     fn assignee(&mut self, e: ExprId) {
+        let e = self.unparen(e);
         let saved = self.cx;
         let ast = &self.file.ast;
         if self.destructuring(e) {
@@ -434,12 +459,12 @@ impl Resolve<'_> {
                 ExprKind::Call(f, xs) => {
                     // The constructor path is pattern syntax, not a runtime callee.
                     let cx = self.cx;
+                    let f = self.unparen(f);
                     self.node(Node::Expr(f.0), false);
                     self.cx = cx;
                     for x in ast.list(xs) { self.assignee(*x); }
                 }
                 ExprKind::Struct(row) => for f in ast.list(ast.row(row).fields) { self.assignee(f.expr); },
-                ExprKind::Paren(x) => self.assignee(x),
                 _ => (),
             }
         } else {
@@ -503,10 +528,11 @@ impl Resolve<'_> {
     /// rustc_hir_analysis/src/check/region.rs:702: all ET nodes, not just the rvalue.
     fn extend_place(&mut self, mut e: ExprId, scope: Option<ScopeId>) {
         loop {
+            e = self.unparen(e);
             self.tree.rvalue_scopes.insert(e.0, scope);
             match self.file.ast.expr(e).kind {
                 ExprKind::AddrOf(_, _, x) | ExprKind::Unary(UnOp::Deref, x) | ExprKind::Field(x, _) |
-                ExprKind::TupleField(x, _) | ExprKind::Index(x, _) | ExprKind::Paren(x) => e = x,
+                ExprKind::TupleField(x, _) | ExprKind::Index(x, _) => e = x,
                 _ => break,
             }
         }

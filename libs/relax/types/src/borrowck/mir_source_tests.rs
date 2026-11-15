@@ -299,10 +299,12 @@ fn ignored_repo_from_makepad_git() {
 
 #[test]
 fn a_closure_that_returns_its_argument_reference() {
-    let (errors, unchecked) = borrowck_source("
-        pub fn f(path: &str) -> &str { path.rsplit_once('/').map_or(\"\", |(d, _)| d) }");
-    assert!(unchecked.is_empty(), "{unchecked:?}");
-    assert!(errors.is_empty(), "{errors:?}");
+    for body in ["d", "((d))"] {
+        let source = format!("pub fn f(path: &str) -> &str {{ path.rsplit_once('/').map_or(\"\", |(d, _)| {body}) }}");
+        let (errors, unchecked) = borrowck_source(&source);
+        assert!(unchecked.is_empty(), "{unchecked:?}");
+        assert!(errors.is_empty(), "{errors:?}");
+    }
 }
 
 #[test]
@@ -419,6 +421,7 @@ fn a_tail_temporary_outlives_the_locals_before_edition_2024() {
         "pub fn f(n: &str) -> Option<usize> { let n = n.to_lowercase(); [n.as_str()].into_iter().next().map(|s| s.len()) }".to_string(),
         "pub fn f() -> i32 { let m = std::sync::Mutex::new(1); *m.lock().unwrap() }".to_string(),
         format!("{D} pub fn f(n: &str) -> usize {{ let n = n.to_lowercase(); D(&n).len() }}"),
+        format!("{D} pub fn f(n: &str) -> usize {{ let n = n.to_lowercase(); ((D(&n).len())) }}"),
         format!("{D} pub fn f(n: &str) -> usize {{ let r = {{ let n = n.to_lowercase(); D(&n).len() }}; r }}"),
         format!("{D} pub fn f(n: &str) -> usize {{ let g = || {{ let n = n.to_lowercase(); D(&n).len() }}; g() }}"),
     ] {

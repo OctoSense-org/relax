@@ -42,7 +42,7 @@ fn scope_of(tree: &ScopeTree, e: ExprId) -> Scope { tree.scopes[tree.temporary_s
 #[test]
 fn region_scope_extension_grammar() {
     // Reference destructors.scope.lifetime-extension and rustc check/region.rs:620.
-    for init in ["&f()", "[&f()]", "(&f(),)", "S { r: &f() }", "T(&f())", "&*(&f())", "{ &f() }", "if true { &f() } else { &0 }", "match true { true => &f(), false => &0 }"] {
+    for init in ["&f()", "[&f()]", "(&f(),)", "S { r: &f() }", "T(&f())", "&*(&f())", "{ &f() }", "if true { &f() } else { &0 }", "match true { true => &f(), false => &0 }", "((&f()))", "&((f()))"] {
         let src = format!("struct S<'a> {{ r: &'a u32 }} struct T<'a>(&'a u32); fn f() -> u32 {{ 1 }} fn probe() {{ let x = {init}; }}");
         let (p, _, b) = collect(&src, 2021);
         let t = region_scope_tree(&p, &b).unwrap();
@@ -58,7 +58,7 @@ fn region_scope_calls_do_not_extend() {
 }
 #[test]
 fn region_scope_explicit_ref_and_place_chain() {
-    for init in ["f()", "f().0", "[f()][0].0"] {
+    for init in ["f()", "f().0", "[f()][0].0", "((f()))", "((f().0))"] {
         let src = format!("fn f() -> (u32,) {{ (1,) }} fn probe() {{ let ref x = {init}; }}");
         let (p, _, b) = collect(&src, 2021);
         let t = region_scope_tree(&p, &b).unwrap();
@@ -83,13 +83,20 @@ fn region_scope_remainders_and_parameters() {
 #[test]
 fn region_scope_tail_editions() {
     for ed in [2021, 2024] {
-        let (p, _, b) = collect("fn f() -> u32 { 1 } fn probe() { let x = { let y = 0; f() }; }", ed);
-        let t = region_scope_tree(&p, &b).unwrap();
-        let e = expr(&p, &b, "f()");
-        let s = scope_of(&t, e);
-        if ed == 2024 { assert_eq!(s.node, Node::Expr(e.0)); } else { assert!(matches!(s.node, Node::Statement(_))); }
-        let y = t.var_scope(local(&b, &p, "y")).unwrap();
-        assert_eq!(t.is_subscope_of(t.temporary_scope(e).unwrap(), y), ed == 2024);
+        for tail in ["f()", "((f()))"] {
+            let src = format!("fn f() -> u32 {{ 1 }} fn probe() {{ let x = {{ let y = 0; {tail} }}; }}");
+            let (p, _, b) = collect(&src, ed);
+            let t = region_scope_tree(&p, &b).unwrap();
+            let e = expr(&p, &b, "f()");
+            let s = scope_of(&t, e);
+            if ed == 2024 { assert_eq!(s.node, Node::Expr(e.0)); } else { assert!(matches!(s.node, Node::Statement(_))); }
+            let y = t.var_scope(local(&b, &p, "y")).unwrap();
+            assert_eq!(t.is_subscope_of(t.temporary_scope(e).unwrap(), y), ed == 2024);
+            let ast = &p.files[b.file as usize].ast;
+            let outer = ast.expr(expr(&p, &b, tail));
+            assert_eq!(t.expr_span(ast, e), (outer.lo, outer.hi));
+            assert!(t.scopes.iter().all(|s| !matches!(s.node, Node::Expr(id) if matches!(ast.expr(ExprId(id)).kind, ExprKind::Paren(_)))));
+        }
     }
 }
 #[test]
@@ -99,9 +106,12 @@ fn region_scope_if_let_editions_and_boolean_conditions() {
         let t = region_scope_tree(&p, &b).unwrap();
         assert_eq!(scope_of(&t, expr(&p, &b, "f()")).data == ScopeData::IfThenRescope, ed == 2024);
     }
-    let (p, _, b) = collect("fn f() -> bool { true } fn g() -> bool { false } fn probe() { if f() && g() {} while f() {} }", 2021);
-    let t = region_scope_tree(&p, &b).unwrap();
-    let g = expr(&p, &b, "g()"); assert_eq!(scope_of(&t, g).node, Node::Expr(g.0));
+    for condition in ["f() && g()", "((f() && g()))"] {
+        let src = format!("fn f() -> bool {{ true }} fn g() -> bool {{ false }} fn probe() {{ if {condition} {{}} while f() {{}} }}");
+        let (p, _, b) = collect(&src, 2021);
+        let t = region_scope_tree(&p, &b).unwrap();
+        let g = expr(&p, &b, "g()"); assert_eq!(scope_of(&t, g).node, Node::Expr(g.0));
+    }
 }
 #[test]
 fn region_scope_while_let_is_iteration_scoped() {
@@ -140,15 +150,20 @@ fn region_scope_const_extension() {
 }
 #[test]
 fn region_scope_closure_body_is_separate() {
-    let (p, _, b) = collect("fn probe() { let x = 0; let f = |p: u32| { let y = &1; p }; }", 2021);
-    let t = region_scope_tree(&p, &b).unwrap();
-    let closure_body = expr(&p, &b, "{ let y = &1; p }");
-    let arguments = t.scope(Node::Expr(closure_body.0), ScopeData::Arguments).unwrap();
-    assert_eq!(t.var_scope(local(&b, &p, "p")), Some(arguments));
-    let x = t.var_scope(local(&b, &p, "x")).unwrap();
-    let y = t.var_scope(local(&b, &p, "y")).unwrap();
-    assert!(!t.is_subscope_of(x, arguments));
-    assert!(t.is_subscope_of(y, arguments));
+    for closure in ["{ let y = &1; p }", "(({ let y = &1; p }))"] {
+        let src = format!("fn probe() {{ let x = 0; let f = |p: u32| {closure}; }}");
+        let (p, _, b) = collect(&src, 2021);
+        let t = region_scope_tree(&p, &b).unwrap();
+        let closure_body = expr(&p, &b, "{ let y = &1; p }");
+        let arguments = t.scope(Node::Expr(closure_body.0), ScopeData::Arguments).unwrap();
+        assert_eq!(t.var_scope(local(&b, &p, "p")), Some(arguments));
+        let x = t.var_scope(local(&b, &p, "x")).unwrap();
+        let y = t.var_scope(local(&b, &p, "y")).unwrap();
+        assert!(!t.is_subscope_of(x, arguments));
+        assert!(t.is_subscope_of(y, arguments));
+        let ast = &p.files[b.file as usize].ast;
+        assert!(t.scopes.iter().all(|s| !matches!(s.node, Node::Expr(id) if matches!(ast.expr(ExprId(id)).kind, ExprKind::Paren(_)))));
+    }
 }
 
 /// Compare the actual builder's StorageDead events, not a second copy of its scope rules.
@@ -194,6 +209,9 @@ fn cross_check(source: &str, edition: u16, extended: bool, tail: bool) -> bool {
         // rustc's cleanup span is the end point of the scope's node (builder/scope.rs `end_point`).
         let e = pf.ast.expr(temp_expr);
         assert!(endings[0].lo >= e.hi - 1, "{:?}", endings);
+        let Node::Expr(id) = data.node else { panic!("{data:?}") };
+        let (_, hi) = tree.expr_span(&pf.ast, ExprId(id));
+        assert_eq!((endings[0].lo, endings[0].hi), (hi - 1, hi));
     } else {
         assert!(matches!(data.node, Node::Statement(_)), "{data:?}");
         // rustc's cleanup span is the end point of the statement (its `;`).
@@ -210,6 +228,7 @@ fn region_scope_builder_cross_check() {
             assert!(cross_check(&src, ed, true, false), "{src}");
         }
         assert!(cross_check("fn f() -> (u32,) { (1,) } fn probe() { let x = &{ f().0 }; }", ed, false, true));
+        assert!(cross_check("fn f() -> (u32,) { (1,) } fn probe() { let x = &{ ((f().0)) }; }", ed, false, true));
         assert!(cross_check("fn f() -> u32 { 1 } fn probe() { let x = match f() { n => n }; }", ed, false, false));
     }
 }
@@ -223,9 +242,14 @@ fn region_scope_builder_explicit_ref_projection_disagreement() {
 }
 #[test]
 fn region_scope_destructuring_assignment_rhs() {
-    let (p, _, b) = collect("fn f() -> (u32,) { (1,) } fn probe() { let mut x = 0; (x,) = f(); }", 2021);
-    let t = region_scope_tree(&p, &b).unwrap();
-    assert!(matches!(scope_of(&t, expr(&p, &b, "f()")).node, Node::Synthetic(_, Synthetic::AssignLet)));
+    for assignee in ["(x,)", "((x,))", "((x),)"] {
+        let src = format!("fn f() -> (u32,) {{ (1,) }} fn probe() {{ let mut x = 0; {assignee} = f(); }}");
+        let (p, _, b) = collect(&src, 2021);
+        let t = region_scope_tree(&p, &b).unwrap();
+        assert!(matches!(scope_of(&t, expr(&p, &b, "f()")).node, Node::Synthetic(_, Synthetic::AssignLet)));
+        let ast = &p.files[b.file as usize].ast;
+        assert!(t.scopes.iter().all(|s| !matches!(s.node, Node::Expr(id) if matches!(ast.expr(ExprId(id)).kind, ExprKind::Paren(_)))));
+    }
 }
 #[test]
 fn region_scope_builtin_matches_and_assert() {
