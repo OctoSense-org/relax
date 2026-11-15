@@ -411,13 +411,15 @@ fn select_tests(package: &str, asked: TestSelection<'_>, targets: &crate::resolv
     let example_targets = if asked.all_examples { &targets.all_examples } else { &targets.examples };
     let mut graph = Vec::new();
     let mut runs_tests = false;
+    // A kind's all-flag drops its names, as cargo's does (`--test nope --tests` runs the whole
+    // set); a name of another kind is still checked (`--bin nope --tests` fails).
     for (names, all, flag, entire) in [
         (asked.bins, bin_targets, "--bin", asked.all_bins),
-        (asked.tests, &targets.tests, "--test", false),
+        (asked.tests, &targets.tests, "--test", asked.all_tests),
         (asked.examples, example_targets, "--example", asked.all_examples),
     ] {
         if !all_tests && !entire && names.is_none() { continue; }
-        let names = names.unwrap_or_default();
+        let names = if entire { &[][..] } else { names.unwrap_or_default() };
         for n in names {
             if !all.iter().any(|t| &t.0 == n) { return Err(error(true, &format!("no target named `{n}`"))); }
         }
@@ -733,8 +735,12 @@ mod tests {
         let missing = "relax test: no target named `nope` in package `sample`; its test targets: --lib, --bin app, --test x, --test y".to_string();
         assert_eq!(select(TestSelection { tests: Some(&["nope".to_string()]), ..Default::default() }, &targets), Err(missing.clone()),
             "an unknown named target lists all available selectors");
-        assert_eq!(select(TestSelection { all_tests: true, tests: Some(&["nope".to_string()]), ..Default::default() }, &targets), Err(missing),
-            "--tests still validates a named selector beside it");
+        assert_eq!(select(TestSelection { all_tests: true, tests: Some(&["nope".to_string()]), ..Default::default() }, &targets), Ok(expected.clone()),
+            "--tests drops the integration test names beside it, as cargo does: an unknown one is no error");
+        assert_eq!(select(TestSelection { all_tests: true, bins: Some(&["nope".to_string()]), ..Default::default() }, &targets), Err(missing),
+            "--tests still checks a bin name beside it");
+        assert_eq!(select(TestSelection { all_bins: true, bins: Some(&["nope".to_string()]), ..Default::default() }, &targets),
+            Ok(vec![Some(("src/main.rs".to_string(), false))]), "--bins drops the bin names beside it");
 
         let example = ("demo".to_string(), "examples/demo.rs".to_string(), true);
         targets.examples = vec![example.clone()];
