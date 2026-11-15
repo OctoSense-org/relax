@@ -8,7 +8,7 @@
 //! lines are read like cargo does, the output kept with cargo's rerun rules. No rustc.
 
 use crate::crates::{CrateUnit, HostUnit};
-pub use crate::resolve::{GraphUnit, Units};
+pub use crate::resolve::{GraphUnit, Unified, Unify, Units};
 use relax_session::sync::Mutex;
 
 #[path = "unitgraph_noop.rs"]
@@ -140,15 +140,13 @@ pub(crate) fn parse_pkg_id(id: &str) -> (String, String, String) {
 }
 
 /// The package's unit graph from Relax's own resolution (resolve.rs): the manifests and
-/// Cargo.lock, no cargo. Read on every launch (13-43 ms for the apps); nothing to cache.
-pub fn unit_graph(sess: &std::sync::Arc<crate::Session>, workspace: &str, package: &str, cargo_flags: &[String]) -> Result<Units, String> {
-    crate::resolve::unit_graph(sess, workspace, package, cargo_flags)
-}
-
-/// `makepad check`'s graph: its target flags are cargo check's (resolve.rs parse_check_flags),
+/// Cargo.lock, no cargo. Read on every launch (13-43 ms for the apps); nothing to cache. `check`:
+/// `makepad check`'s graph, whose target flags are cargo check's (resolve.rs parse_check_flags),
 /// `--tests` the lib's and bins' unit tests and the integration tests, `--lib` the plain lib.
-pub fn check_unit_graph(sess: &std::sync::Arc<crate::Session>, workspace: &str, package: &str, cargo_flags: &[String]) -> Result<Units, String> {
-    crate::resolve::check_unit_graph(sess, workspace, package, cargo_flags)
+/// `unify`: the provided crates' closures as the loader's build resolved them (resolve.rs Unify),
+/// whose features the graph's copies get; empty for a graph that binds none.
+pub fn unit_graph(sess: &std::sync::Arc<crate::Session>, workspace: &str, package: &str, cargo_flags: &[String], check: bool, unify: &[Unify]) -> Result<Units, String> {
+    crate::resolve::unit_graph_for(sess, workspace, package, cargo_flags, check, unify)
 }
 
 pub fn load(g: &Units, check_all_bins: bool, allow_c: bool) -> Result<Graph, String> {

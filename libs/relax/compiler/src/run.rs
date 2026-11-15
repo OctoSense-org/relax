@@ -411,7 +411,7 @@ fn hosted_program(sess: &std::sync::Arc<crate::Session>, args: &[String]) -> boo
             _ => flags.push(w.clone()),
         }
     }
-    let Ok(units) = unitgraph::unit_graph(sess, &workspace, &package, &flags) else { return false };
+    let Ok(units) = unitgraph::unit_graph(sess, &workspace, &package, &flags, false, &unify_for(sess, &package, false)) else { return false };
     let hal = units.units.iter().any(|u| unitgraph::window_host(&unitgraph::manifest_dir_of(&u.src_path)));
     *BOOT_UNITS.lock().unwrap() = Some((package, flags, units));
     hal
@@ -651,6 +651,33 @@ fn with_sysroot_proc_macro(mut units: unitgraph::Units, std_dir: &str) -> unitgr
     units
 }
 
+/// Whether a resolve of `package` binds the provided crates (host code built for the machine),
+/// and the one crate a test harness binds (Some: provided::HARNESS_BINDS). Only a program read
+/// for the machine binds: one read for another target (RELAX_CHECK_TARGET) has a different crate
+/// graph (makepad-script-std reaches makepad-windows-sys on Windows) and only type-checks, so
+/// every provided crate is read from source. `makepad check` runs none of the crates' code
+/// either, whatever source the loader was built from (an identity mismatch refused to check);
+/// its boundary audit (`check --boundary`) binds as a run does, since what it reports is what
+/// JIT-compiled code reaches past the bound ops. A test harness (`makepad test`) binds only the CPU budget: its crates are the tests'
+/// subject, built from their source as `cargo test` builds them, internals and all; the budget's
+/// own tests build it from source too.
+fn binds(sess: &std::sync::Arc<crate::Session>, package: &str, check_only: bool) -> (bool, Option<&'static str>) {
+    let machine = crate::cfg::CfgSet::machine(sess, &[]).triple();
+    let only = HARNESS_RUN.load(Ordering::Acquire).then_some(crate::provided::HARNESS_BINDS);
+    let bind = crate::cfg::CfgSet::host(sess, &[]).triple() == machine && (!check_only || crate::boundary::requested())
+        && only.is_none_or(|o| package.replace('-', "_") != o);
+    (bind, only)
+}
+
+/// The provided crates' closures whose features a resolve of `package` unifies with the loader's
+/// build: those it binds (`binds`), none for a resolve that binds nothing.
+pub(crate) fn unify_for(sess: &std::sync::Arc<crate::Session>, package: &str, check_only: bool) -> Vec<unitgraph::Unify> {
+    match binds(sess, package, check_only) {
+        (true, only) => crate::provided::unify_groups(only),
+        (false, _) => Vec::new(),
+    }
+}
+
 pub(crate) fn resolve_package(
     sess: &std::sync::Arc<crate::Session>,
     workspace: &str,
@@ -676,15 +703,23 @@ pub(crate) fn resolve_package(
     let pre = if boot {
         BOOT_UNITS.lock().unwrap().take()
     } else { None };
+    let unify = unify_for(sess, package, check_only);
     let units = if let Some((_, _, units)) = pre.filter(|(p, f, _)| units_json.is_empty() && p == package && f == cargo_flags) {
         Ok(units)
-    } else if units_json.is_empty() && check_only {
-        unitgraph::check_unit_graph(sess, workspace, package, cargo_flags)
     } else if units_json.is_empty() {
-        unitgraph::unit_graph(sess, workspace, package, cargo_flags)
+        unitgraph::unit_graph(sess, workspace, package, cargo_flags, check_only, &unify)
     } else {
         std::fs::read(units_json).map_err(|e| format!("{}: {}", units_json, e)).and_then(|d| unitgraph::Units::from_json(&d))
     }?;
+    // what the loader's features add to the program's own packages only adds code, as
+    // cargo's feature unification assumes of every feature
+    for u in &units.unified {
+        for f in &u.features {
+            if let Some(why) = crate::provided::non_additive_use(&u.dir, f) {
+                return Err(format!("{} {} is built into this JIT with its feature `{f}`, which the program's own build leaves off: the program would be built with it on, but `{f}` changes code that builds without it ({why}). Turn `{f}` on in the program's build, or build the JIT without it (tools/run/Cargo.toml)", u.name, u.version).into());
+            }
+        }
+    }
     let resolved_units = units.clone();
     let units = with_sysroot_proc_macro(units, std_dir);
     let t_load = Instant::now();
@@ -736,7 +771,7 @@ pub(crate) fn resolve_package(
     let t_inputs = Instant::now();
     let live_inputs = (watches && options.live).then(|| {
         let mut inputs = crate::reload::Inputs::collect(&g, std_dir, workspace);
-        inputs.set_graph(workspace, package, cargo_flags, &resolved_units);
+        inputs.set_graph(workspace, package, cargo_flags, &resolved_units, unify);
         inputs
     });
     let t_subst = Instant::now();
@@ -767,21 +802,8 @@ pub(crate) fn resolve_package(
     }
     {
         // The loader's provided crates are host code built for the machine: their shims bind
-        // only where the program is read for the machine too. A program read for another target
-        // (RELAX_CHECK_TARGET) has a different crate graph (makepad-script-std reaches
-        // makepad-windows-sys on Windows) and only type-checks: it never runs the crates' code,
-        // so nothing binds and every provided crate is read from source.
-        // `makepad check` runs none of it either: every provided crate is read from source,
-        // whatever source the loader was built from (an identity mismatch refused to check).
-        // The boundary audit (`check --boundary`) binds as a run does: what it reports is what
-        // JIT-compiled code reaches past the bound ops.
-        let machine = crate::cfg::CfgSet::machine(sess, &[]).triple();
-        // A test harness (`makepad test`) binds only the CPU budget (provided::HARNESS_BINDS): its
-        // crates are the tests' subject, built from their source as `cargo test` builds them,
-        // internals and all. The budget's own tests build it from source too.
-        let only = HARNESS_RUN.load(Ordering::Acquire).then_some(crate::provided::HARNESS_BINDS);
-        let bind = crate::cfg::CfgSet::host(sess, &[]).triple() == machine && (!check_only || crate::boundary::requested())
-            && only.is_none_or(|o| package.replace('-', "_") != o);
+        // where `binds` says, and their sources must be what the loader was built from.
+        let (bind, only) = binds(sess, package, check_only);
         // The sources are hashed while the build scripts run (and, for a run's boot, while the
         // program loads): they share nothing (the hash reads the provided packages, the scripts
         // write the graph's cfgs and env).
@@ -2337,6 +2359,8 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
             Err(crate::provided::SourceCheckError::Invalid(e)) => {
                 if crate::run_state::observed() { crate::run_state::diagnostic(None, crate::diag::from_legacy(&e, "resolve")); }
                 eprintln!("relax: {e}");
+                // a launcher following the start (--report-to) learns why it ended, as from the resolve
+                report_failed(&e, 1);
                 return 1;
             }
             Ok(()) => {}

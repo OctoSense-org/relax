@@ -241,7 +241,9 @@ fn landed_change(files: &[String]) -> Option<String> {
 
 pub(crate) fn offer_provided(change: crate::provided::ProvidedChange, domain: Option<u32>) {
     let _k = crate::zone_alloc::kept();
-    let mut message = format!("The JIT itself changed ({}) -- Restart to update", change.crate_name);
+    let mut message = format!("The JIT itself changed ({}", change.crate_name);
+    if !change.features.is_empty() { message.push_str(&format!("; {}", change.features.join("; "))); }
+    message.push_str(") -- Restart to update");
     if let Some(landed) = landed_change(&change.files) { message.push_str(&format!(" · {landed}")); }
     let paths = change.files.clone();
     let provided = Some(change.clone());
@@ -277,6 +279,7 @@ pub(crate) fn apply_at_boot(change: &crate::provided::ProvidedChange) -> i32 {
     let _k = crate::zone_alloc::kept();
     let mut what = format!("The JIT itself changed ({}: {}", change.crate_name, change.files.iter().take(3).map(String::as_str).collect::<Vec<_>>().join(", "));
     if change.files.len() > 3 { what.push_str(&format!(" and {} more", change.files.len() - 3)); }
+    if !change.features.is_empty() { what.push_str(&format!("; {}", change.features.join("; "))); }
     what.push(')');
     let failed = |e: String| -> i32 {
         let message = format!("{what}: {e}; the program did not run");

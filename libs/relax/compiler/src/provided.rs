@@ -177,10 +177,13 @@ static MATCHED: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
 /// A provided library changed on disk. These are source paths, including removed files, not
 /// a parsed diagnostic. They also identify the landing and the inputs of the loader rebuild.
+/// `features`: the closure's packages whose features differ too ([`features_line`]); a
+/// features-only difference is no change a rebuild applies, and check_manifest refuses it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProvidedChange {
     pub crate_name: String,
     pub files: Vec<String>,
+    pub features: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -200,16 +203,166 @@ fn check_manifest(name: &str, source: u64, manifest: &[u8], current: &crate::src
     let built = crate::srchash::reached_by(&crate::srchash::decode_manifest(manifest)?, current);
     if crate::srchash::diff_entries(&built, current).next().is_none() { return Ok(()); }
     let mut files = std::collections::BTreeSet::new();
-    for (package, path) in crate::srchash::diff_entries(&built, current) {
+    let mut features = Vec::new();
+    for key @ (package, path) in crate::srchash::diff_entries(&built, current) {
         let package = package.strip_prefix("host:").unwrap_or(package);
-        let Some((name, _version)) = package.rsplit_once('@') else { continue };
-        for pkg in pkgs.iter().filter(|p| p.name.replace('-', "_") == name) {
-            // A feature/version change has no file entry of its own. Watch its manifest too.
-            let path = if path.starts_with('\0') { "Cargo.toml" } else { path.as_str() };
+        let Some((pname, _version)) = package.rsplit_once('@') else { continue };
+        if path == "\0features" {
+            features.push(features_line(pname, built.get(key), current.get(key)));
+            continue;
+        }
+        for pkg in pkgs.iter().filter(|p| p.name.replace('-', "_") == pname) {
+            // a version edit changes the manifest; a feature turned on need not edit any file
+            let path = if path == "\0version" { "Cargo.toml" } else { path.as_str() };
             files.insert(crate::vfs::normalize_path(&std::path::Path::new(&pkg.dir).join(path).to_string_lossy()));
         }
     }
-    Err(SourceCheckError::Changed(ProvidedChange { crate_name: name.into(), files: files.into_iter().collect() }))
+    // The program's graph has the loader's features (run.rs unify_for), so what is left is a
+    // feature the program turns on that the loader's build does not: no rebuild of the same
+    // loader changes that, so it is no update to offer.
+    if files.is_empty() {
+        return Err(SourceCheckError::Invalid(format!("the program builds {name}'s closure with features this JIT was built without ({}): tools/run/Cargo.toml sets the JIT's", features.join("; "))));
+    }
+    Err(SourceCheckError::Changed(ProvidedChange { crate_name: name.into(), files: files.into_iter().collect(), features }))
+}
+
+/// One package's feature difference: `<name> features: <the loader's> -> <the program's>`, with
+/// `(none)` for none (`makepad_script_compute features: vm -> (none)`).
+fn features_line(name: &str, built: Option<&String>, current: Option<&String>) -> String {
+    let list = |v: Option<&String>| v.map(String::as_str).filter(|s| !s.is_empty()).unwrap_or("(none)").to_string();
+    format!("{name} features: {} -> {}", list(built), list(current))
+}
+
+/// Whether turning `feature` on in the package at `dir` only adds code: None, or the first use
+/// that changes code which builds without it ("<rel path>:<line>: `<the cfg text>` <why>").
+/// Unreadable or unlexable source is refused too, since its uses cannot be checked.
+pub fn non_additive_use(dir: &str, feature: &str) -> Option<String> {
+    use crate::lexer::{self, Tok, T};
+
+    fn group_end(toks: &[Tok], open: usize) -> Option<usize> {
+        let mut depth = 0;
+        for (i, t) in toks.iter().enumerate().skip(open) {
+            match t.kind {
+                T::OpenParen | T::OpenBracket | T::OpenBrace => depth += 1,
+                T::CloseParen | T::CloseBracket | T::CloseBrace => {
+                    depth -= 1;
+                    if depth == 0 { return Some(i); }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
+    // Top-level commas separate a cfg_attr predicate from its attributes, and the attributes
+    // from one another. Commas in any/all/derive belong to their own group.
+    fn parts(toks: &[Tok]) -> Vec<&[Tok]> {
+        let mut out = Vec::new();
+        let (mut start, mut i) = (0, 0);
+        while i < toks.len() {
+            match toks[i].kind {
+                T::OpenParen | T::OpenBracket | T::OpenBrace => i = group_end(toks, i).unwrap_or(toks.len()),
+                T::Comma => { out.push(&toks[start..i]); start = i + 1; }
+                _ => {}
+            }
+            i += 1;
+        }
+        if start < toks.len() { out.push(&toks[start..]); }
+        out
+    }
+
+    // (present, under not). Only literal values following the feature key count; token text
+    // in comments, doc comments and unrelated string literals never enters this scan.
+    fn predicate(src: &str, toks: &[Tok], feature: &str) -> (bool, bool) {
+        let mut found = false;
+        let mut not_depth = 0;
+        let mut groups = Vec::new();
+        for (i, t) in toks.iter().enumerate() {
+            match t.kind {
+                T::OpenParen => {
+                    let negated = i > 0 && toks[i - 1].text(src) == "not";
+                    groups.push(negated);
+                    if negated { not_depth += 1; }
+                }
+                T::CloseParen => { if groups.pop() == Some(true) { not_depth -= 1; } }
+                T::Ident | T::RawIdent if t.text(src).trim_start_matches("r#") == "feature" => {
+                    if toks.get(i + 1).is_some_and(|t| t.kind == T::Eq) {
+                        if let Some(value) = toks.get(i + 2).filter(|t| matches!(t.kind, T::Str | T::RawStr)) {
+                            if crate::lit::unescape_str(value.text(src)) == feature {
+                                found = true;
+                                if not_depth > 0 { return (true, true); }
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        (found, false)
+    }
+
+    fn attribute(src: &str, toks: &[Tok], feature: &str) -> Option<(u32, u32, &'static str)> {
+        if toks.get(1)?.kind != T::OpenParen { return None; }
+        let end = group_end(toks, 1)?;
+        let reason = |why| Some((toks[0].lo, toks[end].hi, why));
+        match toks[0].text(src) {
+            "cfg" => {
+                if predicate(src, &toks[2..end], feature).1 { return reason("turns code off when it is on"); }
+            }
+            "cfg_attr" => {
+                let args = parts(&toks[2..end]);
+                let (pred, attrs) = args.split_first()?;
+                let (found, negated) = predicate(src, pred, feature);
+                if negated { return reason("turns code off when it is on"); }
+                let derives_only = attrs.iter().all(|a| {
+                    a.first().is_some_and(|t| t.text(src) == "derive")
+                        && a.get(1).is_some_and(|t| t.kind == T::OpenParen)
+                        && group_end(a, 1) == Some(a.len() - 1)
+                });
+                if found && !derives_only { return reason("changes an item's attributes"); }
+                for attr in attrs {
+                    if let Some(found) = attribute(src, attr, feature) { return Some(found); }
+                }
+            }
+            _ => {}
+        }
+        None
+    }
+
+    let dir = std::path::Path::new(dir);
+    for (rel, _) in crate::srchash::identity_files(dir) {
+        if !rel.ends_with(".rs") { continue; }
+        let src = match crate::vfs::read_to_string(dir.join(&rel)) {
+            Ok(src) => src,
+            Err(e) => return Some(format!("{rel}:1: cannot read feature uses: {e}")),
+        };
+        let mut toks = Vec::new();
+        // The cfg syntax and literal tokens are edition-independent.
+        if let Err(e) = lexer::lex(src.as_bytes(), 2021, &mut toks) {
+            let (line, _) = lexer::line_col(src.as_bytes(), e.pos);
+            return Some(format!("{rel}:{line}: cannot lex feature uses: {}", e.msg));
+        }
+        toks.retain(|t| !t.kind.is_trivia());
+        for (i, t) in toks.iter().enumerate() {
+            let found = if t.kind == T::Pound {
+                let open = i + 1 + usize::from(toks.get(i + 1).is_some_and(|t| t.kind == T::Not));
+                if toks.get(open).is_none_or(|t| t.kind != T::OpenBracket) { continue; }
+                let Some(end) = group_end(&toks, open) else { continue };
+                attribute(&src, &toks[open + 1..end], feature)
+            } else if t.kind == T::Ident && t.text(&src) == "cfg"
+                && toks.get(i + 1).is_some_and(|t| t.kind == T::Not)
+                && toks.get(i + 2).is_some_and(|t| matches!(t.kind, T::OpenParen | T::OpenBracket | T::OpenBrace))
+            {
+                let Some(end) = group_end(&toks, i + 2) else { continue };
+                predicate(&src, &toks[i + 3..end], feature).0.then_some((t.lo, toks[end].hi, "switches code at run time"))
+            } else { None };
+            if let Some((lo, hi, why)) = found {
+                let (line, _) = lexer::line_col(src.as_bytes(), lo);
+                return Some(format!("{rel}:{line}: `{}` {why}", &src[lo as usize..hi as usize]));
+            }
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -240,15 +393,58 @@ mod source_tests {
         let Err(SourceCheckError::Changed(change)) = check_manifest("fixture", source, &encoded, &current, &pkgs) else { panic!("source edits must be an update offer") };
         assert_eq!(change.crate_name, "fixture");
         let mut expected: Vec<_> = (0..24).map(|i| format!("fixture/src/file{i}.rs")).collect();
-        expected.extend(["fixture/Cargo.toml".into(), "fixture/src/removed.rs".into(), "fixture/src/added.rs".into()]);
+        expected.extend(["fixture/src/removed.rs".into(), "fixture/src/added.rs".into()]);
         expected.sort();
-        assert_eq!(change.files, expected);
+        assert_eq!(change.files, expected, "a feature difference names no manifest");
+        assert_eq!(change.features, ["fixture_dep features: (none) -> enabled"]);
 
-        // A feature-only mismatch still needs an update; corrupt embedded data remains an error.
+        // A feature-only mismatch is no update a rebuild applies: refused, with the features and
+        // no file to rebuild from; a version change still watches the manifest; corrupt embedded
+        // data remains an error.
         let mut features = built.clone();
         features.insert(("fixture_dep@1".into(), "\0features".into()), "enabled".into());
-        assert_eq!(check_manifest("fixture", source, &encoded, &features, &pkgs), Err(SourceCheckError::Changed(ProvidedChange { crate_name: "fixture".into(), files: vec!["fixture/Cargo.toml".into()] })));
+        assert_eq!(check_manifest("fixture", source, &encoded, &features, &pkgs), Err(SourceCheckError::Invalid("the program builds fixture's closure with features this JIT was built without (fixture_dep features: (none) -> enabled): tools/run/Cargo.toml sets the JIT's".into())));
+        let mut version = built.clone();
+        version.insert(("fixture_dep@1".into(), "\0version".into()), "2".into());
+        assert_eq!(check_manifest("fixture", source, &encoded, &version, &pkgs), Err(SourceCheckError::Changed(ProvidedChange { crate_name: "fixture".into(), files: vec!["fixture/Cargo.toml".into()], features: vec![] })), "version changes still watch the manifest");
         assert!(matches!(check_manifest("fixture", source, &[1], &current, &pkgs), Err(SourceCheckError::Invalid(_))));
+    }
+
+    #[test]
+    fn feature_additivity_checks_cfg_tokens() {
+        struct Temp(std::path::PathBuf);
+        impl Drop for Temp { fn drop(&mut self) { std::fs::remove_dir_all(&self.0).unwrap(); } }
+        let dir = Temp(std::env::temp_dir().join(format!("relax-feature-uses-{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos())));
+        std::fs::create_dir_all(dir.0.join("src")).unwrap();
+        std::fs::write(dir.0.join("Cargo.toml"), "[package]\nname = 'fixture'\nversion = '1.0.0'\n[features]\nF = []\n").unwrap();
+        let path = dir.0.join("src/lib.rs");
+        let check = || non_additive_use(&dir.0.to_string_lossy(), "F");
+        std::fs::write(&path, r###"#[cfg(feature = "F")]
+fn added() {}
+struct Fields { #[cfg(all(unix, any(feature = "F", test)))] extra: u32 }
+fn statements() { #[cfg(feature = "F")] let _ = 1; }
+#[cfg_attr(feature = "F", derive(Debug, Clone), derive(Copy))]
+struct Derived;
+// #[cfg(not(feature = "F"))]
+/* cfg!(feature = "F") */
+/// #[cfg_attr(feature = "F", repr(C))]
+const TEXT: &str = r#"cfg!(feature = "F")"#;
+const ESCAPED: &str = "#[cfg(not(feature = \"F\"))]";
+#[cfg(not(feature = "other"))]
+fn other_feature() {}
+"###).unwrap();
+        assert_eq!(check(), None, "items, fields, statements and derives add code; comments and strings are inert");
+        for (form, cfg, why) in [
+            ("negated cfg", "cfg(not(feature = \"F\"))", "turns code off when it is on"),
+            ("nested negation", "cfg(all(unix, any(test, not(feature = \"F\"))))", "turns code off when it is on"),
+            ("cfg expression", "cfg!(all(unix, feature = \"F\"))", "switches code at run time"),
+            ("attribute predicate", "cfg_attr(any(test, feature = \"F\"), repr(C))", "changes an item's attributes"),
+            ("mixed attributes", "cfg_attr(feature = \"F\", derive(Debug), repr(C))", "changes an item's attributes"),
+        ] {
+            let body = if cfg.starts_with("cfg!") { format!("const FLAG: bool = {cfg};") } else { format!("#[{cfg}]\nstruct Item;") };
+            std::fs::write(&path, format!("// line one\n\n{body}\n")).unwrap();
+            assert_eq!(check(), Some(format!("src/lib.rs:3: `{cfg}` {why}")), "{form}");
+        }
     }
 
     #[test]
@@ -269,7 +465,7 @@ mod source_tests {
         let mut moved = [pkg("fixture", &[], vec![1]), pkg("fixture-phase", &[], vec![])];
         moved[1].version = "2".into();
         assert!(changed(check(&moved)), "another version of the dependency");
-        assert!(changed(check(&[pkg("fixture", &["other"], vec![])])), "a feature the identity keeps");
+        assert!(matches!(check(&[pkg("fixture", &["other"], vec![])]), Err(SourceCheckError::Invalid(m)) if m.contains("fixture features: (none) -> other")), "a feature the identity keeps: refused, no rebuild offered");
     }
 }
 
@@ -277,6 +473,39 @@ mod source_tests {
 /// the CPU budget is the process's one, and a copy built from source would admit the tests' pool
 /// beside the JIT, neither seeing the other.
 pub const HARNESS_BINDS: &str = "makepad_cpu_budget";
+
+/// The registered crates' closures as the loader's build resolved them (`only`: that crate's),
+/// for a resolve that binds them: the program's graph builds their packages with the loader's
+/// features (resolve.rs Unify), as cargo unifies a package's features across a workspace. Read
+/// from the embedded manifests once; the registry is complete before the first resolve.
+pub fn unify_groups(only: Option<&str>) -> Vec<crate::resolve::Unify> {
+    static GROUPS: std::sync::OnceLock<Vec<crate::resolve::Unify>> = std::sync::OnceLock::new();
+    let groups = GROUPS.get_or_init(|| {
+        let reg: Vec<(String, &'static [u8])> = REGISTRY.lock().unwrap_or_else(|e| e.into_inner()).iter().map(|p| (p.name.clone(), p.manifest)).collect();
+        let _k = crate::zone_alloc::kept();
+        reg.into_iter().filter_map(|(name, manifest)| {
+            // the manifest's (package, path, value) fields (srchash encode_manifest), read in
+            // place: only the packages' feature entries are kept, not every identity file's hash
+            let mut g = crate::resolve::Unify::default();
+            let mut b = manifest;
+            let mut field = || -> Option<&'static str> {
+                let n = usize::try_from(u64::from_le_bytes(b.get(..8)?.try_into().ok()?)).ok()?;
+                let s = std::str::from_utf8(b.get(8..8 + n)?).ok()?;
+                b = &b[8 + n..];
+                Some(s)
+            };
+            while let (Some(package), Some(path), Some(features)) = (field(), field(), field()) {
+                if path != "\0features" || package.starts_with("host:") { continue; }
+                let Some((pname, version)) = package.rsplit_once('@') else { continue };
+                let id = (pname.to_string(), version.to_string());
+                if pname == name { g.root = id.clone(); }
+                g.pkgs.push((id, features.split(", ").filter(|f| !f.is_empty()).map(str::to_string).collect()));
+            }
+            (!g.root.0.is_empty()).then_some(g)
+        }).collect()
+    });
+    groups.iter().filter(|g| only.is_none_or(|o| g.root.0 == o)).cloned().collect()
+}
 
 const IDENTITY_THREADS: usize = 4;
 

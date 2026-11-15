@@ -52,7 +52,7 @@
 //! (a cc/cmake build-dependency), unknown command-line flags.
 
 use crate::toml::{parse_toml, Toml, TomlTable};
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 /// One dependency entry of a manifest (a key may have several: normal + build + per platform).
 #[derive(Clone, Debug)]
@@ -1948,7 +1948,7 @@ fn cfg_holds(expr: &str, cfg: &crate::cfg::CfgSet) -> bool {
 
 /// One node of the feature resolution: a package on one side (host = build-dependency / proc
 /// macro side).
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct Node {
     features: BTreeSet<String>,
     /// optional dependency keys switched on
@@ -2367,6 +2367,67 @@ impl<'a> Feat<'a> {
         }
         Ok(())
     }
+
+    /// The program's resolution unified with the loader's build ([`Unify`]): every target-side
+    /// package of a provided crate's closure, once that crate's own target-side node is active,
+    /// gets the features the loader's build turned on, to a fixpoint (a feature can switch on a
+    /// dependency that reaches another provided crate). A feature the package's manifest no
+    /// longer defines is skipped, and a unification that does not resolve leaves the program's
+    /// own resolution as it was: either is a source change of the provided crate, which the
+    /// source check reports (relax-compiler provided.rs). Returns what was added to the packages
+    /// the program's own resolution reached.
+    fn unify(&mut self, unify: &[Unify]) -> Result<Vec<Unified>, String> {
+        if unify.is_empty() {
+            return Ok(Vec::new());
+        }
+        let before: HashMap<(usize, bool), BTreeSet<String>> = self.nodes.iter().filter(|(_, n)| n.active).map(|(k, n)| (*k, n.features.clone())).collect();
+        let saved = (self.nodes.clone(), self.order.clone());
+        let mut asked: HashSet<((usize, bool), String)> = HashSet::new();
+        let outcome = loop {
+            let ids: Vec<((usize, bool), (String, String))> = self.order.iter().filter(|k| !k.1).map(|k| {
+                let m = &self.r.manifests[k.0];
+                (*k, (m.name.replace('-', "_"), m.version.clone()))
+            }).collect();
+            let on: HashSet<&(String, String)> = ids.iter().map(|(_, id)| id).collect();
+            let mut want: HashMap<&(String, String), Vec<&String>> = HashMap::new();
+            for g in unify.iter().filter(|g| on.contains(&g.root)) {
+                for (p, fs) in &g.pkgs {
+                    want.entry(p).or_default().extend(fs);
+                }
+            }
+            for (k, id) in &ids {
+                let Some(fs) = want.get(id) else { continue };
+                let m = &self.r.manifests[k.0];
+                for f in fs {
+                    let defined = m.features.contains_key(*f) || (m.is_optional_dep(f) && !m.dep_syntax(f));
+                    if defined && asked.insert((*k, (*f).clone())) {
+                        self.work.push((*k, Req::Feature((*f).clone())));
+                    }
+                }
+            }
+            if self.work.is_empty() {
+                break Ok(());
+            }
+            if let Err(e) = self.run() {
+                break Err(e);
+            }
+        };
+        if outcome.is_err() {
+            self.work.clear();
+            (self.nodes, self.order) = saved;
+            return Ok(Vec::new());
+        }
+        let mut out = Vec::new();
+        for (k, had) in &before {
+            let added: Vec<String> = self.nodes[k].features.difference(had).cloned().collect();
+            if !added.is_empty() {
+                let m = &self.r.manifests[k.0];
+                out.push(Unified { name: m.name.clone(), version: m.version.clone(), dir: m.dir.clone(), host: k.1, features: added });
+            }
+        }
+        out.sort_by(|a, b| (&a.name, &a.version, a.host).cmp(&(&b.name, &b.version, b.host)));
+        Ok(out)
+    }
 }
 
 /// One unit of a unit graph: the fields of cargo's `--unit-graph` JSON unit that Relax reads.
@@ -2405,6 +2466,32 @@ pub struct Units {
     pub bins: Vec<String>,
     /// a build script's units: its parent confined its run, with these folders (`relax_script`)
     pub script: Option<ScriptFolders>,
+    /// what the loader's build added to the packages the program's own resolution reached
+    /// ([`Unify`]); empty for a graph resolved without it
+    pub unified: Vec<Unified>,
+}
+
+/// A provided crate's closure as the loader's own build resolved it: the JIT binds the crate to
+/// the loader's compiled copy, so the program's graph builds the closure's packages with the
+/// loader's features, as cargo unifies a package's features across a workspace with the program
+/// and the loader as members. The crate and each package are (name with `_` for `-`, version);
+/// the features are the loader's target-side ones, `host-shims` aside (srchash.rs).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Unify {
+    pub root: (String, String),
+    pub pkgs: Vec<((String, String), Vec<String>)>,
+}
+
+/// A package of the program's graph and the features [`Unify`] turned on in it that the program's
+/// own resolution left off. Only packages that resolution reached: one that only the added
+/// features bring in is code the program never had another build of.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Unified {
+    pub name: String,
+    pub version: String,
+    pub dir: String,
+    pub host: bool,
+    pub features: Vec<String>,
 }
 
 /// The folders of a confined build script's run, as its parent names them (relax-front
@@ -2466,7 +2553,7 @@ impl Units {
         }
         let roots = j.get("roots").map(|r| r.arr().iter().map(|x| x.num() as usize).collect()).unwrap_or_default();
         let script = j.get("relax_script").map(|r| ScriptFolders { read: list(r.get("read")), excluded: list(r.get("excluded")), cwd: s(r.get("cwd")) });
-        Ok(Units { units, roots, bins: Vec::new(), script })
+        Ok(Units { units, roots, bins: Vec::new(), script, unified: Vec::new() })
     }
 }
 
@@ -2727,15 +2814,22 @@ pub fn unit_graph(sess: &std::sync::Arc<crate::Session>, workspace: &str, packag
 
 /// `unit_graph` with git dependencies kept in `git` (tests: a private home and pin file).
 pub fn unit_graph_with(sess: &std::sync::Arc<crate::Session>, workspace: &str, package: &str, flags: &[String], git: GitPlaces) -> Result<Units, String> {
-    graph_of(sess, workspace, package, &parse_flags(flags)?, git)
+    graph_of(sess, workspace, package, &parse_flags(flags)?, git, &[])
+}
+
+/// A run's (`check`: `makepad check`'s) unit graph with the features of the provided crates'
+/// closures unified with the loader's build ([`Unify`]; empty: none).
+pub fn unit_graph_for(sess: &std::sync::Arc<crate::Session>, workspace: &str, package: &str, flags: &[String], check: bool, unify: &[Unify]) -> Result<Units, String> {
+    let o = if check { parse_check_flags(flags)? } else { parse_flags(flags)? };
+    graph_of(sess, workspace, package, &o, GitPlaces::run(), unify)
 }
 
 /// `makepad check`'s unit graph: its target flags are cargo check's (parse_check_flags).
 pub fn check_unit_graph(sess: &std::sync::Arc<crate::Session>, workspace: &str, package: &str, flags: &[String]) -> Result<Units, String> {
-    graph_of(sess, workspace, package, &parse_check_flags(flags)?, GitPlaces::run())
+    graph_of(sess, workspace, package, &parse_check_flags(flags)?, GitPlaces::run(), &[])
 }
 
-fn graph_of(sess: &std::sync::Arc<crate::Session>, workspace: &str, package: &str, o: &Options, git: GitPlaces) -> Result<Units, String> {
+fn graph_of(sess: &std::sync::Arc<crate::Session>, workspace: &str, package: &str, o: &Options, git: GitPlaces, unify: &[Unify]) -> Result<Units, String> {
     let mut r = Resolver::with(sess, workspace, git)?;
     r.offline |= o.offline;
     let root = r.find_member(package)?;
@@ -2747,8 +2841,11 @@ fn graph_of(sess: &std::sync::Arc<crate::Session>, workspace: &str, package: &st
     let m = &f.r.manifests[root];
     f.work.extend(feature_requests(&m.features, &m.implicit_features(), o).into_iter().map(|req| (rk, req)));
     f.run()?;
+    let unified = f.unify(unify)?;
     let (nodes, order) = (std::mem::take(&mut f.nodes), std::mem::take(&mut f.order));
-    emit(&r, &nodes, &order, root, o)
+    let mut units = emit(&r, &nodes, &order, root, o)?;
+    units.unified = unified;
+    Ok(units)
 }
 
 #[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -3083,7 +3180,7 @@ fn emit(r: &Resolver, nodes: &HashMap<(usize, bool), Node>, order: &[(usize, boo
                 if u.host { "host" } else { "target" }, u.name, u.mode, u.features.join(","), deps.join(","));
         }
     }
-    Ok(Units { units: out, roots, bins, script: None })
+    Ok(Units { units: out, roots, bins, script: None, unified: Vec::new() })
 }
 
 #[cfg(test)]
@@ -3350,6 +3447,49 @@ required-features = ["b", "manual"]
         let unknown = e(&["--example", "nope"]);
         assert!(unknown.contains("no example target named `nope`") && unknown.contains("smoke"), "{unknown}");
         assert!(e(&["--example", "smoke", "--bin", "app"]).contains("takes no other target flag"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The features of a provided crate's closure unified with the loader's build (Unify): a
+    /// program that builds the crate with fewer features gets the loader's, as cargo unifies a
+    /// workspace's, and what that added to its own packages is recorded for the additivity check.
+    #[test]
+    fn provided_closure_features_unify_with_the_loaders() {
+        let sess = &std::sync::Arc::new(crate::Session::default());
+        let root = tree("unify", &[
+            ("Cargo.toml", "[workspace]\nresolver = \"2\"\nmembers = [\"app\"]\n"),
+            ("app/Cargo.toml", "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[features]\nspare = []\n[dependencies]\nprov = { path = \"../prov\" }\n"),
+            ("app/src/lib.rs", ""),
+            ("prov/Cargo.toml", "[package]\nname = \"prov\"\nversion = \"1.0.0\"\nedition = \"2021\"\n[features]\ndefault = []\nwide = [\"dep:wide-dep\"]\nbroken = [\"nodep/x\"]\n[dependencies]\nwide-dep = { path = \"../wide-dep\", optional = true }\n"),
+            ("prov/src/lib.rs", ""),
+            ("wide-dep/Cargo.toml", "[package]\nname = \"wide-dep\"\nversion = \"1.0.0\"\nedition = \"2021\"\n[features]\nfast = []\n"),
+            ("wide-dep/src/lib.rs", ""),
+        ]);
+        let id = |n: &str, v: &str| (n.to_string(), v.to_string());
+        let feats = |fs: &[&str]| fs.iter().map(|f| f.to_string()).collect::<Vec<_>>();
+        let group = |fs: &[&str]| Unify { root: id("prov", "1.0.0"), pkgs: vec![
+            (id("prov", "1.0.0"), feats(fs)), (id("wide_dep", "1.0.0"), feats(&["fast"])), (id("gone", "1.0.0"), feats(&["x"])),
+        ] };
+        // a crate the program does not reach unifies nothing, even with a package it does reach
+        let absent = Unify { root: id("absent", "1.0.0"), pkgs: vec![(id("app", "0.1.0"), feats(&["spare"]))] };
+        let graph = |unify: &[Unify]| unit_graph_for(sess, &root, "app", &[], false, unify).unwrap_or_else(|e| panic!("{e}"));
+        let unit = |g: &Units, name: &str| g.units.iter().find(|u| u.name == name).map(|u| u.features.clone());
+        let plain = graph(&[]);
+        assert_eq!(unit(&plain, "prov"), Some(feats(&["default"])), "the program's own resolution");
+        assert!(unit(&plain, "wide_dep").is_none() && plain.unified.is_empty());
+
+        let g = graph(&[group(&["default", "wide", "retired"]), absent.clone()]);
+        assert_eq!(unit(&g, "prov"), Some(feats(&["default", "wide"])), "the loader's features, one the manifest no longer defines skipped");
+        assert_eq!(unit(&g, "wide_dep"), Some(feats(&["fast"])), "a dependency the added feature switches on gets the loader's features too");
+        assert_eq!(unit(&g, "app"), Some(Vec::new()), "a group whose crate the program does not reach changes nothing");
+        assert_eq!(g.unified.len(), 1, "only packages the program reached are recorded: {:?}", g.unified);
+        assert_eq!((g.unified[0].name.as_str(), g.unified[0].features.clone(), g.unified[0].host), ("prov", feats(&["wide"]), false));
+        assert!(g.unified[0].dir.ends_with("prov"), "{}", g.unified[0].dir);
+
+        // a unification that does not resolve (a source change of the provided crate, which the
+        // source check reports) leaves the program's own resolution
+        let g = graph(&[group(&["wide", "broken"])]);
+        assert_eq!((unit(&g, "prov"), unit(&g, "wide_dep"), g.unified.len()), (Some(feats(&["default"])), None, 0));
         let _ = std::fs::remove_dir_all(&root);
     }
 
