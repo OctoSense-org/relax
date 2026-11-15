@@ -212,7 +212,7 @@ fn check_with_scopes_fv(prog: &Program, tcx: &Tcx, body: &Body, regions: &MirReg
         move_errors: vec![], buffered_move_errors: vec![], buffered_mut_errors: vec![],
         fv: fv.map(|v| fv_hook::FvRun::new(v, body, &borrows)), fv_own: None,
         d3: relaxed_feature(prog, body, "disjoint-index"), d3_feeds: None, d3_taken: None, nested };
-    for b in cx.cfg.reverse_postorder.clone() {
+    for b in cx.cfg.dominators.reverse_postorder.clone() {
         let block = &body.basic_blocks[b];
         let block_id = BasicBlock(b as u32);
         if !results.borrows.is_reachable(block_id) { continue; }
@@ -1036,65 +1036,20 @@ fn last_projection(place: &Place) -> Option<(PlaceElem, Place)> {
     Some((elem.clone(), Place { local: place.local, projection: projection.to_vec() }))
 }
 
-/// Rebase Relax nll.rs::compute_dominators onto MIR; reuse its RPO/intersect
-/// algorithm and MIR's Visitor for edges. No second dataflow engine is introduced.
-struct CheckCfg { predecessors: Vec<Vec<BasicBlock>>, idom: Vec<usize>, reverse_postorder: Vec<usize> }
+struct CheckCfg { dominators: crate::mir::dominators::Dominators }
 impl CheckCfg {
     fn new(body: &Body) -> Self {
-        struct Edges(Vec<BasicBlock>);
-        impl Visitor for Edges { fn visit_target(&mut self, b: &BasicBlock, _: bool, _: Location) { self.0.push(*b); } }
-        let n = body.basic_blocks.len();
-        let mut successors = vec![vec![]; n];
-        let mut predecessors = vec![vec![]; n];
-        for (b, block) in body.basic_blocks.iter().enumerate() {
-            let mut edges = Edges(vec![]);
-            edges.visit_terminator(block.terminator.as_ref().unwrap(), Location { block: BasicBlock(b as u32), statement_index: block.statements.len() });
-            for &s in &edges.0 { predecessors[s.0 as usize].push(BasicBlock(b as u32)); }
-            successors[b] = edges.0;
-        }
-        let mut seen = BitSet::new_empty(n);
-        let mut stack = vec![(0, false)];
-        let mut order = vec![];
-        while let Some((b, finish)) = stack.pop() {
-            if finish { order.push(b); continue; }
-            if !seen.insert(b) { continue; }
-            stack.push((b, true));
-            // nightly Postorder consumes successors with next_back().
-            for s in &successors[b] { stack.push((s.0 as usize, false)); }
-        }
-        order.reverse();
-        let mut rank = vec![usize::MAX; n];
-        for (i, &b) in order.iter().enumerate() { rank[b] = i; }
-        let mut idom = vec![usize::MAX; n]; idom[0] = 0;
-        loop {
-            let mut changed = false;
-            for &b in order.iter().skip(1) {
-                let mut new = usize::MAX;
-                for p in predecessors[b].iter().map(|p| p.0 as usize).filter(|&p| idom[p] != usize::MAX) {
-                    if new == usize::MAX { new = p; continue; }
-                    let mut p = p;
-                    while p != new { if rank[p] > rank[new] { p = idom[p]; } else { new = idom[new]; } }
-                }
-                if new != usize::MAX && new != idom[b] { idom[b] = new; changed = true; }
-            }
-            if !changed { break; }
-        }
-        Self { predecessors, idom, reverse_postorder: order }
+        Self { dominators: crate::mir::dominators::Dominators::new(body) }
     }
     fn dominates(&self, a: BasicBlock, b: BasicBlock) -> bool {
-        let mut b = b.0 as usize;
-        loop {
-            if b == a.0 as usize { return true; }
-            let parent = self.idom[b];
-            if parent == usize::MAX || parent == b { return false; } b = parent;
-        }
+        self.dominators.dominates(a, b)
     }
     fn location_dominates(&self, a: Location, b: Location) -> bool {
         if a.block == b.block { a.statement_index <= b.statement_index } else { self.dominates(a.block, b.block) }
     }
     fn predecessor_locations(&self, body: &Body, at: Location) -> Vec<Location> {
         if at.statement_index > 0 { return vec![Location { statement_index: at.statement_index - 1, ..at }]; }
-        self.predecessors[at.block.0 as usize].iter().map(|&block| Location {
+        self.dominators.predecessors[at.block.0 as usize].iter().map(|&block| Location {
             block, statement_index: body.basic_blocks[block.0 as usize].statements.len(),
         }).collect()
     }

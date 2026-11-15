@@ -2,6 +2,7 @@
 //! M0 defines the representation only; producers and consumers migrate in later steps.
 
 pub mod dataflow;
+pub(crate) mod dominators;
 pub mod drop_flag_effects;
 pub mod move_paths;
 pub mod build;

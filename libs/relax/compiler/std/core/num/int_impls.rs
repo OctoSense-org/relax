@@ -48,8 +48,8 @@ impl u8 {
         while exp > 1 { if (exp & 1) == 1 { let r = acc.overflowing_mul(base); acc = r.0; over |= r.1; } exp /= 2; let r = base.overflowing_mul(base); base = r.0; over |= r.1; }
         let r = acc.overflowing_mul(base); (r.0, over | r.1)
     }
-    pub const fn wrapping_add(self, rhs: u8) -> u8 { self.overflowing_add(rhs).0 }
-    pub const fn wrapping_sub(self, rhs: u8) -> u8 { self.overflowing_sub(rhs).0 }
+    pub const fn wrapping_add(self, rhs: u8) -> u8 { self + rhs }
+    pub const fn wrapping_sub(self, rhs: u8) -> u8 { self - rhs }
     pub const fn wrapping_mul(self, rhs: u8) -> u8 { self * rhs }
     pub const fn wrapping_neg(self) -> u8 { self.overflowing_neg().0 }
     pub const fn wrapping_div(self, rhs: u8) -> u8 { self.overflowing_div(rhs).0 }
@@ -170,8 +170,8 @@ impl u16 {
         while exp > 1 { if (exp & 1) == 1 { let r = acc.overflowing_mul(base); acc = r.0; over |= r.1; } exp /= 2; let r = base.overflowing_mul(base); base = r.0; over |= r.1; }
         let r = acc.overflowing_mul(base); (r.0, over | r.1)
     }
-    pub const fn wrapping_add(self, rhs: u16) -> u16 { self.overflowing_add(rhs).0 }
-    pub const fn wrapping_sub(self, rhs: u16) -> u16 { self.overflowing_sub(rhs).0 }
+    pub const fn wrapping_add(self, rhs: u16) -> u16 { self + rhs }
+    pub const fn wrapping_sub(self, rhs: u16) -> u16 { self - rhs }
     pub const fn wrapping_mul(self, rhs: u16) -> u16 { self * rhs }
     pub const fn wrapping_neg(self) -> u16 { self.overflowing_neg().0 }
     pub const fn wrapping_div(self, rhs: u16) -> u16 { self.overflowing_div(rhs).0 }
@@ -292,8 +292,8 @@ impl u32 {
         while exp > 1 { if (exp & 1) == 1 { let r = acc.overflowing_mul(base); acc = r.0; over |= r.1; } exp /= 2; let r = base.overflowing_mul(base); base = r.0; over |= r.1; }
         let r = acc.overflowing_mul(base); (r.0, over | r.1)
     }
-    pub const fn wrapping_add(self, rhs: u32) -> u32 { self.overflowing_add(rhs).0 }
-    pub const fn wrapping_sub(self, rhs: u32) -> u32 { self.overflowing_sub(rhs).0 }
+    pub const fn wrapping_add(self, rhs: u32) -> u32 { self + rhs }
+    pub const fn wrapping_sub(self, rhs: u32) -> u32 { self - rhs }
     pub const fn wrapping_mul(self, rhs: u32) -> u32 { self * rhs }
     pub const fn wrapping_neg(self) -> u32 { self.overflowing_neg().0 }
     pub const fn wrapping_div(self, rhs: u32) -> u32 { self.overflowing_div(rhs).0 }
@@ -414,8 +414,8 @@ impl u64 {
         while exp > 1 { if (exp & 1) == 1 { let r = acc.overflowing_mul(base); acc = r.0; over |= r.1; } exp /= 2; let r = base.overflowing_mul(base); base = r.0; over |= r.1; }
         let r = acc.overflowing_mul(base); (r.0, over | r.1)
     }
-    pub const fn wrapping_add(self, rhs: u64) -> u64 { self.overflowing_add(rhs).0 }
-    pub const fn wrapping_sub(self, rhs: u64) -> u64 { self.overflowing_sub(rhs).0 }
+    pub const fn wrapping_add(self, rhs: u64) -> u64 { self + rhs }
+    pub const fn wrapping_sub(self, rhs: u64) -> u64 { self - rhs }
     pub const fn wrapping_mul(self, rhs: u64) -> u64 { self * rhs }
     pub const fn wrapping_neg(self) -> u64 { self.overflowing_neg().0 }
     pub const fn wrapping_div(self, rhs: u64) -> u64 { self.overflowing_div(rhs).0 }
@@ -550,8 +550,8 @@ impl u128 {
         while exp > 1 { if (exp & 1) == 1 { let r = acc.overflowing_mul(base); acc = r.0; over |= r.1; } exp /= 2; let r = base.overflowing_mul(base); base = r.0; over |= r.1; }
         let r = acc.overflowing_mul(base); (r.0, over | r.1)
     }
-    pub const fn wrapping_add(self, rhs: u128) -> u128 { self.overflowing_add(rhs).0 }
-    pub const fn wrapping_sub(self, rhs: u128) -> u128 { self.overflowing_sub(rhs).0 }
+    pub const fn wrapping_add(self, rhs: u128) -> u128 { self + rhs }
+    pub const fn wrapping_sub(self, rhs: u128) -> u128 { self - rhs }
     pub const fn wrapping_mul(self, rhs: u128) -> u128 { self * rhs }
     pub const fn wrapping_neg(self) -> u128 { self.overflowing_neg().0 }
     pub const fn wrapping_div(self, rhs: u128) -> u128 { self.overflowing_div(rhs).0 }
@@ -673,8 +673,8 @@ impl usize {
         while exp > 1 { if (exp & 1) == 1 { let r = acc.overflowing_mul(base); acc = r.0; over |= r.1; } exp /= 2; let r = base.overflowing_mul(base); base = r.0; over |= r.1; }
         let r = acc.overflowing_mul(base); (r.0, over | r.1)
     }
-    pub const fn wrapping_add(self, rhs: usize) -> usize { self.overflowing_add(rhs).0 }
-    pub const fn wrapping_sub(self, rhs: usize) -> usize { self.overflowing_sub(rhs).0 }
+    pub const fn wrapping_add(self, rhs: usize) -> usize { self + rhs }
+    pub const fn wrapping_sub(self, rhs: usize) -> usize { self - rhs }
     pub const fn wrapping_mul(self, rhs: usize) -> usize { self * rhs }
     pub const fn wrapping_neg(self) -> usize { self.overflowing_neg().0 }
     pub const fn wrapping_div(self, rhs: usize) -> usize { self.overflowing_div(rhs).0 }
@@ -796,8 +796,8 @@ impl usize {
         while exp > 1 { if (exp & 1) == 1 { let r = acc.overflowing_mul(base); acc = r.0; over |= r.1; } exp /= 2; let r = base.overflowing_mul(base); base = r.0; over |= r.1; }
         let r = acc.overflowing_mul(base); (r.0, over | r.1)
     }
-    pub const fn wrapping_add(self, rhs: usize) -> usize { self.overflowing_add(rhs).0 }
-    pub const fn wrapping_sub(self, rhs: usize) -> usize { self.overflowing_sub(rhs).0 }
+    pub const fn wrapping_add(self, rhs: usize) -> usize { self + rhs }
+    pub const fn wrapping_sub(self, rhs: usize) -> usize { self - rhs }
     pub const fn wrapping_mul(self, rhs: usize) -> usize { self * rhs }
     pub const fn wrapping_neg(self) -> usize { self.overflowing_neg().0 }
     pub const fn wrapping_div(self, rhs: usize) -> usize { self.overflowing_div(rhs).0 }
@@ -919,8 +919,8 @@ impl i8 {
         while exp > 1 { if (exp & 1) == 1 { let r = acc.overflowing_mul(base); acc = r.0; over |= r.1; } exp /= 2; let r = base.overflowing_mul(base); base = r.0; over |= r.1; }
         let r = acc.overflowing_mul(base); (r.0, over | r.1)
     }
-    pub const fn wrapping_add(self, rhs: i8) -> i8 { self.overflowing_add(rhs).0 }
-    pub const fn wrapping_sub(self, rhs: i8) -> i8 { self.overflowing_sub(rhs).0 }
+    pub const fn wrapping_add(self, rhs: i8) -> i8 { self + rhs }
+    pub const fn wrapping_sub(self, rhs: i8) -> i8 { self - rhs }
     pub const fn wrapping_mul(self, rhs: i8) -> i8 { self * rhs }
     pub const fn wrapping_neg(self) -> i8 { self.overflowing_neg().0 }
     pub const fn wrapping_div(self, rhs: i8) -> i8 { self.overflowing_div(rhs).0 }
@@ -1043,8 +1043,8 @@ impl i16 {
         while exp > 1 { if (exp & 1) == 1 { let r = acc.overflowing_mul(base); acc = r.0; over |= r.1; } exp /= 2; let r = base.overflowing_mul(base); base = r.0; over |= r.1; }
         let r = acc.overflowing_mul(base); (r.0, over | r.1)
     }
-    pub const fn wrapping_add(self, rhs: i16) -> i16 { self.overflowing_add(rhs).0 }
-    pub const fn wrapping_sub(self, rhs: i16) -> i16 { self.overflowing_sub(rhs).0 }
+    pub const fn wrapping_add(self, rhs: i16) -> i16 { self + rhs }
+    pub const fn wrapping_sub(self, rhs: i16) -> i16 { self - rhs }
     pub const fn wrapping_mul(self, rhs: i16) -> i16 { self * rhs }
     pub const fn wrapping_neg(self) -> i16 { self.overflowing_neg().0 }
     pub const fn wrapping_div(self, rhs: i16) -> i16 { self.overflowing_div(rhs).0 }
@@ -1167,8 +1167,8 @@ impl i32 {
         while exp > 1 { if (exp & 1) == 1 { let r = acc.overflowing_mul(base); acc = r.0; over |= r.1; } exp /= 2; let r = base.overflowing_mul(base); base = r.0; over |= r.1; }
         let r = acc.overflowing_mul(base); (r.0, over | r.1)
     }
-    pub const fn wrapping_add(self, rhs: i32) -> i32 { self.overflowing_add(rhs).0 }
-    pub const fn wrapping_sub(self, rhs: i32) -> i32 { self.overflowing_sub(rhs).0 }
+    pub const fn wrapping_add(self, rhs: i32) -> i32 { self + rhs }
+    pub const fn wrapping_sub(self, rhs: i32) -> i32 { self - rhs }
     pub const fn wrapping_mul(self, rhs: i32) -> i32 { self * rhs }
     pub const fn wrapping_neg(self) -> i32 { self.overflowing_neg().0 }
     pub const fn wrapping_div(self, rhs: i32) -> i32 { self.overflowing_div(rhs).0 }
@@ -1294,8 +1294,8 @@ impl i64 {
         while exp > 1 { if (exp & 1) == 1 { let r = acc.overflowing_mul(base); acc = r.0; over |= r.1; } exp /= 2; let r = base.overflowing_mul(base); base = r.0; over |= r.1; }
         let r = acc.overflowing_mul(base); (r.0, over | r.1)
     }
-    pub const fn wrapping_add(self, rhs: i64) -> i64 { self.overflowing_add(rhs).0 }
-    pub const fn wrapping_sub(self, rhs: i64) -> i64 { self.overflowing_sub(rhs).0 }
+    pub const fn wrapping_add(self, rhs: i64) -> i64 { self + rhs }
+    pub const fn wrapping_sub(self, rhs: i64) -> i64 { self - rhs }
     pub const fn wrapping_mul(self, rhs: i64) -> i64 { self * rhs }
     pub const fn wrapping_neg(self) -> i64 { self.overflowing_neg().0 }
     pub const fn wrapping_div(self, rhs: i64) -> i64 { self.overflowing_div(rhs).0 }
@@ -1427,8 +1427,8 @@ impl i128 {
         while exp > 1 { if (exp & 1) == 1 { let r = acc.overflowing_mul(base); acc = r.0; over |= r.1; } exp /= 2; let r = base.overflowing_mul(base); base = r.0; over |= r.1; }
         let r = acc.overflowing_mul(base); (r.0, over | r.1)
     }
-    pub const fn wrapping_add(self, rhs: i128) -> i128 { self.overflowing_add(rhs).0 }
-    pub const fn wrapping_sub(self, rhs: i128) -> i128 { self.overflowing_sub(rhs).0 }
+    pub const fn wrapping_add(self, rhs: i128) -> i128 { self + rhs }
+    pub const fn wrapping_sub(self, rhs: i128) -> i128 { self - rhs }
     pub const fn wrapping_mul(self, rhs: i128) -> i128 { self * rhs }
     pub const fn wrapping_neg(self) -> i128 { self.overflowing_neg().0 }
     pub const fn wrapping_div(self, rhs: i128) -> i128 { self.overflowing_div(rhs).0 }
@@ -1555,8 +1555,8 @@ impl isize {
         while exp > 1 { if (exp & 1) == 1 { let r = acc.overflowing_mul(base); acc = r.0; over |= r.1; } exp /= 2; let r = base.overflowing_mul(base); base = r.0; over |= r.1; }
         let r = acc.overflowing_mul(base); (r.0, over | r.1)
     }
-    pub const fn wrapping_add(self, rhs: isize) -> isize { self.overflowing_add(rhs).0 }
-    pub const fn wrapping_sub(self, rhs: isize) -> isize { self.overflowing_sub(rhs).0 }
+    pub const fn wrapping_add(self, rhs: isize) -> isize { self + rhs }
+    pub const fn wrapping_sub(self, rhs: isize) -> isize { self - rhs }
     pub const fn wrapping_mul(self, rhs: isize) -> isize { self * rhs }
     pub const fn wrapping_neg(self) -> isize { self.overflowing_neg().0 }
     pub const fn wrapping_div(self, rhs: isize) -> isize { self.overflowing_div(rhs).0 }
@@ -1680,8 +1680,8 @@ impl isize {
         while exp > 1 { if (exp & 1) == 1 { let r = acc.overflowing_mul(base); acc = r.0; over |= r.1; } exp /= 2; let r = base.overflowing_mul(base); base = r.0; over |= r.1; }
         let r = acc.overflowing_mul(base); (r.0, over | r.1)
     }
-    pub const fn wrapping_add(self, rhs: isize) -> isize { self.overflowing_add(rhs).0 }
-    pub const fn wrapping_sub(self, rhs: isize) -> isize { self.overflowing_sub(rhs).0 }
+    pub const fn wrapping_add(self, rhs: isize) -> isize { self + rhs }
+    pub const fn wrapping_sub(self, rhs: isize) -> isize { self - rhs }
     pub const fn wrapping_mul(self, rhs: isize) -> isize { self * rhs }
     pub const fn wrapping_neg(self) -> isize { self.overflowing_neg().0 }
     pub const fn wrapping_div(self, rhs: isize) -> isize { self.overflowing_div(rhs).0 }

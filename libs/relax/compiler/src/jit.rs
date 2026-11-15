@@ -499,7 +499,7 @@ pub struct Unit {
     pub const_failed: std::collections::HashSet<(DefId, Vec<TyId>)>,
     /// `makepad check` (eval_items): the check-mode interpreter's verdicts on the checked crates'
     /// constants and statics, computed ahead on the pool; check_initializer takes each
-    pub interp_ahead: std::collections::HashMap<DefId, relax_types::const_eval::interp::Outcome>,
+    pub interp_ahead: std::collections::HashMap<DefId, relax_types::const_eval::interp::Checked>,
     pub core_path_cache: crate::conc::MemoMap<String, Option<DefId>>,
     /// `T: Unpin` answers (noalias on `&mut T` params needs it)
     unpin_cache: crate::conc::MemoMap<TyId, bool>,
@@ -8200,8 +8200,19 @@ impl Unit {
         use relax_types::const_eval::interp::{check_item, Outcome};
         let def = self.prog.def(d);
         if !self.prog.crates[def.krate as usize].validate || !matches!(def.kind, DefKind::Const | DefKind::Static | DefKind::AnonConst) { return true; }
-        let outcome = match self.interp_ahead.remove(&d) { Some(o) => o, None => check_item(&self.prog, &self.tcx, d) };
-        match outcome {
+        let checked = match self.interp_ahead.remove(&d) { Some(o) => o, None => check_item(&self.prog, &self.tcx, d) };
+        // its long_running_const_eval lint and progress warnings, in the order the evaluation met them
+        for r in &checked.long_running {
+            use relax_types::const_eval::interp::{LongRunning, LONG_RUNNING_MESSAGE};
+            let lint = &relax_types::lint::LONG_RUNNING_CONST_EVAL;
+            match r {
+                LongRunning::Lint { span, scope } => relax_types::lint::emit_scoped(&self.prog, *scope, lint, span.file, span.lo, LONG_RUNNING_MESSAGE),
+                LongRunning::Progress { span } => relax_types::lint::progress_warning(&self.prog, d, lint, span.file, span.lo, LONG_RUNNING_MESSAGE),
+            }
+        }
+        match checked.outcome {
+            // the deny-level lint, reported above: no value, as rustc stops there
+            Outcome::LongRunning => false,
             Outcome::Error(span, msg) => {
                 let e = if msg.starts_with('E') { self.prog.record_error(span.file, span.lo, "typeck", msg) } else { self.prog.record_uncoded_error(span.file, span.lo, "typeck", msg) };
                 self.errors.push(e);

@@ -1051,7 +1051,7 @@ pub(crate) fn live_lints(prog: &crate::program::Program, tcx: &crate::tcx::Tcx, 
         .map(|r| {
             let stage = crate::check_order::stage_of_lint(r.lint, r.def);
             // (a body's liveness lints keep the order its analysis reports them in, as the check's)
-            let seq = if stage.phase == crate::check_order::Phase::Mir && stage.step == crate::check_order::MIR_LIVENESS { r.seq } else { 0 };
+            let seq = if crate::check_order::keeps_report_order(stage, r.lint) { r.seq } else { 0 };
             Entry::new(stage, seq, if r.level >= relax_types::lint::Level::Deny { Out::Error(r.line) } else { Out::Warning(r.line) })
         })
         .collect();
@@ -1667,7 +1667,7 @@ fn check_crate_impl(u: &mut Unit, root: u32, crates: &[u32], front: Vec<String>,
         if !late_ok && late { continue; }
         let stage = if r.lint.is_empty() { Stage::new(Phase::Attrs, 0) } else { crate::check_order::stage_of_lint(r.lint, r.def) };
         // (a body's liveness lints keep the order its analysis reports them in: rustc's)
-        let seq = if stage.phase == Phase::Mir && stage.step == crate::check_order::MIR_LIVENESS { r.seq } else { 0 };
+        let seq = if crate::check_order::keeps_report_order(stage, r.lint) { r.seq } else { 0 };
         entries.push(Entry::new(stage, seq, if r.level >= relax_types::lint::Level::Deny { Out::Error(r.line) } else { Out::Warning(r.line) }));
         flags.push(if late { crate::check_reuse::LATE } else { 0 } | if wf_reports.contains(&i) { crate::check_reuse::WF } else { 0 });
     }

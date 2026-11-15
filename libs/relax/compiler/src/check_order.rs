@@ -30,6 +30,14 @@ pub(crate) const MIR_PROMOTED: u8 = 2;
 pub(crate) const MIR_UNUSED_MUT: u8 = 3;
 pub(crate) const MIR_BORROWCK: u8 = 4;
 pub(crate) const MIR_LIVENESS: u8 = 5;
+
+/// Whether a lint's reports at one place keep the order they were reported in: a body's liveness
+/// lints (the analysis's order), and a constant's long_running_const_eval lint and progress
+/// warnings (the order rustc's evaluation meets them, const_eval machine.rs
+/// increment_const_eval_counter).
+pub(crate) fn keeps_report_order(stage: Stage, lint: &str) -> bool {
+    (stage.phase == Phase::Mir && stage.step == MIR_LIVENESS) || lint == "long_running_const_eval"
+}
 /// The steps of misc_checking_3: check_private_in_public, check_mod_deathness, the late lint
 /// pass, clashing_extern_declarations, check_mod_privacy, check_expectations.
 pub(crate) const LATE_PRIVATE_IN_PUBLIC: u8 = 0;

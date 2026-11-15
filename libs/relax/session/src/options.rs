@@ -361,6 +361,10 @@ pub struct Options {
     /// so one that never ends is rustc's `long_running_const_eval` error (the interpreter's
     /// terminator limit) instead of a hang. Changes the compiled code.
     pub const_fuel: bool,
+    /// `RELAX_TINY_CONST_EVAL_LIMIT=1`: rustc's `-Z tiny-const-eval-limit`, a constant's evaluation
+    /// reaches `long_running_const_eval` after 20 steps instead of 2,000,000, and the progress
+    /// warnings start there (tests of the boundary). Changes no compiled code.
+    pub tiny_const_eval_limit: bool,
     /// A check of a build (internal: `RELAX_CHECK_BUILD=1`, the rustc UI suite's build-fail
     /// cases): after the analyses, rustc's monomorphization collector reduced to its constants and
     /// its recursion limit runs too (check.rs mono_check), as rustc's codegen reports them. `makepad
@@ -459,6 +463,7 @@ impl Default for Options {
             web_threads: WebThreads::Off,
             ctfe: Ctfe::On,
             const_fuel: false,
+            tiny_const_eval_limit: false,
             post_mono: false,
             ra_quick_coalesce: false,
             nan_exact: false,
@@ -564,6 +569,7 @@ impl Options {
             check_target: { let os = get("RELAX_CHECK_TARGET"); let v = os.and_then(|v| v.into_string().ok()); CheckTarget::from_triple(v.as_deref().unwrap_or("")).unwrap_or(CheckTarget::Host) },
             web_threads: if get("RELAX_WEB_THREADS").as_deref() == Some(std::ffi::OsStr::new("1")) { WebThreads::On } else { WebThreads::Off },
             const_fuel: false,
+            tiny_const_eval_limit: get("RELAX_TINY_CONST_EVAL_LIMIT").as_deref() == Some(std::ffi::OsStr::new("1")),
             post_mono: false,
             ctfe: { let os = get("RELAX_CTFE"); let v = os.and_then(|v| v.into_string().ok()); match v.as_deref() { Some("0") => Ctfe::Off, Some("check") => Ctfe::Check, _ => Ctfe::On } },
             ra_quick_coalesce: false,
@@ -657,6 +663,8 @@ impl Options {
             web_threads,
             ctfe,
             const_fuel,
+            // (no compiled code depends on it; a check's verdicts are keyed by every RELAX_* variable)
+            tiny_const_eval_limit: _,
             // (no compiled code depends on it; a check's verdicts are keyed by RELAX_CHECK_BUILD)
             post_mono: _,
             ra_quick_coalesce,

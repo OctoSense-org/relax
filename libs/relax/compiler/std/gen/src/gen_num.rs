@@ -331,9 +331,11 @@ fn gen_int(o: &mut String, t: &Int) {
     let _ = writeln!(o, "        let r = acc.overflowing_mul(base); (r.0, over | r.1)\n    }}");
     // wrapping family
     for op in ["add", "sub", "mul", "neg", "div", "rem", "pow"] {
-        if op == "mul" {
-            // Relax integer operators wrap; do not compute an unused overflow flag.
-            let _ = writeln!(o, "    pub const fn wrapping_mul(self, rhs: {n}) -> {n} {{ self * rhs }}");
+        if let Some(sym) = match op { "add" => Some('+'), "sub" => Some('-'), "mul" => Some('*'), _ => None } {
+            // Relax integer operators wrap; do not compute an unused overflow flag. No call, as
+            // rustc's bodies call intrinsics::wrapping_{add,sub,mul}, which its MIR lowers to the
+            // operator: a constant's long_running_const_eval steps are rustc's.
+            let _ = writeln!(o, "    pub const fn wrapping_{op}(self, rhs: {n}) -> {n} {{ self {sym} rhs }}");
             continue;
         }
         let (args, call) = match op {
