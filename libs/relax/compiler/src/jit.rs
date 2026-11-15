@@ -23934,7 +23934,7 @@ pub(crate) fn live_edits_open() -> bool {
 fn headless_started() {
     if !FIRST_PRESENT.load(Ordering::Acquire) && live_startup_done() {
         let _ = QUIET_START_NS.compare_exchange(0, wall_ns().max(1), Ordering::AcqRel, Ordering::Relaxed);
-        crate::cache::start_deferred_front();
+        crate::cache::start_deferred_front("a quiet start");
     }
 }
 
@@ -23976,6 +23976,17 @@ pub(crate) fn quiet_left(from: u64) -> u64 {
         return STARTUP_QUIET_NS;
     }
     STARTUP_QUIET_NS.saturating_sub(wall_ns().saturating_sub(DEMAND_LAST.load(Ordering::SeqCst).max(from)))
+}
+
+/// A live test session's first pass is done (harness_live::complete), its present: the boot's
+/// deferred records are written from here when no demand compile is in flight, as an app's are
+/// after its first present. A session ends by a signal, which no exit writer survives, and its
+/// quiet start (headless_started) came only once it had sat idle long enough. With a compile
+/// still in flight the quiet start writes them.
+pub(crate) fn first_test_pass_done() {
+    if DEMAND_COMPILES.load(Ordering::SeqCst) == 0 {
+        crate::cache::start_deferred_front("the first test pass");
+    }
 }
 
 /// The program links the platform and its main went quiet without starting an app
@@ -24088,7 +24099,7 @@ pub extern "C" fn relax_first_present() {
             }
             relax_codegen::warm::first_present();
             // the boot's crate records and front graph (cold front end: queued, not written, at load)
-            crate::cache::start_deferred_front();
+            crate::cache::start_deferred_front("the first present");
             if let Some(t) = STARTUP_THREAD.get() {
                 t.unpark();
             }

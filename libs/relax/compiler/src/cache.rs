@@ -6909,16 +6909,18 @@ struct DeferredFront {
 static DEFERRED_FRONT: relax_session::sync::Mutex<Vec<DeferredFront>> = relax_session::sync::Mutex::new(Vec::new());
 
 /// Starts the writer of the boot's deferred records and graph on its own thread (low priority). Called
-/// at the first present; anything not started by then is written by the mid-run writer or the exit.
-pub fn start_deferred_front() {
+/// at the point a present marks (`after`: an app's first present, a check's load, a live test
+/// session's first pass, the quiet start of a program that never presents); anything not started
+/// by then is written by the mid-run writer or the exit.
+pub fn start_deferred_front(after: &'static str) {
     if DEFERRED_FRONT.lock().unwrap().is_empty() { return; }
     let _k = crate::zone_alloc::kept();
-    let _ = crate::run_threads::spawn("run-front-graph", || { let _z = crate::zone_alloc::compiler_thread();
+    let _ = crate::run_threads::spawn("run-front-graph", move || { let _z = crate::zone_alloc::compiler_thread();
         makepad_cpu_budget::set_thread_class(makepad_cpu_budget::BACKGROUND);
         let t = std::time::Instant::now();
         let r = flush_front_graphs();
         if crate::preload::trace() {
-            eprintln!("relax front: records and graph written after the first present: {:?} in {:.1} ms (t={:.0} ms)", r, t.elapsed().as_secs_f64() * 1e3, crate::clock::ms_since_start());
+            eprintln!("relax front: records and graph written after {after}: {:?} in {:.1} ms (t={:.0} ms)", r, t.elapsed().as_secs_f64() * 1e3, crate::clock::ms_since_start());
         }
     });
 }

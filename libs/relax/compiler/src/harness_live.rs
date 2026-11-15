@@ -140,6 +140,8 @@ pub(super) fn complete(v: Verdict, ms: f64) -> Edit {
     // a test session presents no frame: each run's end is its present, the settle and its rebuild
     // follow it as they follow a domain's first frame (run.rs)
     crate::run::domain_present(format!("live test run {}", s.runs));
+    // (its boot's deferred records: written now, not at an exit a signal never lets it reach)
+    if s.runs == 1 { crate::jit::first_test_pass_done(); }
     let Verdict { ran, passed, ignored, failures, stale, why, skipped, tests } = v;
     let failed = failures.len();
     // a run whose patched code faulted is no pass of the edit whatever its tests say (the fault

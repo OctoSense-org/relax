@@ -2056,7 +2056,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
     // parsed) are written now, on the writer's thread beside the check, as a run's are after its
     // first present -- not after the check, which then waited seconds for them at its end
     // (record_check_front)
-    if check && !selftest && front_recordable() { crate::cache::start_deferred_front(); }
+    if check && !selftest && front_recordable() { crate::cache::start_deferred_front("the check's load"); }
     if check && !boundary_options {
         let mut own = vec![false; prog.crates.len()];
         for &k in &checked { prog.crates[k as usize].validate = true; own[k as usize] = true; }
