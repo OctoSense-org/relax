@@ -1881,16 +1881,18 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
         eprintln!("boot-trace: proc-macro world cache flush {:.1} ms; {}", tf.elapsed().as_secs_f64() * 1e3, crate::pmhost::cache_line());
     }
     // the program's files are loaded: the macro world goes (hot reload or a run-time module
-    // builds it again from its disk cache). A live test session whose own crates ran hosted
-    // macros keeps it: the reload of an edited file of theirs runs those macros again, and the
-    // first edit would build the world again (CPU several times a later edit's; relax issue 144).
-    // The session holds it from then on either way.
+    // builds it again from its disk cache). A live test session whose own crates can reach a
+    // hosted macro keeps a world that exists: the reload of an edited file of theirs runs those
+    // macros again, and the first edit would build the world again (CPU several times a later
+    // edit's; relax issues 144 and 223). It reads the registered graph, the same however the load
+    // went: a load that restored those crates ran no hosted macro of theirs. No world: nothing to
+    // keep, and none is built for it. The session holds it from then on either way.
     let keep_world = live_tests && {
         let own: Vec<&str> = crate::check::workspace_crates(&prog, crate_of[subject_ci]).into_iter().map(|k| prog.syms.str(prog.crates[k as usize].name)).collect();
-        crate::pmhost::hosted_caller(|k| own.contains(&k))
+        crate::macro_reg::hosted_reachable(&own)
     };
-    if keep_world && crate::preload::trace() {
-        eprintln!("boot-trace: macro world kept: the live session's own crates run hosted macros");
+    if keep_world && crate::preload::trace() && crate::pmhost::world_alive() {
+        eprintln!("boot-trace: macro world kept: the live session's own crates can reach hosted macros");
     }
     let pm0 = crate::memstat::live_of(crate::memstat::Tag::PmHost);
     let freed = !keep_world && crate::pmhost::free_world();

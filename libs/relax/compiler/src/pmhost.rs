@@ -208,14 +208,6 @@ static WORLD: relax_session::sync::Mutex<Option<std::sync::Arc<Result<World, Str
 /// serde_derive: three stages). rustc builds each proc-macro crate after the ones its dependencies
 /// use; the stages are that order, one world per layer.
 static BOOT_WORLDS: relax_session::sync::Mutex<Vec<std::sync::Arc<Result<World, String>>>> = relax_session::sync::Mutex::new(Vec::new());
-/// The crates whose expansions called into the macro world (by name), in the order of their first
-/// call: a live test session whose own crates are among them keeps the world after its load
-/// (run.rs), as the reload of an edited file runs their hosted macros again.
-static HOSTED_CALLERS: relax_session::sync::Mutex<Vec<String>> = relax_session::sync::Mutex::new(Vec::new());
-/// Did a crate that `own` accepts call a hosted macro?
-pub fn hosted_caller(own: impl Fn(&str) -> bool) -> bool {
-    HOSTED_CALLERS.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|k| own(k))
-}
 /// held while the world is being built: other threads wait for that build
 static BUILDING: relax_session::sync::Mutex<()> = relax_session::sync::Mutex::new(());
 
@@ -880,13 +872,6 @@ fn call(sess: &std::sync::Arc<crate::Session>, entry: &Entry, attr: Option<&Toke
     // the runtime's process-wide UNIT and TLS machinery. Preserve the original reload
     // serialization for this step. Cached script expansions never enter the host.
     let call_krate = crate::macro_reg::current_call_krate();
-    {
-        let mut callers = HOSTED_CALLERS.lock().unwrap_or_else(|e| e.into_inner());
-        if !callers.contains(&call_krate) {
-            let _k = crate::zone_alloc::kept();
-            callers.push(call_krate.clone());
-        }
-    }
     // While the program's crates load (no program unit yet: no program code runs) and the call is
     // into the final world, the expansion runs on the asking thread: the runtime's unit is that
     // world's for every such call at once, and its lazy compiles are owner requests as any thread's.
@@ -1145,6 +1130,29 @@ mod tests {
         }
         assert!(super::free_world(), "the world goes after the build");
         assert!(!super::world_alive(), "and the stage world with it");
+    }
+
+    /// A live test session keeps a macro world when its own crates can reach a hosted macro, read
+    /// from the registered graph, with no macro called (relax issue 223: a load that restored those
+    /// crates from the cache called none, so the world went and the first edit built it again).
+    #[test]
+    fn own_crates_that_reach_a_hosted_macro_keep_the_world() {
+        isolated_test!(own_crates_that_reach_a_hosted_macro_keep_the_world);
+        super::install();
+        let unit = |name: &str, deps: Vec<(usize, String)>, proc_macro: bool| crate::macro_reg::UnitInfo {
+            name: name.into(), src_path: format!("/nowhere/{name}/lib.rs"), edition: 2021, features: Vec::new(), deps, proc_macro,
+            harness: false, registry: false, cfgs: Vec::new(), env: Vec::new(),
+        };
+        let reg = crate::macro_reg::Reg {
+            units: vec![unit("app", vec![(1, "mac".into())], false), unit("mac", Vec::new(), true), unit("other", Vec::new(), false)],
+            derives: vec![("Hosted".into(), crate::macro_reg::Entry { unit: 1, fname: "derive_hosted".into(), kind: crate::macro_reg::Kind::Derive })],
+            ..Default::default()
+        };
+        crate::macro_reg::REG.with(|r| *r.borrow_mut() = Some(reg));
+        assert!(crate::macro_reg::hosted_reachable(&["app"]), "a crate whose dependency is a hosted proc macro keeps the world");
+        assert!(!crate::macro_reg::hosted_reachable(&["other"]), "a crate that reaches no proc macro does not");
+        assert!(crate::macro_reg::hosted_reachable(&["other", "app"]), "one own crate that reaches one is enough");
+        assert!(!super::world_alive(), "the answer builds no world");
     }
 
     /// A world that goes (free_world after a module load or a run's end) writes the records its
