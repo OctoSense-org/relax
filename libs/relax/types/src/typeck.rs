@@ -6782,10 +6782,17 @@ impl<'a> Fcx<'a> {
                 // a non-primitive right operand, or a reference to one, is an operator trait call
                 // too (`256u32 >> &big` with `impl Shr<&Big> for u32`; rustc is_builtin_binop needs
                 // both operands integral): built in, the shift took the reference's address
+                // A type-variable right operand is one as well (rustc op.rs check_expr_binop: the
+                // builtin types apply only when neither operand is a type variable): `a >> n` with
+                // an unannotated closure parameter `n` is `<u8 as Shr<?N>>::Output` until `?N` is
+                // known, so integer fallback can make `1` in `(a >> n) & 1` an i32 (E0277). The
+                // operand's type is resolved with the pending obligations first, as rustc's
+                // resolve_vars_with_obligations does.
                 let tb0 = self.check_expr(b, None);
                 let sb0 = self.shallow(tb0);
+                let sb0 = if matches!(self.tcx.tys.kind(sb0), TyKind::Infer(_)) { self.retry_goals(false); self.shallow(sb0) } else { sb0 };
                 let non_prim = self.non_prim_operand(sb0);
-                if non_prim || self.ref_to_var(sb0) {
+                if non_prim || self.ref_to_var(sb0) || matches!(self.tcx.tys.kind(sb0), TyKind::Infer(_)) {
                     if let Some(r) = self.prim_lhs_op(op, e, sa, sb0, lo, false) {
                         return r;
                     }
@@ -8521,6 +8528,10 @@ pub(crate) fn trait_error_message(prog: &Program, tcx: &Tcx, code: &str, p: &cra
     let core = Some(prog.def(td).krate) == prog.prelude_crate || matches!(prog.syms.str(prog.crates[prog.def(td).krate as usize].name), "core" | "alloc" | "std");
     let self_ty = args.first().cloned().unwrap_or_default();
     let tr = if args.len() > 1 { format!("{}<{}>", name, args[1..].join(", ")) } else { name.clone() };
+    // an operator trait call whose operand types fallback decided (`u8: BitAnd<i32>`)
+    if let ("E0277", true, [_, rhs]) = (code, core, &args[..]) {
+        if let Some(msg) = op_trait_on_unimplemented(&name, &self_ty, rhs) { return msg; }
+    }
     match code {
         "E0277" if tcx.lang_items.get(crate::lang_items::LangItem::Sized) == Some(td) => format!("the size for values of type `{}` cannot be known at compilation time", self_ty),
         "E0277" if core && name == "Send" => format!("`{}` cannot be sent between threads safely", self_ty),
@@ -8968,6 +8979,28 @@ fn binop_unimplemented(op: crate::ast::BinOp, x: &str, y: &str) -> String {
         Lt | Le | Gt | Ge => format!("can't compare `{}` with `{}`", x, y),
         And | Or => format!("mismatched types: expected `bool`, found `{}`", y),
     }
+}
+
+/// core's `#[rustc_on_unimplemented]` message of an operator trait by its name, `x` its `Self` and
+/// `y` its `Rhs` (library/core/src/ops/arith.rs, bit.rs); None for any other trait.
+fn op_trait_on_unimplemented(name: &str, x: &str, y: &str) -> Option<String> {
+    use crate::ast::BinOp::*;
+    let op = match name {
+        "Add" => Add, "Sub" => Sub, "Mul" => Mul, "Div" => Div, "Rem" => Rem,
+        "BitAnd" => BitAnd, "BitOr" => BitOr, "BitXor" => BitXor, "Shl" => Shl, "Shr" => Shr,
+        "AddAssign" => return Some(format!("cannot add-assign `{y}` to `{x}`")),
+        "SubAssign" => return Some(format!("cannot subtract-assign `{y}` from `{x}`")),
+        "MulAssign" => return Some(format!("cannot multiply-assign `{x}` by `{y}`")),
+        "DivAssign" => return Some(format!("cannot divide-assign `{x}` by `{y}`")),
+        "RemAssign" => return Some(format!("cannot calculate and assign the remainder of `{x}` divided by `{y}`")),
+        "BitAndAssign" => return Some(format!("no implementation for `{x} &= {y}`")),
+        "BitOrAssign" => return Some(format!("no implementation for `{x} |= {y}`")),
+        "BitXorAssign" => return Some(format!("no implementation for `{x} ^= {y}`")),
+        "ShlAssign" => return Some(format!("no implementation for `{x} <<= {y}`")),
+        "ShrAssign" => return Some(format!("no implementation for `{x} >>= {y}`")),
+        _ => return None,
+    };
+    Some(binop_unimplemented(op, x, y))
 }
 
 /// An operator trait with no impl for the operands (rustc op.rs report_binop_failure): E0368
