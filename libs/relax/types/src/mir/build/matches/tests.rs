@@ -54,6 +54,7 @@ fn run<R>(source: &str, name: &str, f: impl FnOnce(&mut Builder<'_>, &[Pat], &ty
         upvars: Vec::new(),
         upvar_env: None,
         var_debug_info: Vec::new(),
+        desugaring_let: false,
         unit_temp: None,
         allocs: AllocMap::default(),
     };

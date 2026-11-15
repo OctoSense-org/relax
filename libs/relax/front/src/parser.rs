@@ -116,6 +116,8 @@ pub struct Parser<'a> {
     pub token_input: bool,
     pub sources: Option<std::sync::Arc<SourceRegistry>>,
     exp_depth: u32,
+    /// inside the expansion of a built-in formatting macro (fmtmac), whose text may hold `super let`
+    builtin_exp: u32,
     /// the file's written `#![recursion_limit]`, read on the first macro call
     rec_limit: std::cell::Cell<Option<Option<u32>>>,
     /// every `use` of the tokens so far, for `name_imported`'s quick answer
@@ -250,6 +252,7 @@ impl<'a> Parser<'a> {
             token_input: false,
             sources: None,
             exp_depth: 0,
+            builtin_exp: 0,
             rec_limit: std::cell::Cell::new(None),
             import_summary: Default::default(),
             rules_exp: Default::default(),
@@ -2415,7 +2418,7 @@ impl<'a> Parser<'a> {
             mod_stack, scope_stack, no_prelude, range_dots, next_scope, rule_scopes, foreign_rules, interp, extra_items,
             extra_assoc_items, pending_inner, in_assoc, in_trait, stmt_ctx, cfg_select_rest,
             include_as_expr, foreign_abi, cfg_out, lit_errs, expansion_semi, list_elem_at, expn_attrs_ungated, pending_shape, macro_scope_miss,
-            cfg_select_ends,
+            cfg_select_ends, builtin_exp,
         } = self;
         fn sorted<T: Ord>(mut v: Vec<T>) -> Vec<T> { v.sort(); v }
         let toks: Vec<Tok> = (0..toks.len()).map(|i| toks.at(i)).collect();
@@ -2425,7 +2428,7 @@ impl<'a> Parser<'a> {
         let tables = (ext.len(), exp_map.len(), tok_origin.len(), token_origins.len(), rules_exp.len(), body_origin.len(), pm_editions.len(), foreign_rules.len());
         let shapes: Vec<_> = pending_shape.iter().map(|(r, e)| (*r, e.as_ref().map(|e| (e.pos, e.msg.clone())))).collect();
         format!("toks {toks:?}\npos {pos} edition {edition} lazy {lazy_bodies} {lazy_auto} {lazy_part} {lazy_mods:?} hole {hole_body} {item_macro} macros {} krate {krate}\n\
-            tables {tables:?} token_input {token_input} exp_depth {exp_depth} tok_undo {tok_undo:?} frags {frags:?} interp {interp:?}\n\
+            tables {tables:?} token_input {token_input} exp_depth {exp_depth} builtin_exp {builtin_exp} tok_undo {tok_undo:?} frags {frags:?} interp {interp:?}\n\
             mods {mod_stack:?} scopes {scope_stack:?} {next_scope} {rule_scopes:?} no_prelude {no_prelude} range_dots {range_dots}\n\
             items {item_start:?} {extra_items:?} {extra_assoc_items:?} {pending_inner:?} {in_assoc} {in_trait} {foreign_abi:?}\n\
             stmt {stmt_ctx} {include_as_expr} {expansion_semi} {list_elem_at:?} {expn_attrs_ungated} cfg {cfg_out} {:?} {:?} {lit_errs:?} shapes {shapes:?} macro_scope_miss {}\nast {ast:?}",
@@ -5019,6 +5022,12 @@ impl<'a> Parser<'a> {
 
     /// Interpolated statements already carry their boundary, including a let without `;`.
     fn stmt_after_attrs(&mut self, attrs: Vec<Attr>, interpolated: bool) -> PResult<Stmt> {
+        // `super let`: only the expansion of a built-in formatting macro writes one (rustc's
+        // format_args! lowering); in written code it stays unstable syntax rustc gates
+        let super_ = self.builtin_exp > 0 && self.kind() == T::KwSuper && self.nth(1) == T::KwLet;
+        if super_ {
+            self.pos += 1;
+        }
         if self.kind() == T::KwLet {
             self.pos += 1;
             let pat = self.pat_top()?;
@@ -5045,7 +5054,7 @@ impl<'a> Parser<'a> {
                 self.expect(T::Semi)?;
             }
             let attrs = self.ast.push_list(attrs);
-            let r = self.ast.push_row(LetStmt { attrs, pat, ty: OptTyId::from(ty), init: OptExprId::from(init), else_: OptBlockId::from(else_) });
+            let r = self.ast.push_row(LetStmt { attrs, pat, ty: OptTyId::from(ty), init: OptExprId::from(init), else_: OptBlockId::from(else_), super_ });
             return Ok(Stmt::Let(r));
         }
         if self.at_item_start() {
@@ -6038,7 +6047,7 @@ impl<'a> Parser<'a> {
                     let segs = self.mk_segs(vec![PathSeg::new(SegKind::Ident, name, GenericArgsId::NONE)], false);
                     let path = Path { segs, lo: blo };
                     let tail = self.mk_expr(ExprKind::Path(path), blo);
-                    let r = self.ast.push_row(LetStmt { attrs: List::EMPTY, pat, ty: OptTyId::from(Some(t)), init: OptExprId::from(Some(body)), else_: OptBlockId::NONE });
+                    let r = self.ast.push_row(LetStmt { attrs: List::EMPTY, pat, ty: OptTyId::from(Some(t)), init: OptExprId::from(Some(body)), else_: OptBlockId::NONE, super_: false });
                     vec![Stmt::Let(r), Stmt::Expr(false, tail)]
                 }
                 None => vec![Stmt::Expr(false, body)],

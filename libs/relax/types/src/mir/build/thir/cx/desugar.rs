@@ -304,7 +304,7 @@ impl Cx<'_> {
         let mut leaves = Vec::new();
         let pattern = self.assignee_pat(lhs, rhs_ty, remainder_scope, &mut leaves)?;
         let mut stmts = vec![self.thir.alloc_stmt(Stmt {
-            kind: StmtKind::Let { remainder_scope, init_scope, pattern: Box::new(pattern), initializer: Some(initializer), else_block: None, node: e.0, span },
+            kind: StmtKind::Let { remainder_scope, init_scope, pattern: Box::new(pattern), initializer: Some(initializer), else_block: None, node: e.0, span, super_: false },
         })];
         for (leaf, var, ty) in leaves {
             let leaf_span = self.espan(leaf);

@@ -302,7 +302,7 @@ fn region_scope_for_and_yield_syntax() {
     let p = Program::new(sess);
     let tcx = Tcx::new();
     let b = Body::empty(crate::program::NO_DEF, vec![], 0, tcx.tys.unit);
-    let mut v = Resolve { prog: &p, file: &pf, body: &b, tree: ScopeTree::default(), cx: Context { parent: None, var_parent: None } };
+    let mut v = Resolve { prog: &p, file: &pf, body: &b, tree: ScopeTree::default(), cx: Context { parent: None, var_parent: None }, extended_super_lets: Default::default() };
     let root = root.unwrap();
     v.enter_body(Node::Block(root.0), false); v.block(root, true);
     let t = v.tree;

@@ -55,14 +55,20 @@ impl ScopeTree {
     /// rustc `ScopeTree::temporary_scope`: the scope the temporaries of `expr` die in, and the scope
     /// they will die in from edition 2024 when that differs (`TempLifetime`).
     pub fn temp_lifetime(&self, expr: ExprId) -> (Option<ScopeId>, Option<ScopeId>) {
-        let mut scope = self.scope(Node::Expr(expr.0), ScopeData::Node).expect("expression outside scope tree");
+        let scope = self.scope(Node::Expr(expr.0), ScopeData::Node).expect("expression outside scope tree");
         if let Some(s) = self.rvalue_scopes.get(&expr.0) { return (*s, None); }
+        let (scope, backwards_incompatible) = self.default_temporary_scope(scope);
+        (Some(scope), backwards_incompatible)
+    }
+    /// rustc `ScopeTree::default_temporary_scope` (rustc_middle/src/middle/region.rs): the innermost
+    /// enclosing temporary scope of `inner`, and the one from edition 2024 when that differs.
+    pub fn default_temporary_scope(&self, mut scope: ScopeId) -> (ScopeId, Option<ScopeId>) {
         let mut backwards_incompatible = None;
         while let Some(p) = self.encl_scope(scope) {
             let data = &self.scopes[p.0 as usize];
             match data.data {
-                ScopeData::Destruction => return (Some(scope), backwards_incompatible),
-                ScopeData::IfThenRescope | ScopeData::MatchGuard => return (Some(p), backwards_incompatible),
+                ScopeData::Destruction => return (scope, backwards_incompatible),
+                ScopeData::IfThenRescope | ScopeData::MatchGuard => return (p, backwards_incompatible),
                 _ => {
                     // passing through a tail expression whose temporaries live longer than they will
                     // from edition 2024: remember the first one (region.rs `default_temporary_scope`)
@@ -93,7 +99,7 @@ pub fn node_edition(file: &ParsedFile, node: Node) -> u16 {
 pub fn region_scope_tree(prog: &Program, body: &Body) -> Result<ScopeTree, String> {
     let d = prog.def(body.def);
     let file = &prog.files[body.file as usize];
-    let mut v = Resolve { prog, file, body, tree: ScopeTree::default(), cx: Context { parent: None, var_parent: None } };
+    let mut v = Resolve { prog, file, body, tree: ScopeTree::default(), cx: Context { parent: None, var_parent: None }, extended_super_lets: HashMap::default() };
     // an anonymous constant (array length, const argument or default in a signature or type) is a
     // body of its own, resolved as a constant initializer (rustc region.rs resolve_body: a body
     // owner that is not a fn or closure)
@@ -128,7 +134,12 @@ pub fn region_scope_tree(prog: &Program, body: &Body) -> Result<ScopeTree, Strin
 }
 #[derive(Clone, Copy)]
 struct Context { parent: Option<ScopeId>, var_parent: Option<ScopeId> }
-struct Resolve<'a> { prog: &'a Program, file: &'a ParsedFile, body: &'a Body, tree: ScopeTree, cx: Context }
+struct Resolve<'a> {
+    prog: &'a Program, file: &'a ParsedFile, body: &'a Body, tree: ScopeTree, cx: Context,
+    /// rustc `extended_super_lets`: the `super let` statements (by statement index) a parent `let`
+    /// extends, with the scope it extends them to (None: static)
+    extended_super_lets: HashMap<u32, Option<ScopeId>>,
+}
 impl Resolve<'_> {
     fn unparen(&mut self, e: ExprId) -> ExprId {
         let ast = &self.file.ast;
@@ -199,13 +210,34 @@ impl Resolve<'_> {
                 self.cx.var_parent = self.cx.parent;
             }
             let remainder = self.cx;
-            self.node(Node::Statement(statements.lo + i as u32), true);
+            let stmt_id = statements.lo + i as u32;
+            // rustc region.rs resolve_stmt: a `super let` does not start a scope of its own (its
+            // temporaries belong to the enclosing temporary scope); its node is a plain one here
+            let super_let = matches!(stmt, Stmt::Let(r) if ast.row(*r).super_);
+            self.node(Node::Statement(stmt_id), !super_let);
             match *stmt {
                 Stmt::Let(r) => {
                     let crate::ast::LetStmt { pat, init, .. } = *ast.row(r);
+                    // rustc region.rs resolve_local (LetKind::Super): a `super let` a parent `let`
+                    // extends lives in that `let`'s scope and its initializer extends as a `let`'s
+                    // does; any other lives in the enclosing temporary scope and extends nothing
+                    // (neither child `super let`s nor block tails, #145784)
+                    let extend = if !super_let {
+                        true
+                    } else if let Some(scope) = self.extended_super_lets.remove(&stmt_id) {
+                        self.cx.var_parent = scope;
+                        true
+                    } else {
+                        if let Some(inner) = self.cx.var_parent {
+                            self.cx.var_parent = Some(self.tree.default_temporary_scope(inner).0);
+                        }
+                        false
+                    };
                     if let Some(e) = init.get() {
-                        self.extend_borrows(e, self.cx.var_parent);
-                        if self.explicit_ref(pat) { self.extend_place(e, self.cx.var_parent); }
+                        if extend {
+                            self.extend_borrows(e, self.cx.var_parent);
+                            if self.explicit_ref(pat) { self.extend_place(e, self.cx.var_parent); }
+                        }
                         self.expr(e, false);
                     }
                     self.pat(pat);
@@ -537,6 +569,18 @@ impl Resolve<'_> {
             }
         }
     }
+    /// `{ ...; E& }` and `{ super let ... = E&; ... }` (region.rs:640-650): a block's tail, and its
+    /// `super let`s, which live as long as the extended value.
+    fn extend_block(&mut self, b: BlockId, scope: Option<ScopeId>) {
+        if let Some(t) = self.block_tail(b) { self.extend_borrows(t, scope); }
+        let ast = &self.file.ast;
+        let statements = ast.block(b).stmts;
+        for (i, stmt) in ast.list(statements).iter().enumerate() {
+            if matches!(stmt, Stmt::Let(r) if ast.row(*r).super_) {
+                self.extended_super_lets.insert(statements.lo + i as u32, scope);
+            }
+        }
+    }
     /// The E& grammar; constructor decisions use typeck resolution, not spelling.
     /// rustc_hir_analysis/src/check/region.rs:620-684.
     fn extend_borrows(&mut self, e: ExprId, scope: Option<ScopeId>) {
@@ -547,9 +591,9 @@ impl Resolve<'_> {
             ExprKind::Tuple(xs) | ExprKind::Array(xs) => for x in ast.list(xs) { self.extend_borrows(*x, scope); },
             ExprKind::Struct(row) => for f in ast.list(ast.row(row).fields) { self.extend_borrows(f.expr, scope); },
             ExprKind::Call(f, args) if self.constructor(f) => for x in ast.list(args) { self.extend_borrows(*x, scope); },
-            ExprKind::Block(b, _) | ExprKind::Unsafe(b) => if let Some(t) = self.block_tail(b) { self.extend_borrows(t, scope); },
+            ExprKind::Block(b, _) | ExprKind::Unsafe(b) => self.extend_block(b, scope),
             ExprKind::If(_, b, els) => {
-                if let Some(t) = self.block_tail(b) { self.extend_borrows(t, scope); }
+                self.extend_block(b, scope);
                 if let Some(x) = els.get() { self.extend_borrows(x, scope); }
             }
             ExprKind::Match(_, arms) => for a in ast.list(arms) { self.extend_borrows(a.body, scope); },

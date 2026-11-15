@@ -4952,7 +4952,7 @@ impl<'a> Fcx<'a> {
             }
             match s {
                 Stmt::Let(r) => {
-                    let crate::ast::LetStmt { attrs, pat, ty, init, else_ } = self.ast().row(*r);
+                    let crate::ast::LetStmt { attrs, pat, ty, init, else_, .. } = self.ast().row(*r);
                     if !self.active(*attrs) {
                         continue;
                     }

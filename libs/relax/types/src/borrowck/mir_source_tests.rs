@@ -560,6 +560,34 @@ fn an_async_fn_body_is_ordered_among_its_closures_by_its_block() {
     assert!(errors.is_empty(), "{errors:?}");
 }
 
+/// rustc_ast_lowering format.rs: format_args! keeps its arguments in `super let`s (stable since 1.89), so a
+/// stored `Arguments` keeps them as long as its variable, through a block tail, an `if` and a tuple struct
+/// constructor too; as a call's argument they end with the statement, and a later use is E0716 (twice, as rustc).
+#[test]
+fn a_stored_format_args_keeps_its_arguments_and_a_call_argument_does_not() {
+    let (errors, unchecked) = borrowck_source("
+        fn name() -> String { String::from(\"word\") }
+        fn show(h: &dyn std::fmt::Display) -> String { format!(\"{h}\") }
+        struct Hold<'a>(std::fmt::Arguments<'a>);
+        pub fn main() {
+            let a = format_args!(\"the {}\", name());
+            let b = format_args!(\"{:>6}|{1:w$}\", name(), name(), w = 3);
+            let c = { format_args!(\"{}\", name()) };
+            let d = if a.as_str().is_none() { format_args!(\"{}\", name()) } else { format_args!(\"none\") };
+            let e = Hold(format_args!(\"{}\", name()));
+            show(&a); show(&b); show(&c); show(&d); show(&e.0);
+        }");
+    assert!(unchecked.is_empty(), "{unchecked:?}");
+    assert!(errors.is_empty(), "a stored format_args! keeps its arguments: {errors:?}");
+    let (errors, unchecked) = borrowck_source("
+        fn name() -> String { String::from(\"word\") }
+        fn id<T>(x: T) -> T { x }
+        pub fn main() { let a = id(format_args!(\"the {}\", name())); let _ = a.as_str(); }");
+    assert!(unchecked.is_empty(), "{unchecked:?}");
+    // rustc: two E0716, the macro's own `args` (a desugaring's local is a temporary to the reader) and `name()`
+    assert!(errors.len() == 2 && errors.iter().all(|e| e.starts_with("E0716")), "a call argument's format_args! ends with the statement: {errors:?}");
+}
+
 #[test]
 fn a_type_test_in_a_closure_is_promoted_to_the_lowest_universal_region_of_its_class() {
     let (errors, unchecked) = borrowck_source("

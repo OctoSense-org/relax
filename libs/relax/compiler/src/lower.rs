@@ -332,6 +332,9 @@ pub struct Lcx<'a> {
     temp_moved: HashMap<u32, Vec<(Vec<(u32, u32)>, VReg)>>,
     /// operands of `&` in extending position, mapped to the initializing let's scope
     extend_ops: HashMap<u32, usize>,
+    /// `super let` statements (by statement index) in extending position, mapped to the scope of
+    /// the `let` that extends them (rustc region.rs `extended_super_lets`)
+    extended_super_lets: HashMap<u32, usize>,
     /// field path (variant, field)* from `match_root`'s local to the place the pattern being
     /// bound matches; None below a dereference (nothing can be moved out there)
     pat_path: Option<Vec<(u32, u32)>>,
@@ -564,6 +567,7 @@ impl<'a> Lcx<'a> {
             indirect_tracked: false,
             simd_consts: HashMap::default(),
             extend_ops: Default::default(),
+            extended_super_lets: Default::default(),
             pat_path: None,
             field_moved: HashMap::default(),
             want_mut: false,
@@ -3093,7 +3097,7 @@ impl<'a> Lcx<'a> {
             }
             match s {
                 Stmt::Let(r) => {
-                    let crate::ast::LetStmt { attrs, pat, init, else_, .. } = ast.row(*r);
+                    let crate::ast::LetStmt { attrs, pat, init, else_, super_, .. } = ast.row(*r);
                     if !self.active(*attrs) {
                         continue;
                     }
@@ -3102,7 +3106,22 @@ impl<'a> Lcx<'a> {
                     // made later in a nested one (`let y; if c { y = v; }`: y lives to the block end)
                     let mut lis = Vec::new();
                     self.pat_binding_locals(*pat, &mut lis);
-                    let depth = self.scopes.len() - 1;
+                    // rustc region.rs resolve_local: a `super let` a parent `let` extends belongs to
+                    // that `let`'s scope, and its initializer extends as a `let`'s does; any other
+                    // belongs to the enclosing temporary scope and extends nothing
+                    let extended = if *super_ { self.extended_super_lets.remove(&(blk.stmts.lo + i as u32)) } else { None };
+                    let extend = !*super_ || extended.is_some();
+                    let depth = extended.unwrap_or(self.scopes.len() - 1);
+                    if *super_ && !extend {
+                        // the enclosing temporary scope is the statement's, not a scope of locals: only
+                        // the formatting macros write `super let`, and their bindings have no drop glue
+                        for &li in &lis {
+                            let lt = self.monomorphize(self.b.locals[li as usize].ty);
+                            if self.needs_drop_glue(lt) {
+                                self.err(init.get().map_or(self.pos, |e| ast.expr(e).lo), "a `super let` binding with drop glue outside an extending `let` is not supported".to_string());
+                            }
+                        }
+                    }
                     if !self.probe_pts.is_empty() {
                         self.probe_scope.extend(lis.iter().copied());
                     }
@@ -3183,7 +3202,13 @@ impl<'a> Lcx<'a> {
                         Some(e) => {
                             self.pos = ast.expr(*e).lo;
                             let mut ext = Vec::new();
-                            self.collect_extending(*e, &mut ext);
+                            if extend {
+                                let mut super_lets = Vec::new();
+                                self.collect_extending(*e, &mut ext, &mut super_lets);
+                                for st in super_lets {
+                                    self.extended_super_lets.insert(st, depth);
+                                }
+                            }
                             for x in &ext {
                                 self.extend_ops.insert(*x, depth);
                             }
@@ -3391,7 +3416,10 @@ impl<'a> Lcx<'a> {
             // (Reference destructors.scope.temporary.edition2024); before, its temporaries
             // live to the end of the enclosing temporary scope
             let is_tail = i + 1 == n && matches!(s, Stmt::Expr(false, _));
-            if !is_tail || edition >= 2024 {
+            // a `super let` has no statement scope: its temporaries belong to the enclosing one
+            // (rustc region.rs resolve_stmt)
+            let super_let = matches!(s, Stmt::Let(r) if ast.row(*r).super_);
+            if (!is_tail || edition >= 2024) && !super_let {
                 if is_tail {
                     result = self.settle_before_temp_drop(result, self.body_ty(match s { Stmt::Expr(_, e) => *e, _ => ExprId(0) }), mark);
                 }
@@ -4507,24 +4535,24 @@ impl<'a> Lcx<'a> {
     /// `&` operands in extending position of a `let` initializer (rustc's temporary lifetime
     /// extension): `&e`, and through tuples, arrays, struct literals, tuple struct and variant
     /// constructor calls, casts, parens, block tails, if branches and match arms.
-    fn collect_extending(&self, e: ExprId, out: &mut Vec<u32>) {
+    fn collect_extending(&self, e: ExprId, out: &mut Vec<u32>, super_lets: &mut Vec<u32>) {
         let ast = self.ast();
         match &ast.expr(e).kind {
             ExprKind::AddrOf(_, _, x) => {
                 let x = strip_paren(ast, *x);
                 out.push(x.0);
                 self.extend_place_operands(x, out);
-                self.collect_extending(x, out);
+                self.collect_extending(x, out, super_lets);
             }
-            ExprKind::Paren(x) | ExprKind::Cast(x, _) => self.collect_extending(*x, out),
+            ExprKind::Paren(x) | ExprKind::Cast(x, _) => self.collect_extending(*x, out, super_lets),
             ExprKind::Tuple(v) | ExprKind::Array(v) => {
                 for x in ast.list(*v) {
-                    self.collect_extending(*x, out);
+                    self.collect_extending(*x, out, super_lets);
                 }
             }
             ExprKind::Struct(row) => {
                 for f in ast.list(ast.row(*row).fields) {
-                    self.collect_extending(f.expr, out);
+                    self.collect_extending(f.expr, out, super_lets);
                 }
             }
             // a tuple struct's or variant's constructor call extends its arguments, as typeck's
@@ -4534,24 +4562,33 @@ impl<'a> Lcx<'a> {
                 if matches!(self.b.res.get(&strip_paren(ast, *f).0), Some(Res::Def(d)) if matches!(self.u.prog.def(*d).kind, DefKind::Variant | DefKind::Struct)) =>
             {
                 for x in ast.list(*args) {
-                    self.collect_extending(*x, out);
+                    self.collect_extending(*x, out, super_lets);
                 }
             }
-            ExprKind::Block(b, _) | ExprKind::Unsafe(b) => {
-                if let Some(Stmt::Expr(false, x)) = ast.stmts(*b).last() {
-                    self.collect_extending(*x, out);
-                }
-            }
+            ExprKind::Block(b, _) | ExprKind::Unsafe(b) => self.collect_extending_block(*b, out, super_lets),
             ExprKind::If(_, then, els) => {
-                if let Some(Stmt::Expr(false, x)) = ast.stmts(*then).last() {
-                    self.collect_extending(*x, out);
-                }
-                if let Some(x) = els.get() { self.collect_extending(x, out); }
+                self.collect_extending_block(*then, out, super_lets);
+                if let Some(x) = els.get() { self.collect_extending(x, out, super_lets); }
             }
             ExprKind::Match(_, arms) => {
-                for arm in ast.list(*arms) { self.collect_extending(arm.body, out); }
+                for arm in ast.list(*arms) { self.collect_extending(arm.body, out, super_lets); }
             }
             _ => {}
+        }
+    }
+
+    /// A block in extending position: its tail, and its `super let`s, which live as long as the
+    /// extended value (`{ super let .. = E&; .. }`; region_scope.rs extend_block)
+    fn collect_extending_block(&self, b: BlockId, out: &mut Vec<u32>, super_lets: &mut Vec<u32>) {
+        let ast = self.ast();
+        if let Some(Stmt::Expr(false, x)) = ast.stmts(b).last() {
+            self.collect_extending(*x, out, super_lets);
+        }
+        let stmts = ast.block(b).stmts;
+        for (i, s) in ast.list(stmts).iter().enumerate() {
+            if matches!(s, Stmt::Let(r) if ast.row(*r).super_) {
+                super_lets.push(stmts.lo + i as u32);
+            }
         }
     }
 
