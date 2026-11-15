@@ -2271,52 +2271,66 @@ pub(crate) fn precompile_reachable(up: *mut Unit, addr: u64) -> u64 {
 }
 
 /// `relax_precompile` from the slots `roots`: up to FORK_PRECOMPILE_MAX functions, or with
-/// `exhaustive` all they reach.
+/// `exhaustive` all they reach. Each round walks compiled functions' lowered references or
+/// installed CodeRefs in one owner request, avoiding a round trip per function. Its uncompiled
+/// frontier builds on the calling thread, then the next round reads what those builds reference.
 pub(crate) fn precompile_from(roots: &[u32], exhaustive: bool) -> u64 {
     let up = cur_unit();
     if up.is_null() {
         return 0;
     }
     let limit = if exhaustive { usize::MAX } else { FORK_PRECOMPILE_MAX };
-    let mut todo = roots.to_vec();
+    let mut todo: Vec<_> = roots.iter().map(|&id| (id, false)).collect();
     let mut seen = std::collections::HashSet::new();
     let mut built = 0u64;
-    while let Some(id) = todo.pop() {
-        if seen.len() >= limit {
+    while !todo.is_empty() && seen.len() < limit {
+        let frontier = owner::publish(|| unsafe {
+            let u = &*up;
+            let mut frontier = Vec::new();
+            while let Some((id, revisit)) = todo.pop() {
+                if seen.len() >= limit {
+                    break;
+                }
+                // a frontier slot was counted when reached; revisit it once after its build
+                if (id as usize) >= u.fns.len() || !revisit && !seen.insert(id) {
+                    continue;
+                }
+                let f = &u.fns[id as usize];
+                if !revisit && !f.compiled {
+                    frontier.push(id);
+                    continue;
+                }
+                // the lowered body's callees (before inlining: an inlined callee's own calls are
+                // among its callees') and its call / fn-address sites
+                let mut next: Vec<u32> = f.calls.iter().chain(f.rir_refs.iter()).copied().collect();
+                if next.is_empty() {
+                    // code linked from the disk cache or startup image has no lowered body here:
+                    // every install records its references, including the image's resolved slots
+                    let code = u.code.read().unwrap_or_else(|e| e.into_inner());
+                    // interpreted and no-codegen redirects have refs at their entry, but no index body
+                    if let Some(refs) = code.refs_at(f.code) {
+                        next.extend_from_slice(refs.slots());
+                    }
+                    for (at, _, _) in code.bodies_of(id) {
+                        if at != f.code {
+                            if let Some(refs) = code.refs_at(at) {
+                                next.extend_from_slice(refs.slots());
+                            }
+                        }
+                    }
+                }
+                todo.extend(next.into_iter().filter(|c| (*c as usize) < u.fns.len() && !seen.contains(c)).map(|c| (c, false)));
+            }
+            frontier
+        });
+        if frontier.is_empty() {
             break;
         }
-        if !seen.insert(id) {
-            continue;
-        }
-        if !owner::publish(|| unsafe { (&*up).fns[id as usize].compiled }) {
+        for &id in &frontier {
             unsafe { compile_slot(up, id) };
             built += 1;
         }
-        // the lowered body's callees (before inlining: an inlined callee's own calls are among
-        // its callees') and its call / fn-address sites
-        let mut next: Vec<u32> = owner::publish(|| unsafe {
-            let f = &(&*up).fns[id as usize];
-            f.calls.iter().chain(f.rir_refs.iter()).copied().collect()
-        });
-        if next.is_empty() {
-            // code linked from the disk cache or the startup image has no lowered body here: its
-            // cache entry's relocations name what it calls
-            next = owner::call(owner::Class::Program, || unsafe {
-                let u = &*up;
-                let slot_at = |addr: u64| u.find_fn(addr).or_else(|| (0..2).find_map(|k| u.slots.find(k, addr).map(|x| x.0))).filter(|&id| (id as usize) < u.fns.len());
-                cache_lookup(up, id).map_or(Vec::new(), |c| {
-                    c.2.iter()
-                        .filter_map(|r| match r.target {
-                            relax_backend::rir::Reloc::Slot(c) | relax_backend::rir::Reloc::Thunk(c) | relax_backend::rir::Reloc::Call(c) => Some(c),
-                            // the linker has resolved it: a callee's thunk or stub by address
-                            relax_backend::rir::Reloc::Value(addr) => slot_at(addr),
-                            _ => None,
-                        })
-                        .collect()
-                })
-            });
-        }
-        todo.extend(next.into_iter().filter(|c| !seen.contains(c)));
+        todo = frontier.into_iter().map(|id| (id, true)).collect();
     }
     built
 }
