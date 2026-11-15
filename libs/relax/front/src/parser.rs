@@ -1936,7 +1936,11 @@ impl<'a> Parser<'a> {
                     // `made`'s `pub(crate) use seven_inner as seven;`). That call is a lookup that
                     // found nothing, left for the load's parse with the crate outline, as
                     // `made::inner::seven!()` is; a plain name's scope is the module's own.
-                    if qual.is_none() && !path.global() { self.macro_scope_miss.set(seg.name.lo); }
+                    // A prelude macro's name the crate imports in another module (`use
+                    // input::ime_config as cfg;`, a module in its own namespace) is still the
+                    // prelude's macro here, as rustc resolves it: no miss for it.
+                    let prelude = self.no_prelude == 0 && STD_PRELUDE_MACROS.contains(&name.as_str());
+                    if qual.is_none() && !path.global() && !prelude { self.macro_scope_miss.set(seg.name.lo); }
                     return None;
                 }
                 let q2 = match q.as_str() {
