@@ -248,7 +248,7 @@ impl Queue {
             tiers: [0; TIERS],
             ahead_full: false,
             limit: budget::limit() as usize,
-            background_limit: budget::background_limit() as usize,
+            background_limit: budget::jit_background_limit() as usize,
             widths: !FIRST_PRESENT.load(Ordering::Acquire) && !HEADLESS.load(Ordering::Acquire),
             o3_stopped: TIER_STOP.load(Ordering::Acquire),
             o3_startup: startup_holds_tier1(),
@@ -435,6 +435,18 @@ fn idle_tiers() -> bool {
 }
 fn is_tier_up(tier: usize) -> bool {
     tier == 1 || tier == 2
+}
+/// The JIT comes first in the CPU budget (`budget::set_jit_first`, at each pick): the app is up
+/// (its first present, or a headless run) and tier-up builds (O2, O3) are queued or running. Then
+/// the JIT's Background builds run on up to the machine's physical cores and go ahead of the app's
+/// Background work; once the queue has drained and its last build is done, the app's own work leads
+/// again. Before the first present the start-up's tier widths apply and Background keeps its
+/// ceiling: wider builds there take the CPU the UI thread's first frame compiles on. Measured
+/// states, not a timer: a start-up, a first reach and the settle after an edit each queue their
+/// tier-ups.
+fn jit_first() -> bool {
+    (FIRST_PRESENT.load(Ordering::Acquire) || HEADLESS.load(Ordering::Acquire))
+        && (0..TIERS).filter(|&t| is_tier_up(t)).any(|t| COUNTS[t].load(Ordering::Relaxed) + RUNNING[t].load(Ordering::Relaxed) > 0)
 }
 /// The calling thread may wait for a helper's check or lowering of a body it needs: not while
 /// tier-ups run at the idle policy (idle_tiers), whose prefronts check and lower bodies too, unless
@@ -941,6 +953,7 @@ fn worker_loop(index: usize) {
                     q.tick_queued = true;
                     q.push(Job::Tick, wall_ns());
                 }
+                budget::set_jit_first(jit_first());
                 let now = HeatNow::take();
                 let takes = Takes::of(worker.idle.load(Ordering::Relaxed));
                 let head = q.head(&now, takes);
