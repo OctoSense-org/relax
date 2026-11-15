@@ -125,6 +125,10 @@ mod disabled {
     pub fn states() -> [usize; 29] {
         [0; 29]
     }
+    pub fn old_census(_: &dyn Fn(usize) -> usize, _: &mut [[usize; 3]; 64]) -> [usize; 4] {
+        [0; 4]
+    }
+    pub const GRANULE_BYTES: usize = 4 << 10;
     pub fn detail() -> (usize, usize, usize, usize) {
         (0, 0, 0, 0)
     }
@@ -320,6 +324,14 @@ pub fn arena_census() -> ([usize; 11], [usize; 11]) {
 /// The compiler and burst arenas' chunk states with resident bytes (arena.rs `states`).
 pub fn arena_states() -> ([usize; 29], [usize; 29]) {
     (compiler::states(), burst::states())
+}
+
+/// The granule the arenas commit, release and count residency in.
+pub const GRANULE: usize = compiler::GRANULE_BYTES;
+
+/// The compiler arena's old chunks, block by block (arena.rs `old_census`).
+pub fn compiler_old_census(key: &dyn Fn(usize) -> usize, per_key: &mut [[usize; 3]; 64]) -> [usize; 4] {
+    compiler::old_census(key, per_key)
 }
 
 /// The compiler arena's committed chunks are old from now on (`arena_states`' old row).
