@@ -1737,6 +1737,8 @@ fn watchdog_message() -> String {
 }
 static WATCHDOG_CALLS: relax_session::sync::Mutex<Vec<std::sync::Arc<WatchdogCall>>> = relax_session::sync::Mutex::new(Vec::new());
 static WATCHDOG_WAKE: relax_session::sync::Condvar = relax_session::sync::Condvar::new();
+/// The run-watchdog thread is the run's: it ends with the run, and the next run's first watch starts it again.
+static WATCHDOG_START: std::sync::Once = std::sync::Once::new();
 crate::memo_local! {
     static WATCHDOG_STACK: std::cell::RefCell<Vec<std::sync::Arc<WatchdogCall>>>;
 }
@@ -9157,8 +9159,7 @@ pub fn watchdog_stall(ms: u64) -> u64 {
 /// One worker serves all deadlines and stall watches, including enclosing guards on the same
 /// thread. No thread creation per guard, and no polling instructions in compiled code.
 fn watch(deadline: Option<std::time::Instant>, stall: Option<Stall>) -> u64 {
-    static START: std::sync::Once = std::sync::Once::new();
-    START.call_once(|| {
+    WATCHDOG_START.call_once(|| {
         { let _k = crate::zone_alloc::kept();
         let _ = crate::run_threads::spawn("run-watchdog", || {
             crate::run_threads::on_end(|| WATCHDOG_WAKE.notify_all());
@@ -31935,6 +31936,7 @@ pub(crate) unsafe fn reset_statics() {
     reset(&TLS_NEXT, AtomicU32::new(TLS_FIRST_FREE));
     reset(&AUX_UNITS, relax_session::sync::Mutex::new(Vec::new()));
     reset(&WATCHDOG_CALLS, relax_session::sync::Mutex::new(Vec::new()));
+    reset(&WATCHDOG_START, std::sync::Once::new());
     reset(&QUIT_SEEN, AtomicBool::new(false));
     reset(&ORDER_UNTIL_NS, AtomicU64::new(0));
     reset(&ORDER_PRESENT_LEN, std::sync::atomic::AtomicUsize::new(0));
