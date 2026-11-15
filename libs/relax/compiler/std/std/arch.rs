@@ -3,8 +3,8 @@
 //! `cfg!(target_feature = ..) || detect::check(Feature::..)` as in std_detect; the run-time
 //! check is answered once per process: CPUID/XGETBV on x86_64, sysctl on macOS
 //! aarch64, getauxval on Linux aarch64, and processor-feature queries on Windows aarch64.
-//! aarch64 lists std_detect's single-word features; x86 only the ones the supported crate graph asks for. Any other literal is a compile error,
-//! as an unknown feature is in std.
+//! Both list std_detect's stable features (aarch64: its single-word names). Any other literal is a
+//! compile error, as an unknown feature is in std.
 
 pub use core::arch::aarch64;
 pub use core::arch::x86;
@@ -121,6 +121,27 @@ pub mod detect {
         Sve2p1 = 103,
         Tme = 104,
         Wfxt = 105,
+        // x86_64, the rest of std_detect's stable list (bits 106 on)
+        Tsc = 106,
+        Mmx = 107,
+        Sse4a = 108,
+        Tbm = 109,
+        Sha512 = 110,
+        Sm3 = 111,
+        Sm4 = 112,
+        Avxifma = 113,
+        Avxneconvert = 114,
+        Avxvnniint8 = 115,
+        Avxvnniint16 = 116,
+        Xsaveopt = 117,
+        Xsavec = 118,
+        Xsaves = 119,
+        Rtm = 120,
+        Kl = 121,
+        Widekl = 122,
+        Avx512er = 123,
+        Avx512pf = 124,
+        Avx512vp2intersect = 125,
     }
 
     /// The feature bits, low and high words; bit 127 = initialised (written last, so a reader
@@ -227,6 +248,9 @@ pub mod detect {
         let e = if root.eax >= 7 { __cpuid_count(7, 0) } else { zero };
         let e1 = if root.eax >= 7 && e.eax >= 1 { __cpuid_count(7, 1) } else { zero };
         let ext = if __cpuid(0x80000000).eax >= 0x80000001 { __cpuid(0x80000001).ecx } else { 0 };
+        // leaf 0x0d.1: the XSAVE variants; leaf 0x19: Key Locker (when leaf 7 ecx says it is there)
+        let xs1 = if root.eax >= 0xd { __cpuid_count(0xd, 1).eax } else { 0 };
+        let kl = if e.ecx & (1 << 23) != 0 { __cpuid(0x19).ebx } else { 0 };
         // Never execute XGETBV until both CPU XSAVE and OSXSAVE are set.
         let xcr0 = if p.ecx & (3 << 26) == (3 << 26) { unsafe { _xgetbv(0) } } else { 0 };
         let avx_state = xcr0 & 6 == 6;
@@ -244,6 +268,9 @@ pub mod detect {
         let avx512 = ASM_ENCODES_EVEX && avx && xcr0 & 0xe0 == 0xe0 && fma && f16c;
         // Intel SKL052: affected non-AVX chips falsely advertise BMI1/BMI2.
         let intel = root.ebx == 0x756e6547 && root.edx == 0x49656e69 && root.ecx == 0x6c65746e;
+        // SSE4a and TBM: AMD and Hygon only ("AuthenticAMD", "HygonGenuine")
+        let amd = (root.ebx == 0x68747541 && root.edx == 0x69746e65 && root.ecx == 0x444d4163)
+            || (root.ebx == 0x6f677948 && root.edx == 0x6e65476e && root.ecx == 0x656e6975);
         let bmi = !intel || avx;
         bit(Feature::Sse, p.edx & (1 << 25) != 0)
             | bit(Feature::Sse2, p.edx & (1 << 26) != 0)
@@ -288,6 +315,27 @@ pub mod detect {
             | bit(Feature::Avx512bitalg, avx512 && e.ecx & (1 << 12) != 0)
             | bit(Feature::Avx512vpopcntdq, avx512 && e.ecx & (1 << 14) != 0)
             | bit(Feature::Avxvnni, avx && e1.eax & (1 << 4) != 0)
+            | bit(Feature::Tsc, p.edx & (1 << 4) != 0)
+            | bit(Feature::Mmx, p.edx & (1 << 23) != 0)
+            | bit(Feature::Rtm, e.ebx & (1 << 11) != 0)
+            | bit(Feature::Kl, kl & 1 != 0)
+            | bit(Feature::Widekl, kl & (1 << 2) != 0)
+            | bit(Feature::Sse4a, amd && ext & (1 << 6) != 0)
+            | bit(Feature::Tbm, amd && ext & (1 << 21) != 0)
+            | bit(Feature::Xsaveopt, avx_state && xs1 & 1 != 0)
+            | bit(Feature::Xsavec, avx_state && xs1 & (1 << 1) != 0)
+            | bit(Feature::Xsaves, avx_state && xs1 & (1 << 3) != 0)
+            // the VEX-encoded leaf 7.1 extensions need the OS's AVX state
+            | bit(Feature::Sha512, avx_state && e1.eax & 1 != 0)
+            | bit(Feature::Sm3, avx_state && e1.eax & (1 << 1) != 0)
+            | bit(Feature::Sm4, avx_state && e1.eax & (1 << 2) != 0)
+            | bit(Feature::Avxifma, avx_state && e1.eax & (1 << 23) != 0)
+            | bit(Feature::Avxvnniint8, avx_state && e1.edx & (1 << 4) != 0)
+            | bit(Feature::Avxneconvert, avx_state && e1.edx & (1 << 5) != 0)
+            | bit(Feature::Avxvnniint16, avx_state && e1.edx & (1 << 10) != 0)
+            | bit(Feature::Avx512er, avx512 && e.ebx & (1 << 27) != 0)
+            | bit(Feature::Avx512pf, avx512 && e.ebx & (1 << 26) != 0)
+            | bit(Feature::Avx512vp2intersect, avx512 && e.edx & (1 << 8) != 0)
     }
 
     #[cfg(all(any(target_os = "linux", target_os = "android"), target_arch = "aarch64"))]
@@ -511,6 +559,26 @@ macro_rules! is_x86_feature_detected {
     ("avx512bitalg") => { cfg!(target_feature = "avx512bitalg") || $crate::arch::detect::check($crate::arch::detect::Feature::Avx512bitalg) };
     ("avx512vpopcntdq") => { cfg!(target_feature = "avx512vpopcntdq") || $crate::arch::detect::check($crate::arch::detect::Feature::Avx512vpopcntdq) };
     ("avxvnni") => { cfg!(target_feature = "avxvnni") || $crate::arch::detect::check($crate::arch::detect::Feature::Avxvnni) };
+    ("tsc") => { cfg!(target_feature = "tsc") || $crate::arch::detect::check($crate::arch::detect::Feature::Tsc) };
+    ("mmx") => { cfg!(target_feature = "mmx") || $crate::arch::detect::check($crate::arch::detect::Feature::Mmx) };
+    ("sse4a") => { cfg!(target_feature = "sse4a") || $crate::arch::detect::check($crate::arch::detect::Feature::Sse4a) };
+    ("tbm") => { cfg!(target_feature = "tbm") || $crate::arch::detect::check($crate::arch::detect::Feature::Tbm) };
+    ("sha512") => { cfg!(target_feature = "sha512") || $crate::arch::detect::check($crate::arch::detect::Feature::Sha512) };
+    ("sm3") => { cfg!(target_feature = "sm3") || $crate::arch::detect::check($crate::arch::detect::Feature::Sm3) };
+    ("sm4") => { cfg!(target_feature = "sm4") || $crate::arch::detect::check($crate::arch::detect::Feature::Sm4) };
+    ("avxifma") => { cfg!(target_feature = "avxifma") || $crate::arch::detect::check($crate::arch::detect::Feature::Avxifma) };
+    ("avxneconvert") => { cfg!(target_feature = "avxneconvert") || $crate::arch::detect::check($crate::arch::detect::Feature::Avxneconvert) };
+    ("avxvnniint8") => { cfg!(target_feature = "avxvnniint8") || $crate::arch::detect::check($crate::arch::detect::Feature::Avxvnniint8) };
+    ("avxvnniint16") => { cfg!(target_feature = "avxvnniint16") || $crate::arch::detect::check($crate::arch::detect::Feature::Avxvnniint16) };
+    ("xsaveopt") => { cfg!(target_feature = "xsaveopt") || $crate::arch::detect::check($crate::arch::detect::Feature::Xsaveopt) };
+    ("xsavec") => { cfg!(target_feature = "xsavec") || $crate::arch::detect::check($crate::arch::detect::Feature::Xsavec) };
+    ("xsaves") => { cfg!(target_feature = "xsaves") || $crate::arch::detect::check($crate::arch::detect::Feature::Xsaves) };
+    ("rtm") => { cfg!(target_feature = "rtm") || $crate::arch::detect::check($crate::arch::detect::Feature::Rtm) };
+    ("kl") => { cfg!(target_feature = "kl") || $crate::arch::detect::check($crate::arch::detect::Feature::Kl) };
+    ("widekl") => { cfg!(target_feature = "widekl") || $crate::arch::detect::check($crate::arch::detect::Feature::Widekl) };
+    ("avx512er") => { cfg!(target_feature = "avx512er") || $crate::arch::detect::check($crate::arch::detect::Feature::Avx512er) };
+    ("avx512pf") => { cfg!(target_feature = "avx512pf") || $crate::arch::detect::check($crate::arch::detect::Feature::Avx512pf) };
+    ("avx512vp2intersect") => { cfg!(target_feature = "avx512vp2intersect") || $crate::arch::detect::check($crate::arch::detect::Feature::Avx512vp2intersect) };
     ($t:tt,) => { $crate::is_x86_feature_detected!($t) };
     ($t:tt) => { compile_error!(concat!("unknown x86 target feature: ", $t)) };
 }
