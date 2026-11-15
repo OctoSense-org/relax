@@ -537,12 +537,12 @@ fn answer_session() -> &'static std::sync::Arc<crate::Session> {
 }
 
 /// A session of these options: the machine's CPU, the target.
-fn session_of(mut options: crate::options::Options, runtime: crate::options::RuntimeOptions) -> crate::Session {
+fn session_of(options: crate::options::Options, runtime: crate::options::RuntimeOptions) -> crate::Session {
+    let mut session = crate::Session { options, runtime };
     #[cfg(not(target_arch = "aarch64"))]
     {
-        options.cpu = relax_backend::x64::detect_cpu(&options);
+        session.options.cpu = relax_backend::x64::detect_cpu(&session.options);
     }
-    let mut session = crate::Session { options, runtime };
     session.options.target = session.options.check_target.triple().to_string();
     session
 }
