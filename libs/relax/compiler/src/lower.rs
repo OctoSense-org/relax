@@ -602,39 +602,16 @@ impl<'a> Lcx<'a> {
         }
     }
 
-    /// A provided crate's static lives in the loader; Relax's copy of it would be a second one.
-    /// Plain immutable data (trusted, no interior mutability) may be read from the copy, and a
-    /// static the crate marks `#[relax_api(per_side)]` (a memo of values each side makes and reads
-    /// itself) is JIT code's own instance. Any other is rustc's one copy, laid out by rustc's std:
-    /// JIT code cannot read it with Relax's layouts.
-    fn check_provided_static(&mut self, d: DefId, t: TyId) {
-        let krate = self.u.prog.def(d).krate;
-        let Some((_, p)) = self.u.provided.iter().find(|(k, _)| *k == krate) else { return };
-        if crate::provided::trusted(&self.u.prog, &self.u.tcx, krate, t, 0) {
-            return;
+    /// Classify a provided static and return the loader's address when it is shared.
+    fn check_provided_static(&mut self, d: DefId, t: TyId) -> Option<usize> {
+        match crate::provided::static_use(self.u, d, t) {
+            crate::provided::StaticUse::Shared(addr) => Some(addr),
+            crate::provided::StaticUse::Refused(msg) => {
+                self.provided_err(self.u.prog.def(d).krate, msg);
+                None
+            }
+            _ => None,
         }
-        let name = self.u.prog.def_path(d);
-        if p.per_side.contains(&crate::provided::norm(&name)) || self.thread_local_storage(d, t) {
-            return;
-        }
-        let ts = crate::typeck::ty_to_string(false, &self.u.prog, &self.u.tcx, t);
-        self.provided_err(krate, format!("static `{}` is read from JIT-compiled code, but it lives in a provided crate (built by rustc into the loader), where its one copy is laid out by rustc's std (`{}` is not the same bytes on both sides): call a fn of the crate that is an op (#[relax_api]), or mark the static #[relax_api(per_side)] when each side may keep its own instance (a cache of values only that side makes)", name, ts));
-    }
-
-    /// Static `d` (of type `t`) is a thread-local's storage: a `#[thread_local]` static, or the
-    /// runtime key `thread_local!` keeps for a value with drop glue or a lazy initialiser (a
-    /// `std::thread::LazyKey` static). Each side has its own per-thread storage by construction
-    /// (rustc's lives in its TLS, laid out by its std; Relax's in the JIT's), so JIT code compiled
-    /// from a provided crate's source keeps its own: a thread-local is never shared across the
-    /// boundary, whatever its type (native_vec::LANES on an app's model thread, 10-30).
-    fn thread_local_storage(&self, d: DefId, t: TyId) -> bool {
-        let prog = &self.u.prog;
-        let def = prog.def(d);
-        let ast = &prog.files[def.file as usize].ast;
-        if crate::lang_items::has_attr(prog, def.file, ast.list(ast.item(def.item).attrs), "thread_local") {
-            return true;
-        }
-        matches!(self.u.tcx.tys.kind(t), TyKind::Adt(a, _, _) if matches!(prog.def_path(*a).as_str(), "std::thread::local::LazyKey" | "std::thread::LazyKey"))
     }
 
     /// A type only JIT-compiled code makes: no bound fn's signature reaches it
@@ -7941,11 +7918,15 @@ impl<'a> Lcx<'a> {
                 self.const_val(d, args, t)
             }
             DefKind::Static => {
-                crate::boundary::note_static(self.u, self.b.def, &self.b.args, d);
-                if !self.u.provided.is_empty() {
-                    self.check_provided_static(d, t);
-                }
-                let p = self.static_ptr(d);
+                crate::boundary::note_static(self.u, self.b.def, &self.b.args, d, t);
+                let p = if let Some(addr) = self.check_provided_static(d, t) {
+                    let sym = self.u.shared_static_sym(d, addr);
+                    let p = self.f.vreg(Cls::I);
+                    self.emit(Inst::Addr(p, sym));
+                    p
+                } else {
+                    self.static_ptr(d)
+                };
                 self.read_place(&Place::Mem(p, 0), t)
             }
             // a section bound the linker defines (`__start_<name>`): the program's own static
@@ -8286,11 +8267,15 @@ impl<'a> Lcx<'a> {
                     (self.local_place(li), lt)
                 }
                 Some(Res::Def(d)) if self.u.prog.def(d).kind == DefKind::Static => {
-                    crate::boundary::note_static(self.u, self.b.def, &self.b.args, d);
-                    if !self.u.provided.is_empty() {
-                        self.check_provided_static(d, t);
-                    }
-                    let p = self.static_ptr(d);
+                    crate::boundary::note_static(self.u, self.b.def, &self.b.args, d, t);
+                    let p = if let Some(addr) = self.check_provided_static(d, t) {
+                        let sym = self.u.shared_static_sym(d, addr);
+                        let p = self.f.vreg(Cls::I);
+                        self.emit(Inst::Addr(p, sym));
+                        p
+                    } else {
+                        self.static_ptr(d)
+                    };
                     (Place::Mem(p, 0), t)
                 }
                 Some(Res::Def(d)) if self.u.prog.def(d).kind == DefKind::ForeignStatic && self.u.is_section_bound(d) => {
@@ -12343,14 +12328,15 @@ impl<'a> Lcx<'a> {
                     return self.dummy_val(t);
                 };
                 // the static as a place, as a path to it lowers (lower_def_value)
-                crate::boundary::note_static(self.u, self.b.def, &self.b.args, s);
-                if !self.u.provided.is_empty() {
-                    self.check_provided_static(s, a);
-                }
-                let addr = self.static_addr(s);
-                let addr = self.u.syms.intern(crate::syms::SymKind::Static(s), addr);
+                crate::boundary::note_static(self.u, self.b.def, &self.b.args, s, a);
+                let sym = if let Some(addr) = self.check_provided_static(s, a) {
+                    self.u.shared_static_sym(s, addr)
+                } else {
+                    let addr = self.static_addr(s);
+                    self.u.syms.intern(crate::syms::SymKind::Static(s), addr)
+                };
                 let p = self.f.vreg(Cls::I);
-                self.emit(Inst::Addr(p, addr));
+                self.emit(Inst::Addr(p, sym));
                 let r = self.u.tcx.tys.intern(TyKind::Ref(false, a, crate::types::RegionId::ERASED));
                 args.insert(0, (Val::L(vec![p]), r));
                 self.u.fn_id(FnKey::Inst(shim, vec![a]))

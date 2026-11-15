@@ -65,6 +65,8 @@ pub struct ProvidedCrate {
     /// statics marked `#[relax_api(per_side)]`, by def path: JIT code keeps its own instance
     /// (lower.rs check_provided_static)
     pub per_side: std::collections::HashSet<String>,
+    /// Statics marked bare `#[relax_api]`, by def path: (the loader's address, rustc's size, align).
+    pub shared: HashMap<String, (usize, u64, u64)>,
     pub last_panic: LastPanicFn,
     /// the source identity rustc built it from (srchash.rs; the loader's build.rs): what
     /// check_sources compares the program's copy of the crate with
@@ -82,7 +84,7 @@ pub struct ProvidedCrate {
 
 impl Clone for ProvidedCrate {
     fn clone(&self) -> Self {
-        ProvidedCrate { name: self.name.clone(), shims: self.shims.clone(), types: self.types.clone(), layouts: self.layouts.clone(), per_side: self.per_side.clone(), last_panic: self.last_panic, source: self.source, binding: self.binding, manifest: self.manifest, table: self.table.clone() }
+        ProvidedCrate { name: self.name.clone(), shims: self.shims.clone(), types: self.types.clone(), layouts: self.layouts.clone(), per_side: self.per_side.clone(), shared: self.shared.clone(), last_panic: self.last_panic, source: self.source, binding: self.binding, manifest: self.manifest, table: self.table.clone() }
     }
 }
 
@@ -102,30 +104,33 @@ pub fn register(
     types: HashMap<String, (u64, u64, Option<DropFn>, &'static [u64], &'static [u64])>,
     layouts: HashMap<String, (u64, u64, &'static [u64], &'static [u64])>,
     per_side: std::collections::HashSet<String>,
+    shared: HashMap<String, (usize, u64, u64)>,
     last_panic: LastPanicFn,
     source: u64,
     manifest: &'static [u8],
     table: Vec<&'static relax_api::Entry>,
 ) {
     let name = name.replace('-', "_");
-    let binding = binding_identity(&name, &shims, &types, &layouts, &per_side);
-    REGISTRY.lock().unwrap_or_else(|e| e.into_inner()).push(ProvidedCrate { name, shims, types, layouts, per_side, last_panic, source, binding, manifest, table });
+    let binding = binding_identity(&name, &shims, &types, &layouts, &per_side, &shared);
+    REGISTRY.lock().unwrap_or_else(|e| e.into_inner()).push(ProvidedCrate { name, shims, types, layouts, per_side, shared, last_panic, source, binding, manifest, table });
 }
 
 /// The identity of what JIT code depends on in a provided crate beyond its source text (which
 /// the interface fingerprints and body keys already cover, as for any crate): which fns are
 /// bound and their rustc signatures and argument layouts (the bridge bodies, lower.rs
 /// bridge_func, call shims by symbol), the opaque handles' rustc size, align, drop and field
-/// offsets, and the plain types' rustc layouts. The program's copy of the crate is the loader's
-/// own source (check_sources), so a change of these follows a source change; a change of the
-/// crate's native fn bodies alone (a HAL fix) keeps them, and with them every stored build of
-/// the code above the crate.
+/// offsets, the plain types' rustc layouts, and the per-side/shared statics with shared rustc
+/// sizes and alignments (never addresses, which differ per process). The program's copy of the
+/// crate is the loader's own source (check_sources), so a change of these follows a source
+/// change; a change of the crate's native fn bodies alone (a HAL fix) keeps them, and with them
+/// every stored build of the code above the crate.
 fn binding_identity(
     name: &str,
     shims: &HashMap<String, Shim>,
     types: &HashMap<String, (u64, u64, Option<DropFn>, &'static [u64], &'static [u64])>,
     layouts: &HashMap<String, (u64, u64, &'static [u64], &'static [u64])>,
     per_side: &std::collections::HashSet<String>,
+    shared: &HashMap<String, (usize, u64, u64)>,
 ) -> u64 {
     let mut h = crate::sip::Sip128::new();
     h.str("provided-binding");
@@ -172,6 +177,15 @@ fn binding_identity(
     h.u32(keys.len() as u32);
     for k in keys {
         h.str(k);
+    }
+    let mut keys: Vec<&String> = shared.keys().collect();
+    keys.sort_unstable();
+    h.u32(keys.len() as u32);
+    for k in keys {
+        let (_, size, align) = &shared[k];
+        h.str(k);
+        h.u64(*size);
+        h.u64(*align);
     }
     h.finish128() as u64
 }
@@ -670,13 +684,117 @@ fn is_transparent(prog: &Program, d: DefId) -> bool {
 /// Is `t` the same bytes on both sides of the boundary (rustc-built crate, Relax-built caller)?
 /// `krate` is the provided crate: pointers to its own types are opaque handles.
 pub fn trusted(prog: &Program, tcx: &Tcx, krate: u32, t: TyId, depth: u32) -> bool {
-    trusted_in(prog, tcx, krate, t, depth, false)
+    trusted_in(prog, tcx, krate, t, depth, false, false)
+}
+
+/// The same bytes on both sides, including cells and atomics of trusted values.
+pub fn shared_class(prog: &Program, tcx: &Tcx, krate: u32, t: TyId) -> bool {
+    trusted_in(prog, tcx, krate, t, 0, false, true)
+}
+
+/// How JIT code reaches static `d` (of type `t`) when its crate is provided.
+pub enum StaticUse {
+    NotProvided,
+    Shared(usize),
+    OwnInstance,
+    Copy,
+    Refused(String),
+}
+
+struct SharedStaticRange {
+    start: u64,
+    /// Inclusive last address; a zero-sized static owns just its start.
+    last: u64,
+    /// Largest last address through this entry, so misses skip earlier disjoint ranges.
+    max_last: u64,
+    key: String,
+}
+
+pub(crate) struct SharedStaticIndex(Vec<SharedStaticRange>);
+
+/// The shared provided static holding `addr` (a pointer to it stored in constant data): its
+/// `static:` key and start address.
+pub fn shared_at(u: &crate::jit::Unit, addr: u64) -> Option<(String, u64)> {
+    // Queried for every otherwise unattributed pointer word. Sort once per Unit rather than
+    // scanning every crate's map on each miss; bind_added_provided invalidates the index.
+    let index = u.provided_static_index.get_or_init(|| {
+        let _k = crate::zone_alloc::kept();
+        let mut ranges: Vec<_> = u.provided.iter().flat_map(|(_, p)| p.shared.iter()).map(|(key, &(start, size, _))| {
+            let start = start as u64;
+            SharedStaticRange { start, last: start.saturating_add(size.saturating_sub(1)), max_last: 0, key: key.clone() }
+        }).collect();
+        ranges.sort_unstable_by(|a, b| (a.start, a.last, &a.key).cmp(&(b.start, b.last, &b.key)));
+        let mut max_last = 0;
+        for r in &mut ranges {
+            max_last = max_last.max(r.last);
+            r.max_last = max_last;
+        }
+        SharedStaticIndex(ranges)
+    });
+    let end = index.0.partition_point(|r| r.start <= addr);
+    // Retain aliases and zero-sized statics even if they overlap a nonempty range.
+    index.0[..end].iter().rev().take_while(|r| r.max_last >= addr)
+        .find(|r| r.last >= addr).map(|r| (r.key.clone(), r.start))
+}
+
+pub fn static_use(u: &crate::jit::Unit, d: DefId, t: TyId) -> StaticUse {
+    let prog = &u.prog;
+    let tcx = &u.tcx;
+    let def = prog.def(d);
+    let krate = def.krate;
+    let Some((_, p)) = u.provided.iter().find(|(k, _)| *k == krate) else { return StaticUse::NotProvided };
+    let path = prog.def_path(d);
+    let key = norm(&path);
+    let class_2 = || {
+        let ts = crate::typeck::ty_to_string(false, prog, tcx, t);
+        StaticUse::Refused(format!("static `{path}` (`{ts}`) is laid out and run by rustc's std on the loader's side and by Relax's on this side (a lock, a lazy cell, a collection, a box or an Rc/Arc): reach it through an op of the crate (#[relax_api] fn), or mark it `#[relax_api(per_side)]`"))
+    };
+    if let Some(&(addr, size, align)) = p.shared.get(&key) {
+        if !shared_class(prog, tcx, krate, t) {
+            return class_2();
+        }
+        let l = u.layout_of(t);
+        if size != u64::from(l.size) || align != u64::from(l.align) {
+            return StaticUse::Refused(format!("static `{path}` of provided crate `{}`: the loader and this program disagree on the static's layout (program size {} align {}, loader size {size} align {align}): rebuild makepad from this tree", p.name, l.size, l.align));
+        }
+        return StaticUse::Shared(addr);
+    }
+    if p.per_side.contains(&key) || thread_local_storage(prog, tcx, d, t) {
+        return StaticUse::OwnInstance;
+    }
+    let item = prog.files[def.file as usize].ast.item(def.item);
+    if !matches!(item.kind, crate::ast::ItemKind::Static(true, ..))
+        && tcx.is_freeze(prog, crate::tcx::TypingEnv::fully_monomorphized(prog), t)
+        && trusted(prog, tcx, krate, t, 0)
+    {
+        return StaticUse::Copy;
+    }
+    if shared_class(prog, tcx, krate, t) {
+        StaticUse::Refused(format!("static `{path}` of provided crate `{}` is mutable state the loader's code also uses: mark it `#[relax_api]` (one instance, the loader's) or `#[relax_api(per_side)]` (each side its own)", p.name))
+    } else {
+        class_2()
+    }
+}
+
+/// Static `d` (of type `t`) is a thread-local's storage: a `#[thread_local]` static, or the
+/// runtime key `thread_local!` keeps for a value with drop glue or a lazy initialiser (a
+/// `std::thread::LazyKey` static). Each side has its own per-thread storage by construction
+/// (rustc's lives in its TLS, laid out by its std; Relax's in the JIT's), so JIT code compiled
+/// from a provided crate's source keeps its own: a thread-local is never shared across the
+/// boundary, whatever its type (native_vec::LANES on an app's model thread, 10-30).
+pub fn thread_local_storage(prog: &Program, tcx: &Tcx, d: DefId, t: TyId) -> bool {
+    let def = prog.def(d);
+    let ast = &prog.files[def.file as usize].ast;
+    if crate::lang_items::has_attr(prog, def.file, ast.list(ast.item(def.item).attrs), "thread_local") {
+        return true;
+    }
+    matches!(tcx.tys.kind(t), TyKind::Adt(a, _, _) if matches!(prog.def_path(*a).as_str(), "std::thread::local::LazyKey" | "std::thread::LazyKey"))
 }
 
 /// Diagnose plain fields with the same rules and depth as `trusted` on their ADT.
 pub fn first_untrusted_field(prog: &Program, tcx: &Tcx, krate: u32, d: DefId) -> Option<(String, TyId)> {
     tcx.adts.get(&d)?.variants.iter().flat_map(|v| &v.fields)
-        .find(|f| !trusted_in(prog, tcx, krate, f.ty, 1, true))
+        .find(|f| !trusted_in(prog, tcx, krate, f.ty, 1, true, false))
         .map(|f| (prog.syms.str(f.name).to_string(), f.ty))
 }
 
@@ -711,11 +829,12 @@ pub fn untrusted_path(prog: &Program, tcx: &Tcx, krate: u32, t: TyId) -> String 
 /// `field`: `t` is a field of a provided type, where a pointer to a trait object may pass
 /// through (rustc stores and hands it back, never calls through it: the vtable is Relax's; the
 /// VM's `host: &mut dyn ScriptHost`). As a bound fn's own parameter it may not.
-fn trusted_in(prog: &Program, tcx: &Tcx, krate: u32, t: TyId, depth: u32, field: bool) -> bool {
+/// `cells`: shared static storage may contain cells and atomics of trusted values.
+fn trusted_in(prog: &Program, tcx: &Tcx, krate: u32, t: TyId, depth: u32, field: bool, cells: bool) -> bool {
     if depth > 8 {
         return false;
     }
-    let tr = |t: TyId| trusted_in(prog, tcx, krate, t, depth + 1, false);
+    let tr = |t: TyId| trusted_in(prog, tcx, krate, t, depth + 1, false, cells);
     // a pointer to the crate's own values (rustc made them: the pointer is a handle) or to
     // trusted ones
     let own_pub = |x: TyId| matches!(tcx.tys.kind(x), TyKind::Adt(d, a, _) if a.is_empty() && prog.def(*d).krate == krate && prog.def(*d).is_pub);
@@ -738,6 +857,18 @@ fn trusted_in(prog: &Program, tcx: &Tcx, krate: u32, t: TyId, depth: u32, field:
         TyKind::FnPtr(_, _, header, _) => header.abi.is_c_like(),
         TyKind::Array(e, _) => tr(*e),
         TyKind::Adt(d, a, _) => {
+            if cells {
+                let args = tcx.tys.list(*a);
+                match prog.def_path(*d).as_str() {
+                    // Relax's AtomicU*/AtomicI* names alias Atomic<T> (std/core/sync/atomic.rs).
+                    "core::cell::UnsafeCell" | "core::cell::SyncUnsafeCell" | "core::cell::Cell" | "core::sync::atomic::Atomic" => {
+                        return args.len() == 1 && tr(args[0]);
+                    }
+                    "core::sync::atomic::AtomicBool" => return args.is_empty() && tr(tcx.tys.bool_),
+                    "core::sync::atomic::AtomicPtr" => return args.len() == 1 && tr(tcx.tys.intern(TyKind::Ptr(true, args[0]))),
+                    _ => {}
+                }
+            }
             // Box<T> (global allocator): both sides allocate with the system malloc, but a box
             // OWNS its value: JIT-compiled code that drops it runs T's drop glue. That glue is
             // rustc's when T is marked `#[relax_api(handle)]` (its entry carries rustc's
@@ -783,7 +914,7 @@ fn trusted_in(prog: &Program, tcx: &Tcx, krate: u32, t: TyId, depth: u32, field:
             if adt.is_union {
                 return false;
             }
-            let fields_ok = |v: &crate::tcx::VariantT| v.fields.iter().all(|f| trusted_in(prog, tcx, krate, f.ty, depth + 1, true));
+            let fields_ok = |v: &crate::tcx::VariantT| v.fields.iter().all(|f| trusted_in(prog, tcx, krate, f.ty, depth + 1, true, cells));
             if adt.is_enum {
                 if adt.variants.iter().all(|v| v.fields.is_empty()) {
                     return true;
@@ -1378,7 +1509,7 @@ fn same_bytes(prog: &Program, tcx: &Tcx, krate: u32, t: TyId, ok: &dyn Fn(DefId)
             }
         }
     }
-    trusted_in(prog, tcx, krate, t, 0, true)
+    trusted_in(prog, tcx, krate, t, 0, true, false)
 }
 
 #[cfg(test)]

@@ -49,7 +49,7 @@ pub enum SymKind {
     /// index into `Syms::rw_blocks` (size, align)
     Rw(u32),
     /// an entry of a provided (host-built) crate: `shim:<key>`, `last_panic:<crate>`,
-    /// `drop:<type def path>`
+    /// `drop:<type def path>`, `static:<static def path>`
     Provided(String),
     /// a `#[thread_local]` static's offset (jit.rs Unit::thread_local_place): from the thread
     /// pointer, or in the thread-local block
@@ -707,6 +707,11 @@ fn provenance(u: &Unit, v: u64) -> Option<Sym> {
         return Some(u.syms.intern(SymKind::Thunk(id), v));
     }
     if let Some(s) = u.static_sym_at(v) {
+        return Some(s);
+    }
+    if let Some((key, start)) = crate::provided::shared_at(u, v) {
+        let mut s = u.syms.intern(SymKind::Provided(format!("static:{key}")), start);
+        s.off = (v - start) as i64;
         return Some(s);
     }
     // an anonymous mutable block (a promoted temporary, a per-domain constant): per-domain storage

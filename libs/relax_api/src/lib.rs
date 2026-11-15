@@ -13,11 +13,15 @@
 //!   when Relax lays it out the same and every field is the same bytes on both sides (plain data,
 //!   `String`/`Vec`/`Option<String>` while the two stds agree, other such handles), JIT code builds it
 //!   and reads its fields itself; otherwise its fields never cross.
+//! - `#[relax_api]` on a static: one instance, the loader's, read and written by JIT code at
+//!   the loader's address when its type is the same bytes on both sides.
+//!   JIT code writes the loader's memory, so a pointer it stores in a shared static (`AtomicPtr`,
+//!   `Cell<*const T>`) dangles after the run unless the module's run-end reset clears it.
 //! - `#[relax_api(per_side)]` on a static: each side keeps its own instance (a memo of values
-//!   only that side's code makes and reads, laid out by that side's std). Without it, JIT code
-//!   that reaches a provided crate's static of a type not the same bytes on both sides is refused:
-//!   rustc's one copy cannot be read with Relax's layouts.
-//! - `run`, beside any of these: the ops allocate in the program's heap ([`run_op`]), so the
+//!   only that side's code makes and reads, laid out by that side's std). JIT code reaching an
+//!   unmarked provided static is refused; a type not the same bytes on both sides needs an op
+//!   or its own per-side instance.
+//! - `run`, beside a fn, impl or type mark: the ops allocate in the program's heap ([`run_op`]), so the
 //!   program's end takes what they made. A crate whose objects are the program's (a script VM)
 //!   says it on every attribute. Without it an op allocates in the host's heap ([`host_op`]).
 //!
@@ -141,6 +145,8 @@ pub const HANDLE: u32 = 2;
 pub const PLAIN: u32 = 3;
 /// a static each side keeps its own instance of (`#[relax_api(per_side)]`)
 pub const PER_SIDE: u32 = 4;
+/// A static whose one instance is the loader's: JIT code reads and writes it at the loader's address.
+pub const SHARED: u32 = 5;
 
 /// One marked item, as the attribute lays it down in the `relax_api` link section.
 #[repr(C)]
@@ -172,6 +178,9 @@ pub struct Entry {
     pub enum_layout: &'static [u64],
     /// HANDLE: rustc's drop_in_place, when the type needs drop
     pub drop: Option<DropFn>,
+    /// SHARED: the static's address, taken in its own module (`&raw const`); `size`/`align`
+    /// are then rustc's `size_of`/`align_of` of its declared type.
+    pub addr: Option<fn() -> usize>,
 }
 
 /// An owned buffer in flight across the boundary: pointer, capacity and length (in elements).
@@ -337,7 +346,7 @@ const fn anchor() -> Entry {
     fn none() -> &'static str {
         ""
     }
-    Entry { kind: 0, module: "", key: none, sig: none, shim: None, slots: &[], size: 0, align: 0, offsets: &[], enum_layout: &[], drop: None }
+    Entry { kind: 0, module: "", key: none, sig: none, shim: None, slots: &[], size: 0, align: 0, offsets: &[], enum_layout: &[], drop: None, addr: None }
 }
 
 #[allow(dead_code)]

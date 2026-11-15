@@ -388,6 +388,8 @@ pub struct Unit {
     pub tcx: Tcx,
     /// provided crates (provided.rs): crate index -> its shims
     pub provided: Vec<(u32, crate::provided::ProvidedCrate)>,
+    /// Loader static address ranges, built on the first unattributed constant pointer.
+    pub(crate) provided_static_index: std::sync::OnceLock<crate::provided::SharedStaticIndex>,
     /// their opaque types: drop shim address (0: no drop)
     pub provided_types: HashMap<DefId, u64>,
     /// their handle structs' field offsets as rustc lays them out, in declaration order (the
@@ -5364,6 +5366,7 @@ impl Unit {
             tcx,
             provided_shared: std::sync::OnceLock::new(),
             provided,
+            provided_static_index: std::sync::OnceLock::new(),
             provided_types,
             provided_offsets,
             provided_layout_reasons,
@@ -6034,10 +6037,38 @@ impl Unit {
         self.syms.intern(crate::syms::SymKind::Site(i as u32), i)
     }
 
+    /// A shared provided static is already initialized by the loader.
+    pub(crate) fn static_is_shared(&mut self, d: DefId) -> bool {
+        if self.provided.iter().any(|(k, _)| *k == self.prog.def(d).krate) {
+            if let Some(t) = self.tcx.const_ty(&self.prog, d) {
+                return matches!(crate::provided::static_use(self, d, t), crate::provided::StaticUse::Shared(_));
+            }
+        }
+        false
+    }
+
     /// A static's memory as a symbol.
     pub fn static_sym(&mut self, d: DefId) -> relax_backend::rir::Sym {
+        if self.provided.iter().any(|(k, _)| *k == self.prog.def(d).krate) {
+            if let Some(t) = self.tcx.const_ty(&self.prog, d) {
+                match crate::provided::static_use(self, d, t) {
+                    crate::provided::StaticUse::Shared(addr) => return self.shared_static_sym(d, addr),
+                    crate::provided::StaticUse::Refused(msg) => {
+                        self.static_error(d, msg);
+                        return self.syms.intern(crate::syms::SymKind::Static(d), 0);
+                    }
+                    _ => {}
+                }
+            }
+        }
         let a = self.static_addr(d);
         self.syms.intern(crate::syms::SymKind::Static(d), a)
+    }
+
+    /// A shared static's loader address, named identically by lowering and constant evaluation.
+    pub fn shared_static_sym(&self, d: DefId, addr: usize) -> relax_backend::rir::Sym {
+        let key = crate::provided::norm(&self.prog.def_path(d));
+        self.syms.intern(crate::syms::SymKind::Provided(format!("static:{key}")), addr as u64)
     }
 
     /// The static containing `addr` (pointers to statics stored in constants), with the
@@ -7894,7 +7925,8 @@ impl Unit {
     /// deferred initializer. Otherwise a completed parent can hide the unfinished
     /// static from the retry after its missing module loads.
     pub(crate) fn ctfe_static_addr(&mut self, d: DefId) -> Option<u64> {
-        let a = self.static_addr(d);
+        let sym = self.static_sym(d);
+        let a = self.syms.addr(sym);
         (a != 0 && !DEFERRED_ABORT.with(|f| f.get())).then_some(a)
     }
 
@@ -7918,6 +7950,12 @@ impl Unit {
     /// Static `d` is initialized at `a` (not waiting for the post-boot loader to run it again).
     fn static_ready(&self, d: DefId, a: u64) -> bool {
         self.statics.get(&d) == Some(&a) && !DEFERRED_STATICS.lock().unwrap_or_else(|e| e.into_inner()).contains(&d.0)
+    }
+
+    fn static_error(&mut self, d: DefId, msg: String) {
+        let def = self.prog.def(d);
+        let at = self.pos_str(def.file, self.prog.files[def.file as usize].ast.item(def.item).lo);
+        self.note_error(format!("{at}: {msg}"));
     }
 
     fn static_addr_inner(&mut self, d: DefId) -> u64 {
@@ -7958,6 +7996,17 @@ impl Unit {
                 return 0;
             }
         };
+        // Shared statics are reached through Provided symbols, never JIT-owned storage.
+        // Report here too: callers such as global_asm and the initializer check can ignore 0.
+        let refused = match crate::provided::static_use(self, d, t) {
+            crate::provided::StaticUse::Shared(_) => Some(format!("could not evaluate static `{}`: its storage belongs to the loader and must be reached through its provided static symbol", self.prog.def_path(d))),
+            crate::provided::StaticUse::Refused(msg) => Some(msg),
+            _ => None,
+        };
+        if let Some(msg) = refused {
+            self.static_error(d, msg);
+            return 0;
+        }
         let l = self.layout_of(t);
         let buf = self.rw_data(l.size.max(1) as u64, l.align.max(8) as u64);
         crate::zone_alloc::kept_with(|| {
@@ -15864,7 +15913,9 @@ unsafe fn build_rir_lowered_as(up: *mut Unit, id: u32) -> Result<relax_backend::
             }
         }
         if kind == DefKind::Static {
-            (&mut *up).static_addr(d);
+            if !(&mut *up).static_is_shared(d) {
+                (&mut *up).static_addr(d);
+            }
         } else {
             (&mut *up).const_addr(d, args);
         }
@@ -31737,7 +31788,7 @@ pub(crate) fn const_drain() {
             }
             // (Unit::static_addr publishes an initialized static into FrontShared::consts)
             Wanted::Static(d) => {
-                if u.front.consts.get(&(d, Vec::new())).is_some() {
+                if u.static_is_shared(d) || u.front.consts.get(&(d, Vec::new())).is_some() {
                     left_out_drained(item, true);
                     continue;
                 }
@@ -31856,6 +31907,7 @@ impl Unit {
             self.provided_offsets.extend(handles.iter().filter(|(d, ..)| self.prog.def(*d).kind == DefKind::Struct).map(|(d, _, _, offs, _)| (*d, *offs)));
             self.provided_layout_reasons.extend(crate::zone_alloc::kept_clone(&layout_reasons));
         });
+        self.provided_static_index.take();
         self.lay.opaque.extend(opaque);
         // rustc's layout must be Relax's for a plain type, else it is used through the crate's fns only
         let probe = crate::layout::Layouts::new();

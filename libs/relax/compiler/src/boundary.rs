@@ -32,6 +32,8 @@ struct Entry {
     sites: u32,
     callers: BTreeSet<String>,
     sample: String,
+    /// a static's row: how lowering treats it (`static_class`)
+    class: String,
 }
 
 #[derive(Default)]
@@ -175,8 +177,8 @@ pub fn note_violation(u: &Unit, krate: u32, body: u32, error: &str) {
     a.violations.insert((krate, u.fns[body as usize].name.to_string(), error.lines().next().unwrap_or("").to_string()));
 }
 
-/// A static `d` read or borrowed in the body of (`def`, `args`).
-pub fn note_static(u: &Unit, def: DefId, args: &[TyId], d: DefId) {
+/// A static `d` (of type `t`) read or borrowed in the body of (`def`, `args`).
+pub fn note_static(u: &Unit, def: DefId, args: &[TyId], d: DefId, t: TyId) {
     if !on() {
         return;
     }
@@ -191,6 +193,26 @@ pub fn note_static(u: &Unit, def: DefId, args: &[TyId], d: DefId) {
     if e.sample.is_empty() {
         e.sample = u.prog.def_path(def);
     }
+    if e.class.is_empty() {
+        e.class = static_class(u, d, t);
+    }
+}
+
+/// The provided-static classifier's answer, alongside `static mut` and `Freeze`.
+fn static_class(u: &Unit, d: DefId, t: TyId) -> String {
+    let prog = &u.prog;
+    let def = prog.def(d);
+    let ast = &prog.files[def.file as usize].ast;
+    let item = ast.item(def.item);
+    let is_mut = matches!(item.kind, crate::ast::ItemKind::Static(true, ..));
+    let freeze = u.tcx.is_freeze(prog, crate::tcx::TypingEnv::fully_monomorphized(prog), t);
+    let class = match crate::provided::static_use(u, d, t) {
+        crate::provided::StaticUse::Shared(_) => "shared",
+        crate::provided::StaticUse::OwnInstance | crate::provided::StaticUse::NotProvided => "own",
+        crate::provided::StaticUse::Copy => "copy",
+        crate::provided::StaticUse::Refused(_) => "refused",
+    };
+    format!("class={class} mut={} freeze={}", is_mut as u8, freeze as u8)
 }
 
 /// The C shape of a type at the boundary.
@@ -479,6 +501,9 @@ pub fn run(up: *mut Unit, root: u32) -> (String, usize) {
                 }
                 sig = format!("({}) -> {}={}", parts.join(", "), crate::typeck::ty_to_string(false, &u.prog, &u.tcx, *r), rs);
             }
+        }
+        if *kind == "static" {
+            sig = e.class.clone();
         }
         let _ = writeln!(out, "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}", kind, if bad.is_empty() { "ok" } else { "CLEANUP" }, e.sites, name, sig, bad.join(" "), e.callers.iter().cloned().collect::<Vec<_>>().join(","), e.sample);
     }

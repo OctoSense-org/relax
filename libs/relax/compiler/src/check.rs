@@ -2027,7 +2027,9 @@ fn eval_items(up: *mut Unit, own: &[bool], tainted: &std::collections::HashSet<c
             crate::owner::call(crate::owner::Class::Program, || unsafe {
                 let t2 = std::time::Instant::now();
                 let u = &mut *up;
-                if is_static { u.static_addr(d); } else { u.const_addr(d, Vec::new()); }
+                if is_static {
+                    if !u.static_is_shared(d) { u.static_addr(d); }
+                } else { u.const_addr(d, Vec::new()); }
                 inner.store(t2.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
             })
         });

@@ -13,7 +13,7 @@ pub fn relax_api_impl(attr: TokenStream, item: TokenStream) -> TokenStream {
         Some("impl") => expand_impl(&toks, &args),
         Some("fn") => expand_fn(&toks, &args),
         Some("struct") | Some("enum") => expand_type(&toks, &args),
-        Some("static") => expand_static(&toks, &args),
+        Some("static") => expand_static(&toks, &attr),
         _ => Err("#[relax_api] goes on a fn, an impl block, a struct, an enum or a static".to_string()),
     };
     match res {
@@ -485,7 +485,7 @@ fn op_code(o: &Owner, s: &Sig, phase: &str) -> String {
   kind: ::relax_api::OP, module: module_path!(),
   key: {key},
   sig: {{ fn s() -> &'static str {{ ::core::any::type_name::<{fnptr}>() }} s }},
-  shim: Some({w}), slots: &[{slots}], size: 0, align: 0, offsets: &[], enum_layout: &[], drop: None }};",
+  shim: Some({w}), slots: &[{slots}], size: 0, align: 0, offsets: &[], enum_layout: &[], drop: None, addr: None }};",
         key = key_code(o, &s.name),
         slots = slots.join(", "),
     )
@@ -641,31 +641,85 @@ fn expand_impl(toks: &[TokenTree], args: &[String]) -> Result<(TokenStream, Stri
     Ok((out.into_iter().collect(), extra))
 }
 
-/// `#[relax_api(per_side)] static NAME: T = ..;`: an entry naming the static (its key the def
-/// path), so Relax gives JIT code its own instance instead of refusing the read.
-fn expand_static(toks: &[TokenTree], args: &[String]) -> Result<(TokenStream, String), String> {
+/// `#[relax_api] static [mut] NAME: T = ..;`: the loader's one instance, with its def path,
+/// address and rustc layout. `#[relax_api(per_side)] static NAME: T = ..;`: an entry naming
+/// the static so Relax gives JIT code its own instance instead of refusing the read.
+fn expand_static(toks: &[TokenTree], attr: &TokenStream) -> Result<(TokenStream, String), String> {
+    let mut args: Vec<TokenTree> = attr.clone().into_iter().collect();
+    let shared = args.is_empty();
+    if is_punct(args.last(), ',') {
+        args.pop();
+    }
+    let per_side = args.len() == 1 && is_ident(args.first(), "per_side");
     let mut i = skip_attrs(toks, 0);
     while !is_ident(toks.get(i), "static") {
         i += 1;
     }
     i += 1;
-    if is_ident(toks.get(i), "mut") {
-        return Err("a `static mut` is not marked: use a static with interior mutability".to_string());
+    let mutable = is_ident(toks.get(i), "mut");
+    if mutable {
+        i += 1;
     }
     let name = match toks.get(i) {
         Some(TokenTree::Ident(id)) => id.to_string(),
         _ => return Err("a static without a name".to_string()),
     };
-    if !args.iter().any(|a| a == "per_side") || args.len() != 1 {
-        return Err(format!("`{name}`: a static is marked #[relax_api(per_side)] (each side keeps its own instance)"));
+    if !shared && !per_side {
+        return Err(format!("`{name}`: a static is marked #[relax_api] (one instance, the loader's) or #[relax_api(per_side)] (each side its own)"));
     }
     let id = fnv(&format!("static {name}"));
-    let key = format!("{{ fn k() -> &'static str {{ concat!(module_path!(), \"::{name}\") }} k }}");
     let none = "{ fn s() -> &'static str { \"\" } s }";
-    let extra = format!(
-        "{CFG} {SECTION} #[doc(hidden)] #[allow(non_upper_case_globals)] static __relax_api_s{id:016x}: ::relax_api::Entry = ::relax_api::Entry {{
+    if per_side {
+        if mutable {
+            return Err("a `static mut` is not marked: use a static with interior mutability".to_string());
+        }
+        let key = format!("{{ fn k() -> &'static str {{ concat!(module_path!(), \"::{name}\") }} k }}");
+        let extra = format!(
+            "{CFG} {SECTION} #[doc(hidden)] #[allow(non_upper_case_globals)] static __relax_api_s{id:016x}: ::relax_api::Entry = ::relax_api::Entry {{
   kind: ::relax_api::PER_SIDE, module: module_path!(), key: {key}, sig: {none},
-  shim: None, slots: &[], size: 0, align: 0, offsets: &[], enum_layout: &[], drop: None }};"
+  shim: None, slots: &[], size: 0, align: 0, offsets: &[], enum_layout: &[], drop: None, addr: None }};"
+        );
+        return Ok((toks.iter().cloned().collect(), extra));
+    }
+    if !is_punct(toks.get(i + 1), ':') {
+        return Err(format!("`{name}`: cannot read the static's type"));
+    }
+    let start = i + 2;
+    let mut end = start;
+    let mut depth = 0i32;
+    while end < toks.len() {
+        if is_punct(toks.get(end), '=') && depth == 0 {
+            break;
+        }
+        if is_punct(toks.get(end), '<') {
+            depth += 1;
+        } else if is_punct(toks.get(end), '>') && !is_punct(toks.get(end - 1), '-') {
+            depth -= 1;
+        }
+        end += 1;
+    }
+    if end == start || end == toks.len() {
+        return Err(format!("`{name}`: cannot read the static's type and initializer"));
+    }
+    let ty = toks[start..end].iter().cloned().collect::<TokenStream>().to_string();
+    let key = format!(
+        "{{ fn k() -> &'static str {{
+    static K: ::std::sync::OnceLock<::std::string::String> = ::std::sync::OnceLock::new();
+    K.get_or_init(|| {{
+        let marker = ::core::any::type_name_of_val(&__relax_api_m{id:016x});
+        let scope = marker.rsplit_once(\"::\").expect(\"a static marker's def path\").0;
+        let mut key = ::std::string::String::from(scope);
+        key.push_str(\"::{name}\");
+        key
+    }}).as_str()
+}} k }}"
+    );
+    let extra = format!(
+        "{CFG} #[doc(hidden)] #[allow(non_snake_case)] fn __relax_api_m{id:016x}() {{}}
+{CFG} {SECTION} #[doc(hidden)] #[allow(non_upper_case_globals)] static __relax_api_s{id:016x}: ::relax_api::Entry = ::relax_api::Entry {{
+  kind: ::relax_api::SHARED, module: module_path!(), key: {key}, sig: {none},
+  shim: None, slots: &[], size: ::core::mem::size_of::<{ty}>() as u64, align: ::core::mem::align_of::<{ty}>() as u64,
+  offsets: &[], enum_layout: &[], drop: None, addr: Some({{ fn a() -> usize {{ (&raw const {name}) as usize }} a }}) }};"
     );
     Ok((toks.iter().cloned().collect(), extra))
 }
@@ -916,7 +970,7 @@ fn expand_type(toks: &[TokenTree], args: &[String]) -> Result<(TokenStream, Stri
             "{CFG} {SECTION} #[doc(hidden)] #[allow(non_upper_case_globals)] static __relax_api_t{id:016x}: ::relax_api::Entry = ::relax_api::Entry {{
   kind: ::relax_api::PLAIN, module: module_path!(), key: {key}, sig: {none},
   shim: None, slots: &[], size: ::core::mem::size_of::<{ty}>() as u64, align: ::core::mem::align_of::<{ty}>() as u64,
-  offsets: &[{}], enum_layout: {enum_layout}, drop: None }};",
+  offsets: &[{}], enum_layout: {enum_layout}, drop: None, addr: None }};",
             offsets.join(", ")
         ));
     } else {
@@ -925,7 +979,7 @@ fn expand_type(toks: &[TokenTree], args: &[String]) -> Result<(TokenStream, Stri
 {CFG} {SECTION} #[doc(hidden)] #[allow(non_upper_case_globals)] static __relax_api_t{id:016x}: ::relax_api::Entry = ::relax_api::Entry {{
   kind: ::relax_api::HANDLE, module: module_path!(), key: {key}, sig: {none},
   shim: None, slots: &[], size: ::core::mem::size_of::<{ty}>() as u64, align: ::core::mem::align_of::<{ty}>() as u64,
-  offsets: &[{}], enum_layout: {enum_layout}, drop: if ::core::mem::needs_drop::<{ty}>() {{ Some(__relax_api_d{id:016x}) }} else {{ None }} }};",
+  offsets: &[{}], enum_layout: {enum_layout}, drop: if ::core::mem::needs_drop::<{ty}>() {{ Some(__relax_api_d{id:016x}) }} else {{ None }}, addr: None }};",
             offsets.join(", ")
         ));
         if args.iter().any(|a| a == "default") {
@@ -938,7 +992,7 @@ fn expand_type(toks: &[TokenTree], args: &[String]) -> Result<(TokenStream, Stri
   kind: ::relax_api::OP, module: module_path!(),
   key: {{ fn k() -> &'static str {{ ::core::any::type_name_of_val(&<{ty} as ::core::default::Default>::default) }} k }},
   sig: {{ fn s() -> &'static str {{ ::core::any::type_name::<fn() -> {ty}>() }} s }},
-  shim: Some(__relax_api_h{h:016x}), slots: &[[::core::mem::size_of::<{ty}>() as u64, ::core::mem::align_of::<{ty}>() as u64, 0, 0]], size: 0, align: 0, offsets: &[], enum_layout: &[], drop: None }};"
+  shim: Some(__relax_api_h{h:016x}), slots: &[[::core::mem::size_of::<{ty}>() as u64, ::core::mem::align_of::<{ty}>() as u64, 0, 0]], size: 0, align: 0, offsets: &[], enum_layout: &[], drop: None, addr: None }};"
             ));
         }
         // the handle's trait ops, under the keys Relax's bridges look up
@@ -950,7 +1004,7 @@ fn expand_type(toks: &[TokenTree], args: &[String]) -> Result<(TokenStream, Stri
 {CFG} {SECTION} #[doc(hidden)] #[allow(non_upper_case_globals)] static __relax_api_h{h:016x}_E: ::relax_api::Entry = ::relax_api::Entry {{
   kind: ::relax_api::OP, module: module_path!(),
   key: {{ fn k() -> &'static str {{ concat!(\"<\", module_path!(), \"::{name} as {trait_key}\") }} k }}, sig: {none},
-  shim: Some(__relax_api_h{h:016x}), slots: &[], size: 0, align: 0, offsets: &[], enum_layout: &[], drop: None }};"
+  shim: Some(__relax_api_h{h:016x}), slots: &[], size: 0, align: 0, offsets: &[], enum_layout: &[], drop: None, addr: None }};"
             ));
         };
         if args.iter().any(|a| a == "clone") {

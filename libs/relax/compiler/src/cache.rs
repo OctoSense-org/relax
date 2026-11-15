@@ -6348,6 +6348,9 @@ pub fn write_trace() {
 
 /// The address of a provided (host-built) crate's entry in this process (SymKind::Provided).
 fn provided_value(u: &Unit, name: &str) -> Option<u64> {
+    if let Some(key) = name.strip_prefix("static:") {
+        return u.provided.iter().find_map(|(_, pc)| pc.shared.get(key).map(|&(addr, _, _)| addr as u64));
+    }
     if let Some(key) = name.strip_prefix("shim:") {
         for (_, pc) in &u.provided {
             if let Some(sh) = pc.shims.get(key) {
