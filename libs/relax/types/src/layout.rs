@@ -849,7 +849,12 @@ impl Layouts {
                                 l.leaves = None;
                             }
                         }
-                        None => lcx.missing.borrow_mut().push(t),
+                        // the frame is being found (the compiler's coroutine lowering): the state
+                        // so far, held in memory, where its slot says what its size came from
+                        None => {
+                            lcx.missing.borrow_mut().push(t);
+                            l.leaves = None;
+                        }
                     }
                 }
                 // an FnOnce closure's state holds drop flags its body clears: it lives in memory

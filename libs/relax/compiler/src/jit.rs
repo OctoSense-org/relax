@@ -483,20 +483,19 @@ pub struct Unit {
     /// the newest PRESERVE_LOG_VERSIONS versions'
     pub(crate) preserve_log: std::collections::VecDeque<(u32, PreserveLog)>,
     /// coroutine poll functions lowered to find their state layout (coro_frame): the build of
-    /// the slot takes this RIR, so the layout callers saw and the code agree
+    /// the slot takes this RIR, so the layout callers saw and the code agree. Only a lowering that
+    /// met no layout so far is here (PARTIAL_LAYOUTS): one that did is lowered again
     pub coro_rir: crate::conc::MemoMap<u32, relax_backend::rir::Func>,
     /// coroutine types whose body is being lowered for its layout (on the owner thread)
     pub coro_busy: relax_session::sync::Mutex<Vec<TyId>>,
+    /// coroutine types lowered whose saved storage came from the layout so far of others (their
+    /// blockers, busy or waiting themselves): no frame yet, lowered again once every blocker is
+    /// framed (coro_wake); empty outside coro_frame. Shared, as coro_busy: a lowering ahead on a
+    /// helper thread stops at one (frame_missing).
+    pub coro_waiting: relax_session::sync::Mutex<Vec<(TyId, Vec<TyId>)>>,
     /// slots queued for speculation whose code the disk cache has: their worker links it and
     /// skips the type check ahead (a warm run checked ~11k bodies ahead it never used)
     pub spec_cached: crate::conc::MemoMap<u32, ()>,
-    /// coroutine types whose layout was asked for while their own poll function was being lowered
-    /// (`Box::pin(f(n - 1)).await` builds the callee future, of the same type, before the frame
-    /// is known): the lowering is done again with the frame in place (coro_frame)
-    pub coro_selfref: relax_session::sync::Mutex<Vec<TyId>>,
-    /// slots of coroutine poll functions being lowered again (coro_frame): they skip `coro_rir`,
-    /// which holds the first lowering made with the layout so far
-    pub coro_relower: relax_session::sync::Mutex<Vec<u32>>,
     /// drop_may_unwind answers
     pub unwind_drop_cache: crate::conc::MemoMap<TyId, bool>,
     /// (concrete type, dyn type) -> vtable address
@@ -5565,9 +5564,8 @@ impl Unit {
             preserve_log: Default::default(),
             coro_rir: Default::default(),
             coro_busy: Default::default(),
+            coro_waiting: Default::default(),
             spec_cached: Default::default(),
-            coro_selfref: Default::default(),
-            coro_relower: Default::default(),
             unwind_drop_cache: Default::default(),
             vtables: crate::conc::MemoMap::new_kept(16),
             vtable_makers: Default::default(),
@@ -6646,14 +6644,20 @@ impl Unit {
     }
 
     pub fn closure_storage_layout(&self, ty: TyId) -> crate::layout::Layout {
+        self.closure_storage_layout_served(ty).0
+    }
+
+    /// closure_storage_layout, with the coroutines whose layout so far it holds (frame_missing;
+    /// empty: a complete layout). A lowering's frame provenance (lower.rs) reads them here.
+    pub fn closure_storage_layout_served(&self, ty: TyId) -> (crate::layout::Layout, Vec<TyId>) {
         loop {
             let lcx = crate::layout::LayoutCx::new(&self.prog);
             let layout = self.lay.closure_storage_layout(&lcx, &self.tcx, ty);
-            if lcx.missing.borrow().is_empty() { return layout; }
-            for ct in lcx.missing.into_inner() {
-                if self.tcx.coro_frames.get(&ct).is_none() {
-                    owner::call(owner::Class::Job, || unsafe { (&mut *self.self_ptr.0).coro_frame(ct) });
-                }
+            if lcx.missing.borrow().is_empty() {
+                return (layout, Vec::new());
+            }
+            if let Some(served) = self.frame_missing(lcx.missing.into_inner()) {
+                return (layout, served);
             }
         }
     }
@@ -6688,6 +6692,12 @@ impl Unit {
     /// coroutines `t` contains whose body was not lowered yet are lowered first (rustc computes
     /// a coroutine's layout from its optimized MIR the same way, on demand).
     pub fn layout_of(&self, t: TyId) -> &'static crate::layout::Layout {
+        self.layout_of_served(t).0
+    }
+
+    /// layout_of, with the coroutines whose layout so far it holds (frame_missing; empty: a
+    /// complete layout). A lowering's frame provenance (lower.rs) reads them here.
+    pub fn layout_of_served(&self, t: TyId) -> (&'static crate::layout::Layout, Vec<TyId>) {
         // rustc_ty_utils/src/layout.rs:63-75 @8d1a764: codegen layouts use
         // normalized types, including const aliases in static array lengths.
         let t = self.tcx.normalize_erasing_regions(&self.prog, crate::tcx::TypingEnv::fully_monomorphized(&self.prog), t);
@@ -6695,40 +6705,57 @@ impl Unit {
             let lcx = crate::layout::LayoutCx::new(&self.prog);
             let l = self.lay.of(&lcx, &self.tcx, t);
             if lcx.missing.borrow().is_empty() {
-                return l;
+                return (l, Vec::new());
             }
-            let mut waiting = false;
-            for ct in lcx.missing.into_inner() {
-                if self.tcx.coro_frames.get(&ct).is_none() {
-                    // the coroutine whose poll function is being lowered right now: the layout
-                    // so far (its state without the saved locals) answers this lowering; the
-                    // lowering is repeated once the frame is known (coro_frame)
-                    if self.coro_busy.lock().unwrap_or_else(|e| e.into_inner()).contains(&self.tcx.tys.erase_regions(ct)) {
-                        // a lowering ahead on a helper thread meanwhile: the layout so far is the
-                        // owner's poll lowering's alone; code made from it (an `async fn` returning
-                        // only its state byte, its callers passing 16 bytes) breaks the ABI. The
-                        // build is redone on the owner once the frame is known (r_spawn_e: tokio's
-                        // yield_now resumed after completion).
-                        lower_ahead_needs_unit();
-                        let mut s = self.coro_selfref.lock().unwrap_or_else(|e| e.into_inner());
-                        let ct = self.tcx.tys.erase_regions(ct);
-                        if !s.contains(&ct) { let _k = crate::zone_alloc::kept(); s.push(ct); }
-                        waiting = true;
-                        continue;
-                    }
-                    // lowering a body changes the unit: a unit call
-                    owner::call(owner::Class::Job, || unsafe { (&mut *self.self_ptr.0).coro_frame(ct) });
-                }
-            }
-            if waiting {
-                return l;
+            if let Some(served) = self.frame_missing(lcx.missing.into_inner()) {
+                return (l, served);
             }
         }
     }
 
+    /// Finds the frames of the coroutines a layout was missing (coro_frame). Some: only coroutines
+    /// whose poll function is being lowered right now (coro_busy) or whose frame waits for one
+    /// (coro_waiting) are left, and the layout so far answers: their state without the saved
+    /// locals, held in memory (layout.rs). What is built from it is built from an incomplete layout
+    /// (PARTIAL_LAYOUTS counts it; the list names those coroutines), and coro_frame lowers that
+    /// again once every frame is known. None: the layout is to be asked again, the frames found
+    /// are in it now.
+    fn frame_missing(&self, missing: Vec<TyId>) -> Option<Vec<TyId>> {
+        let (mut served, mut framed) = (Vec::new(), false);
+        for ct in missing {
+            if self.tcx.coro_frames.get(&ct).is_some() {
+                continue;
+            }
+            let ct = self.tcx.tys.erase_regions(ct);
+            if self.coro_busy.lock().unwrap_or_else(|e| e.into_inner()).contains(&ct) || coro_deferred(self, ct).is_some() {
+                // a lowering ahead on a helper thread meanwhile: the layout so far is the
+                // owner's poll lowering's alone; code made from it (an `async fn` returning
+                // only its state byte, its callers passing 16 bytes) breaks the ABI. The
+                // build is redone on the owner once the frame is known (r_spawn_e: tokio's
+                // yield_now resumed after completion).
+                lower_ahead_needs_unit();
+                if !served.contains(&ct) { served.push(ct); }
+                continue;
+            }
+            // lowering a body changes the unit: a unit call
+            owner::call(owner::Class::Job, || unsafe { (&mut *self.self_ptr.0).coro_frame(ct) });
+            framed = true;
+        }
+        if served.is_empty() || framed {
+            return None;
+        }
+        partial_layout_served(self);
+        Some(served)
+    }
+
     /// Lowers coroutine `ct`'s poll function (once) and records its saved locals. Always
     /// records an answer: a body that does not lower gets none (its poll function's build error
-    /// is what runs), a coroutine containing itself is E0733.
+    /// is what runs), a coroutine containing itself is E0733 (lower.rs finish, on the deferral
+    /// graph). A lowering that met a layout so far (a coroutine of the cycle still being lowered:
+    /// frame_missing) gives the frame only when nothing it saves got its storage from one, and
+    /// never the code: the outermost call lowers it again once every frame is known
+    /// (coro_relower). One whose saved storage did waits for those coroutines' frames
+    /// (coro_waiting) and is lowered again as soon as they are known.
     fn coro_frame(&mut self, ct: TyId) {
         let ct = self.tcx.tys.erase_regions(ct);
         if self.tcx.coro_frames.get(&ct).is_some() {
@@ -6758,43 +6785,181 @@ impl Unit {
         }
         self.coro_busy.lock().unwrap_or_else(|e| e.into_inner()).push(ct);
         let up = self as *mut Unit;
-        let _ct = CoroTrace::enter(self, id);
-        let mut r = unsafe { build_rir_lowered(up, id) };
-        // the body asked for the layout of its own future (a temporary that moves into a box): it
-        // was lowered with the state so far, the frame is known now, so lower it again. A saved
-        // local of the future's own type makes the frame differ: E0733 (lower.rs)
-        let again = {
-            let u = unsafe { &*up };
-            let mut s = u.coro_selfref.lock().unwrap_or_else(|e| e.into_inner());
-            let n = s.len();
-            s.retain(|x| *x != ct);
-            n != s.len()
+        let scope = CoroScope::enter(up, ct);
+        let partial0 = partial_layouts();
+        let r = {
+            let _ct = CoroTrace::enter(self, id);
+            unsafe { build_rir_lowered(up, id) }
         };
-        if again && r.is_ok() && unsafe { (&*up).tcx.coro_frames.get(&ct).is_some() } {
-            unsafe { (&mut *up).coro_selfref.lock().unwrap_or_else(|e| e.into_inner()).push(ct) };
-            unsafe { (&*up).coro_relower.lock().unwrap_or_else(|e| e.into_inner()).push(id) };
-            r = unsafe { build_rir_lowered(up, id) };
-            unsafe { (&*up).coro_relower.lock().unwrap_or_else(|e| e.into_inner()).retain(|x| *x != id) };
-            unsafe { (&*up).coro_selfref.lock().unwrap_or_else(|e| e.into_inner()).retain(|x| *x != ct) };
-        }
+        let partial = partial_layouts() != partial0;
         let u = unsafe { &mut *up };
-        u.coro_busy.lock().unwrap_or_else(|e| e.into_inner()).retain(|x| *x != ct);
-        match r {
-            Ok(f) => u.coro_rir.insert(id, f),
-            Err(e) => {
-                if u.fns[id as usize].build_err.is_none() {
-                    // its compile error surfaces when the body is first polled; say it now
-                    // (verbose): a frame without a layout is where a body's error is first met
-                    if crate::run::VERBOSE.load(Ordering::Relaxed) {
-                        eprintln!("relax: coroutine frame of {} not built: {}", u.fns[id as usize].name, e.lines().next().unwrap_or(""));
-                    }
-                    u.reload_errors.insert(id);
-                    u.fns[id as usize].build_err = Some(crate::zone_alloc::slots_with(|| Box::from(e.as_str())));
+        // a cycle that holds itself (lower.rs finish reported E0733 on this lowering): every other
+        // member stops waiting, with no frame and the same error
+        let cycle = CORO_CYCLE.with(|c| {
+            let mut c = c.borrow_mut();
+            if c.first() == Some(&ct) { std::mem::take(&mut *c) } else { Vec::new() }
+        });
+        let e0733 = r.is_err() && !cycle.is_empty();
+        let mut cycle_members = Vec::new();
+        if let (Err(e), true) = (&r, e0733) {
+            for m in cycle.into_iter().filter(|m| *m != ct) {
+                cycle_members.push(m);
+                coro_undefer(u, m);
+                if u.tcx.coro_frames.get(&m).is_none() {
+                    u.tcx.coro_frames.insert(m, (0, 1));
+                }
+                if let Some(mid) = u.closure_fn_id(m) {
+                    u.coro_result(mid, Err(e.clone()));
                 }
             }
         }
-        if u.tcx.coro_frames.get(&ct).is_none() {
-            u.tcx.coro_frames.insert(ct, (0, 1));
+        if coro_deferred(u, ct).is_some() {
+            // its frame waits for the frames its saved storage came from: nothing is published
+        } else {
+            // a body that did not lower (E0733 included) has no frame, only the stand-in below
+            let failed = match &r {
+                Err(e) if u.tcx.coro_frames.get(&ct).is_none() => Some(e.clone()),
+                _ => None,
+            };
+            match r {
+                // built from a layout so far: its frame stands (lower.rs finish recorded it), its
+                // code (or its error) is the next lowering's
+                _ if partial && !e0733 => CORO_RELOWER.with(|l| l.borrow_mut().push(id)),
+                r => u.coro_result(id, r),
+            }
+            if u.tcx.coro_frames.get(&ct).is_none() {
+                u.tcx.coro_frames.insert(ct, (0, 1));
+            }
+            match failed {
+                // the coroutines waiting for it (or for the other members of its E0733 cycle)
+                // get its error, not a frame built from the stand-in
+                Some(e) => {
+                    let mut down = vec![ct];
+                    down.extend(cycle_members);
+                    u.coro_fail_waiters(down, &e);
+                }
+                // the coroutines whose frames waited for this one and now have every frame they need
+                None => u.coro_wake(),
+            }
+        }
+        let outermost = scope.outermost;
+        drop(scope);
+        if let Some(start) = outermost {
+            u.coro_relower(start);
+        }
+    }
+
+    /// The coroutines whose frames waited (coro_waiting) for one of `failed` (bodies that did not
+    /// lower: a stand-in frame), and those that waited for them: each gets `e` and the stand-in, as
+    /// its build error, not a frame.
+    fn coro_fail_waiters(&mut self, mut failed: Vec<TyId>, e: &str) {
+        loop {
+            let next = {
+                let w = self.coro_waiting.lock().unwrap_or_else(|e| e.into_inner());
+                w.iter().find(|(_, blockers)| blockers.iter().any(|b| failed.contains(b))).map(|(t, _)| *t)
+            };
+            let Some(t) = next else { break };
+            coro_undefer(self, t);
+            if self.tcx.coro_frames.get(&t).is_none() {
+                self.tcx.coro_frames.insert(t, (0, 1));
+            }
+            if let Some(id) = self.closure_fn_id(t) {
+                self.coro_result(id, Err(e.to_string()));
+            }
+            failed.push(t);
+        }
+    }
+
+    /// Lowers again each coroutine whose frame waited (coro_waiting) and whose blockers are all
+    /// framed now; each that gets its frame may free others.
+    fn coro_wake(&mut self) {
+        loop {
+            let ready = {
+                let w = self.coro_waiting.lock().unwrap_or_else(|e| e.into_inner());
+                w.iter().find(|(_, blockers)| blockers.iter().all(|b| self.tcx.coro_frames.get(b).is_some())).map(|(t, _)| *t)
+            };
+            let Some(t) = ready else { break };
+            coro_undefer(self, t);
+            self.coro_frame(t);
+        }
+    }
+
+    /// The outermost coro_frame's end: every frame of its cycle is known and nothing is busy. The
+    /// poll functions lowered from a layout so far are lowered again, and that lowering's RIR is
+    /// their code; one that still meets a layout so far is an internal error. Slots whose build met
+    /// one (a constant's initializer run meanwhile) lose its RIR: their next use builds them again.
+    /// The layouts-so-far count is back where it was at the outermost entry: a caller outside the
+    /// cycle only ever saw complete layouts.
+    fn coro_relower(&mut self, start: u64) {
+        let up = self as *mut Unit;
+        // nothing waits once the outermost lowering is done: each wait ends at a frame found
+        // (coro_wake), at the cycle's E0733 or at a blocker's error (coro_fail_waiters)
+        self.coro_waits_left("its cycle was done");
+        while let Some(id) = CORO_RELOWER.with(|l| l.borrow_mut().pop()) {
+            let partial0 = partial_layouts();
+            let r = {
+                let _ct = CoroTrace::enter(self, id);
+                unsafe { build_rir_lowered(up, id) }
+            };
+            let u = unsafe { &mut *up };
+            let r = match r {
+                Ok(_) if partial_layouts() != partial0 => Err(format!("internal: the poll function {} met a layout so far after its coroutine's cycle was framed", u.fns[id as usize].name)),
+                r => r,
+            };
+            u.coro_result(id, r);
+        }
+        let u = unsafe { &mut *up };
+        // nor does a lowering again, whose frames are all known
+        u.coro_waits_left("its cycle's code was lowered again");
+        u.coro_drop_partial();
+        PARTIAL_LAYOUTS.with(|c| c.set(start));
+    }
+
+    /// coro_relower: coroutines still waiting for a frame (none should) get the stand-in and an
+    /// internal error, so no layout so far is served for them outside coro_frame.
+    fn coro_waits_left(&mut self, when: &str) {
+        let left = std::mem::take(&mut *self.coro_waiting.lock().unwrap_or_else(|e| e.into_inner()));
+        for (t, _) in left {
+            if self.tcx.coro_frames.get(&t).is_none() {
+                self.tcx.coro_frames.insert(t, (0, 1));
+            }
+            if let Some(id) = self.closure_fn_id(t) {
+                self.coro_result(id, Err(format!("internal: the frame of {} still waited for another coroutine's when {}", self.fns[id as usize].name, when)));
+            }
+        }
+    }
+
+    /// What a layout so far built is dropped (coro_relower, or an outermost coro_frame unwinding):
+    /// the RIR of the slots built from one, the queue of poll functions to lower again (they have
+    /// no `coro_rir` and are lowered at their build), the waits (an unwinding lowering leaves them:
+    /// those coroutines are framed at their next use).
+    fn coro_drop_partial(&mut self) {
+        for id in CORO_STALE.with(|l| std::mem::take(&mut *l.borrow_mut())) {
+            let f = &mut self.fns[id as usize];
+            f.rir = None;
+            f.lowering = None;
+        }
+        CORO_RELOWER.with(|l| l.borrow_mut().clear());
+        self.coro_waiting.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        CORO_CYCLE.with(|c| c.borrow_mut().clear());
+    }
+
+    /// A coroutine poll function's lowering for its frame (coro_frame): its RIR is the slot's code,
+    /// or its error the slot's build error.
+    fn coro_result(&mut self, id: u32, r: Result<relax_backend::rir::Func, String>) {
+        match r {
+            Ok(f) => self.coro_rir.insert(id, f),
+            Err(e) => {
+                if self.fns[id as usize].build_err.is_none() {
+                    // its compile error surfaces when the body is first polled; say it now
+                    // (verbose): a frame without a layout is where a body's error is first met
+                    if crate::run::VERBOSE.load(Ordering::Relaxed) {
+                        eprintln!("relax: coroutine frame of {} not built: {}", self.fns[id as usize].name, e.lines().next().unwrap_or(""));
+                    }
+                    self.reload_errors.insert(id);
+                    self.fns[id as usize].build_err = Some(crate::zone_alloc::slots_with(|| Box::from(e.as_str())));
+                }
+            }
         }
     }
 
@@ -6941,6 +7106,7 @@ impl Unit {
             TyKind::Dyn(td, targs, _, _, _, _, _) => (td, targs),
             _ => return Err("vtable for a non-dyn type".to_string()),
         };
+        let partial0 = partial_layouts();
         let l = self.layout_of(src);
         let mut words: Vec<u64> = Vec::new();
         // per word: the symbol of a pointer (thunks, supertrait vtables), None for integers
@@ -6998,6 +7164,11 @@ impl Unit {
             bytes.extend_from_slice(&self.ptr_word(*w));
         }
         let a = self.data(&bytes, pb as u64, crate::syms::DataKind::Words(wsyms));
+        // made from a layout so far: for the lowering that asked alone (it is lowered again, and
+        // that lowering's vtable is the one kept)
+        if partial_layouts() != partial0 {
+            return Ok(a);
+        }
         // (named: one of a trait-object type real-time code calls through is compiled after the
         // current request, realtime_vtable)
         self.syms.set_data_name(a, format!("{}{}:{}", crate::syms::VTABLE_NAME, crate::syms::stable_ty(self, src), crate::syms::stable_ty(self, dy)));
@@ -7873,7 +8044,12 @@ impl Unit {
     }
 
     fn const_block(&mut self, body: &Body, bl: crate::ast::BlockId, t: TyId, parent: u32) -> Option<Vec<u8>> {
+        let partial0 = partial_layouts();
         let bytes = crate::ctfe::eval_const_block(self, body, bl, t);
+        // (not kept when made from a layout so far: const_addr_inner)
+        if partial_layouts() != partial0 {
+            return bytes;
+        }
         let _k = crate::zone_alloc::kept();
         let v = bytes.as_ref().map_or((0, 0), |b| (Box::leak(b.clone().into_boxed_slice()).as_ptr() as u64, b.len() as u32));
         self.front.body_consts.insert(BodyConst::Block(bl, t).key(self, parent), v);
@@ -7899,7 +8075,12 @@ impl Unit {
         if let Some(v) = self.front.body_consts.get(&key) {
             return Ok(v.0);
         }
+        let partial0 = partial_layouts();
         let a = self.eval_promoted(body, e, t, parent)?;
+        // (not kept when made from a layout so far: const_addr_inner)
+        if partial_layouts() != partial0 {
+            return Ok(a);
+        }
         let _k = crate::zone_alloc::kept();
         self.front.body_consts.insert(key, (a, 0));
         Ok(a)
@@ -7978,10 +8159,12 @@ impl Unit {
 
     pub fn const_addr(&mut self, d: DefId, args: Vec<TyId>) -> Option<u64> {
         let key = (d, args.clone());
+        let partial0 = partial_layouts();
         let a = self.const_addr_inner(d, args);
         // (FrontShared::consts: lowering ahead reads it; MemoMap::insert prepends, newest wins;
-        // its keys are identity state in the kept heap, as Unit::consts' are: put_const)
-        if let Some(a) = a {
+        // its keys are identity state in the kept heap, as Unit::consts' are: put_const. Not a
+        // value made from a layout so far: const_addr_inner)
+        if let Some(a) = a.filter(|_| partial_layouts() == partial0) {
             if self.front.consts.get(&key) != Some(a) {
                 let _k = crate::zone_alloc::kept();
                 self.front.consts.insert((key.0, key.1.as_slice().to_vec()), a);
@@ -8060,6 +8243,7 @@ impl Unit {
         let t_init = cpu_ns();
         let refusal = RefusalFrame::enter();
         let stand_ins = relax_types::cycle::stand_ins();
+        let partial0 = partial_layouts();
         let evaluated = { let _pop = Pop; self.eval_init(d, args.clone(), false) };
         // a value computed across a cycle read its stand-in (a recovery discriminant, a zero-size
         // layout): rustc reports the E0391 and builds no program, so the constant has no value and
@@ -8070,6 +8254,10 @@ impl Unit {
         INIT_NS[3].fetch_add(cpu_ns() - t_init, Ordering::Relaxed);
         let cert = cert.finish();
         match evaluated {
+            // evaluated from a layout so far (`size_of` of a future whose frame is being found,
+            // coro_frame): the value serves the lowering that asked, which is lowered again; it is
+            // neither kept nor recorded, so that lowering evaluates it again
+            Some(a) if partial_layouts() != partial0 => Some(crate::domain::rehome_const(self, a)),
             Some(a) => {
                 let t_rec = cpu_ns();
                 if let Some(mut cache) = self.cache.take() {
@@ -8091,7 +8279,8 @@ impl Unit {
                 // a module the post-boot loader has still to load: evaluated again later. Nor is a
                 // failure for a constant it read whose body has type errors kept: each use meets
                 // that refusal again, and fails as already reported.
-                if !DEFERRED_ABORT.with(|a| a.get()) && !refused { self.const_failed.insert((d, args)); }
+                // nor one that failed from a layout so far (const_addr_inner's evaluation above)
+                if !DEFERRED_ABORT.with(|a| a.get()) && !refused && partial_layouts() == partial0 { self.const_failed.insert((d, args)); }
                 None
             }
         }
@@ -10437,6 +10626,7 @@ unsafe fn compile_slot_locked(up: *mut Unit, id: u32, outer: bool) -> Compiled {
     }
     // an internal compiler panic (front end or code generator) becomes this function's
     // compile error: the process never goes down for it (rt_compile is extern "C")
+    let partial0 = partial_layouts();
     let r = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| compile_fn(up, id))) {
         Ok(r) => r,
         Err(p) => {
@@ -10456,6 +10646,13 @@ unsafe fn compile_slot_locked(up: *mut Unit, id: u32, outer: bool) -> Compiled {
         }
     };
     Compiled::Code(match r {
+        // built from a layout so far (a constant's initializer run while a coroutine's frame is
+        // found, coro_frame): this call runs it; nothing is installed or recorded, and the slot is
+        // built again at its next use
+        Ok((code, _, relocs)) if partial_layouts() != partial0 => {
+            let u = &mut *up;
+            u.emit_or_redirect(&code, &relocs, "code from a layout so far").unwrap_or(0)
+        }
         Ok((code, map, relocs)) => install_compiled(up, id, &code, map, &relocs, true),
         // it looked into a module the selection skipped: load it, build again
         Err(e) if outer && e.starts_with(DEFERRED_RETRY) && load_deferred(up, id) => return compile_slot_locked(up, id, outer),
@@ -13632,7 +13829,12 @@ unsafe fn build_rir_mode(up: *mut Unit, id: u32, mode: RirMode) -> Result<(), St
     let scope = IceScope::enter();
     let depth0 = BUILD_STACK.try_with(|s| s.borrow().len()).unwrap_or(0);
     let child0 = BUILD_CHILD.try_with(|c| c.borrow().len()).unwrap_or(0);
+    let partial0 = partial_layouts();
     let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| build_rir_unguarded(up, id, mode)));
+    if partial_layouts() != partial0 {
+        // built from a layout so far: its RIR goes when the coroutine cycle is framed (coro_relower)
+        CORO_STALE.with(|l| l.borrow_mut().push(id));
+    }
     drop(scope);
     if r.is_err() {
         // the unwound builds' bookkeeping
@@ -15234,10 +15436,128 @@ fn verify_pass(func: &relax_backend::rir::Func, pass: &str) {
 /// the poll fn's name, inclusive and exclusive CPU ms (exclusive = less the frames built inside it).
 struct CoroTrace { t0: u64, child0: u64, depth: usize, name: String }
 thread_local! { static CORO_TRACE: std::cell::Cell<(usize, u64)> = const { std::cell::Cell::new((0, 0)) }; }
+
+/// RELAX_TRACE=coro: coroutine frame lowerings, timed (CoroTrace), and layouts so far served
+/// outside them
+fn coro_trace_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("RELAX_TRACE").is_ok_and(|v| v.split(',').any(|x| x == "coro")))
+}
+
+thread_local! {
+    /// Layouts so far this thread served (frame_missing: a coroutine whose poll function is being
+    /// lowered, its state without the saved locals). A lowering, a constant evaluation or a vtable
+    /// build that saw it move was built from an incomplete layout: it publishes no code and no value.
+    static PARTIAL_LAYOUTS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// coro_frame's nesting on this thread
+    static CORO_NEST: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    /// poll functions whose frame came from a lowering that met a layout so far: lowered again at
+    /// the outermost coro_frame's end (coro_relower)
+    static CORO_RELOWER: std::cell::RefCell<Vec<u32>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// slots whose RIR was built from a layout so far: dropped at the outermost coro_frame's end
+    static CORO_STALE: std::cell::RefCell<Vec<u32>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// the members of the cycle the current lowering's E0733 closed (lower.rs finish, coro_frame)
+    static CORO_CYCLE: std::cell::RefCell<Vec<TyId>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// The blockers of a coroutine whose frame waits (Unit::coro_waiting).
+fn coro_deferred(u: &Unit, t: TyId) -> Option<Vec<TyId>> {
+    u.coro_waiting.lock().unwrap_or_else(|e| e.into_inner()).iter().find(|(x, _)| *x == t).map(|(_, b)| b.clone())
+}
+
+fn coro_undefer(u: &Unit, t: TyId) {
+    u.coro_waiting.lock().unwrap_or_else(|e| e.into_inner()).retain(|(x, _)| *x != t);
+}
+
+/// lower.rs finish, for coroutine `ct` whose saved storage came from the layout so far of `deps`:
+/// Err when that closes a cycle -- `ct` holds itself by value, directly or through coroutines whose
+/// frames wait for it (rustc's layout_of cycle on a coroutine: E0733), with the cycle's members in
+/// CORO_CYCLE for coro_frame; Ok: `ct` now waits for those frames.
+pub(crate) fn coro_defer(u: &Unit, ct: TyId, deps: Vec<TyId>) -> Result<(), ()> {
+    // the blockers, followed through the waiting coroutines, reaching `ct`
+    let mut seen: Vec<TyId> = Vec::new();
+    let mut stack = deps.clone();
+    let mut closes = false;
+    while let Some(t) = stack.pop() {
+        if t == ct {
+            closes = true;
+        }
+        if seen.contains(&t) {
+            continue;
+        }
+        seen.push(t);
+        if let Some(b) = coro_deferred(u, t) {
+            stack.extend(b);
+        }
+    }
+    if closes {
+        // the waiting coroutines on a way back to `ct`, and `ct`
+        let reaches = |from: TyId| {
+            let (mut seen, mut stack) = (Vec::new(), vec![from]);
+            while let Some(t) = stack.pop() {
+                if t == ct {
+                    return true;
+                }
+                if !seen.contains(&t) {
+                    seen.push(t);
+                    stack.extend(coro_deferred(u, t).unwrap_or_default());
+                }
+            }
+            false
+        };
+        let mut members = vec![ct];
+        members.extend(seen.into_iter().filter(|t| *t != ct && coro_deferred(u, *t).is_some() && reaches(*t)));
+        CORO_CYCLE.with(|c| *c.borrow_mut() = members);
+        return Err(());
+    }
+    let _k = crate::zone_alloc::kept();
+    let mut w = u.coro_waiting.lock().unwrap_or_else(|e| e.into_inner());
+    w.retain(|(x, _)| *x != ct);
+    w.push((ct, deps.to_vec()));
+    Ok(())
+}
+
+/// The layouts so far this thread served: sampled before and after a build, it says whether the
+/// build may publish what it made.
+fn partial_layouts() -> u64 {
+    PARTIAL_LAYOUTS.with(|c| c.get())
+}
+
+fn partial_layout_served(u: &Unit) {
+    PARTIAL_LAYOUTS.with(|c| c.set(c.get() + 1));
+    // only coro_frame's lowering, on its own thread, has a busy coroutine: anything else that gets
+    // here took another thread's
+    if CORO_NEST.with(|c| c.get()) == 0 && coro_trace_on() {
+        let at = BUILD_STACK.try_with(|s| s.borrow().last().copied()).ok().flatten();
+        eprintln!("coro-trace\tlayout so far outside coro_frame\t{}", at.map_or("", |id| &*u.fns[id as usize].name));
+    }
+}
+
+/// A coroutine's frame lowering (coro_frame), also when it unwinds (a cancelled request): it ends
+/// with the coroutine no longer busy; the outermost one, unwinding, drops what a layout so far
+/// built and sets the count back.
+struct CoroScope { up: *mut Unit, ct: TyId, outermost: Option<u64> }
+impl CoroScope {
+    fn enter(up: *mut Unit, ct: TyId) -> CoroScope {
+        let depth = CORO_NEST.with(|c| c.replace(c.get() + 1));
+        CoroScope { up, ct, outermost: (depth == 0).then(partial_layouts) }
+    }
+}
+impl Drop for CoroScope {
+    fn drop(&mut self) {
+        let u = unsafe { &mut *self.up };
+        u.coro_busy.lock().unwrap_or_else(|e| e.into_inner()).retain(|x| *x != self.ct);
+        CORO_NEST.with(|c| c.set(c.get() - 1));
+        if let (Some(start), true) = (self.outermost, std::thread::panicking()) {
+            u.coro_drop_partial();
+            PARTIAL_LAYOUTS.with(|c| c.set(start));
+        }
+    }
+}
+
 impl CoroTrace {
     fn enter(u: &Unit, id: u32) -> Option<CoroTrace> {
-        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if !*ON.get_or_init(|| std::env::var("RELAX_TRACE").is_ok_and(|v| v.split(',').any(|x| x == "coro"))) { return None; }
+        if !coro_trace_on() { return None; }
         let (depth, child) = CORO_TRACE.with(|c| c.get());
         CORO_TRACE.with(|c| c.set((depth + 1, child)));
         let parent = match &u.fns[id as usize].key { FnKey::Closure(_, _, p) => u.fns[*p as usize].name.to_string(), _ => String::new() };
@@ -15932,11 +16252,10 @@ unsafe fn build_rir_lowered_as(up: *mut Unit, id: u32) -> Result<relax_backend::
     let _why = why_function(&*up, id, "lower-fn");
     let _cost_lower = relax_codegen::fncost::phase(3);
     let _mem = crate::memstat::tag(crate::memstat::Tag::Lower);
-    if !(&*up).coro_relower.lock().unwrap_or_else(|e| e.into_inner()).contains(&id) {
-        if let Some(f) = (&*up).coro_rir.get(&id) {
-            return Ok(f.clone());
-        }
+    if let Some(f) = (&*up).coro_rir.get(&id) {
+        return Ok(f.clone());
     }
+    let partial0 = partial_layouts();
     let _warm = relax_codegen::warm::Scope::slot(id, "lowering");
     let key = (&*up).fns[id as usize].key.clone();
     let fname = {
@@ -16194,9 +16513,10 @@ unsafe fn build_rir_lowered_as(up: *mut Unit, id: u32) -> Result<relax_backend::
         u.put_body(id, body);
     }
     // a coroutine's poll function: its state layout was recorded from this RIR (every later
-    // build of the slot takes it again)
+    // build of the slot takes it again), unless the lowering met a layout so far (coro_frame
+    // lowers it again)
     if let FnKey::Closure(file, ce, _) = &key {
-        if u.tcx.coroutines.contains(&(*file, *ce)) {
+        if u.tcx.coroutines.contains(&(*file, *ce)) && partial_layouts() == partial0 {
             u.coro_rir.insert(id, func.clone());
         }
     }

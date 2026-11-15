@@ -254,6 +254,13 @@ pub struct Lcx<'a> {
     /// Body-local answers, discarded if nested constant evaluation re-collects types.
     query_epoch: u64,
     layouts: HashMap<TyId, &'static Layout>,
+    /// the layouts answered so far (jit.rs frame_missing) by type, with the coroutines whose frame
+    /// each is missing; and the slots whose size came from one. A coroutine body publishes its
+    /// frame only when none of its saved slots did (finish).
+    partial_tys: HashMap<TyId, Vec<TyId>>,
+    partial_slots: HashMap<u32, Vec<TyId>>,
+    /// the coroutines whose layout so far this coroutine body's own upvars hold (always saved)
+    partial_upvars: Vec<TyId>,
     /// Repeated uses of a type need the same cleanup decision.
     drop_types: HashMap<TyId, bool>,
     /// Trait dispatch is fully monomorphized here; repeated calls in this body share it.
@@ -542,6 +549,9 @@ impl<'a> Lcx<'a> {
             errors: Vec::new(),
             query_epoch: u.tcx.collect_epoch.load(std::sync::atomic::Ordering::Relaxed),
             layouts: HashMap::default(),
+            partial_tys: HashMap::default(),
+            partial_slots: HashMap::default(),
+            partial_upvars: Vec::new(),
             drop_types: HashMap::default(),
             trait_methods: HashMap::default(),
             scopes: vec![Vec::new()],
@@ -1095,7 +1105,8 @@ impl<'a> Lcx<'a> {
             Some(&l) => (l, false),
             None => {
                 let erased = u.tcx.tys.erase_regions(t);
-                let l = u.layout_of(erased);
+                let (l, served) = u.layout_of_served(erased);
+                if served.is_empty() { self.partial_tys.remove(&t); } else { self.partial_tys.insert(t, served); }
                 self.check_explicit_discriminants(t);
                 let too_big = u.lay.is_too_big(erased);
                 if !too_big { self.layouts.insert(t, l); }
@@ -1279,6 +1290,9 @@ impl<'a> Lcx<'a> {
     fn new_slot_flagged_at(&mut self, t: TyId, arg: bool, ret: bool) -> (VReg, u32) {
         let l = self.layout(t);
         let s = self.f.slot(l.size, l.align);
+        if let Some(d) = self.partial_tys.get(&t) {
+            self.partial_slots.insert(s, d.clone());
+        }
         let sl = &mut self.f.slots[s as usize];
         sl.born = self.coro.is_none();
         sl.arg = arg;
@@ -1913,28 +1927,39 @@ impl<'a> Lcx<'a> {
                 s.born = false;
             }
             let ptr_bytes = self.pb();
-            match coroutine_transform(&mut self.f, &c, ptr_bytes, &tys) {
-                Ok((sz, al, shape)) => {
+            match coroutine_transform(&mut self.f, &c, ptr_bytes, &tys, &self.partial_slots) {
+                Ok((sz, al, shape, mut deps)) => {
                     let area = (sz, al);
+                    for t in std::mem::take(&mut self.partial_upvars) {
+                        if !deps.contains(&t) { deps.push(t); }
+                    }
                     if self.errors.is_empty() {
-                        if self.u.tcx.coro_shapes.get(&c.ct).is_none() {
-                            self.u.tcx.coro_shapes.insert(c.ct, shape);
-                        }
                         if self.u.tcx.coro_slot_ty.get(&self.cur_fn).is_none() {
                             self.u.tcx.coro_slot_ty.insert(self.cur_fn, c.ct);
                         }
-                        match self.u.tcx.coro_frames.get(&c.ct) {
-                            Some(prev) if prev != area => {
-                                // the second lowering of a future that asked for its own layout
-                                // (jit.rs coro_frame) saved a local of its own type across a suspension
-                                if self.u.coro_selfref.lock().unwrap_or_else(|e| e.into_inner()).contains(&c.ct) {
-                                    self.err(self.pos, "recursion in an async fn or block requires boxing: the future would contain itself (E0733)".to_string());
-                                } else {
+                        if !deps.is_empty() {
+                            // what it saves got its size from coroutines whose frames are not known
+                            // yet: no frame now (jit.rs coro_frame lowers it again once they are),
+                            // unless those wait for this one, a future that holds itself
+                            if crate::jit::coro_defer(self.u, c.ct, deps).is_err() {
+                                // (the clause goes with the storage-dead points: the transform saves
+                                // a slot whose future was moved into a box or whose scope ended
+                                // before the suspension point, rustc does not; KNOWN_GAPS.md)
+                                self.err(self.pos, "recursion in an async fn or block requires boxing: the future would contain itself (E0733) (Relax also reports this, where rustc does not, when a future of the cycle is bound to a local before it is boxed: see Relax's KNOWN_GAPS.md)".to_string());
+                            }
+                        } else {
+                            match self.u.tcx.coro_frames.get(&c.ct) {
+                                // a frame is published only from complete layouts, so every lowering
+                                // gives the same one
+                                Some(prev) if prev != area => {
                                     self.err(self.pos, format!("internal: coroutine saved locals {:?} lowered again as {:?}", prev, area));
                                 }
+                                Some(_) => {}
+                                None => {
+                                    self.u.tcx.coro_shapes.insert(c.ct, shape);
+                                    self.u.tcx.coro_frames.insert(c.ct, area);
+                                }
                             }
-                            Some(_) => {}
-                            None => self.u.tcx.coro_frames.insert(c.ct, area),
                         }
                     }
                 }
@@ -2407,7 +2432,8 @@ impl<'a> Lcx<'a> {
         self.f.params.push(env);
         let cx = self.f.vreg(Cls::I);
         self.f.params.push(cx);
-        let ul = self.u.closure_storage_layout(up);
+        let (ul, served) = self.u.closure_storage_layout_served(up);
+        self.partial_upvars = served;
         let caps = self.storage_for_closure(ce).roots.clone();
         let storage = self.u.closure_storage(up);
         let nfields = storage.fields.len();
@@ -7873,7 +7899,11 @@ impl<'a> Lcx<'a> {
     /// Builds a struct/tuple value from field values (registers when it fits).
     fn build_record(&mut self, t: TyId, vi: u32, vals: Vec<(Val, TyId)>) -> Val {
         let storage = matches!(self.kind(t), TyKind::Closure(..));
-        let l = if storage { self.u.closure_storage_layout(t) } else { self.layout(t).clone() };
+        let (l, partial) = if storage {
+            self.u.closure_storage_layout_served(t)
+        } else {
+            (self.layout(t).clone(), self.partial_tys.get(&t).cloned().unwrap_or_default())
+        };
         match l.leaves {
             Some(ref leaves) => {
                 let mut out = Vec::with_capacity(leaves.len());
@@ -7886,6 +7916,9 @@ impl<'a> Lcx<'a> {
             None => {
                 let a = if storage {
                     let slot = self.f.slot(l.size, l.align);
+                    if !partial.is_empty() {
+                        self.partial_slots.insert(slot, partial);
+                    }
                     let address = self.f.vreg(Cls::I);
                     self.emit(Inst::SlotAddr(address, slot));
                     address
@@ -14352,7 +14385,10 @@ fn slot_addrs(f: &Func) -> std::collections::HashMap<u32, (u32, i32)> {
 }
 
 /// `tys`: the types of the body's locals by slot and by register (coro_local_tys), for the state's shape.
-fn coroutine_transform(f: &mut Func, c: &Coro, ptr_bytes: u32, tys: &(std::collections::HashMap<u32, Vec<TyId>>, std::collections::HashMap<u32, TyId>)) -> Result<(u32, u32, u64), String> {
+/// Lays the body's saved slots and values out in the coroutine's state area: its (size, align), the
+/// state's shape (M5), and the coroutines whose layout so far gave a saved slot its size
+/// (`partial`: Lcx::partial_slots).
+fn coroutine_transform(f: &mut Func, c: &Coro, ptr_bytes: u32, tys: &(std::collections::HashMap<u32, Vec<TyId>>, std::collections::HashMap<u32, TyId>), partial: &HashMap<u32, Vec<TyId>>) -> Result<(u32, u32, u64, Vec<TyId>), String> {
     use relax_backend::regalloc::{term_uses, uses_defs};
     // RELAX_TRACE=coro: the transform's sizes and phase times (coro-transform line)
     let tr = coro_transform_trace();
@@ -15017,6 +15053,15 @@ fn coroutine_transform(f: &mut Func, c: &Coro, ptr_bytes: u32, tys: &(std::colle
             saved_at[s as usize].retain(|x| *x != k);
         }
     }
+    // the frame's provenance: what a layout so far sized of what is saved
+    let mut deps: Vec<TyId> = Vec::new();
+    for (s, d) in partial {
+        if saved_at.get(*s as usize).is_some_and(|k| !k.is_empty()) {
+            for t in d {
+                if !deps.contains(t) { deps.push(*t); }
+            }
+        }
+    }
     // a vreg live across a point that only ever holds one saved slot's address is made again
     let remat = |v: usize| -> Option<u32> {
         match slot_defs[v] {
@@ -15415,7 +15460,7 @@ fn coroutine_transform(f: &mut Func, c: &Coro, ptr_bytes: u32, tys: &(std::colle
         }
         h.finish()
     };
-    Ok((size, align, shape))
+    Ok((size, align, shape, deps))
 }
 
 /// Integer constants of drop-flag-like vregs (every definition an `Iconst`) per block, forward
