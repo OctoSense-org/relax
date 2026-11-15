@@ -8260,7 +8260,20 @@ impl<'a> Lcx<'a> {
         };
         let root = self.field_move_path(bx);
         let mark = self.stmt_temps.len();
-        let (bp, bt) = self.lower_place(bx);
+        // a field of a value expression (`..make().leaf`): the place lies in one temporary that
+        // owns the whole value (rustc expr_as_place: as_temp of the base). The update moves its
+        // fields out of that temporary, which drops the rest (the given fields' old values, the
+        // siblings) at its scope's end, as a field read out of it does (rvalue_proj).
+        let mut temp = None;
+        let (bp, bt) = match self.rvalue_proj(bx) {
+            Some((r, path)) if root.is_none() && self.needs_drop_glue(self.body_ty(r)) => {
+                let (ta, rt, f, pl, pt) = self.lower_rvalue_proj(r, &path);
+                self.stmt_temps.push((ta, rt, Some(f)));
+                temp = Some((f, path));
+                (pl, pt)
+            }
+            _ => self.lower_place(bx),
+        };
         for fi in 0..nf as u32 {
             if given.iter().any(|g| g.0 == fi) {
                 continue;
@@ -8274,10 +8287,14 @@ impl<'a> Lcx<'a> {
                     let mut p = path.clone();
                     p.push((vi, fi));
                     self.moved_field(*li, &p);
+                } else if let Some((f, path)) = &temp {
+                    let mut p = path.clone();
+                    p.push((vi, fi));
+                    self.moved_temp_part(*f, &p);
                 }
             }
         }
-        if root.is_none() && !self.base_is_borrowed_place(bx) {
+        if root.is_none() && temp.is_none() && !self.base_is_borrowed_place(bx) {
             // a temporary base: its fields that were not taken are dropped with it
             // (the base temporary itself is not dropped as a whole: its taken fields moved)
             let ba = self.place_addr(&bp, bt);
