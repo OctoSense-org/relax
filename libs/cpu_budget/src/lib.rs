@@ -10,10 +10,6 @@
 //! tokens, Visible none above the JIT's floor. A build has no checkpoint for seconds at a time, in
 //! its optimiser: until its next one the machine runs over its cores, with the build below the
 //! person's work by the OS's priorities.
-//! Early on the JIT comes first: while it reports so (`set_jit_first`: the app is up and the JIT has
-//! tier-up builds queued or running, after a start-up, a first reach or the settle after an edit),
-//! its Background builds run on up to the physical cores and go before the app's Background
-//! waiters. Once the JIT's queue has drained, the app's Background work leads again.
 use relax_api::relax_api;
 use std::cell::Cell;
 use std::collections::{HashMap, VecDeque};
@@ -137,15 +133,6 @@ struct Budget {
     background_limit: usize,
     /// JIT_FLOOR, within a quarter of the limit: on a small machine it would leave Visible nothing.
     jit_floor: usize,
-    /// The machine's physical cores within the budget's: the JIT's Background builds' ceiling while
-    /// it comes first (`jit_first`). SMT siblings are left out, as for `background_limit`.
-    physical: usize,
-    /// The JIT comes first (`set_jit_first`, from its compile queue: the app is up and tier-up
-    /// builds are queued or running): its Background builds run on up to `physical` cores and go
-    /// ahead of the app's Background work. Interactive and Visible work does not count them
-    /// (`builds_passed`), and the OS runs them below it (their thread class). Once the queue drains,
-    /// Background's ceiling is `background_limit` again and the app's Background work leads.
-    jit_first: AtomicBool,
     state: Mutex<State>,
     /// Woken on each change of the table (`State::changes`, `wait_for_change`).
     changed: Condvar,
@@ -170,8 +157,6 @@ impl Budget {
             origin: monotonic_ns(), cores, limit,
             background_limit: limit.saturating_sub(2).min(physical.saturating_sub(1)).max(1),
             jit_floor: JIT_FLOOR.min(limit / 4),
-            physical: physical.clamp(1, cores),
-            jit_first: AtomicBool::new(false),
             state: Mutex::new(State {
                 slots: vec![None; cores], waiters: Vec::new(), ticket: 0,
                 running: 0, jit_running: 0, background: 0, visible: 0, jit_background: 0, jit_waiting: 0, jit_tokens: 0, waiting: 0, parked: [0; 3], admitted: [0; 3],
@@ -201,8 +186,7 @@ impl Budget {
         match class {
             INTERACTIVE => self.cores + self.builds_passed(s, class),
             VISIBLE => self.limit + self.builds_passed(s, class) - self.jit_short(s).min(s.jit_waiting),
-            BACKGROUND if client == JIT && self.jit_short(s) > 0 => self.limit.max(self.jit_background_limit()),
-            BACKGROUND if client == JIT => self.jit_background_limit(),
+            BACKGROUND if client == JIT && self.jit_short(s) > 0 => self.limit,
             BACKGROUND => self.background_limit,
             _ => unreachable!(),
         }
@@ -224,16 +208,7 @@ impl Budget {
             || s.running < self.class_limit(s, class, client)
     }
     fn first(&self, s: &State) -> Option<usize> {
-        s.waiters.iter().enumerate().filter(|(_, w)| self.room(s, w.class, w.client)).min_by_key(|(_, w)| self.order(w.class, w.client, w.ticket)).map(|(i, _)| i)
-    }
-    /// A waiter's place: by class, then, while the JIT comes first, its Background builds before the
-    /// app's Background work, then by ticket.
-    fn order(&self, class: u8, client: u8, ticket: u64) -> (u8, bool, u64) {
-        (class, !(class == BACKGROUND && client == JIT && self.jit_first.load(Relaxed)), ticket)
-    }
-    /// How many of the JIT's Background builds run at once (`jit_first`).
-    fn jit_background_limit(&self) -> usize {
-        if self.jit_first.load(Relaxed) { self.physical.max(self.background_limit) } else { self.background_limit }
+        s.waiters.iter().enumerate().filter(|(_, w)| self.room(s, w.class, w.client)).min_by_key(|(_, w)| (w.class, w.ticket)).map(|(i, _)| i)
     }
     fn refresh(&self, s: &mut State) {
         s.waiting = s.waiters.iter().fold(0, |bits, w| bits | (1 << w.class));
@@ -274,10 +249,10 @@ impl Budget {
         s.changes
     }
     fn acquire<'a>(&'a self, mut s: MutexGuard<'a, State>, mut job: Job, desired: Option<&AtomicU8>) -> u32 {
-        let key = self.order(job.class, job.client, job.ticket);
+        let key = (job.class, job.ticket);
         let first = self.first(&s);
         let immediate = self.room(&s, job.class, job.client)
-            && first.is_none_or(|i| key < self.order(s.waiters[i].class, s.waiters[i].client, s.waiters[i].ticket));
+            && first.is_none_or(|i| key < (s.waiters[i].class, s.waiters[i].ticket));
         if !immediate {
             // Only the contended path grows the waiter list. No thread is created here.
             s.waiters.push(Waiter { class: job.class, client: job.client, ticket: job.ticket, thread: thread::current(), id: me() });
@@ -749,24 +724,6 @@ pub fn limit() -> u32 { global().limit as u32 }
 /// How many Background jobs run at once.
 #[relax_api]
 pub fn background_limit() -> u32 { global().background_limit as u32 }
-/// How many of the JIT's Background builds run at once now: the physical cores while the JIT comes
-/// first (`set_jit_first`), else `background_limit`.
-#[relax_api]
-pub fn jit_background_limit() -> u32 { global().jit_background_limit() as u32 }
-/// The JIT has tier-up builds queued or running (true) or none (false), a measured state its compile
-/// queue reports at each pick. While it has, its Background builds come first (`Budget::jit_first`).
-/// A change wakes the first waiter that now has room.
-#[relax_api]
-pub fn set_jit_first(on: bool) {
-    let b = global();
-    if b.jit_first.swap(on, Relaxed) != on {
-        let mut s = b.lock();
-        b.refresh(&mut s);
-    }
-}
-/// The JIT comes first now (`set_jit_first`).
-#[relax_api]
-pub fn jit_first() -> bool { global().jit_first.load(Relaxed) }
 /// How many of the JIT's Background jobs Visible work leaves room for: `JIT_FLOOR`, on this machine.
 #[relax_api]
 pub fn jit_floor() -> u32 { global().jit_floor as u32 }
