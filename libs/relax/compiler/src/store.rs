@@ -1353,6 +1353,12 @@ pub fn hold_build(dir: &Path) {
         return;
     }
     let p = live_lock(dir, this_build());
+    // a missing store folder is made owner-only, as a run makes its cache folder: made by the
+    // create_dir_all below it took the umask's mode, group-writable under umask 002, and the store
+    // then refused the folder it had just made (a test's first lookup)
+    if !dir.exists() && crate::pack::ensure_private_dir(dir).is_err() {
+        return;
+    }
     loop {
         if std::fs::create_dir_all(dir.join("live")).is_err() {
             return;
