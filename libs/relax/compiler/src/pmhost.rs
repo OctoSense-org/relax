@@ -603,6 +603,23 @@ fn build_world_inner(sess: &std::sync::Arc<crate::Session>, units: &[crate::macr
     }
 }
 
+/// The world's core, alloc (when this std has it), std and proc_macro under `cfg`, each depending
+/// on the ones before it, as the program's std (lib.rs std_pre_crates): one preload, so a crate
+/// image's dependency fingerprints are the restored ones.
+fn world_std_crates(std_dir: &str, cfg: &crate::cfg::CfgSet) -> Vec<crate::preload::PreCrate> {
+    let alloc = format!("{}/alloc/lib.rs", std_dir);
+    let mut v: Vec<crate::preload::PreCrate> = [("core", format!("{}/core/lib.rs", std_dir)), ("alloc", alloc.clone()), ("std", format!("{}/std/lib.rs", std_dir)), ("proc_macro", format!("{}/proc_macro/lib.rs", std_dir))]
+        .into_iter()
+        .filter(|(n, _)| *n != "alloc" || crate::vfs::exists(&alloc))
+        .map(|(name, root)| crate::preload::PreCrate { name: name.to_string(), root, edition: 2021, cfg: cfg.clone(), deps: Vec::new(), proc_macro: false, image_deps: Vec::new(), image_dep_names: Vec::new() })
+        .collect();
+    for i in 0..v.len() {
+        v[i].image_dep_names = (0..i).map(|d| (v[d].name.clone(), v[d].name.clone())).collect();
+        v[i].image_deps = (0..i).collect();
+    }
+    v
+}
+
 /// One build of the world; a macro crate that does not load is named with the error.
 fn build_world_once(sess: &std::sync::Arc<crate::Session>, units: &[crate::macro_reg::UnitInfo], std_dir: &str, need: &[bool], uses_boot: &[bool], confined: &[bool], host_run: &[bool]) -> Result<World, (Option<usize>, String)> {
     let t0 = std::time::Instant::now();
@@ -614,18 +631,36 @@ fn build_world_once(sess: &std::sync::Arc<crate::Session>, units: &[crate::macro
     prog.ptr_bytes = 8;
     // macros run here: the machine's cfg, never RELAX_CHECK_TARGET's
     let host = |f: &[String]| crate::cfg::CfgSet::machine(sess, f);
-    let core = prog.load_crate_deferred("core", &format!("{}/core/lib.rs", std_dir), 2021, host(&[]), Vec::new()).map_err(|e| (None, e))?;
-    let mut std_deps = vec![(prog.syms.intern("core"), core)];
-    let alloc_root = format!("{}/alloc/lib.rs", std_dir);
-    if crate::vfs::exists(&alloc_root) {
-        let a = prog.load_crate_deferred("alloc", &alloc_root, 2021, host(&[]), std_deps.clone()).map_err(|e| (None, e))?;
-        std_deps.push((prog.syms.intern("alloc"), a));
+    // core, alloc, std and proc_macro from their crate images in the disk cache, validated like
+    // the program's (each input file's hash; a world's graph certificate stats them), else the
+    // program's parses or the world's own, recorded for the next world. A world built after a
+    // collected restore (a live session's first edit that expands) parsed all of std again.
+    let images = crate::cache::FrontImages::open(&sess.options);
+    prog.record_front = images.is_some();
+    prog.front_sink = images.as_ref().and_then(|i| i.sink());
+    let std_pre = world_std_crates(std_dir, &host(&[]));
+    let mut crates: Vec<(String, String)> = std_pre.iter().map(|c| (c.name.clone(), c.root.clone())).collect();
+    prog.preload_images_eager(std_pre, images.as_ref().map(|i| i as &dyn crate::crate_image::CrateImages));
+    drop(images);
+    let (_, pm_root) = crates.pop().expect("proc_macro");
+    let mut front = crate::cache::ColdFront::default();
+    let mut std_deps = Vec::new();
+    for (name, root) in &crates {
+        let k = prog.load_crate_deferred(name, root, 2021, host(&[]), std_deps.clone()).map_err(|e| (None, e))?;
+        front.loaded(&prog, k);
+        std_deps.push((prog.syms.intern(name), k));
     }
-    let st = prog.load_crate_deferred("std", &format!("{}/std/lib.rs", std_dir), 2021, host(&[]), std_deps.clone()).map_err(|e| (None, e))?;
-    std_deps.push((prog.syms.intern("std"), st));
+    let core = std_deps[0].1;
     let t_std = t0.elapsed().as_secs_f64() * 1e3;
     let m_std = crate::memstat::live_of(crate::memstat::Tag::PmHost) >> 20;
-    let pm = prog.load_crate_deferred("proc_macro", &format!("{}/proc_macro/lib.rs", std_dir), 2021, host(&[]), std_deps.clone()).map_err(|e| (None, e))?;
+    let pm = prog.load_crate_deferred("proc_macro", &pm_root, 2021, host(&[]), std_deps.clone()).map_err(|e| (None, e))?;
+    front.loaded(&prog, pm);
+    // (boot trace) of them, the crates loaded from their images (no record to write: cache.rs enqueue)
+    let imaged = (0..prog.crates.len()).filter(|&k| prog.front_ahead.get(k).is_some_and(|a| a.is_empty())).count();
+    // their records and graph go with the boot's deferred ones (cache.rs flush_front_graphs); the
+    // macro crates after them load as before, with no images written
+    front.finish(&mut prog);
+    prog.front_sink = None;
     let mut deps0 = std_deps.clone();
     deps0.push((prog.syms.intern("proc_macro"), pm));
     // dependencies first
@@ -702,6 +737,7 @@ fn build_world_once(sess: &std::sync::Arc<crate::Session>, units: &[crate::macro
     // index past its table ("AppendVec index out of bounds" in O3 builds, an O3
     // thread waiting on the owner: `makepad check` hangs)
     u.tier1 = None;
+    let t_unit = t0.elapsed().as_secs_f64() * 1e3;
     // its compiled code in the disk cache like the program's (keyed by the macro crates'
     // fingerprints): a warm start compiles none of it
     if let Some(mode) = crate::cache::mode_from_env(&u.prog.session.options) {
@@ -709,6 +745,7 @@ fn build_world_once(sess: &std::sync::Arc<crate::Session>, units: &[crate::macro
             u.cache = Some(Box::new(crate::cache::CacheCell::new(c)));
         }
     }
+    let t_cache = t0.elapsed().as_secs_f64() * 1e3;
     let id = u.fn_id(crate::jit::FnKey::Inst(bridge_def, Vec::new()));
     let bridge = u.entry(id);
     // the confined macros: the unit a confinement domain whose host code is std's and the
@@ -729,7 +766,7 @@ fn build_world_once(sess: &std::sync::Arc<crate::Session>, units: &[crate::macro
         Err("no confined proc macro in this world".to_string())
     };
     if crate::preload::trace() {
-        eprintln!("boot-trace: macro world: std {:.1} ms, + macro crates {:.1}, + resolve {:.1}, + collect {:.1}, + unit and cache {:.1} ms", t_std, t_crates, t_res, t_col, t0.elapsed().as_secs_f64() * 1e3);
+        eprintln!("boot-trace: macro world: std {:.1} ms ({} of {} crates from images), + macro crates {:.1}, + resolve {:.1}, + collect {:.1}, + unit {:.1}, + cache {:.1}, + bridge {:.1} ms", t_std, imaged, deps0.len(), t_crates, t_res, t_col, t_unit, t_cache, t0.elapsed().as_secs_f64() * 1e3);
         eprintln!("boot-trace: macro world heap (RELAX_MEM_REPORT): std {} MB, + macro crates {}, + collect {}, + unit {} MB", m_std, m_crates, m_col, crate::memstat::live_of(crate::memstat::Tag::PmHost) >> 20);
     }
     let ns = t0.elapsed().as_nanos() as u64;

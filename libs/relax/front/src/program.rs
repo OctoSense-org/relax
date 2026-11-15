@@ -1470,6 +1470,12 @@ impl Program {
         self.start_preload_plan(crates, images, bounded, false, plan);
     }
 
+    /// preload_images for a caller that has not named the crates' consumers (the proc-macro world's
+    /// std): every file of each crate, no demand selection, as a crate that was not preloaded.
+    pub fn preload_images_eager(&mut self, crates: Vec<crate::preload::PreCrate>, images: Option<&dyn crate::crate_image::CrateImages>) {
+        self.start_preload(crates, images, false, true);
+    }
+
     fn start_preload(&mut self, crates: Vec<crate::preload::PreCrate>, images: Option<&dyn crate::crate_image::CrateImages>, bounded: bool, eager_fallback: bool) {
         self.start_preload_plan(crates, images, bounded, eager_fallback, None);
     }
