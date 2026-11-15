@@ -380,8 +380,8 @@ fn plan(g: &Graph, seeds: &[usize], req: &Request) -> Plan {
     // and of the resolved graph only the native closure (the packages whose scripts or libs
     // cargo builds for real): two packages whose closure resolves alike share the build.
     let selection = selection_key(&script_pkgs, &lib_pkgs, c_toolchain());
-    // (v16: a receipt holds its scripts' declared variables, `cached`)
-    let mut h = fnv(b"native-link-v16", 0xcbf29ce484222325);
+    // (v17: the program's C compiler linker and its file)
+    let mut h = fnv(b"native-link-v17", 0xcbf29ce484222325);
     // the worktree: payloads still hold its absolute paths (Target B removes this per payload)
     h = fnv(&crate::dirs::anchors_key().to_le_bytes(), h);
     h = fnv(req.triple.as_bytes(), h);
@@ -412,6 +412,13 @@ fn plan(g: &Graph, seeds: &[usize], req: &Request) -> Plan {
     }
     let cc_version = Command::new(cc()).arg("--version").output().map(|o| o.stdout).unwrap_or_default();
     h = fnv(cc_version.split(|&b| b == b'\n').next().unwrap_or(&[]), h);
+    // the program's linker (the native library links with it): its file as it is now, so an
+    // update of the toolchain under the same name is another build. Its stamp, not its
+    // `--version`: a check without --allow-c reads this key too (Mode::Cached), and must not run
+    // a program the workspace's cargo config names
+    if let Some(linker) = configured_linker(req.workspace, req.triple) {
+        h = fnv(&linker_stamp(&linker), h);
+    }
     let mut native_packages: Vec<_> = seeds.iter().map(|&s| {
         let bs = &g.build_scripts[s];
         let mut features = bs.features.clone();
@@ -666,6 +673,9 @@ struct Outputs {
     /// the program's link arguments (`-C link-arg`s of its binary's rustc command: RUSTFLAGS, the
     /// cargo config's rustflags, its build scripts' `rustc-link-arg`s), as cargo gave them
     link_args: Vec<String>,
+    /// the linker of that same rustc command when it is a C compiler driver; `link_args` are
+    /// written for it
+    linker: Option<String>,
 }
 
 /// (crate, features) of each build script of the graph: what the native steps read of it
@@ -746,10 +756,12 @@ fn outputs_with(pkg: &[(String, String, String)], scripts_of: &[(usize, Vec<Stri
     let mut runs: Vec<(String, String)> = Vec::new();
     let mut env_seen: Vec<(String, Option<String>)> = Vec::new();
     let mut link_args: Vec<String> = Vec::new();
+    let mut linker: Option<String> = None;
     for line in messages.lines() {
         let j = crate::json::parse(line.as_bytes()).map_err(|e| format!("cargo message: {e}"))?;
         if let Some(a) = j.get("relax_link_args") {
             link_args = a.arr().iter().map(|x| x.str().to_string()).collect();
+            linker = j.get("relax_linker").map(|l| l.str()).filter(|l| !l.is_empty()).map(str::to_string);
             continue;
         }
         let (n, v) = id_name_version(j.get("package_id").map(|p| p.str()).unwrap_or(""));
@@ -833,7 +845,7 @@ fn outputs_with(pkg: &[(String, String, String)], scripts_of: &[(usize, Vec<Stri
             None => return Err(format!("--allow-c: a native build script links static library `{}`, but {} is in none of its search paths ({})", name, file, search.join(", "))),
         }
     }
-    Ok(Outputs { scripts, runs, env: env_seen, statics, archives, search, fw_search, dylibs, frameworks, link_args })
+    Ok(Outputs { scripts, runs, env: env_seen, statics, archives, search, fw_search, dylibs, frameworks, link_args, linker })
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -970,7 +982,7 @@ fn run_cargo_with(pkg: &[(String, String, String)], scripts_of: &[(usize, Vec<St
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let out = cmd.output();
-    let link_args = program_link_args(&link_dir, package, flags);
+    let (link_args, linker) = program_link(&link_dir, package, flags);
     let _ = std::fs::remove_dir_all(&link_dir);
     let out = out.map_err(|e| format!("--allow-c needs cargo on PATH to build the native dependencies ({}): {e}", package))?;
     let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
@@ -1056,14 +1068,15 @@ fn run_cargo_with(pkg: &[(String, String, String)], scripts_of: &[(usize, Vec<St
             return Err(format!("--allow-c: cargo and Relax resolve `{} {}` with different features (cargo {:?}, relax {:?})", p.1, p.2, built, ours));
         }
     }
-    keep.push_str(&format!("{{\"relax_link_args\":[{}]}}\n", link_args.iter().map(|a| json_string(a)).collect::<Vec<_>>().join(",")));
+    keep.push_str(&format!("{{\"relax_link_args\":[{}],\"relax_linker\":{}}}\n", link_args.iter().map(|a| json_string(a)).collect::<Vec<_>>().join(","), json_string(linker.as_deref().unwrap_or(""))));
     Ok(keep)
 }
 
-/// The link arguments the wrapper saw on the rustc command of the program (`wrapper`, a file per
-/// crate of the package's binaries and test harnesses): the binary `--bin` names, else the crate
-/// named after the package, else what they all say alike.
-fn program_link_args(dir: &std::path::Path, package: &str, flags: &[&String]) -> Vec<String> {
+/// The link arguments and C compiler linker the wrapper saw on the rustc command of the program
+/// (`wrapper`, a file per crate of the package's binaries and test harnesses): the binary `--bin`
+/// names, else the crate named after the package, else what they all say alike. The first line is
+/// the linker (empty for none), and the remaining non-empty lines are its arguments.
+fn program_link(dir: &std::path::Path, package: &str, flags: &[&String]) -> (Vec<String>, Option<String>) {
     let units: Vec<(String, String)> = std::fs::read_dir(dir).into_iter().flatten().flatten()
         .filter_map(|e| Some((e.file_name().to_str()?.to_string(), std::fs::read_to_string(e.path()).ok()?))).collect();
     let named = flags.iter().position(|f| f.as_str() == "--bin").and_then(|i| flags.get(i + 1)).map(|b| b.as_str())
@@ -1071,7 +1084,60 @@ fn program_link_args(dir: &std::path::Path, package: &str, flags: &[&String]) ->
         .unwrap_or(package).replace('-', "_");
     let alike = units.first().filter(|(_, t)| units.iter().all(|(_, u)| u == t));
     let text = units.iter().find(|(n, _)| *n == named).or(alike).map_or("", |(_, t)| t.as_str());
-    text.lines().filter(|l| !l.is_empty()).map(str::to_string).collect()
+    let mut lines = text.lines();
+    let linker = lines.next().filter(|l| !l.is_empty()).map(str::to_string);
+    (lines.filter(|l| !l.is_empty()).map(str::to_string).collect(), linker)
+}
+
+/// The program's linker when rustc drives it as a C compiler. The last linker and linker flavour
+/// options win; an explicit flavour decides, otherwise its file stem and the target's default
+/// do, as in rustc. An absent or empty linker, or a flavour without a C compiler driver, gives
+/// none, so the native library keeps cc.
+fn linker_of(args: &[String]) -> Option<String> {
+    let mut linker = None;
+    let mut flavor = None;
+    let mut target = "";
+    let mut i = 0;
+    while i < args.len() {
+        let a = &args[i];
+        let value = if a == "--target" {
+            i += 1;
+            target = args.get(i).map(String::as_str).unwrap_or("");
+            None
+        } else if let Some(t) = a.strip_prefix("--target=") {
+            target = t;
+            None
+        } else if a == "-C" || a == "--codegen" {
+            i += 1;
+            args.get(i).map(String::as_str)
+        } else {
+            a.strip_prefix("-C").or_else(|| a.strip_prefix("--codegen="))
+        };
+        if let Some(v) = value.map(str::trim_start) {
+            if let Some(l) = v.strip_prefix("linker=") {
+                linker = Some(l);
+            } else if let Some(f) = v.strip_prefix("linker-flavor=") {
+                flavor = Some(f);
+            }
+        }
+        i += 1;
+    }
+    let linker = linker.filter(|l| !l.is_empty())?;
+    let driver = if let Some(flavor) = flavor {
+        matches!(flavor, "gcc" | "gnu-cc" | "gnu-lld-cc" | "darwin-cc" | "darwin-lld-cc" | "unix-cc")
+    } else {
+        let stem = std::path::Path::new(linker).file_stem().and_then(|s| s.to_str()).unwrap_or("");
+        if matches!(stem, "cc" | "c++" | "gcc" | "g++" | "clang" | "clang++")
+            || ["-cc", "-gcc", "-g++", "-clang", "-clang++"].iter().any(|&s| stem.ends_with(s)) {
+            true
+        } else if matches!(stem, "ld" | "lld" | "rust-lld" | "wasm-ld" | "link" | "lld-link" | "emcc")
+            || stem.starts_with("ld.") || stem.starts_with("ld64") || stem.ends_with("-ld") || stem.ends_with("-wasm-ld") {
+            false
+        } else {
+            !target.ends_with("-msvc") && !target.contains("-uefi") && !target.starts_with("wasm")
+        }
+    };
+    driver.then(|| linker.to_string())
 }
 
 /// The `-C link-arg=` / `-C link-args=` values of a rustc command line, in order.
@@ -1138,6 +1204,47 @@ fn c_toolchain() -> &'static [u8] {
         let out = Command::new(cc()).arg("--version").stdin(Stdio::null()).stderr(Stdio::null()).output();
         crate::zone_alloc::kept_with(|| out.map(|o| o.stdout).unwrap_or_default())
     })
+}
+
+/// The configured target linker, from the environment before cargo config files. Relative paths
+/// with a slash resolve against the config file's base folder; bare names stay on PATH.
+fn configured_linker(workspace: &str, triple: &str) -> Option<String> {
+    let key = format!("CARGO_TARGET_{}_LINKER", triple.to_uppercase().replace(['-', '.'], "_"));
+    if let Some(linker) = std::env::var(key).ok().filter(|l| !l.is_empty()) {
+        return Some(linker);
+    }
+    for (base, path) in crate::resolve::cargo_config_files(workspace) {
+        let Ok(text) = crate::vfs::read_to_string(&path) else { continue };
+        let Ok(config) = crate::toml::parse_toml(&text) else { continue };
+        let Some(linker) = config.get_path(&["target", triple, "linker"]).and_then(|l| l.as_str()) else { continue };
+        let path = std::path::Path::new(linker);
+        return Some(if linker.contains('/') && path.is_relative() {
+            std::path::Path::new(&base).join(path).to_string_lossy().into_owned()
+        } else {
+            linker.to_string()
+        });
+    }
+    None
+}
+
+/// The file a linker name runs (a path, or the first match on PATH) as the key reads it: its
+/// path, size and modification time, read without running it. Empty when no file is found.
+fn linker_stamp(linker: &str) -> Vec<u8> {
+    let named = std::path::Path::new(linker);
+    let file = if named.components().count() > 1 {
+        Some(named.to_path_buf())
+    } else {
+        let exe = if cfg!(windows) && named.extension().is_none() { format!("{linker}.exe") } else { linker.to_string() };
+        std::env::var_os("PATH").and_then(|p| std::env::split_paths(&p).map(|d| d.join(&exe)).find(|f| f.is_file()))
+    };
+    let Some(file) = file else { return Vec::new() };
+    let Ok(meta) = std::fs::metadata(&file) else { return Vec::new() };
+    let mtime = meta.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map_or(0, |d| d.as_nanos());
+    let mut out = std::fs::canonicalize(&file).unwrap_or(file).to_string_lossy().into_owned().into_bytes();
+    out.push(0);
+    out.extend_from_slice(&meta.len().to_le_bytes());
+    out.extend_from_slice(&mtime.to_le_bytes());
+    out
 }
 
 /// `native/lock`, held exclusively: a root is written, or a prune decides what goes. None when
@@ -1324,7 +1431,8 @@ fn link(lib_path: &str, out: &Outputs, triple: &str, resolvable: Resolvable) -> 
     let symbols_path = format!("{}.symbols", tmp);
     // the accessors' object: the callback relink below reuses the link's arguments
     let addresses_path = format!("{}.addresses.o", tmp);
-    let mut cmd = Command::new(cc());
+    let linker = out.linker.clone().unwrap_or_else(cc);
+    let mut cmd = Command::new(&linker);
     // every member of the archives, for the loader's check of which callbacks the program needs
     // (native_stub member_table): each global symbol they define is a root, so the link takes every
     // member that defines one; the program's imports are known when it loads
@@ -1447,7 +1555,7 @@ fn link(lib_path: &str, out: &Outputs, triple: &str, resolvable: Resolvable) -> 
     // that finds a library of the scripts' search folders at load time)
     cmd.args(&out.link_args);
     let run = |cmd: &mut Command| -> Result<(), String> {
-        let out = cmd.output().map_err(|e| format!("--allow-c: cannot run the C compiler to link the native library: {e}"))?;
+        let out = cmd.output().map_err(|e| format!("--allow-c: cannot run the linker to link the native library: {e}"))?;
         if out.status.success() {
             return Ok(());
         }
@@ -1471,7 +1579,7 @@ fn link(lib_path: &str, out: &Outputs, triple: &str, resolvable: Resolvable) -> 
             }
             let table = crate::native_stub::member_table(&members, &callbacks);
             std::fs::write(&stubs_path, crate::native_stub::object(triple, &callbacks, &table)?).map_err(|e| format!("{stubs_path}: {e}"))?;
-            let mut with_stubs = Command::new(cc());
+            let mut with_stubs = Command::new(&linker);
             with_stubs.arg(&stubs_path).args(cmd.get_args());
             run(&mut with_stubs)
         });
@@ -1678,14 +1786,15 @@ pub fn wrapper() -> Option<i32> {
         i += 1;
     }
     let types: Vec<String> = rest.iter().enumerate().filter_map(|(i, a)| if a == "--crate-type" { rest.get(i + 1).cloned() } else { a.strip_prefix("--crate-type=").map(str::to_string) }).collect();
-    // the program's binaries and test harnesses: their link arguments, which the native library is
-    // linked with (program_link_args). The stub's dep-info names the run's folder, so the next
-    // cargo run, with a folder of its own, does not take this one as fresh.
+    // the program's binaries and test harnesses: their C compiler linker on the first line (empty
+    // for none), then their link arguments, which the native library is linked with (program_link).
+    // The stub's dep-info names the run's folder, so the next cargo run, with a folder of its own,
+    // does not take this one as fresh.
     let capture = std::env::var("RELAX_NATIVE_LINK_ARGS").ok().filter(|_| {
         std::env::var_os("CARGO_PRIMARY_PACKAGE").is_some() && (types.iter().any(|t| t == "bin") || rest.iter().any(|a| a == "--test"))
     });
     if let Some(dir) = &capture {
-        let _ = std::fs::write(std::path::Path::new(dir).join(&name), link_args_of(rest).join("\n"));
+        let _ = std::fs::write(std::path::Path::new(dir).join(&name), format!("{}\n{}", linker_of(rest).unwrap_or_default(), link_args_of(rest).join("\n")));
     }
     let emit = value("--emit").unwrap_or_default();
     let json = value("--json").unwrap_or_default().contains("artifacts");
@@ -2078,6 +2187,73 @@ fn a_shared_path_packages_files_are_hashed_in_its_checkout() {
     assert_eq!(one, hash(pkg.to_str().unwrap()), "the virtual path hashes the checkout's files");
     std::fs::write(pkg.join("src/lib.rs"), "pub const LEVEL: u8 = 2;\n").unwrap();
     assert_ne!(one, hash(&virtual_dir), "an edit in the shared package changes its hash");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[cfg(test)]
+#[test]
+fn the_native_library_links_with_the_programs_c_compiler_linker() {
+    let linker = |args: &[&str]| linker_of(&args.iter().map(|a| a.to_string()).collect::<Vec<_>>());
+    assert_eq!(linker(&["--target", "x86_64-unknown-linux-gnu", "--crate-type", "bin", "-C", "linker=/opt/x/bin/clang", "-C", "link-arg=-fuse-ld=/opt/m/bin/mold"]).as_deref(),
+        Some("/opt/x/bin/clang"), "clang is the driver for the program's mold argument");
+    assert_eq!(linker(&["-Clinker=gcc", "-C", "linker=clang"]).as_deref(), Some("clang"), "the last linker wins");
+    assert_eq!(linker(&["--codegen=linker=x86_64-linux-gnu-gcc"]).as_deref(), Some("x86_64-linux-gnu-gcc"), "the long codegen option keeps the target's gcc driver");
+    assert_eq!(linker(&["--codegen", "linker=clang"]).as_deref(), Some("clang"), "the separate long codegen option keeps the driver");
+    assert_eq!(linker(&["-C linker=clang"]).as_deref(), Some("clang"), "the spaced codegen option keeps the driver");
+    assert_eq!(linker(&["--target", "x86_64-unknown-linux-gnu"]), None, "no linker keeps the native library's cc");
+    assert_eq!(linker(&["-Clinker=clang", "-C", "linker="]), None, "an empty last linker keeps the native library's cc");
+    for name in ["ld", "ld.lld", "/usr/bin/ld.gold", "x86_64-linux-gnu-ld", "ld64", "ld64.lld", "lld", "rust-lld", "wasm-ld", "wasm32-wasm-ld", "link", "lld-link", "emcc"] {
+        assert_eq!(linker(&["--target", "x86_64-unknown-linux-gnu", "-C", &format!("linker={name}")]), None, "{name} is not a C compiler driver");
+    }
+    for name in ["cc", "c++", "gcc", "g++", "clang", "clang++", "target-cc", "target-gcc", "target-g++", "target-clang", "target-clang++", "/bin/clang.exe"] {
+        assert_eq!(linker(&["--target=x86_64-pc-windows-msvc", "-C", &format!("linker={name}")]).as_deref(), Some(name), "{name} is a C compiler driver even for an msvc target");
+    }
+    assert_eq!(linker(&["-C", "linker=clang", "-C", "linker-flavor=ld.lld"]), None, "an explicit bare linker flavour overrides the clang name");
+    for flavor in ["gcc", "gnu-cc", "gnu-lld-cc", "darwin-cc", "darwin-lld-cc", "unix-cc"] {
+        assert_eq!(linker(&["-C", "linker=clang", "-C", &format!("linker-flavor={flavor}")]).as_deref(), Some("clang"), "{flavor} drives the linker as a C compiler");
+    }
+    assert_eq!(linker(&["-Clinker=clang", "-Clinker-flavor=gcc", "--codegen=linker-flavor=ld.lld"]), None, "the last long linker flavour overrides the attached flavour");
+    assert_eq!(linker(&["-Clinker=clang", "-C linker-flavor=ld.lld", "--codegen", "linker-flavor=gcc"]).as_deref(), Some("clang"), "the last separate flavour overrides the spaced flavour");
+    assert_eq!(linker(&["-Clinker=mylinker"]).as_deref(), Some("mylinker"), "an unknown linker and unknown target default to a C compiler driver");
+    for (target, want) in [("x86_64-unknown-linux-gnu", Some("mylinker")), ("x86_64-pc-windows-msvc", None), ("x86_64-unknown-uefi", None), ("wasm32-unknown-unknown", None)] {
+        assert_eq!(linker(&["--target", target, "-C", "linker=mylinker"]).as_deref(), want, "an unknown linker follows the default flavour of {target}");
+    }
+
+    let dir = std::env::temp_dir().join(format!("relax-native-linker-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("app"), "/bin/clang\n-fuse-ld=/m/bin/mold\n-Wl,-rpath,/x").unwrap();
+    std::fs::write(dir.join("other"), "\n-Wl,-rpath,/y").unwrap();
+    assert_eq!(program_link(&dir, "app", &[]), (vec!["-fuse-ld=/m/bin/mold".to_string(), "-Wl,-rpath,/x".to_string()], Some("/bin/clang".to_string())),
+        "the selected program keeps its linker and both arguments");
+    assert_eq!(program_link(&dir, "other", &[]), (vec!["-Wl,-rpath,/y".to_string()], None),
+        "an empty first line keeps cc and the following argument");
+
+    let out = outputs_with(&[], &[], &[], "{\"relax_link_args\":[\"-fuse-ld=/m/bin/mold\"],\"relax_linker\":\"/bin/clang\"}\n").expect("the kept linker and its arguments must parse");
+    assert_eq!(out.link_args, ["-fuse-ld=/m/bin/mold"], "the kept run keeps the program's link argument");
+    assert_eq!(out.linker.as_deref(), Some("/bin/clang"), "the kept run keeps the program's linker");
+    let old = outputs_with(&[], &[], &[], "{\"relax_link_args\":[\"-Wl,-rpath,/x\"]}\n").expect("an older kept run must parse");
+    assert_eq!(old.link_args, ["-Wl,-rpath,/x"], "an older kept run keeps its link arguments");
+    assert_eq!(old.linker, None, "an older kept run keeps cc when no linker was recorded");
+    let empty = outputs_with(&[], &[], &[], "{\"relax_link_args\":[],\"relax_linker\":\"\"}\n").expect("an empty kept linker must parse");
+    assert_eq!(empty.linker, None, "an empty kept linker keeps cc");
+
+    let workspace = dir.join("workspace");
+    std::fs::create_dir_all(workspace.join(".cargo")).unwrap();
+    let config = workspace.join(".cargo/config.toml");
+    std::fs::write(&config, "[target.x86_64-unknown-linux-gnu]\nlinker = \"tools/cc-wrap\"\n").unwrap();
+    assert_eq!(configured_linker(workspace.to_str().unwrap(), "x86_64-unknown-linux-gnu"), Some(workspace.join("tools/cc-wrap").to_string_lossy().into_owned()),
+        "a relative linker path resolves against the folder holding the cargo config folder");
+    std::fs::write(&config, "[target.x86_64-unknown-linux-gnu]\nlinker = \"clang\"\n").unwrap();
+    assert_eq!(configured_linker(workspace.to_str().unwrap(), "x86_64-unknown-linux-gnu").as_deref(), Some("clang"),
+        "a bare configured linker stays a PATH lookup");
+    // the key reads the linker's file without running it: another file under the name is another key
+    let tool = dir.join("tool");
+    std::fs::write(&tool, "a").unwrap();
+    let before = linker_stamp(tool.to_str().unwrap());
+    std::fs::write(&tool, "abc").unwrap();
+    assert!(!before.is_empty() && linker_stamp(tool.to_str().unwrap()) != before, "a changed linker file changes its stamp");
+    assert!(linker_stamp(dir.join("missing").to_str().unwrap()).is_empty(), "a linker with no file has an empty stamp");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
