@@ -80,6 +80,14 @@ pub struct FnEntry {
     /// Fixed after naming; an unnamed startup slot gets its whole name replaced on decode.
     pub name: Box<str>,
     pub code: u64,
+    /// When the slot first had code in this process (Unix ns; 0 = never): installed on its first
+    /// call (a lazy compile or cache link, a speculative build taken by that call), from the
+    /// startup image, a seeded build ahead, an O3 install or a borrowed twin's code. The fn cannot
+    /// run before it has code, so its first call is never earlier (RELAX_LIVE_LOG edit `items`).
+    pub first_code_ns: AtomicU64,
+    /// That first code came through the lazy stub, so its time is the first call's; else it came
+    /// ahead of any call (the first call is at or after it, or never was).
+    pub first_by_call: AtomicBool,
     pub pc_map: PcMap,
     /// Allocated in the slot arena only when code history or an inlining caller is recorded.
     pub history: Option<Box<SlotHistory>>,
@@ -4650,8 +4658,19 @@ fn rt_compile_in(up: usize, slot: u64) -> u64 {
             return (&*(up as *mut Unit)).glue_end;
         }
     }
+    let first = unsafe { (&*(up as *mut Unit)).fns[slot as usize].first_code_ns.load(Ordering::Acquire) == 0 };
+    let note_call = |a| {
+        if first && a != PARK_AT_ERROR {
+            let f = unsafe { &(&*(up as *mut Unit)).fns[slot as usize] };
+            // Error stubs never set first_code_ns; only a successful first compile counts.
+            if f.first_code_ns.load(Ordering::Acquire) != 0 {
+                f.first_by_call.store(true, Ordering::Release);
+            }
+        }
+        a
+    };
     if in_thread_exit() && !owner::is_owner() {
-        return owner::call(owner::Class::Program, || unsafe { compile_slot(up as *mut Unit, slot as u32) });
+        return note_call(owner::call(owner::Class::Program, || unsafe { compile_slot(up as *mut Unit, slot as u32) }));
     }
     let _frame = crate::inspect::timeline::CompileMark::begin();
     // a compile that fails with a native panic must not unwind into the JIT frames that called
@@ -4671,7 +4690,7 @@ fn rt_compile_in(up: usize, slot: u64) -> u64 {
                 drop(signals);
                 return park_compile_error(up, slot as u32);
             }
-            Ok(a) => return a,
+            Ok(a) => return note_call(a),
             Err(p) if crate::preempt::is_cancelled(&*p) && cancelled < COMPILE_CANCEL_RETRIES => cancelled += 1,
             Err(p) => return compile_failed_stub(up, slot as u32, &*p),
         }
@@ -5999,6 +6018,16 @@ impl Unit {
         Ok(at)
     }
 
+    /// Slot `id` has code: the first time is kept (first_code_ns); later code keeps it.
+    fn note_first_code(&self, id: u32) {
+        let first = &self.fns[id as usize].first_code_ns;
+        if first.load(Ordering::Acquire) == 0 {
+            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+                .map_or(1, |d| d.as_nanos().min(u64::MAX as u128) as u64).max(1);
+            let _ = first.compare_exchange(0, now, Ordering::AcqRel, Ordering::Acquire);
+        }
+    }
+
     /// Slot `id`'s code is in invalidated memory (invalid.rs): it goes back to its lazy stub and
     /// builds again from the source it runs now (a rollback restoring a version a layout patch
     /// invalidated, a lazily built twin of a rolled-back generation).
@@ -6026,6 +6055,7 @@ impl Unit {
         // A borrowed body must still enter its twin's mark and inline tree.
         let at = if crate::harness::live::enabled() && !self.aux { self.slots.thunk(t) } else { tw.code };
         self.fns[id as usize].borrowed = true;
+        self.note_first_code(id);
         SlotWord::of(&self.slots, id).store(at, Ordering::SeqCst);
         let n = SPECV_BORROWS.fetch_add(1, Ordering::Relaxed);
         if n < 4096 && crate::inspect::flightrec::on() {
@@ -6068,6 +6098,7 @@ impl Unit {
             if crate::harness::live::enabled() && !self.aux { self.slots.thunk(t) } else { tw.code }
         } else { self.slots.stub(b) };
         self.fns[b as usize].borrowed = live;
+        if live { self.note_first_code(b); }
         SlotWord::of(&self.slots, b).store(at, Ordering::SeqCst);
     }
 
@@ -7221,7 +7252,7 @@ impl Unit {
         // Copy explicitly: converting an existing String can keep its old allocation.
         // Clone also copies both Inst's and Shim's owned type arguments.
         let (key, name) = crate::zone_alloc::slots_with(|| (key.clone(), Box::<str>::from(name)));
-        FnEntry { key, name, code: stub_addr, code_len: stub_len, pc_map: PcMap::default(), file, history: None, compiled: false, patch_gen: 0, rir: None, refs: u32::from(entry_ref), rir_refs: Box::default(), entry_ref: AtomicBool::new(entry_ref), entry_ref_counted: entry_ref, building: false, build_err: None, build_ns: 0, cg_ns: 0, version: 0, inflight: false, spec: None, spec_state: 0, spec_depth: u8::MAX, baseline_hint: AtomicBool::new(false), hot_hint: AtomicBool::new(false), o3: AtomicBool::new(false), base_code: AtomicBool::new(false), unverified: AtomicBool::new(false), d3_lowered: AtomicBool::new(false), ran_before: AtomicBool::new(false), twin_ran: AtomicBool::new(false), patched: AtomicBool::new(false), borrowed: false, rir_from: RIR_OWN, normal_rir: None, lowering: None, calls: Box::default() }
+        FnEntry { key, name, code: stub_addr, first_code_ns: AtomicU64::new(0), first_by_call: AtomicBool::new(false), code_len: stub_len, pc_map: PcMap::default(), file, history: None, compiled: false, patch_gen: 0, rir: None, refs: u32::from(entry_ref), rir_refs: Box::default(), entry_ref: AtomicBool::new(entry_ref), entry_ref_counted: entry_ref, building: false, build_err: None, build_ns: 0, cg_ns: 0, version: 0, inflight: false, spec: None, spec_state: 0, spec_depth: u8::MAX, baseline_hint: AtomicBool::new(false), hot_hint: AtomicBool::new(false), o3: AtomicBool::new(false), base_code: AtomicBool::new(false), unverified: AtomicBool::new(false), d3_lowered: AtomicBool::new(false), ran_before: AtomicBool::new(false), twin_ran: AtomicBool::new(false), patched: AtomicBool::new(false), borrowed: false, rir_from: RIR_OWN, normal_rir: None, lowering: None, calls: Box::default() }
     }
 
     /// Slot `id` has its key: the front's slot keys and its ahead check (before the slot is
@@ -8828,6 +8859,7 @@ impl Unit {
         f.code = at;
         f.code_len = code.len() as u32;
         f.pc_map = PcMap::new(&pc_map);
+        if code_as_now().is_none_or(|k| k.tier != tier::STUB) { self.note_first_code(id); }
         crate::inspect::patches::code_installed(self, id);
         // real-time code: what the new code references was walked before this install (or is now)
         unsafe { realtime_installed(self, id, &refs, std::panic::Location::caller()) };
@@ -9167,6 +9199,7 @@ impl Unit {
         f.pc_map = pc_map.into_slots();
         f.compiled = true;
         f.version += 1;
+        self.note_first_code(id);
         crate::inspect::patches::code_installed(self, id);
         if std::mem::take(&mut self.fns[id as usize].borrowed) {
             SPECV_BORROWS_OWN.fetch_add(1, Ordering::Relaxed);
@@ -23292,6 +23325,7 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
                 if let Some(g) = o3_group {
                     crate::invalid::note_install(u, g, id, at, code.len() as u32, u.fns[id as usize].version);
                 }
+                u.note_first_code(id);
                 crate::inspect::patches::code_installed(u, id);
                 let slot = SlotWord::of(&u.slots, id);
                 slot.store(at, Ordering::SeqCst);

@@ -269,6 +269,10 @@ pub struct Outcome {
     pub test_changes: Option<Vec<DefId>>,
     /// the body owners whose bodies the edit changed (a test session lints them: test_edit)
     pub bodies: Vec<DefId>,
+    /// per changed body (`bodies`), before this edit installed anything: the earliest time one of
+    /// its slots or of the slots that inlined them (transitively) had code (Unix ms, jit.rs
+    /// FnEntry::first_code_ns) and whether that code came with a call; None: no code yet
+    pub first_code: Vec<(DefId, Option<(u64, bool)>)>,
     pub group: u32,
     /// ms: parse + classify, check, compile, install
     pub ms: [f64; 4],
@@ -4652,7 +4656,7 @@ unsafe fn apply_mode(up: *mut Unit, edits: Vec<Edit>, sources: &[Edit], partial:
     // an earlier transaction panicked: the program's tables may be half-way through it, and no
     // edit applies to them again -- the restart that recovery offers applies this one
     if let Some(why) = unit_suspect() {
-        return Outcome { failure: Some(makepad_remote::hot::Outcome::Panic), kept: 0, pending: false, rung: Rung::Restart, files, lines: vec![format!("not applied to a program an earlier edit left half-made ({why}): a process restart applies it")], names: Vec::new(), changed: 0, test_changes: None, bodies: Vec::new(), group: 0, ms: [0.0; 4], undo: None, work: [0; 5], deferred: Vec::new() };
+        return Outcome { failure: Some(makepad_remote::hot::Outcome::Panic), kept: 0, pending: false, rung: Rung::Restart, files, lines: vec![format!("not applied to a program an earlier edit left half-made ({why}): a process restart applies it")], names: Vec::new(), changed: 0, test_changes: None, bodies: Vec::new(), first_code: Vec::new(), group: 0, ms: [0.0; 4], undo: None, work: [0; 5], deferred: Vec::new() };
     }
     // an internal compiler panic in the transaction refuses the edit with its message. Nothing
     // undoes what the transaction had changed of the program by then (its file versions, defs,
@@ -4745,7 +4749,7 @@ unsafe fn apply_mode(up: *mut Unit, edits: Vec<Edit>, sources: &[Edit], partial:
             // the message and where the compiler panicked: the report names the spot
             let msg = crate::lifeline::panic_line(&*p);
             mark_unit_suspect(&format!("internal compiler error applying an edit: {msg}"));
-            Outcome { failure: Some(makepad_remote::hot::Outcome::Panic), kept: 0, pending: false, rung: Rung::Restart, files, lines: vec![format!("internal compiler error applying the edit: {} -- Relax bug, report it; the app runs on with its code, and a restart applies the edit", msg)], names: Vec::new(), changed: 0, test_changes: None, bodies: Vec::new(), group: 0, ms: [0.0; 4], undo: None, work: [0; 5], deferred: Vec::new() }
+            Outcome { failure: Some(makepad_remote::hot::Outcome::Panic), kept: 0, pending: false, rung: Rung::Restart, files, lines: vec![format!("internal compiler error applying the edit: {} -- Relax bug, report it; the app runs on with its code, and a restart applies the edit", msg)], names: Vec::new(), changed: 0, test_changes: None, bodies: Vec::new(), first_code: Vec::new(), group: 0, ms: [0.0; 4], undo: None, work: [0; 5], deferred: Vec::new() }
         }
     };
     if r.rung != Rung::Patch { crate::sip::restore_late_files(&late); }
@@ -4803,6 +4807,42 @@ fn front_wait_said(paths: &[String], waited: Option<std::time::Duration>) {
     }
 }
 
+/// Outcome::first_code of `bodies`: every slot of each body (its instances, the closures in it,
+/// their twins) and the slots that inlined them, read before the edit installs any code or drops
+/// an inlining record.
+fn first_code(u: &Unit, bodies: &[DefId]) -> Vec<(DefId, Option<(u64, bool)>)> {
+    let mut slots: std::collections::HashMap<DefId, Vec<u32>> = bodies.iter().map(|&d| (d, Vec::new())).collect();
+    if slots.is_empty() { return Vec::new(); }
+    for id in 0..u.fns.len() {
+        let mut base = id as u32;
+        loop {
+            match &u.fns[base as usize].key {
+                FnKey::Inst(d, _) => {
+                    if let Some(ids) = slots.get_mut(d) { ids.push(id as u32); }
+                    break;
+                }
+                FnKey::Closure(_, _, p) | FnKey::Sandbox(p) | FnKey::Plain(p) | FnKey::Ctfe(p) => base = *p,
+                _ => break,
+            }
+        }
+    }
+    bodies.iter().map(|&d| {
+        let mut work = slots[&d].clone();
+        let mut seen = std::collections::HashSet::new();
+        let mut first: Option<(u64, bool)> = None;
+        while let Some(id) = work.pop() {
+            if !seen.insert(id) { continue; }
+            let f = &u.fns[id as usize];
+            let ns = f.first_code_ns.load(Ordering::Acquire);
+            if ns != 0 && first.is_none_or(|(t, _)| ns < t) {
+                first = Some((ns, f.first_by_call.load(Ordering::Acquire)));
+            }
+            work.extend(f.history().inlined_into.iter().copied());
+        }
+        (d, first.map(|(ns, by_call)| (ns / 1_000_000, by_call)))
+    }).collect()
+}
+
 unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Result<crate::program::FileVersion, String>>>, t0: Instant, partial: u8, retries: usize, module: bool, base: &IncludeBase) -> Outcome {
     let transaction = TRANSACTIONS.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
     let session = unsafe { crate::jit::unit_session(up) };
@@ -4815,7 +4855,7 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
     u.flush_cache_records();
     note_edited_crates(u, &olds);
     let cache_ahead0 = jit::CACHE_AHEAD.load(std::sync::atomic::Ordering::Relaxed);
-    let mut out = Outcome { failure: None, kept: 0, pending: false, rung: Rung::Refuse, files: olds.clone(), lines: Vec::new(), names: Vec::new(), changed: 0, test_changes: None, bodies: Vec::new(), group: 0, ms: [0.0; 4], undo: None, work: [0; 5], deferred: Vec::new() };
+    let mut out = Outcome { failure: None, kept: 0, pending: false, rung: Rung::Refuse, files: olds.clone(), lines: Vec::new(), names: Vec::new(), changed: 0, test_changes: None, bodies: Vec::new(), first_code: Vec::new(), group: 0, ms: [0.0; 4], undo: None, work: [0; 5], deferred: Vec::new() };
     // 1-2: parse and classify every file; nothing changes yet
     let mut versions = Vec::new();
     let mut changes = Vec::new();
@@ -4940,6 +4980,7 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
         return out;
     }
     out.bodies = changes.iter().filter_map(|c| match c { Change::Body(d) => Some(*d), _ => None }).collect();
+    out.first_code = first_code(u, &out.bodies);
     if changes.iter().all(|c| matches!(c, Change::Body(_))) && versions.iter().all(|(_, p)|
         p.added.is_empty() && p.removed.is_empty() && p.removed_uses.is_empty() && !p.attributes_changed) {
         out.test_changes = Some(out.bodies.clone());
@@ -8774,8 +8815,13 @@ fn unix_ms(t: std::time::SystemTime) -> f64 {
 /// This process's edits: (rung name, ms from the save to the rung applied).
 static SESSION: relax_session::sync::Mutex<Vec<(&'static str, f64)>> = relax_session::sync::Mutex::new(Vec::new());
 
-/// One edit's record. `saved`: the newest edited file's modification time (the save).
-fn log_edit(what: &str, o: &Outcome, saved: Option<std::time::SystemTime>, seen: std::time::Instant) {
+/// One edit's record. `saved`: the newest edited file's modification time (the save). `paths`:
+/// the edited files as the watch names them (`files` keeps their base names). `items`: each
+/// changed body owner with where it is and when it first had code before this edit
+/// (`first_code_ms`, Unix ms, Outcome::first_code: no call can come earlier) and how
+/// (`linked`: "call", installed by its first call, so that is the first call's time; "ahead",
+/// installed before any call, which came at or after it or never; null with no code).
+fn log_edit(up: *mut Unit, what: &str, paths: &[String], o: &Outcome, saved: Option<std::time::SystemTime>, seen: std::time::Instant) {
     if crate::run_state::observed() {
         // an edit waiting for a restart is no failure: the app runs on, the restart is offered
         let applied = o.failure.is_none() && (o.rung == Rung::Restart || o.rung == Rung::Patch && !o.pending
@@ -8806,11 +8852,31 @@ fn log_edit(what: &str, o: &Outcome, saved: Option<std::time::SystemTime>, seen:
         crate::inspect::engine_req::code_update(if rung == "restart" { "restart" } else { "patched" }, what, o.changed as u64);
     }
     let reasons: Vec<String> = o.lines.iter().take(8).map(|l| json_str(l)).collect();
+    let paths: Vec<String> = paths.iter().map(|p| json_str(p)).collect();
+    let items: Vec<String> = if o.first_code.is_empty() { Vec::new() } else {
+        crate::owner::call(crate::owner::Class::Program, || {
+            let prog = unsafe { &(*up).prog };
+            o.first_code.iter().map(|&(d, first)| {
+                let def = prog.def(d);
+                let pos = prog.files[def.file as usize].ast.item(def.item).name.lo;
+                let loc = prog.source_location(def.file, pos);
+                let line = loc.source.line_col(loc.span.lo).0;
+                let (time, linked) = match first {
+                    Some((ms, by_call)) => (ms.to_string(), json_str(if by_call { "call" } else { "ahead" })),
+                    None => ("null".to_string(), "null".to_string()),
+                };
+                format!("{{\"path\":{},\"file\":{},\"line\":{},\"first_code_ms\":{},\"linked\":{}}}",
+                    json_str(&prog.def_path(d)), json_str(loc.source.path()), line, time, linked)
+            }).collect()
+        })
+    };
     live_log(&format!(
-        "{{\"event\":\"edit\",\"t\":{:.0},\"pid\":{},\"files\":{},\"rung\":\"{}\",\"changed\":{},\"fns\":{},\"rebuilt\":{},\"ahead\":{},\"ahead_cached\":{},\"field_named\":{},\"field_deps\":{},\"ms\":{{\"detect\":{:.1},\"parse\":{:.1},\"check\":{:.1},\"compile\":{:.1},\"install\":{:.1},\"work\":{:.1},\"total\":{:.1}}},\"reasons\":[{}]}}",
+        "{{\"event\":\"edit\",\"t\":{:.0},\"pid\":{},\"files\":{},\"paths\":[{}],\"items\":[{}],\"rung\":\"{}\",\"changed\":{},\"fns\":{},\"rebuilt\":{},\"ahead\":{},\"ahead_cached\":{},\"field_named\":{},\"field_deps\":{},\"ms\":{{\"detect\":{:.1},\"parse\":{:.1},\"check\":{:.1},\"compile\":{:.1},\"install\":{:.1},\"work\":{:.1},\"total\":{:.1}}},\"reasons\":[{}]}}",
         unix_ms(now),
         std::process::id(),
         json_str(what),
+        paths.join(","),
+        items.join(","),
         rung,
         o.changed,
         o.names.len(),
@@ -8908,7 +8974,7 @@ enum StreamTarget {
 static STREAMS: relax_session::sync::Mutex<Vec<(usize, StreamTarget, StreamFile)>> = relax_session::sync::Mutex::new(Vec::new());
 
 fn idle_outcome(file: Option<u32>, line: &str) -> Outcome {
-    Outcome { failure: None, kept: 0, pending: false, rung: Rung::Patch, files: file.into_iter().collect(), lines: vec![line.to_string()], names: Vec::new(), changed: 0, test_changes: None, bodies: Vec::new(), group: 0, ms: [0.0; 4], undo: None, work: [0; 5], deferred: Vec::new() }
+    Outcome { failure: None, kept: 0, pending: false, rung: Rung::Patch, files: file.into_iter().collect(), lines: vec![line.to_string()], names: Vec::new(), changed: 0, test_changes: None, bodies: Vec::new(), first_code: Vec::new(), group: 0, ms: [0.0; 4], undo: None, work: [0; 5], deferred: Vec::new() }
 }
 
 unsafe fn stream_file(up: *mut Unit, path: &str) -> Option<u32> {
@@ -8944,7 +9010,7 @@ unsafe fn feed_stream(up: *mut Unit, target: &StreamTarget, file: u32, path: &st
     if o.rung == Rung::Refuse {
         o.lines = vec!["incomplete: no item applied".to_string()];
     }
-    log_edit(path, &o, None, seen);
+    log_edit(up, path, &[path.to_string()], &o, None, seen);
     o
 }
 
@@ -9036,13 +9102,13 @@ unsafe fn drain_streams(up: *mut Unit) {
                 if let Err(error) = parsed {
                     let mut o = idle_outcome(Some(file), &error);
                     o.rung = Rung::Refuse;
-                    log_edit(&path, &o, None, seen);
+                    log_edit(up, &path, std::slice::from_ref(&path), &o, None, seen);
                     eprintln!("relax live: {}", error);
                 } else if let Some(src) = composed {
                     let o = apply_mode(up, vec![Edit { file, path: path.clone(), src }], &[], 0, matches!(target, StreamTarget::Module(_)));
                     record_stream(up, target, &o);
                     if o.rung != Rung::Patch {
-                        log_edit(&path, &o, None, seen);
+                        log_edit(up, &path, std::slice::from_ref(&path), &o, None, seen);
                         for line in &o.lines { eprintln!("relax live: {}: {}", path, line); }
                     }
                 }
@@ -9637,8 +9703,8 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
     // one more round at once, whatever the events say: a write resumed while the batch was read,
     // or files moved outside a dock app's sync
     let mut again = false;
-    // installed patches whose landing is checked once LANDING has passed: (when, patch group, the edit)
-    let mut landing: Vec<(Instant, u32, String)> = Vec::new();
+    // installed patches whose landing is checked once LANDING has passed: (when, patch group, the edit, paths)
+    let mut landing: Vec<(Instant, u32, String, Vec<String>)> = Vec::new();
     let mut last_scan = Instant::now();
     // a WM dock app: only a devhub sync of landed work may change its code (`DockGate`)
     let mut dock = DockGate::from_env();
@@ -9854,9 +9920,9 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
         // has not reached that call (a loop that never returns): the edit restarts the app.
         let now = Instant::now();
         if landing.iter().any(|l| l.0 <= now) {
-            let due: Vec<(u32, String)> = landing.iter().filter(|l| l.0 <= now).map(|l| (l.1, l.2.clone())).collect();
+            let due: Vec<(u32, String, Vec<String>)> = landing.iter().filter(|l| l.0 <= now).map(|l| (l.1, l.2.clone(), l.3.clone())).collect();
             landing.retain(|l| l.0 > now);
-            for (gen, what) in due {
+            for (gen, what, paths) in due {
                 let t_land = Instant::now();
                 let w0 = crate::jit::wall_ns();
                 let old = crate::owner::call(crate::owner::Class::Program, || { let held = t_land.elapsed(); (running_old_code(&*up, gen), held) });
@@ -9867,7 +9933,7 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
                 }
                 if let Some(name) = old.0 {
                     let lines = vec![format!("`{name}` still runs the code from before the edit: a call made before the patch has not returned (a loop) -- restart the app")];
-                    log_edit(&what, &Outcome { failure: None, kept: 0, pending: false, rung: Rung::Restart, files: Vec::new(), lines: lines.clone(), names: Vec::new(), changed: 0, test_changes: None, bodies: Vec::new(), group: gen, ms: [0.0; 4], undo: None, work: [0; 5], deferred: Vec::new() }, None, Instant::now());
+                    log_edit(up, &what, &paths, &Outcome { failure: None, kept: 0, pending: false, rung: Rung::Restart, files: Vec::new(), lines: lines.clone(), names: Vec::new(), changed: 0, test_changes: None, bodies: Vec::new(), first_code: Vec::new(), group: gen, ms: [0.0; 4], undo: None, work: [0; 5], deferred: Vec::new() }, None, Instant::now());
                     restart_for_edit(&what, &lines);
                     for l in &lines { eprintln!("relax live:   {}", l); }
                     patch_refused_event(&what, false, &lines);
@@ -10270,9 +10336,10 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
             }
             for &k in &moved { stalled.insert(k, (Vec::new(), undeclared.clone())); }
             let what: Vec<String> = removed.iter().chain(&which).map(|&k| files[k].0.rsplit('/').next().unwrap_or("").to_string()).collect();
+            let paths: Vec<String> = removed.iter().chain(&which).map(|&k| files[k].0.clone()).collect();
             let what = what.join(", ");
-            let o = Outcome { failure: None, kept: 0, pending: false, rung: Rung::Refuse, files: Vec::new(), lines: undeclared.clone(), names: Vec::new(), changed: 0, test_changes: None, bodies: Vec::new(), group: 0, ms: [0.0; 4], undo: None, work: [0; 5], deferred: Vec::new() };
-            log_edit(&what, &o, saved, seen);
+            let o = Outcome { failure: None, kept: 0, pending: false, rung: Rung::Refuse, files: Vec::new(), lines: undeclared.clone(), names: Vec::new(), changed: 0, test_changes: None, bodies: Vec::new(), first_code: Vec::new(), group: 0, ms: [0.0; 4], undo: None, work: [0; 5], deferred: Vec::new() };
+            log_edit(up, &what, &paths, &o, saved, seen);
             eprintln!("relax live: {}: NOT applied (errors below); the app runs the previous code", what);
             for l in &undeclared { eprintln!("relax live:   {}", l); }
             patch_refused_event(&what, true, &undeclared);
@@ -10302,9 +10369,10 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
         if edits.is_empty() {
             // saved back to the running text (e.g. the fix after a refused edit): the program
             // already runs it -- an edit applied in place for the scoreboard
-            let mut o = Outcome { failure: None, kept: 0, pending: false, rung: Rung::Patch, files: Vec::new(), lines: Vec::new(), names: Vec::new(), changed: 0, test_changes: None, bodies: Vec::new(), group: 0, ms: [0.0; 4], undo: None, work: [0; 5], deferred: Vec::new() };
+            let mut o = Outcome { failure: None, kept: 0, pending: false, rung: Rung::Patch, files: Vec::new(), lines: Vec::new(), names: Vec::new(), changed: 0, test_changes: None, bodies: Vec::new(), first_code: Vec::new(), group: 0, ms: [0.0; 4], undo: None, work: [0; 5], deferred: Vec::new() };
             let what: Vec<String> = changed.iter().map(|&k| files[k].0.rsplit('/').next().unwrap_or("").to_string()).collect();
-            log_edit(&what.join(", "), &o, saved, seen);
+            let paths: Vec<String> = changed.iter().map(|&k| files[k].0.clone()).collect();
+            log_edit(up, &what.join(", "), &paths, &o, saved, seen);
             if crate::harness::live::enabled() {
                 drop(_reloading);
                 let back = test_edit(up, changed.iter().map(|&k| files[k].0.clone()).collect(), &mut o, &mut undos);
@@ -10316,6 +10384,7 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
             continue;
         }
         let names: Vec<String> = edits.iter().map(|e| e.path.rsplit('/').next().unwrap_or("").to_string()).collect();
+        let paths: Vec<String> = edits.iter().map(|e| e.path.clone()).collect();
         let originals: Vec<_> = edits.iter().map(|e| e.src.clone()).collect();
         // A writer may have resumed while we read. Keep these texts pending and
         // collect its next batch before compiling or requesting a recovery.
@@ -10353,7 +10422,7 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
             if quiet_retry && only_previous_errors && internal_failure(&o.lines) {
                 failure = Some(makepad_remote::hot::Outcome::Refused);
             }
-            log_edit(&what, &o, saved, seen);
+            log_edit(up, &what, &paths, &o, saved, seen);
             eprintln!("relax live: {}: NOT applied (errors below); the app runs the previous code", what);
             for l in &o.lines { eprintln!("relax live:   {}", l); }
             patch_refused_event(&what, true, &o.lines);
@@ -10408,7 +10477,7 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
         if o.rung == Rung::Restart || (o.rung == Rung::Patch && o.lines.iter().any(|l| l.starts_with(HELD))) {
             RESTART_SAVED_MS.store(saved.map_or(0.0, unix_ms) as u64, std::sync::atomic::Ordering::Relaxed);
         }
-        log_edit(&what, &o, saved, seen);
+        log_edit(up, &what, &paths, &o, saved, seen);
         if crate::harness::live::enabled() {
             drop(_reloading);
             let back = test_edit(up, which.iter().map(|&k| files[k].0.clone()).collect(), &mut o, &mut undos);
@@ -10442,7 +10511,7 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
         crate::tui::flush();
         if o.rung == Rung::Patch {
             patch_landed(which.iter().map(|&k| files[k].0.clone()), changed_items(up, &o));
-            if o.group != 0 { landing.push((Instant::now() + LANDING, o.group, what.clone())); }
+            if o.group != 0 { landing.push((Instant::now() + LANDING, o.group, what.clone(), paths.clone())); }
         }
         // what is left unverified reports when the borrow checker answers; else the verdict is now
         let patched = o.rung == Rung::Patch;

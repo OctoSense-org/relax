@@ -69,6 +69,56 @@ fn deferred_reexport_signatures() {
     std::fs::remove_dir_all(dir).unwrap();
 }
 
+/// RELAX_LIVE_LOG edit items (relax issue 226): a body that ran before the edit (on its own or
+/// inlined into its caller) had code before it, one never called had none -- the edit's own
+/// install of it does not count.
+#[test]
+fn live_edit_first_code_before_patch() {
+    std::env::set_var("RELAX_STD", concat!(env!("CARGO_MANIFEST_DIR"), "/std"));
+    let dir = std::env::temp_dir().join(format!("relax-first-code-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("lib.rs").to_string_lossy().into_owned();
+    let source = "pub fn called(out: &mut u32) { *out = helper(); }\nfn helper() -> u32 { 11 }\npub fn never(out: &mut u32) { *out = 5; }\n";
+    std::fs::write(&path, source).unwrap();
+    let session = Arc::new(crate::Session::default());
+    let (prog, core, app_crate) = crate::load_with_std(&session, &path, "first_code", false).unwrap();
+    let named = |name: &str| prog.defs.iter().enumerate().find_map(|(i, d)| {
+        let id = crate::program::DefId(i as u32);
+        (d.krate == app_crate && prog.name(id) == name).then_some(id)
+    }).unwrap();
+    let (called, helper, never) = (named("called"), named("helper"), named("never"));
+    let mut tcx = crate::tcx::Tcx::new();
+    tcx.collect(&prog);
+    let mut u = crate::jit::Unit::new(prog, tcx, core);
+    let up = &mut *u as *mut crate::jit::Unit;
+    let entry = crate::owner::call(crate::owner::Class::Program, || {
+        let id = u.fn_id(crate::jit::FnKey::Inst(called, vec![]));
+        u.entry(id)
+    });
+    let run = |expected| {
+        let mut result = 0u32;
+        unsafe { crate::jit::call_jit(up, entry, &mut result as *mut u32 as u64) }
+            .unwrap_or_else(|p| panic!("JIT call panicked: {}", p.message));
+        assert_eq!(result, expected);
+    };
+    run(11);
+    let file = u.prog.def(called).file;
+    let edited_at = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
+    let outcome = unsafe { crate::reload::apply(up, vec![crate::reload::Edit {
+        file, path, src: source.replace("11", "12").replace("5;", "6;").into_bytes(),
+    }]) };
+    assert_eq!(outcome.rung, crate::reload::Rung::Patch, "{:?}", outcome.lines);
+    assert_eq!(outcome.first_code.len(), outcome.bodies.len(), "every changed body has a snapshot");
+    let helper_code = outcome.first_code.iter().find(|(d, _)| *d == helper).expect("helper changed").1;
+    let (time, _) = helper_code.expect("helper had code, directly or inlined into called");
+    assert!(time > 0 && time <= edited_at, "helper's first code {time} must be in 1..={edited_at}");
+    assert_eq!(outcome.first_code.iter().find(|(d, _)| *d == never).expect("never changed").1, None,
+        "patch installs must not count as code before the edit");
+    run(12);
+    std::mem::forget(u);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
 #[test]
 fn gandalf_live_edit_guard_and_reporting() {
     // Unit/runtime and diagnostic sinks are process-global; each guard setting gets a
