@@ -647,8 +647,9 @@ impl<'a> Lcx<'a> {
         if let TyKind::Adt(d, _, _) = self.u.tcx.tys.kind(t) {
             let krate = self.u.prog.def(*d).krate;
             if self.u.provided.iter().any(|(k, _)| *k == krate) && !crate::provided::trusted(&self.u.prog, &self.u.tcx, krate, t, 0) && !self.u.provided_rustc_layout(*d) && !self.relax_only_instance(t) {
-                let ts = crate::typeck::ty_to_string(false, &self.u.prog, &self.u.tcx, t);
-                self.provided_err(krate, format!("`{}` is built in JIT-compiled code, but values of it reach the rustc-built code of its provided crate (a bound fn takes or returns it) and its layout is not C-shaped: build it with a fn of the crate, or keep it out of bound signatures", ts));
+                let ts = crate::typeck::type_name(&self.u.prog, &self.u.tcx, t);
+                let remedy = self.provided_layout_remedy(*d);
+                self.provided_err(krate, format!("`{}` is built in JIT-compiled code, but values of it reach the rustc-built code of its provided crate (a bound fn takes or returns it) and {}", ts, remedy));
             }
         }
     }
@@ -705,15 +706,28 @@ impl<'a> Lcx<'a> {
         !self.u.provided_shared_contains(t)
     }
 
+    /// Only called after a refusal: binding already recorded the layout or field-byte failure.
+    fn provided_layout_remedy(&self, d: DefId) -> String {
+        if self.u.tcx.adts.get(&d).is_some_and(|a| a.is_enum && a.repr_int.is_none() && a.variants.iter().any(|v| !v.fields.is_empty())) {
+            return "its data variants have no primitive repr. Mark it #[repr(u8)] so both compilers lay it out alike, or use a fn of the crate".into();
+        }
+        let reason = self.u.provided_layout_reasons.get(&d).map(String::as_str).unwrap_or("no layout was exported by #[relax_api]");
+        if !self.u.provided_types.contains_key(&d) {
+            return format!("its layout remains opaque ({}). Mark it #[relax_api(handle)], or use a fn of the crate", reason);
+        }
+        format!("its layout remains opaque ({}). Use a fn of the crate", reason)
+    }
+
     /// An opaque provided enum (provided.rs; rustc's layout, no tag known to Relax) cannot be
     /// matched on or built by variant in JIT-compiled code, unless its layout and field bytes
     /// agree with rustc's (`provided_rustc_layout`).
     fn check_provided_opaque_enum(&mut self, t: TyId, what: &str) {
         if let TyKind::Adt(d, a, _) = self.kind(t) {
             if a.is_empty() && self.u.provided_types.contains_key(&d) && !self.u.provided_rustc_layout(d) {
-                let ts = crate::typeck::ty_to_string(false, &self.u.prog, &self.u.tcx, t);
+                let ts = crate::typeck::type_name(&self.u.prog, &self.u.tcx, t);
                 let krate = self.u.prog.def(d).krate;
-                self.provided_err(krate, format!("`{}` is {} by variant in JIT-compiled code, but it lives in a provided crate (built by rustc into the loader) and its layout is not C-shaped: use a method of the crate (e.g. a fieldless kind)", ts, what));
+                let remedy = self.provided_layout_remedy(d);
+                self.provided_err(krate, format!("`{}` is {} by variant in JIT-compiled code, but it lives in a provided crate (built by rustc into the loader) and {}", ts, what, remedy));
             }
         }
     }

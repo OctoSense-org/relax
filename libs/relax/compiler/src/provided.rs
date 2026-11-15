@@ -1209,29 +1209,51 @@ fn parse_enum_layout(table: &[u64]) -> Option<(u8, Vec<(u64, &[u64])>)> {
     table.is_empty().then_some((bytes, variants))
 }
 
-/// The primitive-repr enum's tag and every variant's fields agree with rustc's export.
+/// Why the primitive-repr enum's tag or variant fields disagree with rustc's export.
 /// Size and alignment are checked by the caller, for plain types and handles alike.
-pub(crate) fn enum_layout_matches(prog: &Program, tcx: &Tcx, d: DefId, l: &crate::layout::Layout, table: &[u64]) -> bool {
-    let Some(adt) = tcx.adts.get(&d).filter(|a| a.is_enum) else { return false };
-    let Some(repr) = adt.repr_int else { return false };
-    let Some((bytes, variants)) = parse_enum_layout(table) else { return false };
+fn enum_layout_mismatch(prog: &Program, tcx: &Tcx, d: DefId, l: &crate::layout::Layout, table: &[u64]) -> Option<String> {
+    let Some(adt) = tcx.adts.get(&d).filter(|a| a.is_enum) else { return Some("the JIT has no enum layout".into()) };
+    let Some(repr) = adt.repr_int else { return Some("the enum has no primitive repr".into()) };
+    if table.is_empty() { return Some("rustc's export has no enum layout".into()); }
+    let Some((bytes, variants)) = parse_enum_layout(table) else { return Some("rustc's exported enum layout table is malformed".into()) };
     let (repr_bytes, signed) = tcx.tys.int_info(repr);
     if repr_bytes != bytes as u32
         || l.tag != Some((0, relax_backend::rir::Mem::Int(bytes, signed)))
         || l.enc != crate::layout::TagEnc::Direct
-        || variants.len() != adt.variants.len()
-        || variants.len() != l.variant_fields.len()
     {
-        return false;
+        return Some("the tag width, position or encoding disagrees with rustc's export".into());
+    }
+    if variants.len() != adt.variants.len() || variants.len() != l.variant_fields.len() {
+        return Some("the variant count disagrees with rustc's export".into());
     }
     // rustc's export sign-extends signed tags to u64; stores use the repr-width bits.
     let mask = u64::MAX >> (64 - bytes as u32 * 8);
-    variants.iter().enumerate().all(|(vi, (tag, offsets))| {
-        adt.tag_for_variant(tcx, prog, vi as u32).is_some_and(|t| (t.val as u64 & mask) == (*tag & mask))
-            && offsets.len() == adt.variants[vi].fields.len()
-            && offsets.len() == l.variant_fields[vi].len()
-            && offsets.iter().zip(&l.variant_fields[vi]).all(|(a, b)| *a == *b as u64)
-    })
+    for (vi, (tag, offsets)) in variants.iter().enumerate() {
+        let name = prog.syms.str(adt.variants[vi].name);
+        if !adt.tag_for_variant(tcx, prog, vi as u32).is_some_and(|t| (t.val as u64 & mask) == (*tag & mask)) {
+            return Some(format!("variant `{}`'s tag disagrees with rustc's export", name));
+        }
+        if offsets.len() != adt.variants[vi].fields.len()
+            || offsets.len() != l.variant_fields[vi].len()
+            || !offsets.iter().zip(&l.variant_fields[vi]).all(|(a, b)| *a == *b as u64)
+        {
+            return Some(format!("variant `{}`'s field offsets disagree with rustc's export", name));
+        }
+    }
+    None
+}
+
+/// The reason a provided type's layout disagrees with its export, shared by plain types and
+/// handle candidates. Empty tables on plain types retain their size/align-only check.
+pub(crate) fn layout_mismatch(prog: &Program, tcx: &Tcx, d: DefId, l: &crate::layout::Layout, size: u32, align: u32, offs: &[u64], enum_layout: &[u64]) -> Option<String> {
+    if l.size != size || l.align != align {
+        return Some(format!("size/align disagree with rustc's export (JIT {}/{}, rustc {}/{})", l.size, l.align, size, align));
+    }
+    if !offs.is_empty() && (offs.len() != l.fields.len() || !offs.iter().zip(&l.fields).all(|(a, b)| *a == *b as u64)) {
+        return Some("field offsets disagree with rustc's export".into());
+    }
+    if !enum_layout.is_empty() { return enum_layout_mismatch(prog, tcx, d, l, enum_layout); }
+    None
 }
 
 /// The `#[relax_api(handle)]` structs and primitive-repr enums among `cands` (def, rustc's size,
@@ -1244,8 +1266,15 @@ pub(crate) fn enum_layout_matches(prog: &Program, tcx: &Tcx, d: DefId, l: &crate
 /// them until they pass, a demoted plain type); `known`: handles found the same before (a crate
 /// an app domain added after the boot).
 pub fn same_layout_handles(prog: &Program, tcx: &Tcx, cands: &[(DefId, u32, u32, &[u64], &[u64])], opaque: &dyn Fn(DefId) -> bool, known: &dyn Fn(DefId) -> bool) -> Vec<DefId> {
+    same_layout_handles_with_reasons(prog, tcx, cands, opaque, known).0
+}
+
+/// The same agreement gate, retaining the first rejection of each candidate at binding so a
+/// later refusal can explain it without rerunning the layout or field-byte fixed point.
+pub(crate) fn same_layout_handles_with_reasons(prog: &Program, tcx: &Tcx, cands: &[(DefId, u32, u32, &[u64], &[u64])], opaque: &dyn Fn(DefId) -> bool, known: &dyn Fn(DefId) -> bool) -> (Vec<DefId>, HashMap<DefId, String>) {
+    let mut rejected = HashMap::new();
     if cands.is_empty() {
-        return Vec::new();
+        return (Vec::new(), rejected);
     }
     let probe = crate::layout::Layouts::new();
     let lcx = crate::layout::LayoutCx::new(prog);
@@ -1255,16 +1284,24 @@ pub fn same_layout_handles(prog: &Program, tcx: &Tcx, cands: &[(DefId, u32, u32,
         .filter(|(d, size, align, offs, enum_layout)| {
             let adt = match tcx.adts.get(d) {
                 Some(a) if !a.is_union && (a.is_enum || a.variants.len() == 1) => a,
-                _ => return false,
+                _ => {
+                    rejected.insert(*d, "the JIT has no supported struct or enum layout".into());
+                    return false;
+                }
             };
             let t = tcx.tys.intern(TyKind::Adt(*d, crate::types::List::EMPTY, crate::types::RegionArgsId::EMPTY));
             let l = probe.of(&lcx, tcx, t);
-            if l.size != *size || l.align != *align { return false; }
-            if adt.is_enum { return enum_layout_matches(prog, tcx, *d, l, enum_layout); }
-            !offs.is_empty()
-                && offs.len() == adt.variants[0].fields.len()
-                && offs.len() == l.fields.len()
-                && offs.iter().zip(&l.fields).all(|(a, b)| *a == *b as u64)
+            let reason = layout_mismatch(prog, tcx, *d, l, *size, *align, if adt.is_enum { &[] } else { offs }, &[])
+                .or_else(|| {
+                    if adt.is_enum { return enum_layout_mismatch(prog, tcx, *d, l, enum_layout); }
+                    if offs.is_empty() { return Some("rustc's export has no struct field offsets".into()); }
+                    (offs.len() != adt.variants[0].fields.len()).then(|| "field offsets disagree with rustc's export".into())
+                });
+            if let Some(reason) = reason {
+                rejected.insert(*d, reason);
+                return false;
+            }
+            true
         })
         .map(|c| c.0)
         .collect();
@@ -1274,9 +1311,20 @@ pub fn same_layout_handles(prog: &Program, tcx: &Tcx, cands: &[(DefId, u32, u32,
         let same = |krate: u32, t: TyId| same_bytes(prog, tcx, krate, t, &|d| now.contains(&d) || known(d), std_same, opaque, 0);
         ok.retain(|d| {
             let krate = prog.def(*d).krate;
-            tcx.adts.get(d).is_some_and(|a| a.variants.iter().enumerate().all(|(vi, v)| {
-                (0..v.fields.len()).all(|fi| same(krate, tcx.field_ty(prog, crate::tcx::TypingEnv::fully_monomorphized(prog), *d, vi as u32, fi as u32, &[])))
-            }))
+            let adt = tcx.adts.get(d).unwrap(); // admitted above
+            for (vi, v) in adt.variants.iter().enumerate() {
+                for (fi, f) in v.fields.iter().enumerate() {
+                    let ft = tcx.field_ty(prog, crate::tcx::TypingEnv::fully_monomorphized(prog), *d, vi as u32, fi as u32, &[]);
+                    if !same(krate, ft) {
+                        let variant = if adt.is_enum { format!("variant `{}` ", prog.syms.str(v.name)) } else { String::new() };
+                        let field = if v.shape == 1 { fi.to_string() } else { prog.syms.str(f.name).to_string() };
+                        let ty = crate::typeck::ty_to_string(false, prog, tcx, ft);
+                        rejected.insert(*d, format!("{}field `{}` of type `{}` is not the same bytes on both sides", variant, field, ty));
+                        return false;
+                    }
+                }
+            }
+            true
         });
         if ok.len() == now.len() {
             break;
@@ -1284,7 +1332,7 @@ pub fn same_layout_handles(prog: &Program, tcx: &Tcx, cands: &[(DefId, u32, u32,
     }
     let mut v: Vec<DefId> = ok.into_iter().collect();
     v.sort_by_key(|d| d.0);
-    v
+    (v, rejected)
 }
 
 /// Is field `t` of an opaque handle of provided crate `krate` the same bytes on both sides, so
@@ -1385,7 +1433,7 @@ pub enum Signed { Negative(u8) = -3, Empty }
             table
         };
         let check = |cands: &[(DefId, u32, u32, &[u64], &[u64])]| {
-            same_layout_handles(&prog, &tcx, cands, &|d| cands.iter().any(|c| c.0 == d), &|_| false)
+            same_layout_handles_with_reasons(&prog, &tcx, cands, &|d| cands.iter().any(|c| c.0 == d), &|_| false)
         };
         let check_enum = |d, table: &[u64]| {
             let l = layout(d);
@@ -1393,16 +1441,20 @@ pub enum Signed { Negative(u8) = -3, Empty }
         };
         let data = def("Data");
         let table = export(data);
-        assert_eq!(check_enum(data, &table), [data], "a repr(u8) data enum with matching layout must pass");
+        assert_eq!(check_enum(data, &table).0, [data], "a repr(u8) data enum with matching layout must pass");
         let mut wrong = table.clone();
         wrong[6] += 1; // Byte's sole field, after Empty's tag/count and Byte's tag/count.
-        assert!(check_enum(data, &wrong).is_empty(), "a wrong field offset must keep the enum opaque");
+        let (same, rejected) = check_enum(data, &wrong);
+        assert!(same.is_empty(), "a wrong field offset must keep the enum opaque");
+        assert!(rejected[&data].contains("variant `Byte`'s field offsets"), "wrong offsets must name the variant: {:?}", rejected);
         wrong = table.clone();
         wrong[2] += 1;
-        assert!(check_enum(data, &wrong).is_empty(), "a wrong tag value must keep the enum opaque");
+        let (same, rejected) = check_enum(data, &wrong);
+        assert!(same.is_empty(), "a wrong tag value must keep the enum opaque");
+        assert!(rejected[&data].contains("variant `Empty`'s tag"), "wrong tags must name the variant: {:?}", rejected);
         wrong = table.clone();
         wrong[0] = 2;
-        assert!(check_enum(data, &wrong).is_empty(), "a wrong tag width must keep the enum opaque");
+        assert!(check_enum(data, &wrong).0.is_empty(), "a wrong tag width must keep the enum opaque");
         for (bad, why) in [
             (&table[..1], "missing variant count"),
             (&table[..table.len() - 1], "truncated variant"),
@@ -1411,17 +1463,17 @@ pub enum Signed { Negative(u8) = -3, Empty }
             (&[1, 1, 0, u64::MAX][..], "oversized field count"),
         ] {
             assert!(parse_enum_layout(bad).is_none(), "malformed table must fail parsing: {why}");
-            assert!(check_enum(data, bad).is_empty(), "malformed table must keep the enum opaque: {why}");
+            assert!(check_enum(data, bad).0.is_empty(), "malformed table must keep the enum opaque: {why}");
         }
         wrong = table.clone();
         wrong.push(0);
         assert!(parse_enum_layout(&wrong).is_none(), "trailing data must fail parsing");
-        assert!(check_enum(data, &wrong).is_empty(), "trailing data must keep the enum opaque");
+        assert!(check_enum(data, &wrong).0.is_empty(), "trailing data must keep the enum opaque");
         let rust = def("RustData");
-        assert!(check_enum(rust, &export(rust)).is_empty(), "repr(Rust) must stay opaque even with its own layout table");
+        assert!(check_enum(rust, &export(rust)).0.is_empty(), "repr(Rust) must stay opaque even with its own layout table");
         for name in ["CData", "Signed"] {
             let d = def(name);
-            assert_eq!(check_enum(d, &export(d)), [d], "primitive repr must accept matching C payload alignment and signed tags: {name}");
+            assert_eq!(check_enum(d, &export(d)).0, [d], "primitive repr must accept matching C payload alignment and signed tags: {name}");
         }
 
         let (recursive, s) = (def("Recursive"), def("S"));
@@ -1430,11 +1482,13 @@ pub enum Signed { Negative(u8) = -3, Empty }
         let mut offsets: Vec<u64> = sl.fields.iter().map(|off| *off as u64).collect();
         let mut expected = vec![recursive, s];
         expected.sort_by_key(|d| d.0);
-        assert_eq!(check(&[(recursive, el.size, el.align, &[], &et), (s, sl.size, sl.align, &offsets, &[])]), expected,
+        assert_eq!(check(&[(recursive, el.size, el.align, &[], &et), (s, sl.size, sl.align, &offsets, &[])]).0, expected,
             "an enum holding Vec<S> and S holding that enum must pass together");
         offsets[0] += 1;
-        assert!(check(&[(recursive, el.size, el.align, &[], &et), (s, sl.size, sl.align, &offsets, &[])]).is_empty(),
+        let (same, rejected) = check(&[(recursive, el.size, el.align, &[], &et), (s, sl.size, sl.align, &offsets, &[])]);
+        assert!(same.is_empty(),
             "a wrong S offset must reject both S and the enum whose later variant holds Vec<S>");
+        assert!(rejected[&recursive].contains("variant `Values` field `0` of type `Vec<S, Global>` is not the same bytes"), "field-byte failure must name the variant, field and type: {:?}", rejected);
     }
 }
 
