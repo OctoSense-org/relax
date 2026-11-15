@@ -5255,7 +5255,12 @@ impl SharedMerge {
         let have: HashSet<(String, u8, String)> = all.iter().map(|(c, k, n, _)| (c.clone(), *k, n.clone())).collect();
         all.extend(self.run.iter().filter(|(c, k, n, _)| !have.contains(&(c.clone(), *k, n.clone()))).cloned());
         all.sort();
-        Some(encode_ledger(all.iter()))
+        let mut sites = match disk {
+            Some(b) => ledger_include_sites(b)?,
+            None => Vec::new(),
+        };
+        sites.extend(crate::builtins::recorded_include_sites());
+        Some(encode_ledger_sites(all.iter(), sites))
     }
 }
 
@@ -5636,21 +5641,66 @@ fn replay_store_ledger(p: &Store, present: &HashSet<String>, memo: &HashMap<(u8,
     replay_store_ledger_named(p, &|c| present.contains(c).then(|| c.to_string()), memo)
 }
 
-/// replay_store_ledger, crates mapped as ledger_current_named maps them.
+/// replay_store_ledger, crates mapped as ledger_current_named maps them. Its include sites
+/// restore include ownership when cached code did not expand the calls in this run.
 fn replay_store_ledger_named(p: &Store, name_of: &dyn Fn(&str) -> Option<String>, memo: &HashMap<(u8, String, String), u128>) {
     let Some((KIND_LEDGER, payload)) = p.get(LEDGER_KEY) else { return };
     let mut d = D { b: payload, p: 0 };
     let Some(n) = d.u32() else { return };
+    let mut files = HashSet::default();
     for _ in 0..n {
         let (Some(c), Some(k), Some(name), Some(h)) = (d.str(), d.u8(), d.str(), d.u128()) else { return };
         let Some(c) = name_of(c) else { continue };
         let cur = memo.get(&(k, c.clone(), name.to_string())).copied().unwrap_or(h);
         crate::sip::note_late_hash(&c, k, name, cur);
+        if crate::sip::late_base(k) == crate::sip::LATE_FILE { files.insert(name.to_string()); }
+    }
+    if let Some(sites) = ledger_include_sites(payload) { replay_include_sites(&sites, &files); }
+}
+
+/// The include sites after a ledger's late-input rows. Every ledger has them: each store's key
+/// names the build that wrote it (front_id, codegen_id::id), so no store of a build without
+/// them is read. They are in no key or validation hash.
+type IncludeSites = Vec<(String, Vec<(u32, String)>)>;
+const INCLUDE_SITES_TAG: &[u8] = b"include-sites\0";
+
+/// The include sites of a ledger (None: a malformed ledger).
+fn ledger_include_sites(payload: &[u8]) -> Option<IncludeSites> {
+    let mut d = D { b: payload, p: 0 };
+    for _ in 0..d.u32()? {
+        d.str()?; d.u8()?; d.str()?; d.u128()?;
+    }
+    crate::crate_image::decode(d.b.get(d.p..)?.strip_prefix(INCLUDE_SITES_TAG)?)
+}
+
+/// Replay only sites of validated late files, including when a demand part or a crate's image
+/// supplied the parsed items without running include_input. Never infer an includer from a crate.
+fn replay_include_sites(sites: &IncludeSites, files: &HashSet<String>) {
+    if files.is_empty() { return; }
+    for (includer, sites) in sites {
+        for (at, path) in sites {
+            if files.contains(path) { crate::builtins::note_include_site(includer, *at, path); }
+        }
     }
 }
 
+/// Store the usual late-input rows and their recorded include sites, outside cache identities.
 fn encode_ledger<'a>(inputs: impl Iterator<Item = &'a (String, u8, String, u128)>) -> Vec<u8> {
+    encode_ledger_sites(inputs, crate::builtins::recorded_include_sites())
+}
+
+/// Encode a late-input ledger with sites from this run and any retained ledger. Only paths in
+/// its late-file rows are kept; grouping and sorting make the optional tail deterministic.
+fn encode_ledger_sites<'a>(inputs: impl Iterator<Item = &'a (String, u8, String, u128)>, sites: IncludeSites) -> Vec<u8> {
     let inputs: Vec<_> = inputs.collect();
+    let files: HashSet<&str> = inputs.iter().filter(|(_, k, _, _)| crate::sip::late_base(*k) == crate::sip::LATE_FILE).map(|(_, _, p, _)| p.as_str()).collect();
+    let mut grouped = std::collections::BTreeMap::<String, Vec<(u32, String)>>::new();
+    for (includer, sites) in sites {
+        for site in sites {
+            if files.contains(site.1.as_str()) { grouped.entry(includer.clone()).or_default().push(site); }
+        }
+    }
+    let sites: IncludeSites = grouped.into_iter().map(|(p, mut sites)| { sites.sort(); sites.dedup(); (p, sites) }).collect();
     let mut e = E::default();
     e.u32(inputs.len() as u32);
     for (c, k, name, h) in inputs {
@@ -5659,6 +5709,8 @@ fn encode_ledger<'a>(inputs: impl Iterator<Item = &'a (String, u8, String, u128)
         e.str(name);
         e.u128(*h);
     }
+    e.0.extend_from_slice(INCLUDE_SITES_TAG);
+    e.0.extend_from_slice(&crate::crate_image::encode(&sites));
     e.0
 }
 
@@ -6910,6 +6962,8 @@ fn record_now_ns() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos() as u64)
 }
 
+/// Write the validated graph and demand parts, with a late-input ledger carrying their include
+/// sites. The ledger's include sites change no graph, part, front-image or code key.
 fn write_front_graph(job: &FrontGraphWrite) -> Option<()> {
     let _profile = crate::load_profile::span(job.profile, "front-graph-write", "graph writer");
     // RELAX_BOOT_TRACE: where a graph write's time goes (one line per recorded graph)
@@ -6973,6 +7027,14 @@ fn write_front_graph(job: &FrontGraphWrite) -> Option<()> {
         let recorded = { let _r = crate::load_profile::span(job.profile, "front-graph-demand-record", "graph writer"); demand.recorded_parts() };
         mark("demand-record");
         if recorded.len() != demand.parts.len() { return None; }
+        let mut sites = crate::builtins::recorded_include_sites();
+        for st in &previous {
+            if let Some((KIND_LEDGER, payload)) = st.get(LEDGER_KEY) { sites.extend(ledger_include_sites(payload)?); }
+        }
+        let mut late = demand.late_inputs.clone();
+        for part in &recorded { late.extend(part.late_inputs.iter().cloned()); }
+        late.sort(); late.dedup();
+        entries.push(NewEntry { key: LEDGER_KEY, kind: KIND_LEDGER, payload: encode_ledger_sites(late.iter(), sites) });
         let _encode = crate::load_profile::span(job.profile, "rust-demand-encode", "graph writer");
         if job.profile { eprintln!("rust-demand-parts: encoded={} retained={} writer=post-load", recorded.iter().filter(|p| p.key == 0).count(), recorded.iter().filter(|p| p.key != 0).count()); }
         // the changed crates' parts are encoded in parallel, each opening its crate's front-image
@@ -7640,6 +7702,11 @@ impl crate::crate_image::CrateImages for FrontImages {
             }
             return None;
         }
+        // the graph's ledger (write_front_graph writes one beside every demand image)
+        let st = Store::open(&front_graph_path(&self.dir, recipe.identity))?;
+        let Some((KIND_LEDGER, payload)) = st.get(LEDGER_KEY) else { return None };
+        let files = late.iter().filter(|(_, k, _, _, _)| crate::sip::late_base(*k) == crate::sip::LATE_FILE).map(|(_, _, p, _, _)| (*p).clone()).collect();
+        replay_include_sites(&ledger_include_sites(payload)?, &files);
         for (c, kind, name, _, content) in late { crate::sip::note_late_input(c, kind, name, content.as_deref()); }
         Some(image)
     }
@@ -7674,6 +7741,9 @@ impl crate::crate_image::CrateImages for FrontImages {
         let Some(image) = saved.demand_image.clone().filter(|image| image.graph == graph && image.parts.len() == crates.len()) else { return None; };
         let path = front_graph_path(&self.dir, identity);
         let store = Store::open(&path)?;
+        // the graph's ledger (write_front_graph writes one beside every demand image)
+        let Some((KIND_LEDGER, ledger)) = store.get(LEDGER_KEY) else { return None };
+        let sites = ledger_include_sites(ledger)?;
         let profile = crates.first().is_some_and(|c| c.cfg.session.runtime.profile);
         let keys = from.iter().zip(crates).map(|(&j, c)| {
             let part = &image.parts[j];
@@ -7696,6 +7766,8 @@ impl crate::crate_image::CrateImages for FrontImages {
                 if profile { eprintln!("rust-demand-part-invalid: {} late {kind} {name}", c.name); }
                 return None;
             }
+            let files = late.iter().filter(|(_, k, _, _, _)| crate::sip::late_base(*k) == crate::sip::LATE_FILE).map(|(_, _, p, _, _)| (*p).clone()).collect();
+            replay_include_sites(&sites, &files);
             for (c, kind, name, _, content) in late { crate::sip::note_late_input(c, kind, name, content.as_deref()); }
             Some(part.key)
         }).collect::<Vec<_>>();
@@ -7752,6 +7824,8 @@ impl crate::crate_image::CrateImages for FrontImages {
         self.selected_image(c, deps, Some((plan, deferred)))
     }
 }
+/// Restore a front image's late inputs and include sites. Whole crate images and unchanged-file
+/// images both bypass expansion, so the ledger names each included file's includer.
 fn replay_front_ledger(st: &Store) -> Option<()> {
     let (kind, b) = st.get(LEDGER_KEY)?;
     if kind != KIND_LEDGER {
@@ -7759,13 +7833,16 @@ fn replay_front_ledger(st: &Store) -> Option<()> {
     }
     let mut d = D { b, p: 0 };
     let n = d.u32()?;
+    let mut files = HashSet::default();
     for _ in 0..n {
         let c = d.str()?;
         let k = d.u8()?;
         let name = d.str()?;
         let _hash = d.u128()?;
         crate::sip::note_late_input(c, k, name, crate::crates::late_value_now(c, k, name).as_deref());
+        if crate::sip::late_base(k) == crate::sip::LATE_FILE { files.insert(name.to_string()); }
     }
+    replay_include_sites(&ledger_include_sites(b)?, &files);
     Some(())
 }
 impl Cache {

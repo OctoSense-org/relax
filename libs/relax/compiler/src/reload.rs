@@ -1714,31 +1714,43 @@ fn included_files(std_dir: &str) -> Vec<String> {
 }
 
 /// The files file `pf` (file `path`) names in an include!/include_str!/include_bytes! call
-/// anywhere in its text and its expansions: an item-level `include!("x.rs");` is in no item
-/// (`item_includes` looks at fns, consts and statics), the items it expands to are the file's.
-fn file_includes(pf: &crate::parser::ParsedFile, path: &str) -> Vec<String> {
-    if !pf.src.windows(8).any(|w| w == b"include!" || w == b"include_") { return Vec::new(); }
-    crate::builtins::include_literals(&toks(pf, 0, pf.src.len() as u32, &[])).iter().map(|rel| crate::builtins::include_path(Some(path), rel)).collect()
+/// anywhere in its text and its expansions, plus recorded sites outside fn/const/static items
+/// or without an authored offset. A module-level include's expanded items belong to this file.
+fn file_includes(pf: &crate::parser::ParsedFile, path: &str, exp: &ExpIncludes) -> Vec<String> {
+    use crate::ast::ItemKind;
+    let mut named: Vec<String> = exp.sites.iter().filter(|(at, _)| *at == u32::MAX || !pf.ast.items.iter().any(|it| {
+        matches!(it.kind, ItemKind::Fn(..) | ItemKind::Const(..) | ItemKind::Static(..)) && it.lo <= *at && *at < it.hi
+    })).map(|(_, p)| p.clone()).collect();
+    if names_include(&pf.src) {
+        named.extend(crate::builtins::include_literals(&toks(pf, 0, pf.src.len() as u32, &[])).iter().map(|rel| crate::builtins::include_path(Some(path), rel)));
+    }
+    named.sort(); named.dedup();
+    named
 }
 
 /// The files fn, const or static item `it` includes with include!/include_str!/include_bytes! (`pf` is
 /// file `path`'s text). Its whole text: what `classify` compares as the item, and the expansions
 /// of the macro calls in it (a macro's `include_str!(concat!($key, ".txt"))`: an app's demo plates;
 /// a save of such a file said "patched" and the program kept the old text).
-/// `exp`: `ExpIncludes::of(pf)`.
+/// Also reads resolved sites whose authored offsets lie in the item, from `exp`'s one lookup
+/// for this file (`ExpIncludes::of(pf, path)`), including paths no token text can name.
 fn item_includes(pf: &crate::parser::ParsedFile, path: &str, it: &crate::ast::Item, exp: &ExpIncludes) -> Vec<String> {
     use crate::ast::ItemKind;
     if !matches!(it.kind, ItemKind::Fn(..) | ItemKind::Const(..) | ItemKind::Static(..)) { return Vec::new(); }
+    let mut named: Vec<String> = exp.sites.iter().filter(|(at, _)| it.lo <= *at && *at < it.hi).map(|(_, p)| p.clone()).collect();
+    named.sort(); named.dedup();
     // the expansions that name an include and were made by a call in the item (directly or
     // through the expansions their calls lie in)
     let mine: Vec<(u32, u32)> = exp.hot.iter().filter(|(_, calls)| calls.iter().any(|&c| it.lo <= c && c < it.hi)).map(|&(region, _)| region).collect();
     // (most code includes nothing: one look for the macro name first)
-    if mine.is_empty() && !names_include(pf.bytes(it.lo, it.hi)) { return Vec::new(); }
+    if mine.is_empty() && !names_include(pf.bytes(it.lo, it.hi)) { return named; }
     let mut texts = toks(pf, it.lo, it.hi, &[]);
     for (a, b) in mine {
         texts.extend(toks(pf, a, b, &[]));
     }
-    crate::builtins::include_literals(&texts).iter().map(|rel| crate::builtins::include_path(Some(path), rel)).collect()
+    named.extend(crate::builtins::include_literals(&texts).iter().map(|rel| crate::builtins::include_path(Some(path), rel)));
+    named.sort(); named.dedup();
+    named
 }
 
 fn names_include(text: &[u8]) -> bool {
@@ -1748,20 +1760,24 @@ fn names_include(text: &[u8]) -> bool {
 /// A file's expansions whose text names include!/include_str!/include_bytes!, each with the call
 /// positions of the chain of expansions that made it: its own call, the call of the expansion that
 /// call lies in, and so on. Item `it` takes such an expansion when one of those calls is in its
-/// text (`item_includes`). Built once per file: growing each item's expansions to a fixpoint over
+/// text (`item_includes`). Also holds the file's recorded resolved include sites, looked up once.
+/// Built once per file: growing each item's expansions to a fixpoint over
 /// all of the file's expansions cost items x expansions² on the owner, and a native build that
 /// rewrote a large generated bindings file held a large app's owner ~20 s per watch round.
 pub(crate) struct ExpIncludes {
     hot: Vec<((u32, u32), Vec<u32>)>,
+    sites: Vec<(u32, String)>,
 }
 
 impl ExpIncludes {
     pub(crate) fn none() -> Self {
-        Self { hot: Vec::new() }
+        Self { hot: Vec::new(), sites: Vec::new() }
     }
 
-    pub(crate) fn of(pf: &crate::parser::ParsedFile) -> Self {
-        if !expansions_include(pf) { return Self::none(); }
+    /// Read the includer's resolved sites once, even when no expansion text names an include.
+    pub(crate) fn of(pf: &crate::parser::ParsedFile, path: &str) -> Self {
+        let sites = crate::builtins::include_sites(path);
+        if !expansions_include(pf) { return Self { hot: Vec::new(), sites }; }
         let mut regions: Vec<(u32, u32, u32)> = pf.exp_map.iter().collect();
         for part in pf.parts() { regions.extend(part.exp_map.iter()); }
         regions.retain(|&(a, b, _)| a < b);
@@ -1784,12 +1800,12 @@ impl ExpIncludes {
             }
             hot.push(((a, b), calls));
         }
-        Self { hot }
+        Self { hot, sites }
     }
 
-    /// Whether any of the file's expansions names an include.
+    /// Whether expansion text or recorded sites name an include for this file.
     fn any(&self) -> bool {
-        !self.hot.is_empty()
+        !self.hot.is_empty() || !self.sites.is_empty()
     }
 }
 
@@ -1811,7 +1827,7 @@ fn expansions_include(pf: &crate::parser::ParsedFile) -> bool {
 }
 
 /// Whether item `it`'s code includes a file whose content is not what the running code read
-/// (`base`; a file it never read is no part of running code).
+/// (`base`; a file it never read is no part of running code), using text and recorded sites.
 fn includes_moved(pf: &crate::parser::ParsedFile, path: &str, it: &crate::ast::Item, base: &IncludeBase, exp: &ExpIncludes) -> bool {
     if base.is_empty() { return false; }
     item_includes(pf, path, it, exp).iter().any(|p| base.get(p).is_some_and(|seen| {
@@ -1830,8 +1846,8 @@ pub(crate) fn include_edits(prog: &crate::program::Program, changed: &[String], 
         if !own_source_file(prog, file) { continue; }
         let pf = &prog.files[file as usize];
         let src = &pf.src[..pf.src_len as usize];
-        if file_includes(pf, &path).iter().any(|p| changed.contains(p)) || {
-            let exp = ExpIncludes::of(pf);
+        let exp = ExpIncludes::of(pf, &path);
+        if file_includes(pf, &path, &exp).iter().any(|p| changed.contains(p)) || {
             (exp.any() || names_include(src)) && pf.ast.items.iter().any(|it| item_includes(pf, &path, it, &exp).iter().any(|p| changed.contains(p)))
         } {
             out.push(Edit { file, path, src: src.to_vec() });
@@ -1840,17 +1856,17 @@ pub(crate) fn include_edits(prog: &crate::program::Program, changed: &[String], 
     out
 }
 
-/// The saved included files (`changed`) no own source file's code names (`item_includes`): a path
-/// made by other tokens (`env!`, a macro of another file). Which code read them is not known.
+/// The saved included files (`changed`) no own source file names through text or recorded
+/// expansion sites. Which code read them is not known.
 pub(crate) fn include_unmatched(prog: &crate::program::Program, changed: &[String]) -> Vec<String> {
     let mut left: Vec<String> = changed.to_vec();
     for (path, file) in prog.current_source_files(|_| true) {
         if left.is_empty() { break; }
         if !own_source_file(prog, file) { continue; }
         let pf = &prog.files[file as usize];
-        let named = file_includes(pf, &path);
+        let exp = ExpIncludes::of(pf, &path);
+        let named = file_includes(pf, &path, &exp);
         left.retain(|p| !named.contains(p));
-        let exp = ExpIncludes::of(pf);
         if !exp.any() && !names_include(&pf.src[..pf.src_len as usize]) { continue; }
         for it in pf.ast.items.iter() {
             let named = item_includes(pf, &path, it, &exp);
@@ -1899,7 +1915,7 @@ fn classify_moving(prog: &crate::program::Program, old_file: u32, new: &crate::p
     };
     let body_span = fn_body_span;
     let (mut pairs, mut removed, mut added) = pair_items(old, new);
-    let old_exp = if base.is_empty() { ExpIncludes::none() } else { ExpIncludes::of(old) };
+    let old_exp = if base.is_empty() { ExpIncludes::none() } else { ExpIncludes::of(old, &prog.file_paths[old_file as usize]) };
     trace_sub("classify_pair");
     // a fn whose signature changed (M2/M4): the old fn goes and a new one with the new signature
     // comes (its own slots: frames of the old code in flight keep calling the old one), and every
@@ -10966,7 +10982,7 @@ pub fn other() -> usize {
         let (file, plate_item) = item_of("plate");
         let (_, other_item) = item_of("other");
         let pf = &prog.files[file as usize];
-        let exp = ExpIncludes::of(pf);
+        let exp = ExpIncludes::of(pf, path_text);
         let named = item_includes(pf, path_text, pf.ast.item(plate_item), &exp);
         assert!(named.iter().any(|p| std::path::Path::new(p) == plate), "the calling fn includes the plate: {named:?}");
         assert_eq!(item_includes(pf, path_text, pf.ast.item(other_item), &exp), Vec::<String>::new(), "the other fn includes nothing");
@@ -11019,7 +11035,7 @@ pub fn reads() -> usize {
         }
         assert!(texts.contains("docs"), "the expansions' own text: {texts:?}");
         let it = pf.ast.item(prog.def(reads).item);
-        assert_eq!(item_includes(&pf, path_text, it, &ExpIncludes::of(&pf)), Vec::<String>::new(), "the body includes nothing");
+        assert_eq!(item_includes(&pf, path_text, it, &ExpIncludes::of(&pf, path_text)), Vec::<String>::new(), "the body includes nothing");
         let _ = std::fs::remove_file(&path);
     }
 }

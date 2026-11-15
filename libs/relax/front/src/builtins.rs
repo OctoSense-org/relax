@@ -870,6 +870,28 @@ pub fn include_path(current: Option<&str>, rel: &str) -> String {
     crate::vfs::normalize_path(&path)
 }
 
+static INCLUDE_SITES: relax_session::sync::Mutex<Option<crate::fxhash::HashMap<String, Vec<(u32, String)>>>> = relax_session::sync::Mutex::new(None);
+
+/// Record an expanded include's authored file, byte offset and resolved path. An offset of
+/// u32::MAX means the expansion has no call position in that file's own text.
+/// Warm stores replay the same records when they take an image without expanding its calls.
+pub fn note_include_site(includer: &str, at: u32, path: &str) {
+    let mut sites = INCLUDE_SITES.lock().unwrap();
+    let sites = sites.get_or_insert_with(Default::default).entry(includer.to_string()).or_default();
+    let site = (at, path.to_string());
+    if let Err(i) = sites.binary_search(&site) { sites.insert(i, site); }
+}
+
+/// The resolved include paths recorded for one authored file, sorted by byte offset and path.
+pub fn include_sites(includer: &str) -> Vec<(u32, String)> {
+    INCLUDE_SITES.lock().unwrap().as_ref().and_then(|m| m.get(includer).cloned()).unwrap_or_default()
+}
+
+/// A snapshot for the late-input ledger: only expansion records, never inferred includers.
+pub fn recorded_include_sites() -> Vec<(String, Vec<(u32, String)>)> {
+    INCLUDE_SITES.lock().unwrap().as_ref().map(|m| m.iter().map(|(p, s)| (p.clone(), s.clone())).collect()).unwrap_or_default()
+}
+
 /// The paths (as written) of the `include!("..")` / `include_str!("..")` / `include_bytes!("..")`
 /// calls among token texts: a plain or raw string literal argument, or `concat!` of such literals
 /// (another computed one, `env!(..)`, is not seen).
@@ -905,7 +927,8 @@ pub fn include_literals<'a>(texts: &[&'a [u8]]) -> Vec<String> {
     out
 }
 
-/// Resolve nested includes relative to the file that authored the invocation.
+/// Resolve nested includes relative to the file that authored the invocation, recording the
+/// resolved path and its authored position for reloads (source_span follows token origins).
 /// `literal`: include_str! / include_bytes! (Parser::late_flags).
 fn include_input(p: &crate::parser::Parser, lo: usize, hi: usize, call_lo: u32, literal: bool) -> Result<(String, Vec<u8>), String> {
     let args = lit_args(p, lo, hi)?;
@@ -916,6 +939,15 @@ fn include_input(p: &crate::parser::Parser, lo: usize, hi: usize, call_lo: u32, 
     } else { None };
     let current = authored.as_ref().map(|s| s.path.as_str()).or_else(|| p.bctx.as_ref().map(|c| c.path.as_str()));
     let path = include_path(current, rel);
+    if let Some(current) = current {
+        let text = authored.as_ref().map_or(p.src, |s| &s.src);
+        // source_span follows token origins and expansion calls into authored text. An
+        // empty or out-of-source span has no authored position: keep only the file then.
+        let at = if source.lo < source.hi && source.hi as usize <= text.len() {
+            source.lo
+        } else { u32::MAX };
+        note_include_site(current, at, &path);
+    }
     let data = crate::vfs::read(&path).map_err(|e| format!("couldn't read `{}`: {}", path, e))?;
     crate::sip::note_late_input(p.bctx.as_ref().map_or("", |c| c.krate.as_str()), crate::sip::LATE_FILE | p.late_flags(literal), &path, Some(&data));
     Ok((path, data))
@@ -3152,4 +3184,5 @@ pub(crate) unsafe fn reset_statics() {
     reset(&BY_DIR, relax_session::sync::Mutex::new(None));
     reset(&ROOT, std::sync::OnceLock::new());
     reset(&PAYLOADS, relax_session::sync::Mutex::new(None));
+    reset(&INCLUDE_SITES, relax_session::sync::Mutex::new(None));
 }
