@@ -17,6 +17,11 @@
 //! row; one into an audited crate fails the check (exit 1). It is the error a run reports only
 //! when the code that reaches it first runs (an app's deck reached `shell::Shared::global`
 //! through the unmarked `makepad_hal::screens`); the gates run the audit over the apps.
+//!
+//! An independent declaration scan reports missing or mismatched tagged Option entries as
+//! `option-entry` failures, including unreachable items. `--boundary options` runs only
+//! this scan for every bound provided crate, before creating a JIT unit. On another check
+//! target it scans registered crates from source and checks their typed Option markers.
 
 use crate::types::AliasTyKind;
 use crate::types::{AliasTy};
@@ -39,6 +44,7 @@ struct Entry {
 #[derive(Default)]
 struct Audit {
     crates: Vec<u32>,
+    option_entries: Vec<String>,
     /// (kind, item) -> entry; kind: "call", "generic", "field", "static"
     rec: BTreeMap<(&'static str, String), Entry>,
     /// call key -> (param types, return type) as printed
@@ -57,25 +63,55 @@ pub(crate) fn requested() -> bool {
     REQUESTED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// Starts an audit of the named crates (before lowering anything); `all`: every provided crate
-/// the loader binds in this program.
-pub fn start(u: &Unit, names: &[String]) -> Result<(), String> {
+/// Resolve the audited crate set; cross-target options use registry names without binding.
+pub(crate) fn crates(prog: &crate::program::Program, provided: &[(u32, crate::provided::ProvidedCrate)], names: &[String], cross_options: bool) -> Result<Vec<u32>, String> {
     let mut crates = Vec::new();
-    if names.len() == 1 && names[0] == "all" {
-        crates.extend(u.provided.iter().map(|(k, _)| *k));
+    if names.len() == 1 && matches!(names[0].as_str(), "all" | "options") {
+        if cross_options {
+            crates.extend(crate::provided::registered_in(prog));
+        } else {
+            crates.extend(provided.iter().map(|(k, _)| *k));
+        }
         if crates.is_empty() {
-            return Err("--boundary all: no provided crate binds in this program (is the loader built from this source?)".into());
+            if cross_options {
+                return Err("--boundary options: no registered provided crate in this program".to_string());
+            }
+            return Err(format!("--boundary {}: no provided crate binds in this program (is the loader built from this source?)", names[0]));
+        }
+    } else {
+        for n in names {
+            let n2 = n.replace('-', "_");
+            match prog.crates.iter().position(|c| prog.syms.str(c.name) == n2) {
+                Some(i) => crates.push(i as u32),
+                None => return Err(format!("--boundary: no crate `{}` in the graph", n)),
+            }
         }
     }
-    for n in names.iter().filter(|n| n.as_str() != "all") {
-        let n2 = n.replace('-', "_");
-        match u.prog.crates.iter().position(|c| u.prog.syms.str(c.name) == n2) {
-            Some(i) => crates.push(i as u32),
-            None => return Err(format!("--boundary: no crate `{}` in the graph", n)),
-        }
-    }
-    *AUDIT.lock().unwrap() = Some(Audit { crates, ..Default::default() });
+    crates.sort_unstable();
+    crates.dedup();
+    Ok(crates)
+}
+
+/// Start the static guard before the audit lowers any bodies.
+pub fn start(u: &Unit, names: &[String]) -> Result<(), String> {
+    let crates = crates(&u.prog, &u.provided, names, false)?;
+    let option_entries = u.provided.iter().filter(|(k, _)| crates.contains(k))
+        .flat_map(|(k, _)| crate::provided::option_entry_rows(&u.prog, &u.tcx, *k, None)).collect();
+    *AUDIT.lock().unwrap() = Some(Audit { crates, option_entries, ..Default::default() });
     Ok(())
+}
+
+/// Declaration-only audit, before a program's JIT unit is created.
+pub(crate) fn options(prog: &crate::program::Program, tcx: &crate::tcx::Tcx, crates: &[u32], target: Option<&str>) -> (String, usize) {
+    // One set for all the crates, as the loader's map is one: an entry any provided crate
+    // lists covers the type wherever it crosses
+    let covered = target.map(|_| crates.iter().flat_map(|&k| crate::provided::option_listed_types(prog, tcx, k)).collect());
+    let mut rows: Vec<_> = crates.iter().flat_map(|&k| crate::provided::option_entry_rows(prog, tcx, k, covered.as_ref())).collect();
+    rows.sort();
+    let missing = rows.len();
+    let target = target.map_or(String::new(), |t| format!(" ({t})"));
+    rows.push(format!("relax check --boundary options{target}: {} missing Option entries in {} provided crates", missing, crates.len()));
+    (rows.join("\n") + "\n", missing)
 }
 
 #[inline]
@@ -386,6 +422,9 @@ pub fn run(up: *mut Unit, root: u32) -> (String, usize) {
     for f in &fails {
         let _ = writeln!(out, "{}", f);
     }
+    for row in &a.option_entries {
+        let _ = writeln!(out, "{}", row);
+    }
     // the audited crates' violations fail the check; another provided crate's are listed
     let crate_name = |k: u32| u.prog.syms.str(u.prog.crates[k as usize].name).to_string();
     let failing = a.violations.iter().filter(|(k, _, _)| a.crates.contains(k)).count();
@@ -511,5 +550,5 @@ pub fn run(up: *mut Unit, root: u32) -> (String, usize) {
     for (s, (n, sites)) in &shapes {
         let _ = writeln!(out, "#   {:<40} {:>5} {:>6} {}", s, n, sites, if c_representable(s.trim_start_matches("ret ")) { "" } else { "CLEANUP" });
     }
-    (out, failing)
+    (out, failing + a.option_entries.len())
 }

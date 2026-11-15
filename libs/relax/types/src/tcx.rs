@@ -225,6 +225,9 @@ pub struct Tcx {
     /// ADTs that each hold the previous one several times is exponential
     pub(crate) dtorck_constraints: std::sync::Mutex<crate::fxhash::HashMap<(DefId, usize), std::sync::Arc<crate::next_solver::dropck_outlives::DropckConstraint>>>,
     pub tys: Types,
+    /// Provided Option layout verdicts belong to this type context, never to a process-wide
+    /// TyId or name. OnceLock computes each verdict once even during parallel binding.
+    pub provided_option_layouts: crate::conc::MemoMap<TyId, std::sync::Arc<std::sync::OnceLock<Result<(), String>>>>,
     envs: env::Envs,
     /// Immutable entries; each declaration is lowered once by its first reader.
     sigs: ImageMap<DefId, std::sync::OnceLock<Box<SigParts>>>,
@@ -431,6 +434,7 @@ impl Tcx {
     fn with_types(tys: Types) -> Tcx {
         Tcx {
             tys,
+            provided_option_layouts: crate::conc::MemoMap::new_kept(8),
             dcx: Default::default(),
             dtorck_constraints: Default::default(),
             envs: env::Envs::new(),
@@ -802,6 +806,7 @@ impl Tcx {
     }
 
     fn publish_declaration_inputs_with_solver(&mut self, visible: Option<&[bool]>, keep_solver: bool) {
+        self.provided_option_layouts.clear();
         self.variances.take();
         for cell in self.sigs.decoded_values_mut() {
             if let Some(p) = cell.get_mut() {
@@ -816,6 +821,8 @@ impl Tcx {
     /// Round-47 file input publication. Both version ids are invalidated so old
     /// dependencies cannot retain file-relative coordinates across edit/revert.
     pub fn publish_file_bodies(&mut self, files: &[u32]) {
+        // Const bodies can affect array lengths and hence Option layouts too.
+        self.provided_option_layouts.clear();
         let epoch = self.collect_epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
         self.queries.file_bodies_changed(files, epoch);
     }

@@ -32,6 +32,15 @@
 //! Nothing generated is checked in.
 
 pub use relax_api_macro::relax_api;
+/// Export const-verified `Option<X>` layouts for concrete payload types in unmarked items.
+/// `option_layouts! { u32, MyType }` emits the same entries as the attribute's Option scan,
+/// under the using crate's `host-shims` feature. Lifetimes are instantiated as `'static`.
+/// Its typed [`OptionListed`] markers are emitted on every target, without that feature.
+pub use relax_api_macro::option_layouts;
+
+/// One Option the crate lists or a marked item spells, read by the Option-entry guard
+/// on every target (`check --boundary options`). This marker has no runtime cost.
+pub struct OptionListed<T>(pub ::core::marker::PhantomData<T>);
 
 static APP_CALL: std::sync::OnceLock<fn(unsafe extern "C" fn(*mut u8), *mut u8) -> bool> = std::sync::OnceLock::new();
 
@@ -230,6 +239,7 @@ pub struct Entry {
     pub key: fn() -> &'static str,
     /// OP: `core::any::type_name` of the op's fn pointer type (`fn(&krate::heap::ScriptHeap) -> u32`):
     /// Relax compares it with its own reading of the same source; "" for a handle's trait ops
+    /// OPTION: "option_layouts" for an explicit list, "" for a marked item's inferred entry.
     pub sig: fn() -> &'static str,
     pub shim: Option<ShimFn>,
     /// OP: per parameter, then the result: [size, align, pointee size, pointee align] as rustc

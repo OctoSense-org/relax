@@ -1215,7 +1215,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
             // with --check: list every site only relaxed mode accepts (what rustc would reject)
             "--strict-report" => crate::relaxed::STRICT_REPORT.store(true, Ordering::Relaxed),
             // `--boundary a,b`: with --check, audit what JIT-compiled code reaches inside
-            // crates a, b (boundary.rs)
+            // crates a, b (boundary.rs); `options`: the declaration-only Option guard.
             "--boundary" => {
                 crate::boundary::REQUESTED.store(true, Ordering::Relaxed);
                 i += 1;
@@ -1230,6 +1230,10 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
     if i >= args.len() {
         return usage();
     }
+    let boundary_options = boundary.as_ref().is_some_and(|b| b.len() == 1 && b[0] == "options");
+    let boundary_target = (boundary_options && crate::cfg::CfgSet::host(sess, &[]).triple() != crate::cfg::CfgSet::machine(sess, &[]).triple())
+        .then(|| crate::cfg::CfgSet::host(sess, &[]).triple());
+    if boundary.is_some() && !check { return usage(); }
     if also_requested && (!check || watch || root_only || selftest || session.is_some()) { return usage(); }
     // a profile is a test's: `makepad run` builds as the release profile does. A test's start of
     // its package's binary (CARGO_BIN_EXE_<name>, which names it in RELAX_ARG0) has the test's, as
@@ -2004,12 +2008,23 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
 
     drop(mem_g);
     let mem_g = crate::memstat::tag(crate::memstat::Tag::Sigs);
+    // A boundary guard reads every declaration of the audited crates, including modules
+    // a run's demand selection left out. Cross-target options use registered names only;
+    // on the machine resolve the same matched registry as Unit::new.
+    let boundary_provided = if boundary.is_some() && boundary_target.is_none() { crate::provided::take_for(&prog) } else { Vec::new() };
+    let boundary_crates = if let Some(names) = &boundary {
+        match crate::boundary::crates(&prog, &boundary_provided, names, boundary_target.is_some()) {
+            Ok(crates) => crates,
+            Err(e) => { eprintln!("relax: {e}"); return 2; }
+        }
+    } else { Vec::new() };
+    for (k, _) in &boundary_provided { prog.crates[*k as usize].rustc_laid = true; }
     // ---- signatures, layouts, impl tables
     let t = Instant::now();
     // A check reports validation errors of its crates' impl headers and field types, which
     // declaration collection lowers: the crates are marked before it runs (a run marks its app's
     // crates below).
-    let checked = if check {
+    let checked = if check && !boundary_options {
         crate::check::checked_crates(&prog, root, watch || root_only || session.is_some(), selftest || workspace_check, &also)
     } else { Vec::new() };
     // a one-shot check reuses the verdicts of the crates whose inputs did not change since a
@@ -2040,7 +2055,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
     // first present -- not after the check, which then waited seconds for them at its end
     // (record_check_front)
     if check && !selftest && front_recordable() { crate::cache::start_deferred_front(); }
-    if check {
+    if check && !boundary_options {
         let mut own = vec![false; prog.crates.len()];
         for &k in &checked { prog.crates[k as usize].validate = true; own[k as usize] = true; }
         // rustc's import resolution replayed over the checked crates whose verdicts are not reused:
@@ -2088,7 +2103,20 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
     // (a closure miss): load those files and collect again, until nothing is missing.
     let mut deferred_errors: Vec<String> = Vec::new();
     loop {
-        let mods = prog.misses_to_load(&crate::program::collect_misses_take());
+        // These declarations are lazy queries. Force them before draining misses, so a
+        // signature in an unreachable item can demand its dependency's skipped modules.
+        for (i, def) in prog.defs.iter().enumerate().filter(|(_, d)| boundary_crates.contains(&d.krate)) {
+            match def.kind {
+                DefKind::Fn | DefKind::AssocFn | DefKind::ForeignFn => { tcx.fn_sig(&prog, DefId(i as u32)); }
+                DefKind::Static | DefKind::ForeignStatic => { tcx.const_ty(&prog, DefId(i as u32)); }
+                DefKind::Const if boundary_target.is_some() => { tcx.const_ty(&prog, DefId(i as u32)); }
+                _ => {}
+            }
+        }
+        let mut mods = prog.misses_to_load(&crate::program::collect_misses_take());
+        mods.extend(prog.skipped_files.keys().copied().filter(|m| boundary_crates.contains(&prog.mods[*m as usize].krate)));
+        mods.sort_unstable();
+        mods.dedup();
         if mods.is_empty() { break; }
         if std::env::var_os("RELAX_DEFERRED_TRACE").is_some() {
             eprintln!("relax deferred: signatures name types in {} skipped file(s): loaded before main", mods.len());
@@ -2123,6 +2151,22 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
         }
     }
 
+    if boundary_options {
+        let (report, missing) = crate::boundary::options(&prog, &tcx, &boundary_crates, boundary_target);
+        // Signatures, statics and typed markers are lazy declaration queries. Do not let a failed query
+        // turn an incomplete scan into a passing guard.
+        let mut declaration_errors = Vec::new();
+        for (i, def) in prog.defs.iter().enumerate().filter(|(_, d)| boundary_crates.contains(&d.krate)) {
+            if matches!(def.kind, DefKind::Fn | DefKind::AssocFn | DefKind::ForeignFn | DefKind::Static | DefKind::ForeignStatic)
+                || (boundary_target.is_some() && def.kind == DefKind::Const)
+            {
+                declaration_errors.extend_from_slice(tcx.signature_errors(&prog, DefId(i as u32)));
+            }
+        }
+        for error in &declaration_errors { eprintln!("{error}"); }
+        print!("{report}");
+        return i32::from(missing > 0 || !load_clean || !declaration_errors.is_empty() || !watch_load_errors.is_empty() || !crate::macro_reg::derive_failures().is_empty());
+    }
     if check {
         // a check runs no program: a constant that cannot be evaluated is a reported error
         // (E0080), as for `makepad test` / `live`, not the end of the process
@@ -2187,7 +2231,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
             print!("{}", rep);
             std::mem::forget(u);
             if violations > 0 {
-                eprintln!("relax check --boundary: {} provided-crate violation(s) (`violation` rows)", violations);
+                eprintln!("relax check --boundary: {} provided-crate violation(s) (violation or option-entry rows)", violations);
                 return 1;
             }
             return 0;

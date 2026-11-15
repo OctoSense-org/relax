@@ -91,7 +91,7 @@ impl Clone for ProvidedCrate {
 static REGISTRY: Mutex<Vec<ProvidedCrate>> = Mutex::new(Vec::new());
 
 /// The binary's const-verified Option layouts, keyed by normalised type name.
-/// Collected once before crate registration; not yet consulted for boundary trust.
+/// Collected once before crate registration; tagged Options must match before sharing bytes.
 static OPTION_LAYOUTS: std::sync::OnceLock<HashMap<String, [u64; 6]>> = std::sync::OnceLock::new();
 
 /// Installs the loader's complete Option table before any provided crate is registered.
@@ -647,6 +647,14 @@ pub fn read_identity_files(pkgs: &[crate::srchash::SrcPkg]) {
     }
 }
 
+/// The loader's provided crates present in a source-only program, matched by name as
+/// `take_for` matches them, without a source-identity check or any host binding table.
+pub(crate) fn registered_in(prog: &Program) -> Vec<u32> {
+    REGISTRY.lock().unwrap_or_else(|e| e.into_inner()).iter()
+        .filter_map(|p| prog.crates.iter().position(|c| prog.syms.str(c.name) == p.name).map(|i| i as u32))
+        .collect()
+}
+
 /// The registered crates as (crate index in `prog`, entry) whose source matched (check_sources);
 /// crates not in the program are left out. Taken once per unit (Unit::new).
 pub fn take_for(prog: &Program) -> Vec<(u32, ProvidedCrate)> {
@@ -767,6 +775,9 @@ pub fn static_use(u: &crate::jit::Unit, d: DefId, t: TyId) -> StaticUse {
     let key = norm(&path);
     let class_2 = || {
         let ts = crate::typeck::ty_to_string(false, prog, tcx, t);
+        if let Some(reason) = option_layout_reason(prog, tcx, t) {
+            return StaticUse::Refused(format!("static `{path}` (`{ts}`): {reason}"));
+        }
         StaticUse::Refused(format!("static `{path}` (`{ts}`) is laid out and run by rustc's std on the loader's side and by Relax's on this side (a lock, a lazy cell, a collection, a box or an Rc/Arc): reach it through an op of the crate (#[relax_api] fn), or mark it `#[relax_api(per_side)]`"))
     };
     if let Some(&(addr, size, align)) = p.shared.get(&key) {
@@ -851,10 +862,16 @@ pub fn untrusted_path(prog: &Program, tcx: &Tcx, krate: u32, t: TyId) -> String 
 /// VM's `host: &mut dyn ScriptHost`). As a bound fn's own parameter it may not.
 /// `cells`: shared static storage may contain cells and atomics of trusted values.
 fn trusted_in(prog: &Program, tcx: &Tcx, krate: u32, t: TyId, depth: u32, field: bool, cells: bool) -> bool {
+    trusted_options_in(prog, tcx, krate, t, depth, field, cells, None)
+}
+
+/// Cross-target declaration scans use the crate's typed entries for nested Options too;
+/// the machine's layout words cannot establish another target's coverage.
+fn trusted_options_in(prog: &Program, tcx: &Tcx, krate: u32, t: TyId, depth: u32, field: bool, cells: bool, covered: Option<&std::collections::HashSet<TyId>>) -> bool {
     if depth > 8 {
         return false;
     }
-    let tr = |t: TyId| trusted_in(prog, tcx, krate, t, depth + 1, false, cells);
+    let tr = |t: TyId| trusted_options_in(prog, tcx, krate, t, depth + 1, false, cells, covered);
     // a pointer to the crate's own values (rustc made them: the pointer is a handle) or to
     // trusted ones
     let own_pub = |x: TyId| matches!(tcx.tys.kind(x), TyKind::Adt(d, a, _) if a.is_empty() && prog.def(*d).krate == krate && prog.def(*d).is_pub);
@@ -871,7 +888,7 @@ fn trusted_in(prog: &Program, tcx: &Tcx, krate: u32, t: TyId, depth: u32, field:
     };
     match tcx.tys.kind(t) {
         TyKind::Bool | TyKind::Char | TyKind::Int(_) | TyKind::Float(_) | TyKind::Never => true,
-        // tuples: rustc's size checked through LAYOUTS (layout_deps)
+        // Tuples share bytes only when every element does.
         TyKind::Tuple(v) => tcx.tys.list(*v).iter().all(|x| tr(*x)),
         TyKind::Ref(_, x, _) | TyKind::Ptr(_, x) => pointee(*x),
         TyKind::FnPtr(_, _, header, _) => header.abi.is_c_like(),
@@ -911,13 +928,15 @@ fn trusted_in(prog: &Program, tcx: &Tcx, krate: u32, t: TyId, depth: u32, field:
                     });
             }
             let std_crate = is_std(prog, prog.def(*d).krate);
-            // Option<T>: rustc's layout (niche or tag), checked per op slot (the entry's slots)
             // PhantomData<T>: zero-sized, the same on both sides
             if tcx.adts.get(d).is_some_and(|a| a.is_phantom_data()) {
                 return true;
             }
             if tcx.lang_items.get(LangItem::Option) == Some(*d) && tcx.tys.list(*a).len() == 1 {
-                return tr(tcx.tys.list(*a)[0]);
+                // Tagged Options need the const-verified six-word agreement, independently
+                // of a slot's size/align. Niche verification is a separate step.
+                let payload = tcx.tys.list(*a)[0];
+                return tr(payload) && option_entry_covered(prog, tcx, t, payload, covered);
             }
             if !a.is_empty() {
                 return false;
@@ -934,7 +953,7 @@ fn trusted_in(prog: &Program, tcx: &Tcx, krate: u32, t: TyId, depth: u32, field:
             if adt.is_union {
                 return false;
             }
-            let fields_ok = |v: &crate::tcx::VariantT| v.fields.iter().all(|f| trusted_in(prog, tcx, krate, f.ty, depth + 1, true, cells));
+            let fields_ok = |v: &crate::tcx::VariantT| v.fields.iter().all(|f| trusted_options_in(prog, tcx, krate, f.ty, depth + 1, true, cells, covered));
             if adt.is_enum {
                 if adt.variants.iter().all(|v| v.fields.is_empty()) {
                     return true;
@@ -962,42 +981,335 @@ fn is_std(prog: &Program, krate: u32) -> bool {
     matches!(prog.syms.str(prog.crates[krate as usize].name), "core" | "alloc" | "std")
 }
 
-/// Every type in `t` whose layout the bound fn relies on and that is not the crate's own
-/// non-generic type (marked plain / handle already): std instances (Option<T>) and other crates'
-/// types, whose size/align the op entries' slots record; Relax compares before binding.
-pub fn layout_deps(prog: &Program, tcx: &Tcx, krate: u32, t: TyId, out: &mut Vec<TyId>) {
-    match tcx.tys.kind(t) {
-        TyKind::Ref(_, x, _) | TyKind::Ptr(_, x) => {
-            // a pointer to the crate's own values is a handle; to others: their layout matters
-            if !matches!(tcx.tys.kind(*x), TyKind::Adt(d, _, _) if prog.def(*d).krate == krate) {
-                layout_deps(prog, tcx, krate, *x, out);
-            }
-        }
-        TyKind::Slice(e) | TyKind::Array(e, _) => layout_deps(prog, tcx, krate, *e, out),
-        TyKind::Tuple(v) if !v.is_empty() => {
-            if !out.contains(&t) {
-                out.push(t);
-            }
-            for x in tcx.tys.list(*v) {
-                layout_deps(prog, tcx, krate, *x, out);
-            }
-        }
+/// Class G: the language guarantees the null niche for this payload.
+fn option_guaranteed(prog: &Program, tcx: &Tcx, payload: TyId) -> bool {
+    match tcx.tys.kind(payload) {
+        TyKind::Ref(..) | TyKind::FnPtr(..) => true,
         TyKind::Adt(d, a, _) => {
-            // (Global, a container's allocator: zero-sized and the same on both sides)
-            if tcx.adts.get(d).is_some_and(|a| a.is_box()) || is_global_alloc(tcx, t) {
-                return;
+            let args = tcx.tys.list(*a);
+            (tcx.adts.get(d).is_some_and(|a| a.is_box())
+                && (1..=2).contains(&args.len()) && args.get(1).is_none_or(|al| is_global_alloc(tcx, *al)))
+                || (is_std(prog, prog.def(*d).krate) && (prog.name(*d) == "NonNull" || prog.name(*d).starts_with("NonZero")))
+        }
+        _ => false,
+    }
+}
+
+/// A direct tag at offset zero and all six words must agree; a niche entry states no tag.
+fn option_layout_matches(l: &crate::layout::Layout, jit: &[u128; 6], entry: Option<&[u64; 6]>) -> bool {
+    l.enc == crate::layout::TagEnc::Direct
+        && matches!(l.tag, Some((0, relax_backend::rir::Mem::Int(w, _))) if w > 0 && u128::from(w) == jit[3])
+        && entry.is_some_and(|e| e[3] > 0 && e.map(u128::from) == *jit)
+}
+
+/// Only the layout verdict is cached: payload trust still uses the caller's crate/depth rules.
+fn option_layout_verdict(prog: &Program, tcx: &Tcx, t: TyId, payload: TyId) -> Result<(), String> {
+    let cell = tcx.provided_option_layouts.get(&t).unwrap_or_else(|| {
+        let _kept = crate::zone_alloc::kept();
+        tcx.provided_option_layouts.insert_first(t, std::sync::Arc::new(std::sync::OnceLock::new()))
+    });
+    cell.get_or_init(|| {
+        let _kept = crate::zone_alloc::kept();
+        if option_guaranteed(prog, tcx, payload) { return Ok(()); }
+        let probe = crate::layout::Layouts::new();
+        let l = probe.of(&crate::layout::LayoutCx::new(prog), tcx, t);
+        // Class N keeps its existing acceptance until the niche verification step.
+        if matches!(l.enc, crate::layout::TagEnc::Niche { .. }) { return Ok(()); }
+        let adt = &tcx.adts[&tcx.lang_items.get(LangItem::Option).unwrap()];
+        let none = adt.variants.iter().position(|v| v.fields.is_empty()).unwrap();
+        let some = adt.variants.iter().position(|v| v.fields.len() == 1).unwrap();
+        let payload_off = l.variant_fields.get(some).and_then(|f| f.first()).copied().unwrap_or(0);
+        let tag_bytes = match l.tag { Some((_, relax_backend::rir::Mem::Int(w, _))) => w, _ => 0 };
+        let jit = [l.size as u128, l.align as u128, payload_off as u128, tag_bytes as u128,
+            adt.tag_for_variant(tcx, prog, none as u32).unwrap().val,
+            adt.tag_for_variant(tcx, prog, some as u32).unwrap().val];
+        let name = crate::typeck::type_name(prog, tcx, t);
+        let entry = OPTION_LAYOUTS.get().and_then(|m| m.get(&norm(&name)));
+        if option_layout_matches(l, &jit, entry) { return Ok(()); }
+        let exported = entry.map_or_else(|| "no entry".to_string(), |e| format!("{:?}", e));
+        let payload = crate::typeck::type_name(prog, tcx, payload);
+        Err(format!("Option layout mismatch for `{name}`: JIT {jit:?} (tag {:?}, encoding {:?}), rustc {exported}; words are [size, align, payload offset, tag width, None tag, Some tag]. List `{payload}` in a `relax_api::option_layouts!` in the module that spells it, or the crate's list when its names resolve there", l.tag, l.enc))
+    }).clone()
+}
+
+/// Options listed by this crate on the checked target (the guard unions every crate's). Query declared types only: the
+/// zero-sized marker's initializer and the host-only layout oracle need not run.
+pub(crate) fn option_listed_types(prog: &Program, tcx: &Tcx, krate: u32) -> std::collections::HashSet<TyId> {
+    let mut covered = std::collections::HashSet::new();
+    for (i, _) in prog.defs.iter().enumerate().filter(|(_, d)| d.krate == krate && d.kind == DefKind::Const) {
+        let Some(t) = tcx.const_ty(prog, DefId(i as u32)) else { continue };
+        let TyKind::Adt(marker, args, _) = tcx.tys.kind(t) else { continue };
+        if prog.def_path(*marker) != "relax_api::OptionListed" { continue; }
+        let [option] = tcx.tys.list(*args) else { continue };
+        if matches!(tcx.tys.kind(*option), TyKind::Adt(d, a, _) if tcx.lang_items.get(LangItem::Option) == Some(*d) && tcx.tys.list(*a).len() == 1)
+            && !tcx.has_param(*option)
+        {
+            // Markers instantiate lifetimes as 'static; declarations may use bound ones.
+            // Both keys are interned with regions erased, never compared by spelling.
+            covered.insert(option_entry_type(prog, tcx, *option));
+        }
+    }
+    covered
+}
+
+/// Resolve aliases and const arguments as layouts do, then intern one lifetime-insensitive
+/// identity for both the marker's type and the declaration's type.
+fn option_entry_type(prog: &Program, tcx: &Tcx, t: TyId) -> TyId {
+    let t = tcx.tys.erase_all_regions(t);
+    tcx.tys.erase_all_regions(tcx.normalize_erasing_regions(prog, crate::tcx::TypingEnv::fully_monomorphized(prog), t))
+}
+
+fn option_entry_covered(prog: &Program, tcx: &Tcx, t: TyId, payload: TyId, covered: Option<&std::collections::HashSet<TyId>>) -> bool {
+    let Some(covered) = covered else { return option_layout_verdict(prog, tcx, t, payload).is_ok() };
+    if option_guaranteed(prog, tcx, payload) { return true; }
+    let layouts = crate::layout::Layouts::new();
+    match layouts.of(&crate::layout::LayoutCx::new(prog), tcx, t).enc {
+        crate::layout::TagEnc::Niche { .. } => true,
+        crate::layout::TagEnc::Direct => covered.contains(&option_entry_type(prog, tcx, t)),
+        _ => false,
+    }
+}
+
+/// Every concrete tagged Option spelled by this crate's declarations, even when no body
+/// reaches the item. One failure per type per crate, with a source occurrence.
+/// Only signatures, fields and static types are queried; no function body is lowered.
+pub(crate) fn option_entry_rows(prog: &Program, tcx: &Tcx, krate: u32, covered: Option<&std::collections::HashSet<TyId>>) -> Vec<String> {
+    use crate::ast::{ItemKind, SelfParam, VariantData};
+    let crate_name = prog.syms.str(prog.crates[krate as usize].name);
+    let root = &prog.mods[prog.crates[krate as usize].root_mod as usize];
+    let list_file = option_entry_path(&prog.file_paths[root.file as usize]);
+    let mut rows = std::collections::BTreeMap::new();
+    let layouts = crate::layout::Layouts::new();
+    for (i, def) in prog.defs.iter().enumerate().filter(|(_, d)| d.krate == krate
+        && matches!(d.kind, DefKind::Fn | DefKind::AssocFn | DefKind::ForeignFn | DefKind::Struct | DefKind::Enum | DefKind::Static | DefKind::ForeignStatic)) {
+        let d = DefId(i as u32);
+        let file = &prog.files[def.file as usize];
+        let ast = &file.ast;
+        let item = ast.item(def.item);
+        let mut roots = Vec::new();
+        match def.kind {
+            DefKind::Fn | DefKind::AssocFn | DefKind::ForeignFn => {
+                let Some(sig) = tcx.fn_sig(prog, d).filter(|s| s.n_generics == 0) else { continue };
+                let ItemKind::Fn(s, _, _) = item.kind else { continue };
+                let written = ast.fn_sig(s);
+                let mut types = Vec::new();
+                if let Some(receiver) = written.self_param.get() {
+                    types.push(match receiver { SelfParam::Typed(_, t) => Some(t), _ => None });
+                }
+                types.extend(ast.list(written.params).iter().map(|p| Some(p.ty)));
+                for (j, &t) in sig.params.iter().enumerate() {
+                    roots.push((t, types.get(j).copied().flatten(), item.lo));
+                }
+                roots.push((sig.ret, written.ret.get(), item.lo));
             }
-            if prog.def(*d).krate != krate || !a.is_empty() {
-                if !out.contains(&t) {
-                    out.push(t);
+            DefKind::Struct | DefKind::Enum => {
+                let Some(adt) = tcx.adts.get(&d).filter(|a| a.n_generics == 0) else { continue };
+                let data: Vec<_> = match &item.kind {
+                    ItemKind::Struct(_) => vec![ast.as_struct(&item.kind).unwrap().data],
+                    ItemKind::Enum(_) => ast.list(ast.as_enum(&item.kind).unwrap().variants).iter().map(|v| v.data).collect(),
+                    _ => continue,
+                };
+                for (vi, v) in adt.variants.iter().enumerate() {
+                    let fields = match data.get(vi) {
+                        Some(VariantData::Tuple(f) | VariantData::Struct(f)) => ast.list(*f),
+                        _ => &[],
+                    };
+                    for (j, f) in v.fields.iter().enumerate() {
+                        let source = fields.get(j);
+                        roots.push((f.ty, source.map(|f| f.ty), source.map_or(item.lo, |f| f.ty_span.0)));
+                    }
                 }
             }
-            for x in tcx.tys.list(*a) {
-                layout_deps(prog, tcx, krate, *x, out);
+            DefKind::Static | DefKind::ForeignStatic => {
+                let Some(t) = tcx.const_ty(prog, d) else { continue };
+                let source = match item.kind { ItemKind::Static(_, t, _) => Some(t), _ => None };
+                roots.push((t, source, item.lo));
             }
+            _ => continue,
         }
-        _ => {}
+        let cells = matches!(def.kind, DefKind::Static | DefKind::ForeignStatic);
+        let mut seen = std::collections::HashSet::new();
+        while let Some((t, source, pos)) = roots.pop() {
+            if !seen.insert(t) { continue; }
+            let source = source.map(|mut s| {
+                while let crate::ast::Ty::Paren(inner) = ast.ty(s) { s = *inner; }
+                s
+            });
+            let written = source.map(|s| ast.ty(s));
+            let pos = match written { Some(crate::ast::Ty::Path(p)) => p.lo, _ => pos };
+            let mut children = Vec::new();
+            let mut spellings = Vec::new();
+            match tcx.tys.kind(t) {
+                TyKind::Adt(ad, args, _) => {
+                    children.extend_from_slice(tcx.tys.list(*args));
+                    let path = match written {
+                        Some(crate::ast::Ty::Path(p)) if tcx.resolve_type_path_def(prog, def.file, def.scope, p) == Some(*ad) => Some(p),
+                        _ => None,
+                    };
+                    if let Some(p) = path {
+                        if let Some(seg) = ast.segs(p.segs).last() {
+                            if let Some(crate::ast::GenericArgs::Angle(args)) = ast.gargs(seg.args()) {
+                                for a in ast.list(*args) {
+                                    match a {
+                                        crate::ast::GenericArg::Type(t) => spellings.push(Some(*t)),
+                                        crate::ast::GenericArg::Const(_) => spellings.push(None),
+                                        _ => {}
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if tcx.lang_items.get(LangItem::Option) == Some(*ad) && children.len() == 1 {
+                        let payload = children[0];
+                        if !tcx.has_param(payload) && trusted_options_in(prog, tcx, krate, payload, 1, false, cells, covered)
+                            && layouts.of(&crate::layout::LayoutCx::new(prog), tcx, t).enc == crate::layout::TagEnc::Direct
+                            && covered.map_or_else(|| option_layout_verdict(prog, tcx, t, payload).is_err(),
+                                |listed| !listed.contains(&option_entry_type(prog, tcx, t)))
+                        {
+                            // keyed by the type too: two types of one name (a private `AbsInfo` in two
+                            // modules) each need their own entry
+                            let name = norm(&crate::typeck::type_name(prog, tcx, t));
+                            rows.entry((name, option_entry_type(prog, tcx, t))).or_insert_with(|| {
+                                let payload = path.and_then(|p| option_payload_spelling(file, p))
+                                    .unwrap_or_else(|| option_local_spelling(&crate::typeck::type_name(prog, tcx, payload), crate_name));
+                                let loc = prog.source_location(def.file, pos);
+                                let spelling_file = option_entry_path(loc.source.path());
+                                format!("option-entry\tFAIL\t{}\tOption<{}>\t{}:{} ({})\tadd `{}` to a relax_api::option_layouts! in {} (or the crate's list in {} when its names resolve there)",
+                                    crate_name, payload, spelling_file, loc.source.line_col(loc.span.lo).0,
+                                    key(prog, tcx, d), payload, spelling_file, list_file)
+                            });
+                        }
+                    }
+                }
+                TyKind::Ref(_, x, _) | TyKind::Ptr(_, x) | TyKind::Slice(x) | TyKind::Array(x, _) => {
+                    children.push(*x);
+                    spellings.push(match written {
+                        Some(crate::ast::Ty::Ref(_, _, x) | crate::ast::Ty::Ptr(_, x) | crate::ast::Ty::Slice(x) | crate::ast::Ty::Array(x, _)) => Some(*x),
+                        _ => None,
+                    });
+                }
+                TyKind::Tuple(args) => {
+                    children.extend_from_slice(tcx.tys.list(*args));
+                    if let Some(crate::ast::Ty::Tuple(args)) = written { spellings.extend(ast.list(*args).iter().copied().map(Some)); }
+                }
+                TyKind::FnPtr(args, ret, _, _) => {
+                    children.extend_from_slice(tcx.tys.list(*args));
+                    children.push(*ret);
+                    if let Some(crate::ast::Ty::Fn(f)) = written {
+                        let f = ast.fn_ptr(*f);
+                        spellings.extend(ast.list(f.params).iter().copied().map(Some));
+                        spellings.push(f.ret.get());
+                    }
+                }
+                _ => {}
+            }
+            roots.extend(children.into_iter().enumerate().map(|(j, t)| (t, spellings.get(j).copied().flatten(), pos)));
+        }
     }
+    rows.into_values().collect()
+}
+
+/// Keep diagnostics relative to the working tree when it contains the source.
+fn option_entry_path(path: &str) -> String {
+    let path = std::path::Path::new(path);
+    std::env::current_dir().ok().and_then(|root| path.strip_prefix(root).ok().map(|p| p.to_string_lossy().into_owned()))
+        .unwrap_or_else(|| path.to_string_lossy().into_owned())
+}
+
+/// The actual payload text of a resolved Option path. Aliases fall back to Relax's name.
+fn option_payload_spelling(file: &crate::parser::ParsedFile, path: &crate::ast::Path) -> Option<String> {
+    let seg = file.ast.segs(path.segs).last()?;
+    let (toks, base) = file.part_at(seg.name.lo).map_or((&file.toks, 0), |p| (&p.toks, p.tok_base));
+    let start = toks.iter().position(|t| t.lo == seg.name.lo)?;
+    let open = base + start as u32 + 1;
+    if file.tok_text(open) != "<" { return None; }
+    let lo = file.tok(open).hi;
+    // break_and_eat rewrites >>, >= and >>= in place, losing the first closing >'s token.
+    // bytes also resolves expansion text beyond src, including lazy bodies' expansions.
+    let bytes = file.bytes(lo, u32::MAX);
+    let mut depth = 1;
+    let mut delimiters = 0;
+    for (i, &byte) in bytes.iter().enumerate() {
+        match byte {
+            b'(' | b'[' | b'{' => delimiters += 1,
+            b')' | b']' | b'}' => delimiters -= 1,
+            b'<' if delimiters == 0 => depth += 1,
+            b'>' if delimiters == 0 && (i == 0 || bytes[i - 1] != b'-') => {
+                depth -= 1;
+                if depth == 0 {
+                    let text = std::str::from_utf8(&bytes[..i]).ok()?;
+                    let mut out = String::new();
+                    let mut space = false;
+                    let mut prev = None;
+                    for ch in text.chars() {
+                        if ch.is_whitespace() { space = true; continue; }
+                        if space && prev.is_some() && !matches!(prev, Some('(' | '[' | '<'))
+                            && !matches!(ch, ')' | ']' | '>' | ',' | ';')
+                        {
+                            out.push(' ');
+                        }
+                        out.push(ch);
+                        prev = Some(ch);
+                        space = false;
+                    }
+                    return Some(out);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Relax's own-crate paths must be nameable from that crate's source, even inside a tuple.
+fn option_local_spelling(name: &str, krate: &str) -> String {
+    let prefix = format!("{krate}::");
+    let mut out = String::with_capacity(name.len());
+    let mut copied = 0;
+    for (at, _) in name.match_indices(&prefix) {
+        if !name[..at].chars().next_back().is_none_or(|c| c.is_whitespace() || matches!(c, '(' | '[' | '<' | '&' | ',')) {
+            continue;
+        }
+        out.push_str(&name[copied..at]);
+        out.push_str("crate::");
+        copied = at + prefix.len();
+    }
+    out.push_str(&name[copied..]);
+    out
+}
+
+/// Find a refused Option within a rejected type for binding/lowering diagnostics. This does
+/// not decide trust or open std's private fields; it reuses the cached layout verdict.
+pub(crate) fn option_layout_reason(prog: &Program, tcx: &Tcx, t: TyId) -> Option<String> {
+    fn walk(prog: &Program, tcx: &Tcx, t: TyId, depth: u32) -> Option<String> {
+        if depth > 8 { return None; }
+        let next = |x| walk(prog, tcx, x, depth + 1);
+        match tcx.tys.kind(t) {
+            TyKind::Ref(_, x, _) | TyKind::Ptr(_, x) | TyKind::Slice(x) | TyKind::Array(x, _) => next(*x),
+            TyKind::Tuple(args) => tcx.tys.list(*args).iter().find_map(|x| next(*x)),
+            TyKind::Adt(d, a, _) => {
+                let args = tcx.tys.list(*a);
+                if tcx.lang_items.get(LangItem::Option) == Some(*d) && args.len() == 1 {
+                    let reason = tcx.provided_option_layouts.get(&t)
+                        .and_then(|cell| cell.get().and_then(|verdict| verdict.as_ref().err().cloned()));
+                    return reason.or_else(|| next(args[0]));
+                }
+                if is_std(prog, prog.def(*d).krate) {
+                    return args.iter().find_map(|x| next(*x));
+                }
+                let adt = tcx.adts.get(d)?;
+                for (vi, v) in adt.variants.iter().enumerate() {
+                    for fi in 0..v.fields.len() {
+                        let ft = tcx.field_ty(prog, crate::tcx::TypingEnv::fully_monomorphized(prog), *d, vi as u32, fi as u32, args);
+                        if let Some(reason) = next(ft) { return Some(reason); }
+                    }
+                }
+                None
+            }
+            _ => None,
+        }
+    }
+    walk(prog, tcx, t, 0)
 }
 
 /// `alloc::alloc::Global` (lang `global_alloc_ty`): the allocator of a Box or Vec that crosses.
@@ -1175,7 +1487,10 @@ pub fn unbound_reason(prog: &Program, tcx: &Tcx, krate: u32, d: DefId, opaque: &
     if parent.kind == DefKind::Impl && tcx.impl_trait.get(&def.parent).is_some_and(|t| tcx.lang_items.get(LangItem::Drop) == Some(*t)) {
         return Some("Drop::drop (in the drop shim)");
     }
-    if first_untrusted_signature_type(prog, tcx, krate, d, opaque).is_some() {
+    if let Some(t) = first_untrusted_signature_type(prog, tcx, krate, d, opaque) {
+        if option_layout_reason(prog, tcx, t).is_some() {
+            return Some("Option layout mismatch");
+        }
         return Some("signature not C-shaped");
     }
     None
@@ -1470,7 +1785,8 @@ pub(crate) fn same_layout_handles_with_reasons(prog: &Program, tcx: &Tcx, cands:
                         let variant = if adt.is_enum { format!("variant `{}` ", prog.syms.str(v.name)) } else { String::new() };
                         let field = if v.shape == 1 { fi.to_string() } else { prog.syms.str(f.name).to_string() };
                         let ty = crate::typeck::ty_to_string(false, prog, tcx, ft);
-                        rejected.insert(*d, format!("{}field `{}` of type `{}` is not the same bytes on both sides", variant, field, ty));
+                        let detail = option_layout_reason(prog, tcx, ft).map_or(String::new(), |reason| format!(": {reason}"));
+                        rejected.insert(*d, format!("{}field `{}` of type `{}` is not the same bytes on both sides{}", variant, field, ty, detail));
                         return false;
                     }
                 }
@@ -1535,6 +1851,26 @@ fn same_bytes(prog: &Program, tcx: &Tcx, krate: u32, t: TyId, ok: &dyn Fn(DefId)
 #[cfg(test)]
 mod layout_tests {
     use super::*;
+
+    #[test]
+    fn option_layout_checks_every_tag_word() {
+        use crate::layout::{Layout, TagEnc};
+        use relax_backend::rir::Mem;
+        let l = Layout {
+            size: 32, align: 16, fields: vec![], tag: Some((0, Mem::Int(16, false))),
+            enc: TagEnc::Direct, variant_fields: vec![vec![], vec![16]], leaves: None,
+            niche: None, uninhabited: false,
+        };
+        let table = [32, 16, 16, 16, 0, 1];
+        let jit = table.map(u128::from);
+        assert!(option_layout_matches(&l, &jit, Some(&table)), "matching Option layout must be accepted");
+        for (word, property) in [(3, "tag width"), (2, "payload offset"), (4, "None tag"), (5, "Some tag")] {
+            let mut wrong = table;
+            wrong[word] += 1;
+            assert!(!option_layout_matches(&l, &jit, Some(&wrong)), "doctored {property} must be refused");
+        }
+        assert!(!option_layout_matches(&l, &jit, None), "a tagged Option with no entry must be refused");
+    }
 
     #[test]
     fn same_layout_handles_checks_enum_agreement() {

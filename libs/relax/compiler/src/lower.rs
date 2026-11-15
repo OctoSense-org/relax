@@ -601,7 +601,8 @@ impl<'a> Lcx<'a> {
             }
             if self.u.provided.iter().any(|(k, _)| *k == krate) && !crate::provided::trusted(&self.u.prog, &self.u.tcx, krate, t, 0) && !self.u.provided_rustc_layout(*d) && !self.relax_only_instance(t) {
                 let ts = crate::typeck::ty_to_string(false, &self.u.prog, &self.u.tcx, t);
-                self.provided_err(krate, format!("a field of `{}` is read from JIT-compiled code, but `{}` lives in a provided crate (built by rustc into the loader) and its layout is not C-shaped: call a method of the crate instead", ts, ts));
+                let detail = crate::provided::option_layout_reason(&self.u.prog, &self.u.tcx, t).map_or(String::new(), |reason| format!(". {reason}"));
+                self.provided_err(krate, format!("a field of `{}` is read from JIT-compiled code, but `{}` lives in a provided crate (built by rustc into the loader) and its layout is not C-shaped: call a method of the crate instead{}", ts, ts, detail));
             }
         }
     }
@@ -629,7 +630,7 @@ impl<'a> Lcx<'a> {
             let krate = self.u.prog.def(*d).krate;
             if self.u.provided.iter().any(|(k, _)| *k == krate) && !crate::provided::trusted(&self.u.prog, &self.u.tcx, krate, t, 0) && !self.u.provided_rustc_layout(*d) && !self.relax_only_instance(t) {
                 let ts = crate::typeck::type_name(&self.u.prog, &self.u.tcx, t);
-                let remedy = self.provided_layout_remedy(*d);
+                let remedy = self.provided_layout_remedy(*d, t);
                 self.provided_err(krate, format!("`{}` is built in JIT-compiled code, but values of it reach the rustc-built code of its provided crate (a bound fn takes or returns it) and {}", ts, remedy));
             }
         }
@@ -688,7 +689,10 @@ impl<'a> Lcx<'a> {
     }
 
     /// Only called after a refusal: binding already recorded the layout or field-byte failure.
-    fn provided_layout_remedy(&self, d: DefId) -> String {
+    fn provided_layout_remedy(&self, d: DefId, t: TyId) -> String {
+        if let Some(reason) = crate::provided::option_layout_reason(&self.u.prog, &self.u.tcx, t) {
+            return reason;
+        }
         if self.u.tcx.adts.get(&d).is_some_and(|a| a.is_enum && a.repr_int.is_none() && a.variants.iter().any(|v| !v.fields.is_empty())) {
             return "its data variants have no primitive repr. Mark it #[repr(u8)] so both compilers lay it out alike, or use a fn of the crate".into();
         }
@@ -707,7 +711,7 @@ impl<'a> Lcx<'a> {
             if a.is_empty() && self.u.provided_types.contains_key(&d) && !self.u.provided_rustc_layout(d) {
                 let ts = crate::typeck::type_name(&self.u.prog, &self.u.tcx, t);
                 let krate = self.u.prog.def(d).krate;
-                let remedy = self.provided_layout_remedy(d);
+                let remedy = self.provided_layout_remedy(d, t);
                 self.provided_err(krate, format!("`{}` is {} by variant in JIT-compiled code, but it lives in a provided crate (built by rustc into the loader) and {}", ts, what, remedy));
             }
         }
@@ -738,12 +742,15 @@ impl<'a> Lcx<'a> {
                             let opaque = |a| self.u.provided_types.contains_key(&a);
                             if let Some(reason) = crate::provided::unbound_reason(&self.u.prog, &self.u.tcx, krate, d, &opaque) {
                                 msg.push_str(&format!(" (`{}` of {} is #[relax_api] but runs here as JIT code: {}", key, name, reason));
-                                if reason == "signature not C-shaped" {
+                                if matches!(reason, "signature not C-shaped" | "Option layout mismatch") {
                                     if let Some(t) = crate::provided::first_untrusted_signature_type(&self.u.prog, &self.u.tcx, krate, d, &opaque) {
                                         msg.push_str(&format!(": `{}` does not cross the boundary", crate::typeck::ty_to_string(false, &self.u.prog, &self.u.tcx, t)));
                                         let path = crate::provided::untrusted_path(&self.u.prog, &self.u.tcx, krate, t);
                                         if !path.is_empty() {
                                             msg.push_str(&format!(" (at {})", path));
+                                        }
+                                        if let Some(detail) = crate::provided::option_layout_reason(&self.u.prog, &self.u.tcx, t) {
+                                            msg.push_str(&format!(": {}", detail));
                                         }
                                     }
                                 }
@@ -1548,7 +1555,8 @@ impl<'a> Lcx<'a> {
                         let ts = crate::typeck::ty_to_string(false, &self.u.prog, &self.u.tcx, t);
                         let fs = fdef.map_or(String::new(), |(name, _)| format!(" (`{}: {}`)", self.u.prog.syms.str(name), crate::typeck::ty_to_string(false, &self.u.prog, &self.u.tcx, ft)));
                         let krate = self.u.prog.def(*d).krate;
-                        self.provided_err(krate, format!("a field of `{}`{} is reached from JIT-compiled code (a field access, a pattern or a trait impl's body), but `{}` lives in a provided crate (built by rustc into the loader) and that field's bytes are rustc's alone (only plain data, pointers and the crate's handles are reached at rustc's offsets): call a fn of the crate, or route the impl to rustc's (jit.rs provided_fmt_hash)", ts, fs, ts));
+                        let detail = crate::provided::option_layout_reason(&self.u.prog, &self.u.tcx, ft).map_or(String::new(), |reason| format!(". {reason}"));
+                        self.provided_err(krate, format!("a field of `{}`{} is reached from JIT-compiled code (a field access, a pattern or a trait impl's body), but `{}` lives in a provided crate (built by rustc into the loader) and that field's bytes are rustc's alone (only plain data, pointers and the crate's handles are reached at rustc's offsets): call a fn of the crate, or route the impl to rustc's (jit.rs provided_fmt_hash){}", ts, fs, ts, detail));
                         // the fn fails with the error above; lowering goes on over a scratch place of
                         // the field's type so nothing after it trips over a shapeless one
                         let a = self.new_slot_for(ft);

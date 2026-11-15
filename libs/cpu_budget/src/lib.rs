@@ -18,6 +18,10 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicU8, Ordering::Re
 use std::sync::{Condvar, Mutex, MutexGuard, OnceLock};
 use std::thread::{self, Thread};
 
+relax_api::option_layouts! {
+    (u8, Span),
+}
+
 pub const INTERACTIVE: u8 = 0;
 pub const VISIBLE: u8 = 1;
 pub const BACKGROUND: u8 = 2;

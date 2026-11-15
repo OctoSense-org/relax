@@ -415,6 +415,25 @@ const SECTION: &str = "#[used] #[cfg_attr(target_vendor = \"apple\", link_sectio
 /// Payload spelling -> the cfg predicates of each occurrence in this marked item.
 type OptionSpellings = BTreeMap<String, Vec<String>>;
 
+/// Explicit payload spellings use the attribute's const oracle and entry emitter too.
+/// Per-payload cfg attributes let a crate keep its platform-specific types in one list.
+pub fn option_layouts_impl(input: TokenStream) -> TokenStream {
+    let toks: Vec<_> = input.into_iter().collect();
+    let mut options = OptionSpellings::new();
+    for payload in split_commas(&toks) {
+        let cfg = layout_conditions(&payload);
+        let ty = &payload[skip_attrs(&payload, 0)..];
+        if ty.is_empty() || !option_nameable(ty) {
+            return "compile_error!(\"option_layouts! expects concrete payload types\");".parse().unwrap();
+        }
+        options.entry(option_static(ty)).or_default().push(format!("all({})", cfg.join(", ")));
+    }
+    // An anonymous scope also permits repeated lists in the same module.
+    let extra = option_code(fnv(&text(&toks, None)), &options, true);
+    let code = format!("const _: () = {{ {extra} }};");
+    code.parse().unwrap_or_else(|e| panic!("option_layouts generated invalid tokens ({e:?}): {code}"))
+}
+
 fn option_nameable(toks: &[TokenTree]) -> bool {
     toks.iter().enumerate().all(|(i, t)| match t {
         TokenTree::Ident(id) => is_punct(i.checked_sub(1).and_then(|n| toks.get(n)), '\'')
@@ -435,7 +454,7 @@ fn option_static(toks: &[TokenTree]) -> String {
             while i < toks.len() && !is_punct(toks.get(i), '>') { i += 1; }
         } else if let TokenTree::Group(g) = &toks[i] {
             let inner = option_static(&g.stream().into_iter().collect::<Vec<_>>());
-            let mut group = Group::new(g.delimiter(), inner.parse().expect("Option type tokens"));
+            let mut group = Group::new(g.delimiter(), inner.parse().unwrap_or_else(|e| panic!("Option type tokens ({e:?}): {inner}")));
             group.set_span(g.span());
             out.push(TokenTree::Group(group));
         } else {
@@ -476,7 +495,7 @@ fn collect_options(toks: &[TokenTree], cfg: &[String], out: &mut OptionSpellings
     }
 }
 
-fn option_code(id: u64, options: &OptionSpellings) -> String {
+fn option_code(id: u64, options: &OptionSpellings, explicit: bool) -> String {
     let mut extra = String::new();
     for (n, (payload, conditions)) in options.iter().enumerate() {
         extra.push_str(&format!(
@@ -484,11 +503,14 @@ fn option_code(id: u64, options: &OptionSpellings) -> String {
 static __relax_api_o{id:016x}_{n}: ::relax_api::Entry = ::relax_api::Entry {{
   kind: ::relax_api::OPTION, module: module_path!(),
   key: {{ fn k() -> &'static str {{ ::core::any::type_name::<::core::option::Option<{payload}>>() }} k }},
-  sig: {{ fn s() -> &'static str {{ \"\" }} s }},
+  sig: {{ fn s() -> &'static str {{ \"{origin}\" }} s }},
   shim: None, slots: &[], size: 0, align: 0, offsets: &[],
   enum_layout: {{ const TABLE: [u64; 6] = ::relax_api::option_layout::<{payload}>(); &TABLE }},
-  drop: None, addr: None }};\n",
+  drop: None, addr: None }};
+#[cfg(any({conditions}))] #[doc(hidden)] #[allow(non_upper_case_globals, dead_code)]
+const __relax_api_l{id:016x}_{n}: ::relax_api::OptionListed<::core::option::Option<{payload}>> = ::relax_api::OptionListed(::core::marker::PhantomData);\n",
             conditions = conditions.join(", "),
+            origin = if explicit { "option_layouts" } else { "" },
         ));
     }
     extra
@@ -528,7 +550,7 @@ fn type_option_code(toks: &[TokenTree], body_start: usize, is_struct: bool, id: 
             }
         }
     }
-    option_code(id, &options)
+    option_code(id, &options, false)
 }
 
 /// The wrapper's first statement: whose heap the op allocates in. `#[relax_api(run)]`: the
@@ -614,7 +636,7 @@ fn op_code(o: &Owner, s: &Sig, phase: &str) -> String {
         key = key_code(o, &s.name),
         slots = slots.join(", "),
     );
-    extra.push_str(&option_code(id, &options));
+    extra.push_str(&option_code(id, &options, false));
     extra
 }
 
