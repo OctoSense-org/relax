@@ -7,7 +7,9 @@
 //! --subject <its source>`, run.rs): its own main, statics, environment, threads, exit status
 //! and errors, as under cargo. A file of the program that does not parse stops the run there, as
 //! cargo builds no target then. Without a selection all of them run (cargo test's default minus
-//! doc tests, which are counted and said).
+//! doc tests, which are counted and said). `--tests` is cargo's set (the lib and bins as unit tests,
+//! the integration tests, the examples with `test = true`), and a selector that matches no target
+//! is an error that names the package's targets.
 //! A `harness = false` target runs as a plain program (`makepad run --plain-test --subject ..`),
 //! as cargo runs it: its exit status is its verdict.
 //! `--live` keeps one harness target (default: the lib, else the package's only harness target) running across source edits.
@@ -88,6 +90,7 @@ pub fn cmd_test_package(args: &[String], grants: &[String]) -> i32 {
     let mut bins: Option<Vec<String>> = None;
     let mut tests: Option<Vec<String>> = None;
     let mut examples: Option<Vec<String>> = None;
+    let mut all_bins = false;
     let mut all_examples = false;
     let mut selections = 0;
     let mut all_tests = false;
@@ -103,6 +106,7 @@ pub fn cmd_test_package(args: &[String], grants: &[String]) -> i32 {
             "--live" => live = true,
             "--lib" => { lib = true; selections += 1; }
             "--bins" => {
+                all_bins = true;
                 bins.get_or_insert_with(Vec::new);
             }
             "--bin" => match words.next() {
@@ -126,7 +130,6 @@ pub fn cmd_test_package(args: &[String], grants: &[String]) -> i32 {
             // examples built with `--test`: all of them, or the named ones (cargo test's default
             // tests those with `test = true`)
             "--examples" => {
-                all_tests = true;
                 all_examples = true;
                 examples.get_or_insert_with(Vec::new);
             }
@@ -208,7 +211,7 @@ pub fn cmd_test_package(args: &[String], grants: &[String]) -> i32 {
     }
     let sess = std::sync::Arc::new(crate::Session::default());
     let live_default = live && !lib && bins.is_none() && tests.is_none();
-    let crate::resolve::TestTargets { lib: has_lib, bins: bin_targets, tests: targets, examples: example_targets, all_bins: every_bin, all_examples: every_example } = match crate::resolve::test_targets(&sess, &crate::run::workspace_dir(), &package,
+    let package_targets = match crate::resolve::test_targets(&sess, &crate::run::workspace_dir(), &package,
         &feature_flags, bins.as_deref().unwrap_or_default(), tests.as_deref().unwrap_or_default(), examples.as_deref().unwrap_or_default()) {
         Ok(t) => t,
         Err(e) => {
@@ -216,13 +219,7 @@ pub fn cmd_test_package(args: &[String], grants: &[String]) -> i32 {
             return 101;
         }
     };
-    // `--examples`: every example, `test = true` or not (an `--example <name>` beside it is one of them)
-    let example_targets = if all_examples {
-        examples = Some(Vec::new());
-        every_example
-    } else {
-        example_targets
-    };
+    let crate::resolve::TestTargets { lib: has_lib, bins: bin_targets, tests: targets, all_bins: every_bin, .. } = &package_targets;
     if live_default {
         if has_lib.as_ref().is_some_and(|l| l.test) {
             lib = true;
@@ -239,57 +236,15 @@ pub fn cmd_test_package(args: &[String], grants: &[String]) -> i32 {
             else { tests = Some(vec![name.clone()]); }
         }
     }
-    if live && lib && has_lib.is_none() { return live_usage(); }
-    let default_selection = !lib && bins.is_none() && tests.is_none() && examples.is_none();
-    if default_selection {
-        lib = has_lib.as_ref().is_some_and(|l| l.test);
-        bins = (!bin_targets.is_empty()).then(Vec::new);
-        tests = (!targets.is_empty()).then(Vec::new);
-        // the examples with `test = true` (relax issue 120: cargo runs their tests, makepad test skipped them)
-        examples = (!example_targets.is_empty()).then(Vec::new);
-    }
-    // each run: None the lib's unit tests (`--lib`), else one bin or test target out of the
-    // package's test graph: its source path, and whether it is a `harness = false` one (a plain
-    // program, its exit status the verdict, as cargo runs it)
-    let mut runs: Vec<Option<(String, bool)>> = Vec::new();
-    if lib {
-        runs.push(None);
-    }
-    // a selection's targets, harness ones first: every target for an empty one
-    let chosen = |all: &[(String, String, bool)], names: &[String]| -> Result<Vec<(String, bool)>, String> {
-        for n in names {
-            if !all.iter().any(|t| &t.0 == n) {
-                return Err(format!("no target named `{n}` in package `{package}`"));
-            }
+    let asked = TestSelection { lib, bins: bins.as_deref(), tests: tests.as_deref(), examples: examples.as_deref(), all_bins, all_tests, all_examples };
+    let SelectedTests { runs, graph, runs_tests, default_selection } = match select_tests(&package, asked, &package_targets) {
+        Ok(selected) => selected,
+        Err((named, e)) => {
+            eprintln!("{e}");
+            // under --live a selector that matched nothing is a usage error; a missing named target is not
+            return if live && !named { 2 } else { 101 };
         }
-        let (h, p): (Vec<_>, Vec<_>) = all.iter().filter(|t| names.is_empty() || names.contains(&t.0)).partition(|t| t.2);
-        Ok(h.into_iter().chain(p).map(|t| (t.1.clone(), !t.2)).collect())
     };
-    for (sel, all) in [(&bins, &bin_targets), (&tests, &targets), (&examples, &example_targets)] {
-        let Some(names) = sel else { continue };
-        match chosen(all, names) {
-            Ok(r) => runs.extend(r.into_iter().map(Some)),
-            Err(e) => {
-                eprintln!("relax test: {e}");
-                return 101;
-            }
-        }
-    }
-    // the test program of the selected bin, integration test and example targets, as `cargo
-    // test` builds them: each named (the `harness = false` ones too); `--bins` / `--examples`
-    // say that the names after them are targets built with `--test` (resolve.rs parse_flags)
-    let mut graph: Vec<String> = Vec::new();
-    for (sel, all, flag) in [(&bins, &bin_targets, "--bin"), (&tests, &targets, "--test"), (&examples, &example_targets, "--example")] {
-        let Some(names) = sel else { continue };
-        let mut first = true;
-        for t in all.iter().filter(|t| names.is_empty() || names.contains(&t.0)) {
-            if first && flag != "--test" {
-                graph.push(if flag == "--bin" { "--bins" } else { "--examples" }.to_string());
-            }
-            first = false;
-            graph.extend([flag.to_string(), t.0.clone()]);
-        }
-    }
     if live && (runs.len() != 1 || runs[0].as_ref().is_some_and(|r| r.1)) { return live_usage(); }
     let exe = match crate::dirs::loader_exe() {
         Ok(e) => e,
@@ -317,10 +272,9 @@ pub fn cmd_test_package(args: &[String], grants: &[String]) -> i32 {
     // `makepad check` checks it, in a process of its own beside the runs, and its errors fail the
     // command at its end, as a path dependency's do (check.rs start_test_deps). The bins are no
     // crates of the test program.
-    let runs_tests = tests.as_ref().is_some_and(|names| targets.iter().any(|t| names.is_empty() || names.contains(&t.0)));
     let mut bin_checks = BinChecks(Vec::new());
     if runs_tests && !live {
-        for (name, _, _) in &every_bin {
+        for (name, _, _) in every_bin {
             match start_bin_check(&exe, &profile, &pre, &package, name, &flags) {
                 Ok(child) => bin_checks.0.push(BinCheck { name: name.clone(), child: Some(child), t0: std::time::Instant::now() }),
                 Err(e) => {
@@ -410,6 +364,82 @@ pub fn cmd_test_package(args: &[String], grants: &[String]) -> i32 {
         }
     }
     code
+}
+
+/// Requested selectors; an empty name list selects every target of that kind.
+#[derive(Default)]
+struct TestSelection<'a> {
+    lib: bool,
+    bins: Option<&'a [String]>,
+    tests: Option<&'a [String]>,
+    examples: Option<&'a [String]>,
+    all_bins: bool,
+    all_tests: bool,
+    all_examples: bool,
+}
+
+struct SelectedTests {
+    // None: the lib's unit tests; Some: a source path and whether it has no harness.
+    runs: Vec<Option<(String, bool)>>,
+    graph: Vec<String>,
+    runs_tests: bool,
+    default_selection: bool,
+}
+
+/// Selects runs and their graph together, rejecting empty explicit selectors before a build. The
+/// error says whether it is a named target that is missing (`true`) or a selector that matched nothing.
+fn select_tests(package: &str, asked: TestSelection<'_>, targets: &crate::resolve::TestTargets) -> Result<SelectedTests, (bool, String)> {
+    let error = |named: bool, what: &str| {
+        let mut names = Vec::new();
+        if targets.lib.is_some() { names.push("--lib".to_string()); }
+        for (flag, all) in [("--bin", &targets.all_bins), ("--test", &targets.tests), ("--example", &targets.all_examples)] {
+            names.extend(all.iter().map(|t| format!("{flag} {}", t.0)));
+        }
+        let names = if names.is_empty() { "none".to_string() } else { names.join(", ") };
+        (named, format!("relax test: {what} in package `{package}`; its test targets: {names}"))
+    };
+    let lib_test = targets.lib.as_ref().is_some_and(|l| l.test);
+    let default_selection = !asked.lib && !asked.all_bins && !asked.all_tests && !asked.all_examples
+        && asked.bins.is_none() && asked.tests.is_none() && asked.examples.is_none();
+    // `--tests` takes cargo's test-enabled set; named selectors add to it in test_targets.
+    let all_tests = default_selection || asked.all_tests;
+    let mut runs = Vec::new();
+    if asked.lib || (all_tests && lib_test) { runs.push(None); }
+    // `--bins` / `--examples`: every bin / example, `test = true` or not (cargo's "all binary
+    // targets" and "all example targets"), names beside them included
+    let bin_targets = if asked.all_bins { &targets.all_bins } else { &targets.bins };
+    let example_targets = if asked.all_examples { &targets.all_examples } else { &targets.examples };
+    let mut graph = Vec::new();
+    let mut runs_tests = false;
+    for (names, all, flag, entire) in [
+        (asked.bins, bin_targets, "--bin", asked.all_bins),
+        (asked.tests, &targets.tests, "--test", false),
+        (asked.examples, example_targets, "--example", asked.all_examples),
+    ] {
+        if !all_tests && !entire && names.is_none() { continue; }
+        let names = names.unwrap_or_default();
+        for n in names {
+            if !all.iter().any(|t| &t.0 == n) { return Err(error(true, &format!("no target named `{n}`"))); }
+        }
+        let chosen: Vec<_> = all.iter().filter(|t| all_tests || entire || names.is_empty() || names.contains(&t.0)).collect();
+        // The graph stays in target order; the runs keep harness targets before plain ones.
+        if !chosen.is_empty() {
+            if flag == "--test" { runs_tests = true; }
+            else { graph.push(if flag == "--bin" { "--bins" } else { "--examples" }.to_string()); }
+        }
+        for t in &chosen { graph.extend([flag.to_string(), t.0.clone()]); }
+        let (h, p): (Vec<_>, Vec<_>) = chosen.into_iter().partition(|t| t.2);
+        runs.extend(h.into_iter().chain(p).map(|t| Some((t.1.clone(), !t.2))));
+    }
+    for (missing, what) in [
+        (asked.lib && targets.lib.is_none(), "no lib target"),
+        (asked.all_bins && bin_targets.is_empty(), "no bin target"),
+        (asked.all_examples && targets.all_examples.is_empty(), "no example target"),
+        (asked.all_tests && !lib_test && targets.bins.is_empty() && targets.tests.is_empty() && targets.examples.is_empty(), "no test target"),
+    ] {
+        if missing { return Err(error(false, what)); }
+    }
+    Ok(SelectedTests { runs, graph, runs_tests, default_selection })
 }
 
 /// The checks of the package's bins beside the runs (start_bin_check). A return before their
@@ -653,6 +683,94 @@ fn is_rust_block(info: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_selector_that_matches_nothing_names_the_real_targets() {
+        use super::{select_tests, TestSelection};
+        use crate::resolve::{LibTarget, TestTargets};
+
+        let bin = ("app".to_string(), "src/main.rs".to_string(), true);
+        let x = ("x".to_string(), "tests/x.rs".to_string(), true);
+        let y = ("y".to_string(), "tests/y.rs".to_string(), false);
+        let mut targets = TestTargets {
+            lib: None, bins: vec![bin.clone()], tests: vec![x.clone()], examples: Vec::new(),
+            all_bins: vec![bin.clone()], all_examples: Vec::new(),
+        };
+        let select = |asked: TestSelection<'_>, targets: &TestTargets| select_tests("sample", asked, targets).map(|s| s.runs).map_err(|e| e.1);
+        assert_eq!(select(TestSelection { lib: true, ..Default::default() }, &targets),
+            Err("relax test: no lib target in package `sample`; its test targets: --bin app, --test x".to_string()),
+            "--lib without a lib names the bin and integration test");
+
+        targets.lib = Some(LibTarget { path: "src/lib.rs".to_string(), test: true, doctest: true });
+        assert_eq!(select(TestSelection { lib: true, ..Default::default() }, &targets), Ok(vec![None]),
+            "--lib selects the lib alone");
+        targets.bins.clear();
+        targets.all_bins.clear();
+        targets.tests.clear();
+        assert_eq!(select(TestSelection { all_bins: true, bins: Some(&[]), ..Default::default() }, &targets),
+            Err("relax test: no bin target in package `sample`; its test targets: --lib".to_string()),
+            "--bins without bins names the lib");
+        assert_eq!(select(TestSelection { all_examples: true, examples: Some(&[]), ..Default::default() }, &targets),
+            Err("relax test: no example target in package `sample`; its test targets: --lib".to_string()),
+            "--examples without examples names the lib");
+        assert_eq!(select(TestSelection { all_tests: true, tests: Some(&[]), ..Default::default() }, &targets), Ok(vec![None]),
+            "--tests includes unit tests in a lib-only package");
+        targets.lib.as_mut().unwrap().test = false;
+        assert_eq!(select(TestSelection { all_tests: true, ..Default::default() }, &targets),
+            Err("relax test: no test target in package `sample`; its test targets: --lib".to_string()),
+            "--tests respects test = false on the lib");
+        assert_eq!(select(TestSelection { lib: true, ..Default::default() }, &targets), Ok(vec![None]),
+            "an explicit --lib still selects a lib with test = false");
+        targets.lib.as_mut().unwrap().test = true;
+        targets.bins = vec![bin.clone()];
+        targets.all_bins = vec![bin];
+        targets.tests = vec![x, y];
+        let mut expected = vec![None, Some(("src/main.rs".to_string(), false)),
+            Some(("tests/x.rs".to_string(), false)), Some(("tests/y.rs".to_string(), true))];
+        assert_eq!(select(TestSelection { all_tests: true, ..Default::default() }, &targets), Ok(expected.clone()),
+            "--tests selects the lib, bin and both integration tests, including a plain target");
+        assert_eq!(select(TestSelection { all_tests: true, tests: Some(&["x".to_string()]), ..Default::default() }, &targets), Ok(expected.clone()),
+            "a named integration test beside --tests never narrows its set");
+        let missing = "relax test: no target named `nope` in package `sample`; its test targets: --lib, --bin app, --test x, --test y".to_string();
+        assert_eq!(select(TestSelection { tests: Some(&["nope".to_string()]), ..Default::default() }, &targets), Err(missing.clone()),
+            "an unknown named target lists all available selectors");
+        assert_eq!(select(TestSelection { all_tests: true, tests: Some(&["nope".to_string()]), ..Default::default() }, &targets), Err(missing),
+            "--tests still validates a named selector beside it");
+
+        let example = ("demo".to_string(), "examples/demo.rs".to_string(), true);
+        targets.examples = vec![example.clone()];
+        targets.all_examples = vec![example, ("plain".to_string(), "examples/plain.rs".to_string(), false)];
+        expected.push(Some(("examples/demo.rs".to_string(), false)));
+        let selected = select_tests("sample", TestSelection { all_tests: true, ..Default::default() }, &targets).expect("--tests has enabled targets");
+        assert_eq!(selected.runs, expected, "--tests includes only the examples returned as test-enabled or named");
+        assert_eq!(selected.graph, ["--bins", "--bin", "app", "--test", "x", "--test", "y", "--examples", "--example", "demo"],
+            "the graph includes every selected target with the existing build flags");
+        assert!(selected.runs_tests, "integration tests still require the separate bin checks");
+        assert!(!selected.default_selection, "--tests does not report default-selection doc tests");
+        assert_eq!(select(TestSelection::default(), &targets), Ok(expected),
+            "the default selection still includes every test-enabled target");
+        assert_eq!(select(TestSelection { tests: Some(&["nope".to_string()]), ..Default::default() }, &targets),
+            Err("relax test: no target named `nope` in package `sample`; its test targets: --lib, --bin app, --test x, --test y, --example demo, --example plain".to_string()),
+            "the alternatives include examples that can be selected explicitly even with test = false");
+        assert_eq!(select(TestSelection { all_examples: true, ..Default::default() }, &targets),
+            Ok(vec![Some(("examples/demo.rs".to_string(), false)), Some(("examples/plain.rs".to_string(), true))]),
+            "--examples selects every example without selecting the lib, bins or integration tests");
+        targets.all_bins.push(("tool".to_string(), "src/bin/tool.rs".to_string(), true));
+        assert_eq!(select(TestSelection { all_bins: true, bins: Some(&["app".to_string()]), ..Default::default() }, &targets),
+            Ok(vec![Some(("src/main.rs".to_string(), false)), Some(("src/bin/tool.rs".to_string(), false))]),
+            "--bins takes every bin, a test = false one too, and a name beside it does not narrow it");
+        assert!(select_tests("sample", TestSelection { tests: Some(&["nope".to_string()]), ..Default::default() }, &targets).is_err_and(|e| e.0),
+            "a missing named target is told apart from a selector that matched nothing");
+
+        let empty = TestTargets { lib: None, bins: Vec::new(), tests: Vec::new(), examples: Vec::new(), all_bins: Vec::new(), all_examples: Vec::new() };
+        assert_eq!(select(TestSelection::default(), &empty), Ok(Vec::new()),
+            "no selector on an empty package remains a successful empty selection");
+        assert_eq!(select(TestSelection { all_tests: true, ..Default::default() }, &empty),
+            Err("relax test: no test target in package `sample`; its test targets: none".to_string()),
+            "an explicit --tests on an empty package is an error with no alternatives");
+        assert!(select_tests("sample", TestSelection { all_bins: true, bins: Some(&[]), ..Default::default() }, &empty).is_err_and(|e| !e.0),
+            "a selector that matched nothing is no missing named target (under --live a usage error)");
+    }
+
     #[test]
     fn doctests_counted_as_rustdoc_reads_them() {
         let src = "/// ```\n/// assert!(true);\n/// ```\n/// ```text\n/// no\n/// ```\n//! ```rust,no_run\n//! x\n//! ```\n/// ```ignore\n/// ```\n/// ~~~sh\n/// ~~~\n//// ```\n// ```\n/** ```\n * a\n * ``` */\n";
