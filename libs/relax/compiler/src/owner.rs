@@ -886,6 +886,11 @@ pub fn program_waiting() -> bool {
     FOREGROUND.load(Ordering::Relaxed) + MAIN_PUBLISH.load(Ordering::Relaxed) > 0
 }
 
+/// A main-thread request is queued: an install-ahead batch gives the owner back between links.
+pub(crate) fn main_waiting() -> bool {
+    MAIN_QUEUED.load(Ordering::Relaxed) + MAIN_PUBLISH.load(Ordering::Relaxed) > 0
+}
+
 /// A request waits now that long work on the owner (the cache's mid-run writes, the settle
 /// rebuild) gives the owner back for, at its next check: what `program_waiting` counts, or a Job
 /// a thread waits for (a back end's constant or static, a report, inspect). Background publishes,

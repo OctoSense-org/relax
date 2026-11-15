@@ -5284,6 +5284,7 @@ fn summary_inner(why: &str) {
                     "relax cache: {} hits, {} misses, {} link failures, {} refused by their dependency certificate (per-item cpu: body digests {:.1} ms, certificates written {:.1} ms, checked {:.1} ms) (link {:.1} ms wall with the lock; by speculative workers {} hits {:.1} ms), {} recorded ({} in a wider crate's store, {} made from the program's {} sealed crates alone; shared stores: {} recorded, {} linked, {} kept out by a late input; {} not recorded for the checkout's path in their data), {} not storable {:?}; written {:?} in {:.1} ms",
                     st.hits, st.misses, st.link_fail, st.cert_rejects, st.body_ns as f64 / 1e6, st.cert_write_ns as f64 / 1e6, st.cert_check_ns as f64 / 1e6, st.link_ns as f64 / 1e6, st.spec_hits, st.spec_link_ns as f64 / 1e6, st.recorded, st.wider_store, st.sealed_records, st.sealed_crates, st.shared_records, st.shared_hits, st.shared_kept_out, st.checkout_text, st.unencodable, c.why_unencodable, r, t.elapsed().as_secs_f64() * 1e3
                 );
+                verbose!("{}", jit::install_ahead_line());
                 if let Some(s) = crate::front::summary() {
                     verbose!("{}", s);
                 }
