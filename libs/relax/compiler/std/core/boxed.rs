@@ -554,6 +554,17 @@ impl<'a, 'b> From<&'b str> for Box<dyn Error + 'a> {
         Box::new(StringError(String::from(err)))
     }
 }
+// library/alloc/src/boxed/convert.rs: through the String impls
+impl<'a, 'b> From<crate::borrow::Cow<'b, str>> for Box<dyn Error + Send + Sync + 'a> {
+    fn from(err: crate::borrow::Cow<'b, str>) -> Box<dyn Error + Send + Sync + 'a> {
+        From::from(String::from(err))
+    }
+}
+impl<'a, 'b> From<crate::borrow::Cow<'b, str>> for Box<dyn Error + 'a> {
+    fn from(err: crate::borrow::Cow<'b, str>) -> Box<dyn Error + 'a> {
+        From::from(String::from(err))
+    }
+}
 
 // library/alloc/src/boxed.rs:2420: `E: Error` is Sized, so Box<dyn Error> is not an Error and
 // `From<E: Error> for Box<dyn Error>` does not overlap the reflexive `From<T> for T`
