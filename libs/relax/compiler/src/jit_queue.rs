@@ -107,11 +107,17 @@ pub(super) struct Queue {
     /// the run quits (`quit`): no check or lowering ahead, O2 or speculative build nobody waits for
     /// is queued
     quitting: bool,
+    /// the open interval of the hold ledger (`note_hold`)
+    hold: Option<Hold>,
 }
+/// An open interval of the hold ledger: since `since` (wall ns) a free worker found the best queued
+/// tier-up held for `HOLD_REASONS[reason]`, `queued` tier-ups in the queue, before or after the
+/// first present.
+struct Hold { reason: usize, after: bool, since: u64, queued: u64 }
 impl Queue {
     fn new() -> Self {
         Self { entries: Vec::new(), running: Vec::new(), serial: 0, waiters: HashMap::default(), plan: std::array::from_fn(|_| std::array::from_fn(|_| BTreeSet::new())), indices: HashMap::default(), by_slot: HashMap::default(), refresh_cursor: 0, ahead_class: budget::BACKGROUND, ahead_len: 0,
-            tick_at: Instant::now(), tick_queued: false, timer: None, inbox: Vec::new(), quitting: false }
+            tick_at: Instant::now(), tick_queued: false, timer: None, inbox: Vec::new(), quitting: false, hold: None }
     }
     /// Queues `job`; returns whether it can start now.
     pub(super) fn push(&mut self, job: Job, at: u64) -> bool {
@@ -297,6 +303,40 @@ impl Queue {
             _ => None,
         }
     }
+    /// Why the best queued tier-up (O2, O3) does not start at this pick: its gate (`class_blocked`,
+    /// `entry_blocked`), else "idle lane" when only the other kind of worker may start it
+    /// (`takes`), else "budget" when the admission refused the head (`head_refused`). None when no
+    /// tier-up is queued or nothing holds it.
+    fn tier_up_hold(&self, head_refused: bool, takes: Takes) -> Option<usize> {
+        if (COUNTS[1].load(Ordering::Relaxed) + COUNTS[2].load(Ordering::Relaxed)) == 0 { return None; }
+        let policy = self.policy();
+        let (_, tier, class, serial) = [1usize, 2].into_iter()
+            .flat_map(|tier| self.plan[tier].iter().enumerate().filter_map(move |(stored, bucket)| bucket.iter().next().map(|&(key, serial)| (tier, stored as u8, key, serial))))
+            .map(|(tier, stored, key, serial)| {
+                let class = self.bucket_class(tier, stored);
+                (rank(class, key.0, serial), tier, class, serial)
+            })
+            .min_by_key(|r| r.0)?;
+        let why = self.class_blocked(class, tier, &policy).or_else(|| self.entry_blocked(&self.entries[self.indices[&serial]]));
+        let reason = match why {
+            Some(why) => why,
+            None if !takes.takes(tier) => "idle lane",
+            None if head_refused => "budget",
+            None => return None,
+        };
+        Some(HOLD_REASONS.iter().position(|r| *r == reason).unwrap_or(HOLD_REASONS.len() - 1))
+    }
+    /// The hold ledger at a pick that parks or starts a tier-up: the open interval ends when its
+    /// reason, the phase (the first present) or the queued tier-ups' count changed, or a tier-up
+    /// starts (`reason` None); its wall goes to `HELD_NS` and that times the queued count to
+    /// `HELD_QUEUED_NS`. Under the queue lock: a clock read and two atomics per interval.
+    fn note_hold(&mut self, reason: Option<usize>, now: u64) {
+        let after = past_startup();
+        let queued = (COUNTS[1].load(Ordering::Relaxed) + COUNTS[2].load(Ordering::Relaxed)) as u64;
+        if matches!(&self.hold, Some(h) if Some(h.reason) == reason && h.after == after && h.queued == queued) { return; }
+        if let Some(h) = self.hold.take() { h.close(now); }
+        self.hold = reason.map(|reason| Hold { reason, after, since: now, queued });
+    }
     fn ordered(&self, limit: usize) -> Vec<(usize, Option<&'static str>)> {
         let policy = self.policy();
         let mut rows = Vec::new();
@@ -414,6 +454,37 @@ const TIER_NAMES: [&str; TIERS] = ["ahead", "O2", "O3", "spec", "tick", "check"]
 /// What the jobs of each tier took so far, the CPU of the threads running them (makepad inspect `jit spent`).
 static JOB_CPU: [AtomicU64; TIERS] = [const { AtomicU64::new(0) }; TIERS];
 static JOB_RUNS: [AtomicU64; TIERS] = [const { AtomicU64::new(0) }; TIERS];
+/// The hold ledger's reasons: what holds a runnable tier-up back while a worker is free. The gates'
+/// own (`class_blocked`, `entry_blocked`), then "idle lane" (only a worker of the other kind may
+/// start it: idle_tiers), "budget" (the admission refused the head) and "other" (a gate this list
+/// does not name yet).
+const HOLD_REASONS: [&str; 11] = ["UI burst", "first-compile reserve", "visible reserve", "startup tier width", "demand compiles", "O3 stopped", "startup", "same slot running", "idle lane", "budget", "other"];
+/// Per reason, before the first present ([0]) and after it ([1]): the wall ns a free worker found the
+/// best queued tier-up held for it, and those ns times the tier-ups queued then (build-ns waiting).
+static HELD_NS: [[AtomicU64; HOLD_REASONS.len()]; 2] = [const { [const { AtomicU64::new(0) }; HOLD_REASONS.len()] }; 2];
+static HELD_QUEUED_NS: [[AtomicU64; HOLD_REASONS.len()]; 2] = [const { [const { AtomicU64::new(0) }; HOLD_REASONS.len()] }; 2];
+impl Hold {
+    fn close(&self, now: u64) {
+        let ns = now.saturating_sub(self.since);
+        HELD_NS[self.after as usize][self.reason].fetch_add(ns, Ordering::Relaxed);
+        HELD_QUEUED_NS[self.after as usize][self.reason].fetch_add(ns.saturating_mul(self.queued), Ordering::Relaxed);
+    }
+}
+/// The hold ledger (makepad inspect `jit`): per reason the seconds a free worker found the best queued
+/// tier-up held, and the build-seconds the queued tier-ups waited meanwhile, before the first present
+/// and after it, the open interval counted to now.
+pub(super) fn held_line() -> String {
+    let open = { let q = lock(); q.hold.as_ref().map(|h| (h.reason, h.after, wall_ns().saturating_sub(h.since), h.queued)) };
+    let phase = |after: bool| {
+        let rows: Vec<String> = HOLD_REASONS.iter().enumerate().filter_map(|(i, name)| {
+            let (mut ns, mut queued) = (HELD_NS[after as usize][i].load(Ordering::Relaxed), HELD_QUEUED_NS[after as usize][i].load(Ordering::Relaxed));
+            if let Some((reason, a, extra, n)) = open { if reason == i && a == after { ns += extra; queued += extra.saturating_mul(n); } }
+            (ns > 0).then(|| format!("{name} {:.2} s ({:.1} build-s)", ns as f64 / 1e9, queued as f64 / 1e9))
+        }).collect();
+        if rows.is_empty() { "none".to_string() } else { rows.join(", ") }
+    };
+    format!("tier-ups held while a worker was free: before the first present {}; after {}", phase(false), phase(true))
+}
 /// The same per slot for its O2 and O3 jobs: O2 ns, O2 jobs, O3 ns, O3 jobs.
 static SLOT_CPU: relax_session::sync::Mutex<Option<HashMap<u32, [u64; 4]>>> = relax_session::sync::Mutex::new(None);
 /// A worker's park state, on its own cache line (each worker writes its flag at every job).
@@ -973,6 +1044,16 @@ fn worker_loop(index: usize) {
                     let more = q.runnable();
                     Some((e, job, more, go_idle))
                 });
+                // the hold ledger: a tier-up that starts ends the open interval; a worker that parks
+                // finds why the best queued one does not start (other work started leaves it open)
+                match &picked {
+                    Some((e, ..)) if is_tier_up(e.job.tier()) => if q.hold.is_some() { q.note_hold(None, wall_ns()) },
+                    Some(_) => {}
+                    None => {
+                        let hold = q.tier_up_hold(head.is_some(), takes);
+                        q.note_hold(hold, wall_ns());
+                    }
+                }
                 // idle, or held back by the budget: parked until a wake, the timer worker until
                 // the tick is due
                 picked.ok_or_else(|| ((!q.tick_queued && q.timer.is_none()).then(|| {
@@ -1312,6 +1393,8 @@ pub(crate) unsafe fn reset_statics() {
     reset(&RUNNING, [const { AtomicUsize::new(0) }; TIERS]);
     reset(&JOB_CPU, [const { AtomicU64::new(0) }; TIERS]);
     reset(&JOB_RUNS, [const { AtomicU64::new(0) }; TIERS]);
+    reset(&HELD_NS, [const { [const { AtomicU64::new(0) }; HOLD_REASONS.len()] }; 2]);
+    reset(&HELD_QUEUED_NS, [const { [const { AtomicU64::new(0) }; HOLD_REASONS.len()] }; 2]);
     reset(&SLOT_CPU, relax_session::sync::Mutex::new(None));
     reset(&THREADS, OnceLock::new());
     reset(&NEXT_WORKER, AtomicUsize::new(0));

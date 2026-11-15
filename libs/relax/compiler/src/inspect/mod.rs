@@ -1404,6 +1404,7 @@ fn cmd_jit(req: &Req, out: &mut Out) {
         all / 1_000_000,
         blocks
     ));
+    out.line(&crate::jit::queue_held_line());
     // a program that presents frames: its rate in the same window (0 = it draws nothing now)
     if f1 > 0 {
         out.line(&format!("frames: {:.0} fps in the window ({} presented in all)", (f1 - f0) as f64 * 1000.0 / ms as f64, f1));
