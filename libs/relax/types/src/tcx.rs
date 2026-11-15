@@ -2517,7 +2517,22 @@ impl Tcx {
                 }
             },
             ast::Ty::Path(p) => self.lower_path_ty(cx, prog, file, module, env, p, Some(t)),
-            ast::Ty::DynTrait(bounds, _) => self.lower_dyn(cx, prog, file, module, env, ast.list(*bounds), 0, Some(t)),
+            ast::Ty::DynTrait(bounds, dyn_) => {
+                let bounds = ast.list(*bounds);
+                // Parsing accepts bare syntax in every edition: a macro's `$t:ty` may only
+                // stringify it. Reject it when used as a type, using the written token's edition.
+                if !dyn_ {
+                    let pos = bounds.iter().find_map(|b| match b {
+                        ast::Bound::Trait { path, .. } => Some(path.lo),
+                        _ => None,
+                    }).unwrap_or(0);
+                    if prog.files[file as usize].edition_at(pos) >= 2021 {
+                        self.err(cx, prog, file, pos, "E0782: trait objects must include the `dyn` keyword".to_string());
+                        return self.tys.error;
+                    }
+                }
+                self.lower_dyn(cx, prog, file, module, env, bounds, 0, Some(t))
+            }
             ast::Ty::ImplTrait(_) if env.impl_params.iter().any(|x| x.0 == t.0) => {
                 let i = env.impl_params.iter().find(|x| x.0 == t.0).unwrap().1;
                 self.tys.intern(TyKind::Param(i))

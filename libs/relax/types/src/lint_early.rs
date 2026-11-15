@@ -1452,8 +1452,12 @@ impl<'a> W<'a> {
                         }
                     }
                     let dyn2015_exception = self.pf.edition == 2015 && is_dyn && i == 0 && path.global();
+                    // a bare trait object (2015/2018 `Send + Sync`) starts with its first bound's
+                    // written path, never a parenthesized bound: a `(` right before it opens the
+                    // type around the object (`&(Shape + Sync)`)
+                    let enclosing_paren = matches!(ty, Ty::DynTrait(_, false)) && i == 0;
                     if let Some(pos) = self.bound_parens(b) {
-                        if (is_last || !fn_with_explicit_ret_ty) && !dyn2015_exception {
+                        if (is_last || !fn_with_explicit_ret_ty) && !dyn2015_exception && !enclosing_paren {
                             self.emit_delims(&UNUSED_PARENS, pos, "parentheses", "type");
                         }
                     }

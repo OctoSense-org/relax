@@ -3906,8 +3906,8 @@ impl<'a> Parser<'a> {
     }
 
     fn ty_impl_header(&mut self) -> PResult<TyId> {
-        // bare trait path in 2015 may be `impl Trait + Send`; rare. dyn handled by ty().
-        self.ty()
+        // An impl's self type allows `+` bounds, including bare trait objects before 2021.
+        self.ty_plus()
     }
 
     // ------------------------------------------------------------ use trees
@@ -4599,14 +4599,15 @@ impl<'a> Parser<'a> {
                     { let m = self.ast.push_row(MacCall { path, delim, toks, args }); Ty::Mac(m) }
                 } else {
                     let path = self.path(false)?;
-                    if plus && self.kind() == T::Plus && matches!(self.nth(1), T::Lifetime | T::Ident | T::PathSep | T::Question) {
-                        // bare trait object `Trait + Send` (pre-2021)
+                    if plus && self.eat_plus() {
+                        // rustc parse_remaining_bounds: a path followed by `+` is a bare trait
+                        // object (even a trailing `+`); its edition is checked when lowering.
                         let mut b = vec![Bound::Trait { hrtb: List::EMPTY, maybe: false, konst: false, async_: false, path }];
-                        while self.eat(T::Plus) {
-                            if !self.at_bound_start() {
+                        while self.at_bound_start() {
+                            b.push(self.bound()?);
+                            if !self.eat_plus() {
                                 break;
                             }
-                            b.push(self.bound()?);
                         }
                         Ty::DynTrait(self.ast.push_list(b), false)
                     } else {
