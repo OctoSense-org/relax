@@ -794,10 +794,10 @@ pub(crate) fn resolve_package(
             u.host_checks = Some(p.checks(&u.pkg.0, &u.pkg.1, &u.pkg.2, !u.path_source, true));
         }
         // and what each script is told of the profile its package builds for (PROFILE, OPT_LEVEL,
-        // DEBUG; a host-only package's: the build-override's)
+        // DEBUG; a host-only package's, and a host side's run: the build-override's)
         for bs in g.build_scripts.iter_mut() {
             let ((dir, name, version), c) = (&g.pkg[bs.krate], &g.crates[bs.krate]);
-            bs.profile = p.script(dir, name, version, c.registry, c.host_only || c.proc_macro);
+            bs.profile = p.script(dir, name, version, c.registry, bs.host || c.host_only || c.proc_macro);
         }
     }
     {

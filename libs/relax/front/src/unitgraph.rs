@@ -35,6 +35,11 @@ pub struct BuildScript {
     /// what the script is told of its profile (PROFILE, OPT_LEVEL, DEBUG): a run's builds are
     /// release's, a test's its profile's (relax-compiler run.rs)
     pub profile: crate::resolve::ScriptProfile,
+    /// the host side's own run of the script, for a crate the program and the macro world both
+    /// use with different features: cargo lists a run per feature set, each with its OUT_DIR, and
+    /// this one's output is the macro world's copy's (`HostUnit::build_outputs`), never the
+    /// program's (relax issue 220)
+    pub host: bool,
 }
 
 impl BuildScript {
@@ -285,6 +290,8 @@ pub fn load(g: &Units, check_all_bins: bool, allow_c: bool) -> Result<Graph, Str
     let mut build_scripts: Vec<BuildScript> = Vec::new();
     // run-custom-build unit -> its script (lib and bins of a package depend on one run)
     let mut script_of_run: std::collections::HashMap<usize, usize> = Default::default();
+    // (crate, run unit) of each host side's run of its package's script
+    let mut host_runs: Vec<(usize, usize)> = Vec::new();
     for (ci, c) in crates.iter_mut().enumerate() {
         let mut nd = Vec::new();
         for (i, n) in &c.deps {
@@ -298,15 +305,28 @@ pub fn load(g: &Units, check_all_bins: bool, allow_c: bool) -> Result<Graph, Str
                 }
                 let build_deps = raw.get(*bu).map(|r| r.deps.clone()).unwrap_or_default();
                 script_of_run.insert(*i, build_scripts.len());
-                build_scripts.push(BuildScript { krate: ci, also: Vec::new(), src_path: p.clone(), edition: *ed, features: f.clone(), build_deps, links_deps: Vec::new(), kept: kept_script(&pkg[ci].0), profile: crate::resolve::ScriptProfile::RUN });
+                build_scripts.push(BuildScript { krate: ci, also: Vec::new(), src_path: p.clone(), edition: *ed, features: f.clone(), build_deps, links_deps: Vec::new(), kept: kept_script(&pkg[ci].0), profile: crate::resolve::ScriptProfile::RUN, host: false });
             }
         }
         c.deps = nd;
         if let Some(h) = &mut c.host {
+            host_runs.extend(h.deps.iter().filter(|(i, _)| run_build.get(*i).is_some_and(|r| r.is_some())).map(|(i, _)| (ci, *i)));
             h.deps = h.deps.iter().filter_map(|(i, n)| {
                 map.get(*i).filter(|&&ci| ci != usize::MAX).map(|&ci| (ci, n.clone()))
             }).collect();
         }
+    }
+    // a host side's run that is not the program side's (its own feature set, its own OUT_DIR, as
+    // cargo runs it): a script of its own, whose output goes to the macro world's copy; the same
+    // run as the program side's (one feature set) is that script's already
+    for (ci, run) in host_runs {
+        if script_of_run.contains_key(&run) {
+            continue;
+        }
+        let Some(Some((p, ed, f, bu))) = run_build.get(run) else { continue };
+        let build_deps = raw.get(*bu).map(|r| r.deps.clone()).unwrap_or_default();
+        script_of_run.insert(run, build_scripts.len());
+        build_scripts.push(BuildScript { krate: ci, also: Vec::new(), src_path: p.clone(), edition: *ed, features: f.clone(), build_deps, links_deps: Vec::new(), kept: kept_script(&pkg[ci].0), profile: crate::resolve::ScriptProfile::RUN, host: true });
     }
     // a script run's dependencies on other runs: those of its package's dependencies with `links`
     for (&run, &s) in &script_of_run {
@@ -667,7 +687,9 @@ pub fn run_build_scripts(sess: &std::sync::Arc<crate::Session>, g: &mut Graph, t
         // archives, `links =`) is cargo's too with `--allow-c`: its archives join the run's
         // native library. Without the flag it runs under Relax as before.
         let kept_native = builds && matches!(script_role(pname, bs), ScriptRole::Artefact);
-        if noop::script(bs, &g.raw) || !(kept_native || matches!(script_role(pname, bs), ScriptRole::ToRemove)) {
+        // (a host side's run of a native package: cargo's build runs and reports it with the
+        // program side's, `apply_native_scripts`)
+        if bs.host || noop::script(bs, &g.raw) || !(kept_native || matches!(script_role(pname, bs), ScriptRole::ToRemove)) {
             return None;
         }
         crate::native::native_reason(g, bs).map(|reason| (i, reason))
@@ -823,8 +845,10 @@ pub fn run_build_scripts(sess: &std::sync::Arc<crate::Session>, g: &mut Graph, t
             if !job.is_finished() {
                 let (mut cfgs, mut env, mut libs) = (gr.cfgs.clone(), gr.env.clone(), gr.link_libs.clone());
                 let mut ok = true;
-                for (krates, r, out_dir, confined) in &results {
-                    let Ok(stdout) = r else { ok = false; break };
+                for (krates, r, out_dir, confined, host) in &results {
+                    // a host side's run: its output is the macro world's own (apply_host_output),
+                    // which these tables do not carry; the world starts once the scripts are done
+                    let (Ok(stdout), false) = (r, *host) else { ok = false; break };
                     for &k in krates {
                         if script_output_into(&mut cfgs, &mut env, &mut libs, &gr.pkg, k, stdout, out_dir.clone(), check_only, *confined).is_err() { ok = false; }
                     }
@@ -989,10 +1013,10 @@ fn relax_scripts(sess: &std::sync::Arc<crate::Session>, g: &Graph, target_dir: &
             Ok(stdout) => Ok(script_metadata(stdout)),
             Err(_) => Err("its build script failed".to_string()),
         });
-        results.lock().unwrap().push((g.build_scripts[i].krates(), r, out_dir, confined));
+        results.lock().unwrap().push((g.build_scripts[i].krates(), r, out_dir, confined, g.build_scripts[i].host));
     };
     let unbuilt = |bs: &BuildScript| {
-        let build_dir = root.take(&format!("{}-unbuilt", g.crates[bs.krate].name));
+        let build_dir = root.take(&format!("{}-unbuilt", script_name(g, bs)));
         let out_dir = format!("{}/out", build_dir);
         let _ = std::fs::create_dir_all(&out_dir);
         out_dir
@@ -1004,12 +1028,12 @@ fn relax_scripts(sess: &std::sync::Arc<crate::Session>, g: &Graph, target_dir: &
         }
         if let Some(&(_, why)) = check_skipped.iter().find(|s| s.0 == bs.krate) {
             let out_dir = unbuilt(bs);
-            results.lock().unwrap().push((bs.krates(), Ok(String::new()), out_dir, false));
+            results.lock().unwrap().push((bs.krates(), Ok(String::new()), out_dir, false, bs.host));
             meta.lock().unwrap().insert(i, Err(why.to_string()));
             continue;
         }
         let (dir, pname, ver) = &g.pkg[bs.krate];
-        let name = &g.crates[bs.krate].name;
+        let name = &script_name(g, bs);
         let role = if noop::script(bs, &g.raw) {
             if sess.runtime.profile {
                 eprintln!("relax build-script: {} skipped (no effect under RELAX_BUILD_SCRIPT)", pname);
@@ -1095,7 +1119,7 @@ fn relax_scripts(sess: &std::sync::Arc<crate::Session>, g: &Graph, target_dir: &
                     // reads aws-lc-sys's DEP_ metadata) leaves its crate unconfigured, said once, not fatal
                     Err((e, true)) => {
                         eprintln!("relax check: {} (its crate is checked without the script's cfgs)", e.lines().next().unwrap_or(""));
-                        results.lock().unwrap().push((bs.krates(), Ok(String::new()), unbuilt(bs), false));
+                        results.lock().unwrap().push((bs.krates(), Ok(String::new()), unbuilt(bs), false, bs.host));
                         meta.lock().unwrap().insert(i, Err(C_DEP_NOT_RUN.to_string()));
                         continue;
                     }
@@ -1106,7 +1130,7 @@ fn relax_scripts(sess: &std::sync::Arc<crate::Session>, g: &Graph, target_dir: &
                     }
                 }
                 let (dir, pname, ver) = g.pkg[bs.krate].clone();
-                let name = g.crates[bs.krate].name.clone();
+                let name = script_name(g, bs);
                 let raw = &g.raw;
                 let done = &done;
                 let receipt = receipts[i];
@@ -1177,13 +1201,41 @@ fn script_metadata(stdout: &str) -> Vec<(String, String)> {
 
 /// The scripts' `cargo:` lines into the graph: cfgs, link libraries, env (OUT_DIR included).
 fn apply_script_results(g: &mut Graph, results: Vec<ScriptRun>, check_only: bool) -> Result<(), String> {
-    for (krates, r, out_dir, confined) in results {
+    for (krates, r, out_dir, confined, host) in results {
         // a script that failed fails a check too, as under `cargo check` (the scripts a check did
         // not run for C answered empty: relax_scripts)
         let stdout = r?;
-        for k in krates { apply_script_output(g, k, &stdout, out_dir.clone(), check_only, confined)?; }
+        for k in krates {
+            if host {
+                apply_host_output(g, k, &stdout, out_dir.clone(), check_only, confined)?;
+            } else {
+                apply_script_output(g, k, &stdout, out_dir.clone(), check_only, confined)?;
+            }
+        }
     }
     Ok(())
+}
+
+/// A host side's run (`BuildScript::host`): its cfgs and environment, its OUT_DIR among them, are
+/// the macro world's copy of crate `k`'s (`HostUnit::build_outputs`, as `apply_native_scripts`
+/// gives cargo's host runs), and the program's crate keeps its own.
+fn apply_host_output(g: &mut Graph, k: usize, stdout: &str, out_dir: String, check_only: bool, confined: bool) -> Result<(), String> {
+    let (dir, name, ver) = &g.pkg[k];
+    let mut env = pkg_env(dir, name, ver);
+    env.push(("CARGO_CRATE_NAME".to_string(), g.crates[k].name.clone()));
+    let (mut cfgs, mut env) = (vec![Vec::new()], vec![env]);
+    script_output_into(&mut cfgs, &mut env, &mut g.link_libs, std::slice::from_ref(&g.pkg[k]), 0, stdout, out_dir, check_only, confined)?;
+    if let (Some(h), Some(cfgs), Some(env)) = (g.crates[k].host.as_mut(), cfgs.pop(), env.pop()) {
+        h.build_outputs = Some((cfgs, env));
+    }
+    Ok(())
+}
+
+/// The name a script's build folders take: its crate's, a host side's run's with `-host` (its
+/// folders never meet the program side's, whatever their keys).
+fn script_name(g: &Graph, bs: &BuildScript) -> String {
+    let name = &g.crates[bs.krate].name;
+    if bs.host { format!("{name}-host") } else { name.clone() }
 }
 
 /// One crate's share of a script's output (`stdout`, its OUT_DIR; `confined`: the script ran
@@ -1193,8 +1245,8 @@ fn apply_script_output(g: &mut Graph, k: usize, stdout: &str, out_dir: String, c
 }
 
 /// A script's share of the graph: (its crates, its stdout or why it failed, its OUT_DIR, whether
-/// it ran confined).
-type ScriptRun = (Vec<usize>, Result<String, String>, String, bool);
+/// it ran confined, whether it is a host side's run: `BuildScript::host`).
+type ScriptRun = (Vec<usize>, Result<String, String>, String, bool, bool);
 
 /// apply_script_output into these tables (the graph's, or copies of them).
 #[allow(clippy::too_many_arguments)]
