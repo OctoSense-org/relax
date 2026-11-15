@@ -706,10 +706,11 @@ impl<'a> Lcx<'a> {
     }
 
     /// An opaque provided enum (provided.rs; rustc's layout, no tag known to Relax) cannot be
-    /// matched on or built by variant in JIT-compiled code.
+    /// matched on or built by variant in JIT-compiled code, unless its layout and field bytes
+    /// agree with rustc's (`provided_rustc_layout`).
     fn check_provided_opaque_enum(&mut self, t: TyId, what: &str) {
         if let TyKind::Adt(d, a, _) = self.kind(t) {
-            if a.is_empty() && self.u.provided_types.contains_key(&d) {
+            if a.is_empty() && self.u.provided_types.contains_key(&d) && !self.u.provided_rustc_layout(d) {
                 let ts = crate::typeck::ty_to_string(false, &self.u.prog, &self.u.tcx, t);
                 let krate = self.u.prog.def(d).krate;
                 self.provided_err(krate, format!("`{}` is {} by variant in JIT-compiled code, but it lives in a provided crate (built by rustc into the loader) and its layout is not C-shaped: use a method of the crate (e.g. a fieldless kind)", ts, what));

@@ -5336,7 +5336,7 @@ impl Unit {
         }
         let (provided_types, opaque_layouts, check_layouts, handles) = provided_type_tables(&prog, &provided);
         let provided_types = crate::zone_alloc::kept_clone(&provided_types);
-        let provided_offsets = crate::zone_alloc::kept_with(|| handles.iter().map(|(d, _, _, offs)| (*d, *offs)).collect::<HashMap<DefId, &'static [u64]>>());
+        let provided_offsets = crate::zone_alloc::kept_with(|| handles.iter().filter(|(d, ..)| prog.def(*d).kind == DefKind::Struct).map(|(d, _, _, offs, _)| (*d, *offs)).collect::<HashMap<DefId, &'static [u64]>>());
         let slots = crate::zone_alloc::kept_with(|| {
             if no_codegen {
                 Box::new(relax_backend::rir::SlotTable::new(NC_STRIDE as u64, NC_STRIDE as u64, 8, TIER_REC as u64))
@@ -5621,11 +5621,12 @@ impl Unit {
         if !check_layouts.is_empty() {
             let probe = crate::layout::Layouts::new();
             let mut demoted = Vec::new();
-            for (d, size, align, path, offs) in check_layouts {
+            for (d, size, align, path, offs, enum_layout) in check_layouts {
                 let t = u.tcx.tys.intern(TyKind::Adt(d, crate::types::List::EMPTY, crate::types::RegionArgsId::EMPTY));
                 let l = probe.of(&crate::layout::LayoutCx::new(&u.prog), &u.tcx, t);
                 let offs_ok = offs.is_empty() || (offs.len() == l.fields.len() && offs.iter().zip(&l.fields).all(|(a, b)| *a == *b as u64));
-                if l.size != size || l.align != align || !offs_ok {
+                let enum_ok = enum_layout.is_empty() || crate::provided::enum_layout_matches(&u.prog, &u.tcx, d, l, enum_layout);
+                if l.size != size || l.align != align || !offs_ok || !enum_ok {
                     eprintln!("relax: provided type {}: rustc lays it out in {} bytes (align {}, field offsets {:?}), Relax in {} (align {}, {:?}): opaque, used through the crate's fns only", path, size, align, offs, l.size, l.align, l.fields);
                     demoted.push((d, size, align));
                 }
@@ -5673,7 +5674,7 @@ impl Unit {
     }
 
 
-    /// The handle structs among `handles` whose rustc layout is Relax's own
+    /// The handle structs and primitive-repr enums among `handles` whose rustc layout is Relax's own
     /// (provided::same_layout_handles) get it: no longer opaque, JIT-compiled code builds them and
     /// reads their fields (`provided_rustc_layout`); rustc's drop and trait ops stay theirs.
     fn rustc_laid_handles(&mut self, handles: &HandleLayouts) {
@@ -31794,15 +31795,15 @@ fn ctfe_error_message(m: &str) -> String {
     if builtin.iter().any(|b| m.starts_with(b)) { m.replacen("the len is", "the length is", 1) } else { format!("evaluation panicked: {}", m) }
 }
 
-/// The handle structs of `provided_type_tables` with their rustc layout: (def, size, align, field
-/// offsets), checked by provided::same_layout_handles.
-type HandleLayouts = Vec<(DefId, u32, u32, &'static [u64])>;
+/// The handle structs and enums of `provided_type_tables` with their rustc layout: (def, size,
+/// align, struct field offsets, enum layout table), checked by provided::same_layout_handles.
+type HandleLayouts = Vec<(DefId, u32, u32, &'static [u64], &'static [u64])>;
 
 /// Per provided crate present in `provided`: its opaque (handle) types with rustc's drop, their
-/// layouts, the plain types whose layout must be checked against rustc's, and the handle structs
+/// layouts, the plain types whose layout must be checked against rustc's, and the handle types
 /// whose rustc layout may be Relax's own (provided::same_layout_handles).
 fn provided_type_tables(prog: &Program, provided: &[(u32, crate::provided::ProvidedCrate)])
-    -> (HashMap<DefId, u64>, HashMap<DefId, (u32, u32)>, Vec<(DefId, u32, u32, String, &'static [u64])>, HandleLayouts)
+    -> (HashMap<DefId, u64>, HashMap<DefId, (u32, u32)>, Vec<(DefId, u32, u32, String, &'static [u64], &'static [u64])>, HandleLayouts)
 {
     let mut provided_types = HashMap::new();
     let mut opaque_layouts = HashMap::new();
@@ -31812,14 +31813,14 @@ fn provided_type_tables(prog: &Program, provided: &[(u32, crate::provided::Provi
         for (i, def) in prog.defs.iter().enumerate() {
             if def.krate == *k && matches!(def.kind, DefKind::Struct | DefKind::Enum) {
                 let path = crate::provided::norm(&prog.def_path(DefId(i as u32)));
-                if let Some((size, align, drop, offs, _enum_layout)) = pc.types.get(path.as_str()) {
+                if let Some((size, align, drop, offs, enum_layout)) = pc.types.get(path.as_str()) {
                     provided_types.insert(DefId(i as u32), drop.map_or(0, |f| f as usize as u64));
                     opaque_layouts.insert(DefId(i as u32), (*size as u32, *align as u32));
-                    if !offs.is_empty() {
-                        handles.push((DefId(i as u32), *size as u32, *align as u32, *offs));
+                    if !offs.is_empty() || !enum_layout.is_empty() {
+                        handles.push((DefId(i as u32), *size as u32, *align as u32, *offs, *enum_layout));
                     }
-                } else if let Some((size, align, offs, _enum_layout)) = pc.layouts.get(path.as_str()) {
-                    check_layouts.push((DefId(i as u32), *size as u32, *align as u32, path, *offs));
+                } else if let Some((size, align, offs, enum_layout)) = pc.layouts.get(path.as_str()) {
+                    check_layouts.push((DefId(i as u32), *size as u32, *align as u32, path, *offs, *enum_layout));
                 }
             }
         }
@@ -31843,16 +31844,17 @@ impl Unit {
         crate::zone_alloc::kept_with(|| {
             self.provided.extend(added.iter().cloned());
             self.provided_types.extend(types);
-            self.provided_offsets.extend(handles.iter().map(|(d, _, _, offs)| (*d, *offs)));
+            self.provided_offsets.extend(handles.iter().filter(|(d, ..)| self.prog.def(*d).kind == DefKind::Struct).map(|(d, _, _, offs, _)| (*d, *offs)));
         });
         self.lay.opaque.extend(opaque);
         // rustc's layout must be Relax's for a plain type, else it is used through the crate's fns only
         let probe = crate::layout::Layouts::new();
-        for (d, size, align, path, offs) in check_layouts {
+        for (d, size, align, path, offs, enum_layout) in check_layouts {
             let t = self.tcx.tys.intern(TyKind::Adt(d, crate::types::List::EMPTY, crate::types::RegionArgsId::EMPTY));
             let l = probe.of(&crate::layout::LayoutCx::new(&self.prog), &self.tcx, t);
             let offs_ok = offs.is_empty() || (offs.len() == l.fields.len() && offs.iter().zip(&l.fields).all(|(a, b)| *a == *b as u64));
-            if l.size != size || l.align != align || !offs_ok {
+            let enum_ok = enum_layout.is_empty() || crate::provided::enum_layout_matches(&self.prog, &self.tcx, d, l, enum_layout);
+            if l.size != size || l.align != align || !offs_ok || !enum_ok {
                 eprintln!("relax: provided type {}: rustc lays it out in {} bytes (align {}, field offsets {:?}), Relax in {} (align {}, {:?}): opaque, used through the crate's fns only", path, size, align, offs, l.size, l.align, l.fields);
                 self.lay.opaque.insert(d, (size, align));
                 crate::zone_alloc::kept_with(|| self.provided_types.insert(d, 0));

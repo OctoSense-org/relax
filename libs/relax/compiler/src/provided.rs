@@ -59,8 +59,8 @@ pub struct ProvidedCrate {
     /// order: same_layout_handles, primitive-repr enum layout table)
     pub types: HashMap<String, (u64, u64, Option<DropFn>, &'static [u64], &'static [u64])>,
     /// plain types by def path: rustc's (size, align, field offsets, enum layout table).
-    /// Size, align and struct field offsets are checked against Relax's at unit creation;
-    /// the enum layout table is carried for a future agreement check.
+    /// Size, align, struct field offsets and enum layout are checked against Relax's at
+    /// unit creation and when a run adds provided crates.
     pub layouts: HashMap<String, (u64, u64, &'static [u64], &'static [u64])>,
     /// statics marked `#[relax_api(per_side)]`, by def path: JIT code keeps its own instance
     /// (lower.rs check_provided_static)
@@ -1191,15 +1191,59 @@ fn std_vec_same(prog: &Program, tcx: &Tcx, probe: &crate::layout::Layouts) -> Op
     Some(StdSame { vec: vd, option })
 }
 
-/// The `#[relax_api(handle)]` structs among `cands` (def, rustc's size, align, field offsets)
-/// whose layout is the same on both sides: Relax lays the struct out at rustc's size, align and
-/// field offsets, and every field is the same bytes (`trusted` data, a `String` / `Vec<T>` of
+/// Parses Entry::enum_layout, rejecting bad widths, missing words and trailing data.
+fn parse_enum_layout(table: &[u64]) -> Option<(u8, Vec<(u64, &[u64])>)> {
+    let (&bytes, table) = table.split_first()?;
+    let bytes = match bytes { 1 | 2 | 4 | 8 => bytes as u8, _ => return None };
+    let (&count, mut table) = table.split_first()?;
+    let count = usize::try_from(count).ok()?;
+    if count > table.len() / 2 { return None; }
+    let mut variants = Vec::with_capacity(count);
+    for _ in 0..count {
+        let (&tag, rest) = table.split_first()?;
+        let (&fields, rest) = rest.split_first()?;
+        let fields = usize::try_from(fields).ok()?;
+        variants.push((tag, rest.get(..fields)?));
+        table = &rest[fields..];
+    }
+    table.is_empty().then_some((bytes, variants))
+}
+
+/// The primitive-repr enum's tag and every variant's fields agree with rustc's export.
+/// Size and alignment are checked by the caller, for plain types and handles alike.
+pub(crate) fn enum_layout_matches(prog: &Program, tcx: &Tcx, d: DefId, l: &crate::layout::Layout, table: &[u64]) -> bool {
+    let Some(adt) = tcx.adts.get(&d).filter(|a| a.is_enum) else { return false };
+    let Some(repr) = adt.repr_int else { return false };
+    let Some((bytes, variants)) = parse_enum_layout(table) else { return false };
+    let (repr_bytes, signed) = tcx.tys.int_info(repr);
+    if repr_bytes != bytes as u32
+        || l.tag != Some((0, relax_backend::rir::Mem::Int(bytes, signed)))
+        || l.enc != crate::layout::TagEnc::Direct
+        || variants.len() != adt.variants.len()
+        || variants.len() != l.variant_fields.len()
+    {
+        return false;
+    }
+    // rustc's export sign-extends signed tags to u64; stores use the repr-width bits.
+    let mask = u64::MAX >> (64 - bytes as u32 * 8);
+    variants.iter().enumerate().all(|(vi, (tag, offsets))| {
+        adt.tag_for_variant(tcx, prog, vi as u32).is_some_and(|t| (t.val as u64 & mask) == (*tag & mask))
+            && offsets.len() == adt.variants[vi].fields.len()
+            && offsets.len() == l.variant_fields[vi].len()
+            && offsets.iter().zip(&l.variant_fields[vi]).all(|(a, b)| *a == *b as u64)
+    })
+}
+
+/// The `#[relax_api(handle)]` structs and primitive-repr enums among `cands` (def, rustc's size,
+/// align, struct field offsets, enum layout table) whose layout is the same on both sides:
+/// Relax agrees with rustc's size, align, field offsets and enum tags, and every field of every
+/// variant is the same bytes (`trusted` data, a `String` / `Vec<T>` of
 /// such data when the two stds agree (std_vec_same), or another such handle). JIT-compiled code
 /// may build these and read their fields; their drop and the trait ops the attribute lists stay
 /// rustc's. `opaque`: the types Relax uses through the crate's fns only (the candidates among
 /// them until they pass, a demoted plain type); `known`: handles found the same before (a crate
 /// an app domain added after the boot).
-pub fn same_layout_handles(prog: &Program, tcx: &Tcx, cands: &[(DefId, u32, u32, &'static [u64])], opaque: &dyn Fn(DefId) -> bool, known: &dyn Fn(DefId) -> bool) -> Vec<DefId> {
+pub fn same_layout_handles(prog: &Program, tcx: &Tcx, cands: &[(DefId, u32, u32, &[u64], &[u64])], opaque: &dyn Fn(DefId) -> bool, known: &dyn Fn(DefId) -> bool) -> Vec<DefId> {
     if cands.is_empty() {
         return Vec::new();
     }
@@ -1208,17 +1252,17 @@ pub fn same_layout_handles(prog: &Program, tcx: &Tcx, cands: &[(DefId, u32, u32,
     let std_same = std_vec_same(prog, tcx, &probe);
     let mut ok: std::collections::HashSet<DefId> = cands
         .iter()
-        .filter(|(d, size, align, offs)| {
+        .filter(|(d, size, align, offs, enum_layout)| {
             let adt = match tcx.adts.get(d) {
-                Some(a) if !a.is_enum && !a.is_union && a.variants.len() == 1 => a,
+                Some(a) if !a.is_union && (a.is_enum || a.variants.len() == 1) => a,
                 _ => return false,
             };
             let t = tcx.tys.intern(TyKind::Adt(*d, crate::types::List::EMPTY, crate::types::RegionArgsId::EMPTY));
             let l = probe.of(&lcx, tcx, t);
+            if l.size != *size || l.align != *align { return false; }
+            if adt.is_enum { return enum_layout_matches(prog, tcx, *d, l, enum_layout); }
             !offs.is_empty()
                 && offs.len() == adt.variants[0].fields.len()
-                && l.size == *size
-                && l.align == *align
                 && offs.len() == l.fields.len()
                 && offs.iter().zip(&l.fields).all(|(a, b)| *a == *b as u64)
         })
@@ -1230,8 +1274,9 @@ pub fn same_layout_handles(prog: &Program, tcx: &Tcx, cands: &[(DefId, u32, u32,
         let same = |krate: u32, t: TyId| same_bytes(prog, tcx, krate, t, &|d| now.contains(&d) || known(d), std_same, opaque, 0);
         ok.retain(|d| {
             let krate = prog.def(*d).krate;
-            let n = tcx.adts.get(d).map_or(0, |a| a.variants[0].fields.len());
-            (0..n).all(|fi| same(krate, tcx.field_ty(prog, crate::tcx::TypingEnv::fully_monomorphized(prog), *d, 0, fi as u32, &[])))
+            tcx.adts.get(d).is_some_and(|a| a.variants.iter().enumerate().all(|(vi, v)| {
+                (0..v.fields.len()).all(|fi| same(krate, tcx.field_ty(prog, crate::tcx::TypingEnv::fully_monomorphized(prog), *d, vi as u32, fi as u32, &[])))
+            }))
         });
         if ok.len() == now.len() {
             break;
@@ -1286,6 +1331,111 @@ fn same_bytes(prog: &Program, tcx: &Tcx, krate: u32, t: TyId, ok: &dyn Fn(DefId)
         }
     }
     trusted_in(prog, tcx, krate, t, 0, true)
+}
+
+#[cfg(test)]
+mod layout_tests {
+    use super::*;
+
+    #[test]
+    fn same_layout_handles_checks_enum_agreement() {
+        isolated_test!(same_layout_handles_checks_enum_agreement);
+        std::env::set_var("RELAX_STD", concat!(env!("CARGO_MANIFEST_DIR"), "/std"));
+        struct Temp(std::path::PathBuf);
+        impl Drop for Temp { fn drop(&mut self) { std::fs::remove_dir_all(&self.0).unwrap(); } }
+        let dir = Temp(std::env::temp_dir().join(format!("relax-enum-agreement-{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos())));
+        std::fs::create_dir_all(&dir.0).unwrap();
+        let path = dir.0.join("lib.rs");
+        std::fs::write(&path, r#"
+#[repr(u8)]
+pub enum Data { Empty = 3, Byte(u8), Named { byte: u8, wide: u64 } = 16, Last }
+pub enum RustData { Empty, Value(u8, u64) }
+#[repr(u8)]
+pub enum Recursive { Empty, Values(Vec<S>) }
+pub struct S { pub value: Recursive }
+#[repr(C, u8)]
+pub enum CData { Empty, Byte(u8), Wide(u64) }
+#[repr(i8)]
+pub enum Signed { Negative(u8) = -3, Empty }
+"#).unwrap();
+        let (prog, _, krate) = crate::load_with_std(&std::sync::Arc::new(crate::Session::default()), path.to_str().unwrap(), "enum_agreement", false).unwrap();
+        drop(dir);
+        let mut tcx = Tcx::new();
+        tcx.collect(&prog);
+        assert!(tcx.errors.is_empty(), "enum agreement source must collect: {:?}", tcx.errors);
+        let def = |name: &str| prog.defs.iter().enumerate().find_map(|(i, d)| {
+            let id = DefId(i as u32);
+            (d.krate == krate && prog.name(id) == name).then_some(id)
+        }).unwrap();
+        let probe = crate::layout::Layouts::new();
+        let lcx = crate::layout::LayoutCx::new(&prog);
+        let layout = |d| probe.of(&lcx, &tcx, tcx.tys.intern(TyKind::Adt(d, crate::types::List::EMPTY, crate::types::RegionArgsId::EMPTY)));
+        // This is the export rustc supplies when its layout agrees; mutations below isolate
+        // each check without hard-coding the target's sizes or payload alignment.
+        let export = |d| {
+            let l = layout(d);
+            let Some((_, relax_backend::rir::Mem::Int(bytes, _))) = l.tag else { panic!("fixture enum must have an integer tag") };
+            let adt = tcx.adts.get(&d).unwrap();
+            let mut table = vec![bytes as u64, adt.variants.len() as u64];
+            for (vi, offsets) in l.variant_fields.iter().enumerate() {
+                table.push(adt.tag_for_variant(&tcx, &prog, vi as u32).unwrap().signed_value() as u64);
+                table.push(offsets.len() as u64);
+                table.extend(offsets.iter().map(|off| *off as u64));
+            }
+            table
+        };
+        let check = |cands: &[(DefId, u32, u32, &[u64], &[u64])]| {
+            same_layout_handles(&prog, &tcx, cands, &|d| cands.iter().any(|c| c.0 == d), &|_| false)
+        };
+        let check_enum = |d, table: &[u64]| {
+            let l = layout(d);
+            check(&[(d, l.size, l.align, &[], table)])
+        };
+        let data = def("Data");
+        let table = export(data);
+        assert_eq!(check_enum(data, &table), [data], "a repr(u8) data enum with matching layout must pass");
+        let mut wrong = table.clone();
+        wrong[6] += 1; // Byte's sole field, after Empty's tag/count and Byte's tag/count.
+        assert!(check_enum(data, &wrong).is_empty(), "a wrong field offset must keep the enum opaque");
+        wrong = table.clone();
+        wrong[2] += 1;
+        assert!(check_enum(data, &wrong).is_empty(), "a wrong tag value must keep the enum opaque");
+        wrong = table.clone();
+        wrong[0] = 2;
+        assert!(check_enum(data, &wrong).is_empty(), "a wrong tag width must keep the enum opaque");
+        for (bad, why) in [
+            (&table[..1], "missing variant count"),
+            (&table[..table.len() - 1], "truncated variant"),
+            (&[3, 0][..], "invalid tag width"),
+            (&[1, u64::MAX][..], "oversized variant count"),
+            (&[1, 1, 0, u64::MAX][..], "oversized field count"),
+        ] {
+            assert!(parse_enum_layout(bad).is_none(), "malformed table must fail parsing: {why}");
+            assert!(check_enum(data, bad).is_empty(), "malformed table must keep the enum opaque: {why}");
+        }
+        wrong = table.clone();
+        wrong.push(0);
+        assert!(parse_enum_layout(&wrong).is_none(), "trailing data must fail parsing");
+        assert!(check_enum(data, &wrong).is_empty(), "trailing data must keep the enum opaque");
+        let rust = def("RustData");
+        assert!(check_enum(rust, &export(rust)).is_empty(), "repr(Rust) must stay opaque even with its own layout table");
+        for name in ["CData", "Signed"] {
+            let d = def(name);
+            assert_eq!(check_enum(d, &export(d)), [d], "primitive repr must accept matching C payload alignment and signed tags: {name}");
+        }
+
+        let (recursive, s) = (def("Recursive"), def("S"));
+        let (el, sl) = (layout(recursive), layout(s));
+        let et = export(recursive);
+        let mut offsets: Vec<u64> = sl.fields.iter().map(|off| *off as u64).collect();
+        let mut expected = vec![recursive, s];
+        expected.sort_by_key(|d| d.0);
+        assert_eq!(check(&[(recursive, el.size, el.align, &[], &et), (s, sl.size, sl.align, &offsets, &[])]), expected,
+            "an enum holding Vec<S> and S holding that enum must pass together");
+        offsets[0] += 1;
+        assert!(check(&[(recursive, el.size, el.align, &[], &et), (s, sl.size, sl.align, &offsets, &[])]).is_empty(),
+            "a wrong S offset must reject both S and the enum whose later variant holds Vec<S>");
+    }
 }
 
 /// What this module holds of a run, as a fresh process has it (`run_end`). Nothing of the run is left that could see it.
