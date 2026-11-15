@@ -5450,7 +5450,8 @@ fn summary_inner(why: &str) {
             verbose!("relax: ahead until the first present: {} bodies checked, workers cpu {:.0} ms; {} lowered ({} taken by builds), cpu {:.0} ms", p(0), p(4) as f64 / 1e6, p(5), p(6), p(7) as f64 / 1e6);
         }
         if s.ctfe_data + s.ctfe_code > 0 && !silent() {
-            verbose!("relax: constant initializers: {} evaluated to data, {} compiled and run; evaluation cpu {:.1} ms", s.ctfe_data, s.ctfe_code, s.ctfe_ns as f64 / 1e6);
+            let (twins, bytes, ms) = crate::ctfe_twin::census(u);
+            verbose!("relax: constant initializers: {} evaluated to data, {} compiled and run ({} constant-evaluation twins, {:.1} KB, built in {:.1} ms); evaluation cpu {:.1} ms", s.ctfe_data, s.ctfe_code, twins, bytes as f64 / 1024.0, ms, s.ctfe_ns as f64 / 1e6);
         }
         // RELAX_MAIN_COMPILE_LOG=<path>: the main thread's compiles, ms since main started: app
         // execution vs compile on the critical path. Per line: start end slot how typeck_ahead
@@ -5602,6 +5603,7 @@ fn summary_inner(why: &str) {
                     FnKey::Glue(g, _) => (if *g == jit::GLUE_DROP { "drop" } else { "glue" }, "-".to_string(), true),
                     FnKey::Sandbox(_) => ("sandbox", "-".to_string(), false),
                     FnKey::Plain(_) => ("plain", "-".to_string(), false),
+                    FnKey::Ctfe(_) => ("ctfe", "-".to_string(), false),
                 };
                 let src = jit::src_size(u, idx as u32);
                 let (origin, tr, selfty) = report_origin(u, &f.key);
@@ -5721,7 +5723,7 @@ fn report_origin(u: &jit::Unit, key: &FnKey) -> (&'static str, String, String) {
             };
             (origin, tr, selfty)
         }
-        FnKey::Shim(_) | FnKey::Glue(..) | FnKey::Sandbox(_) | FnKey::Plain(_) => ("-", String::new(), String::new()),
+        FnKey::Shim(_) | FnKey::Glue(..) | FnKey::Sandbox(_) | FnKey::Plain(_) | FnKey::Ctfe(_) => ("-", String::new(), String::new()),
     }
 }
 

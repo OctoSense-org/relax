@@ -2163,8 +2163,9 @@ impl Linker {
 /// Whether slot `id`'s code stays out of the startup image: a sandboxed twin's identity and
 /// symbols resolve only once its unit's sandbox is set up (a run-time module's load, a macro
 /// world's confinement), after the image's prelink; it links lazily from its entry.
+/// Constant-evaluation twins are compiler-only code and have no disk entry at all.
 fn not_in_image(u: &Unit, id: u32) -> bool {
-    matches!(u.fns[id as usize].key, crate::jit::FnKey::Sandbox(_))
+    matches!(u.fns[id as usize].key, crate::jit::FnKey::Sandbox(_) | crate::jit::FnKey::Ctfe(_))
 }
 
 /// Whether slot `id` is a startup image slot whose identity is still encoded.

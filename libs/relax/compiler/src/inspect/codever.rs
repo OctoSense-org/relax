@@ -25,7 +25,7 @@ fn fn_lines_depth(u: &Unit, id: u32, depth: u32) -> Option<(u32, u32, u32)> {
     }
     match &u.fns[id as usize].key {
         FnKey::Inst(d, _) => def_lines(u, *d),
-        FnKey::Plain(b) | FnKey::Sandbox(b) => fn_lines_depth(u, *b, depth + 1),
+        FnKey::Plain(b) | FnKey::Sandbox(b) | FnKey::Ctfe(b) => fn_lines_depth(u, *b, depth + 1),
         FnKey::Closure(_, _, p) => fn_lines_depth(u, *p, depth + 1),
         _ => None,
     }
@@ -477,7 +477,7 @@ impl Resolver {
             if same_file(u, f, pf) && pl >= lo && pl <= hi {
                 return None;
             }
-        } else if !matches!(u.fns[id as usize].key, FnKey::Inst(..) | FnKey::Closure(..) | FnKey::Plain(..)) {
+        } else if !matches!(u.fns[id as usize].key, FnKey::Inst(..) | FnKey::Closure(..) | FnKey::Plain(..) | FnKey::Ctfe(..)) {
             // glue and shims: generated code, positions of what they forward to
             return None;
         }
@@ -699,7 +699,7 @@ pub(crate) fn own_slot(u: &Unit, id: u32, targets: &[u32]) -> bool {
             return true;
         }
         s = match u.fns[s as usize].key {
-            FnKey::Plain(b) | FnKey::Sandbox(b) => b,
+            FnKey::Plain(b) | FnKey::Sandbox(b) | FnKey::Ctfe(b) => b,
             FnKey::Closure(_, _, p) => p,
             _ => return false,
         };
@@ -791,6 +791,7 @@ pub fn cmd_versions(req: &Req, out: &mut Out) {
                 FnKey::Closure(..) => "closure".to_string(),
                 FnKey::Plain(b) => format!("SPEC-V unverified twin of slot {}", b),
                 FnKey::Sandbox(b) => format!("sandboxed twin of slot {}", b),
+                FnKey::Ctfe(b) => format!("ctfe twin of slot {}", b),
                 FnKey::Glue(..) => "glue".to_string(),
                 FnKey::Shim(..) => "shim".to_string(),
             };

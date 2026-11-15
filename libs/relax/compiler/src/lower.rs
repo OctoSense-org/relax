@@ -217,6 +217,11 @@ pub struct Lcx<'a> {
     /// SPEC-V: this body is unverified code: calls that pass `&mut` beside another pointer-holding
     /// argument go to the callee's unverified-mode twin
     plain_calls: bool,
+    /// the body of a constant-evaluation twin (ctfe_twin.rs): its source loops count rustc's
+    /// const-eval steps (`back_edge`)
+    ctfe_steps: bool,
+    /// lowering a promoted call of such a body (`promoted_call`): its steps are its own already
+    in_promoted: bool,
     /// Relaxed Rust D3: the run-time disjoint-index checks of this body's clean verdict ((earlier,
     /// later) index expressions), and the slot each earlier index is kept in (by its span).
     d3: Option<std::sync::Arc<Vec<(relax_types::mir::Span, relax_types::mir::Span)>>>,
@@ -445,6 +450,7 @@ pub fn fn_name(u: &Unit, key: &FnKey) -> String {
         FnKey::Sandbox(b) if *b == u32::MAX => "sandbox:invalid-fn-pointer".to_string(),
         FnKey::Sandbox(b) => format!("sandbox:{}", u.fns[*b as usize].name),
         FnKey::Plain(b) => format!("{} [unverified]", u.fns[*b as usize].name),
+        FnKey::Ctfe(b) => format!("ctfe:{}", u.fns[*b as usize].name),
     }
 }
 
@@ -500,6 +506,7 @@ impl<'a> Lcx<'a> {
         // SPEC-V: unverified code (no clean verdict yet, or an unverified-mode twin) sends its
         // aliasing-prone calls to unverified-mode twins
         let plain_calls = crate::jit::PLAIN_LOWER.with(|c| c.get()).is_some_and(|p| p.0 == cur_fn) || ((cur_fn as usize) < u.fns.len() && !u.verdict_clean(cur_fn));
+        let ctfe_steps = crate::ctfe_twin::lowering(cur_fn);
         let mut f = Func::new(name, b.file);
         let entry = f.block();
         let n = b.locals.len();
@@ -517,6 +524,8 @@ impl<'a> Lcx<'a> {
             u,
             cur_fn,
             plain_calls,
+            ctfe_steps,
+            in_promoted: false,
             d3,
             d3_slots: HashMap::default(),
             b,
@@ -3588,7 +3597,6 @@ impl<'a> Lcx<'a> {
         let exit = self.f.block();
         self.goto(head);
         self.switch(head);
-        self.const_fuel_tick();
         let self_t = self.u.tcx.tys.intern(TyKind::Ref(true, iter_t, crate::types::RegionId::ERASED));
         let r = self.emit_instance(instance, vec![(Val::L(vec![iter_addr]), self_t)], opt_t);
         let rpl = self.val_to_place(r);
@@ -3617,7 +3625,7 @@ impl<'a> Lcx<'a> {
         self.loops.pop();
         self.pop_scope();
         self.stmt_temps.truncate(iter_temp);
-        self.goto(head);
+        self.back_edge(head);
         self.switch(exit);
         // the iterator itself is dropped after the loop
         self.drop_at(iter_addr, iter_t);
@@ -6315,8 +6323,20 @@ impl<'a> Lcx<'a> {
                 }
             }
         }
+        // a const or static initializer's borrowed call of a const fn is rustc's promoted
+        // (promote_consts.rs validate_call: promote_all_fn), a constant evaluated on its own: in
+        // a constant-evaluation twin its steps are counted apart from the initializer's
+        let own = shared && self.ctfe_steps && self.const_init && !self.in_promoted && self.promoted_call(x);
+        if own {
+            self.in_promoted = true;
+            self.promoted_steps(true);
+        }
         let (blk0, at0) = (self.cur, self.f.blocks[self.cur as usize].insts.len());
         let v = self.lower_expr(x);
+        if own {
+            self.promoted_steps(false);
+            self.in_promoted = false;
+        }
         let l = self.layout(xt);
         if l.size == 0 {
             // a promoted zero-sized value has no storage: its address is its alignment (as
@@ -7433,7 +7453,6 @@ impl<'a> Lcx<'a> {
                 let exit = self.f.block();
                 self.goto(head);
                 self.switch(head);
-                self.const_fuel_tick();
                 let outer = self.scopes.len();
                 self.push_scope();
                 let mark = self.stmt_temps.len();
@@ -7451,7 +7470,7 @@ impl<'a> Lcx<'a> {
                 self.lower_block_tscope(*b);
                 self.loops.pop();
                 self.drop_scopes_from(outer);
-                self.goto(head);
+                self.back_edge(head);
                 self.switch(fail);
                 self.drop_scopes_from(outer);
                 self.goto(exit);
@@ -7469,13 +7488,12 @@ impl<'a> Lcx<'a> {
                 let res = self.result_place(t);
                 self.goto(head);
                 self.switch(head);
-                self.const_fuel_tick();
 
                 let l = label.map(|x| self.lifetime_sym(x));
                 self.loops.push(LoopCx { label: l, brk: exit, cont: head, result: Some((res.clone(), t)), scope_depth: self.scopes.len(), temps_depth: self.stmt_temps.len() });
                 self.lower_block_tscope(*b);
                 self.loops.pop();
-                self.goto(head);
+                self.back_edge(head);
                 self.switch(exit);
                 if self.is_never(t) {
                     self.term(Term::Unreachable);
@@ -7515,7 +7533,7 @@ impl<'a> Lcx<'a> {
                     let td = self.loops[i].temps_depth;
                     self.exit_scopes(depth, td);
                     let c = self.loops[i].cont;
-                    self.goto(c);
+                    self.back_edge(c);
                 }
                 self.dead();
                 self.unit()
@@ -10698,12 +10716,34 @@ impl<'a> Lcx<'a> {
         self.read_place(&res, t)
     }
 
-    /// A loop head in a checked program counts one iteration of the constant being evaluated
-    /// (see Options::const_fuel).
-    fn const_fuel_tick(&mut self) {
-        if !self.u.prog.session.options.const_fuel { return; }
-        let rt = self.u.syms.intern(crate::syms::SymKind::Rt("const_fuel"), const_fuel_addr());
+    /// The jump back to source loop `head` (the end of its body, a `continue`). In a constant-
+    /// evaluation twin's body it counts one step first, as rustc's CtfeLimit counts the block a
+    /// successor of which dominates it (rustc_mir_transform/src/ctfe_limit.rs:16-40). Only source
+    /// loops count: loops the lowering makes for what MIR does in one statement (an array repeat)
+    /// are not steps.
+    /// Is `x` a call of a const fn on promotable operands: in a const or static initializer,
+    /// rustc's promoted (promote_consts.rs validate_call: promote_all_fn)? (Not its check that the
+    /// call's block is no dead code: what this decides is only whose steps the call's are.)
+    fn promoted_call(&mut self, x: ExprId) -> bool {
+        let ast = self.ast();
+        let ExprKind::Call(f, args) = ast.expr(strip_paren(ast, x)).kind.clone() else { return false };
+        let TyKind::FnDef(d, ..) = self.kind(self.body_ty(f)) else { return false };
+        self.u.tcx.fn_sig(&self.u.prog, d).is_some_and(|s| s.is_const) && ast.list(args).iter().all(|a| self.promotable(*a))
+    }
+
+    /// The begin or end of a promoted's steps in a constant-evaluation twin (`promoted_call`).
+    fn promoted_steps(&mut self, begin: bool) {
+        let (name, addr) = if begin { ("const_fuel_promoted", const_fuel_promoted_addr()) } else { ("const_fuel_promoted_end", const_fuel_promoted_end_addr()) };
+        let rt = self.u.syms.intern(crate::syms::SymKind::Rt(name), addr);
         self.emit(Inst::Call(Callee::Host(rt), Vec::new(), Vec::new()));
+    }
+
+    fn back_edge(&mut self, head: u32) {
+        if self.ctfe_steps {
+            let rt = self.u.syms.intern(crate::syms::SymKind::Rt("const_fuel"), const_fuel_addr());
+            self.emit(Inst::Call(Callee::Host(rt), Vec::new(), Vec::new()));
+        }
+        self.goto(head);
     }
 
     fn lower_for(&mut self, p: PatId, it: ExprId, b: BlockId, label: Option<Ident>) {
@@ -16135,9 +16175,24 @@ fn rt_cannot_unwind() {
 }
 
 rt_fn! {
-/// A loop head of a checked program (Options::const_fuel).
+/// One step of the constant being evaluated (a constant-evaluation twin's call or loop back
+/// edge: ctfe_twin.rs).
 fn rt_const_fuel() {
     crate::jit::const_fuel_tick();
+}
+}
+
+rt_fn! {
+/// A promoted's steps begin inside a constant's evaluation (`promoted_call`).
+fn rt_const_fuel_promoted() {
+    crate::jit::const_fuel_promoted(true);
+}
+}
+
+rt_fn! {
+/// They end: the constant's steps go on.
+fn rt_const_fuel_promoted_end() {
+    crate::jit::const_fuel_promoted(false);
 }
 }
 
@@ -16151,6 +16206,16 @@ fn rt_sb_alloca(size: u64, align: u64) -> u64 {
 
 pub fn const_fuel_addr() -> u64 {
     let f: rt_fn_ty!(fn()) = rt_const_fuel;
+    f as usize as u64
+}
+
+fn const_fuel_promoted_addr() -> u64 {
+    let f: rt_fn_ty!(fn()) = rt_const_fuel_promoted;
+    f as usize as u64
+}
+
+fn const_fuel_promoted_end_addr() -> u64 {
+    let f: rt_fn_ty!(fn()) = rt_const_fuel_promoted_end;
     f as usize as u64
 }
 

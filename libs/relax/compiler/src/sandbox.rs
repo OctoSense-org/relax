@@ -2395,6 +2395,7 @@ unsafe fn call_target(up: *mut Unit, id: u32, sandboxed: &HashSet<u32>, allow: A
             Ok(twin(up, id))
         }
         FnKey::Sandbox(_) => Ok(id),
+        FnKey::Ctfe(_) => Err("a constant-evaluation twin cannot be part of a sandboxed module".into()),
         _ => Ok(twin(up, id)),
     }
 }
@@ -2516,7 +2517,7 @@ pub unsafe fn twin_rir(up: *mut Unit, id: u32, base: u32) -> Result<Func, String
     // Keep base-slot dependency/type-check metadata used by reload invalidation.
     // Metering itself never uses that tier-dependent optimized body.
     jit::build_rir(up, base)?;
-    let mut f = jit::sandbox_source_rir(up, base)?;
+    let mut f = jit::source_rir(up, base)?;
     transform(up, &mut f, id)?;
     // RELAX_SANDBOX_DUMP=<substring>: the transformed RIR of matching twins
     if let Some(pat) = sandbox_dump() {

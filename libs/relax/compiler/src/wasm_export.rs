@@ -60,7 +60,7 @@ pub(crate) fn note_samples(u: &Unit, it: impl Iterator<Item = (u32, u64)>) {
     let m = g.get_or_insert_with(HashMap::new);
     for (mut id, w) in it {
         // a twin's time is its slot's (the export ships the slot)
-        while let crate::jit::FnKey::Plain(p) | crate::jit::FnKey::Sandbox(p) = u.fns[id as usize].key {
+        while let crate::jit::FnKey::Plain(p) | crate::jit::FnKey::Sandbox(p) | crate::jit::FnKey::Ctfe(p) = u.fns[id as usize].key {
             if p == id || p as usize >= u.fns.len() { break; }
             id = p;
         }
@@ -684,7 +684,8 @@ pub fn finish(u: &Unit) {
     // Const/static initializer slots run only in the compiler. Their declared
     // images are linked as data; their evaluator bodies are not runtime roots.
     // Use the coverage collector's same distinction, keeping every union root.
-    funcs.retain(|id, _| (*id as usize) < u.fns.len() && (forced.contains(id)
+    funcs.retain(|id, _| (*id as usize) < u.fns.len()
+        && !matches!(u.fns[*id as usize].key, crate::jit::FnKey::Ctfe(_)) && (forced.contains(id)
         || u.fns[*id as usize].compiled && crate::coverage::runtime_function(u, *id)));
     if std::env::var_os("RELAX_WASM_EXPORT_STATS").is_some() {
         eprintln!("wasm export: {} slots captured, {} installed runtime/union roots (of {} slots in the unit); {} compiler initializer roots excluded", n_cap, funcs.len(), u.fns.len(), n_initializers);
@@ -1208,7 +1209,7 @@ fn emit(u: &Unit, funcs: &BTreeMap<u32, Func>, kept: &std::collections::BTreeSet
             let krate = loop {
                 match &u.fns[owner as usize].key {
                     crate::jit::FnKey::Inst(d, _) => break u.prog.syms.str(u.prog.crates[u.prog.def(*d).krate as usize].name),
-                    crate::jit::FnKey::Closure(_, _, p) | crate::jit::FnKey::Plain(p) | crate::jit::FnKey::Sandbox(p)
+                    crate::jit::FnKey::Closure(_, _, p) | crate::jit::FnKey::Plain(p) | crate::jit::FnKey::Sandbox(p) | crate::jit::FnKey::Ctfe(p)
                         if *p != owner && (*p as usize) < u.fns.len() => owner = *p,
                     _ => break "<generated>",
                 }
@@ -1637,7 +1638,7 @@ fn slot_crate(u: &Unit, id: u32) -> Option<&crate::program::CrateInfo> {
     loop {
         match &u.fns[owner as usize].key {
             crate::jit::FnKey::Inst(d, _) => return u.prog.crates.get(u.prog.def(*d).krate as usize),
-            crate::jit::FnKey::Closure(_, _, p) | crate::jit::FnKey::Plain(p) | crate::jit::FnKey::Sandbox(p)
+            crate::jit::FnKey::Closure(_, _, p) | crate::jit::FnKey::Plain(p) | crate::jit::FnKey::Sandbox(p) | crate::jit::FnKey::Ctfe(p)
                 if *p != owner && (*p as usize) < u.fns.len() => owner = *p,
             _ => return None,
         }
@@ -1671,7 +1672,7 @@ fn generic_instance(u: &Unit, id: u32) -> bool {
     loop {
         match &u.fns[owner as usize].key {
             crate::jit::FnKey::Inst(_, args) => return !args.is_empty(),
-            crate::jit::FnKey::Closure(_, _, p) | crate::jit::FnKey::Plain(p) | crate::jit::FnKey::Sandbox(p)
+            crate::jit::FnKey::Closure(_, _, p) | crate::jit::FnKey::Plain(p) | crate::jit::FnKey::Sandbox(p) | crate::jit::FnKey::Ctfe(p)
                 if *p != owner && (*p as usize) < u.fns.len() => owner = *p,
             _ => return true,
         }

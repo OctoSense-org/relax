@@ -56,6 +56,8 @@ pub enum LongRunning {
 pub struct Checked {
     pub outcome: Outcome,
     pub long_running: Vec<LongRunning>,
+    /// the steps its evaluation counted (nested constants and promoteds count their own)
+    pub steps: u64,
 }
 
 /// const_eval/machine.rs LINT_TERMINATOR_LIMIT: the step at which `long_running_const_eval` fires.
@@ -274,7 +276,7 @@ pub fn check_item(prog: &Program, tcx: &Tcx, def: DefId) -> Checked {
     // (an evaluation the interpreter could not finish has no verdict: its reports would be the
     // native run's to make)
     let long_running = if matches!(outcome, Outcome::Unsupported(_)) { Vec::new() } else { std::mem::take(&mut it.long_running) };
-    Checked { outcome, long_running }
+    Checked { outcome, long_running, steps: it.steps }
 }
 
 /// valtrees.rs const_to_valtree_inner over the value of non-generic constant `def`.

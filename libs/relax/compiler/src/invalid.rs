@@ -96,7 +96,7 @@ pub(crate) fn group_of(u: &Unit, id: u32, gen: u32, inlined: &[u32]) -> Option<G
     } else {
         match f.key {
             // (a twin's base may be no slot: the sandbox's invalid-fn-pointer stand-in)
-            FnKey::Plain(b) | FnKey::Sandbox(b) if (b as usize) < u.fns.len() => source_gen(u, id).max(source_gen(u, b)),
+            FnKey::Plain(b) | FnKey::Sandbox(b) | FnKey::Ctfe(b) if (b as usize) < u.fns.len() => source_gen(u, id).max(source_gen(u, b)),
             _ => source_gen(u, id),
         }
     };
@@ -106,7 +106,7 @@ pub(crate) fn group_of(u: &Unit, id: u32, gen: u32, inlined: &[u32]) -> Option<G
     let g = own.max(inlined_gen(u, id, inlined));
     if crate::modules::any_module_crate() {
         let base = match f.key {
-            FnKey::Sandbox(b) => b,
+            FnKey::Sandbox(b) | FnKey::Ctfe(b) => b,
             FnKey::Inst(..) | FnKey::Closure(..) => id,
             _ => u32::MAX,
         };
@@ -141,7 +141,7 @@ pub(crate) fn inlined_gen(u: &Unit, id: u32, inlined: &[u32]) -> u32 {
         return 0;
     }
     let base = match u.fns[id as usize].key {
-        FnKey::Plain(b) | FnKey::Sandbox(b) if (b as usize) < u.fns.len() => Some(b),
+        FnKey::Plain(b) | FnKey::Sandbox(b) | FnKey::Ctfe(b) if (b as usize) < u.fns.len() => Some(b),
         _ => None,
     };
     let mut stack: Vec<u32> = inlined.iter().copied().chain(u.body_deps.get(&id).into_iter().flatten().copied()).chain(base.into_iter().flat_map(|b| u.body_deps.get(&b).into_iter().flatten().copied())).collect();

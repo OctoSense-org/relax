@@ -45,6 +45,10 @@ pub enum FnKey {
     /// instead of the slot when it passes `&mut` next to another pointer-holding argument, so a
     /// call that breaks the borrow rules never runs code compiled under the `noalias` assumption.
     Plain(u32),
+    /// the constant-evaluation twin of a slot (ctfe_twin.rs): its body as lowered, counting
+    /// rustc's const-eval steps, its calls going to twins; baseline only, never cached, inlined
+    /// or tiered up
+    Ctfe(u32),
 }
 
 /// Round 23: the erased nightly Instance identity survives slot interning and caching.
@@ -1783,6 +1787,7 @@ fn boot_arm(u: &Unit, id: u32) -> usize {
             Some(k) => *k,
             None => return crate::boot_stats::REST,
         },
+        FnKey::Ctfe(base) => return boot_arm(u, *base),
         _ => return crate::boot_stats::REST,
     };
     crate::boot_stats::arm_of(krate, || {
@@ -2396,6 +2401,7 @@ pub(crate) fn precompile_from(roots: &[u32], exhaustive: bool) -> u64 {
                     continue;
                 }
                 let f = &u.fns[id as usize];
+                if matches!(f.key, FnKey::Ctfe(_)) { continue; }
                 if !revisit && !f.compiled {
                     frontier.push(id);
                     continue;
@@ -3666,38 +3672,79 @@ pub(crate) fn rt_boundary_panic(entry: &str, p: Box<dyn std::any::Any + Send>) -
     raise_with("panic", message, 0, 0, fp, ret, std::ptr::null())
 }
 
-/// Loop iterations one constant's evaluation may run before rustc's `long_running_const_eval`
-/// error (rustc_const_eval machine.rs LINT_TERMINATOR_LIMIT counts MIR terminators: each
-/// iteration has at least one, so a loop within the interpreter's limit is within this one).
-const LINT_TERMINATOR_LIMIT: u64 = 2_000_000;
 pub(crate) const LONG_RUNNING_CONST_EVAL: &str = "constant evaluation is taking a long time";
 /// The panic kind of that stop (a distinct kind, not a message).
 pub(crate) const LONG_RUNNING_KIND: &str = "long_running_const_eval";
 
 thread_local! {
-    /// (iterations so far, the iteration at which the evaluation stops) of the constant being
-    /// evaluated on this thread; each evaluation counts separately (rustc: one interpreter each)
-    static CONST_FUEL: std::cell::Cell<(u64, u64)> = const { std::cell::Cell::new((0, LINT_TERMINATOR_LIMIT)) };
+    /// (steps so far, the step at which the evaluation stops, the constant's own steps while a
+    /// promoted of it counts: const_fuel_promoted) of the constant being evaluated on this thread;
+    /// each evaluation counts separately (rustc: one interpreter each)
+    static CONST_FUEL: std::cell::Cell<(u64, u64, u64)> = const { std::cell::Cell::new((0, u64::MAX, 0)) };
 }
 
-/// A loop head of the checked program ran: while a constant is evaluated, the evaluation ends
-/// as `long_running_const_eval` after the limit (none when the lint is allowed at the constant).
+/// The step count of a constant evaluation's native code (ctfe_twin.rs) and of rustc's
+/// interpreter (relax_types const_eval interp) for each constant both evaluated (tests).
+/// (its path, the interpreter's steps, the native steps)
+#[cfg(test)]
+pub(crate) static CONST_STEPS: relax_session::sync::Mutex<Vec<(String, u64, u64)>> = relax_session::sync::Mutex::new(Vec::new());
+#[cfg(test)]
+thread_local! {
+    /// the interpreter's steps for the constant whose native run follows (check_initializer)
+    static INTERP_STEPS: std::cell::Cell<Option<(DefId, u64)>> = const { std::cell::Cell::new(None) };
+}
+
+/// (tests) constant `d`'s native run ended: its steps beside the interpreter's (CONST_STEPS)
+#[cfg(test)]
+fn note_native_steps(prog: &Program, d: DefId) {
+    if let Some((_, interp)) = INTERP_STEPS.with(|c| c.get()).filter(|x| x.0 == d) {
+        INTERP_STEPS.with(|c| c.set(None));
+        let native = CONST_FUEL.with(|c| c.get().0);
+        CONST_STEPS.lock().unwrap_or_else(|e| e.into_inner()).push((prog.def_path(d), interp, native));
+    }
+}
+
+/// One step of the constant being evaluated on this thread (a constant-evaluation twin's call or
+/// loop back edge, ctfe_twin.rs): at the limit, the evaluation ends as `long_running_const_eval`.
 pub(crate) fn const_fuel_tick() {
     if !in_const_eval() { return; }
-    let Ok((n, limit)) = CONST_FUEL.try_with(|c| { let (n, l) = c.get(); c.set((n + 1, l)); (n + 1, l) }) else { return };
+    let Ok((n, limit)) = CONST_FUEL.try_with(|c| { let (n, l, o) = c.get(); c.set((n + 1, l, o)); (n + 1, l) }) else { return };
     if n == limit {
         leave_thread(LONG_RUNNING_KIND, LONG_RUNNING_CONST_EVAL.to_string());
     }
 }
 
+/// A promoted's evaluation inside the constant's begins (`begin`) or ends (lower.rs
+/// promoted_call): rustc evaluates a promoted as a constant of its own, with its own steps and
+/// the same limit; the constant's steps go on after it.
+pub(crate) fn const_fuel_promoted(begin: bool) {
+    if !in_const_eval() { return; }
+    let _ = CONST_FUEL.try_with(|c| { let (n, l, o) = c.get(); c.set(if begin { (0, l, n) } else { (o, l, 0) }); });
+}
+
+/// The check-mode interpreter's verdict on a constant (Unit::check_initializer).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum InterpVerdict {
+    /// it reported an error or the deny-level lint: no value, as rustc stops there
+    Rejected,
+    /// it evaluated the constant: the native run has no step limit
+    Accepted,
+    /// none (no check, a generic constant, outside its subset): the native step limit decides
+    None,
+}
+
 /// One evaluation's own counter: the enclosing evaluation's is saved and comes back.
-struct ConstEvalScope { saved_fuel: (u64, u64), saved_coverage: Option<(*mut u64, u64)> }
+struct ConstEvalScope { saved_fuel: (u64, u64, u64), saved_coverage: Option<(*mut u64, u64)> }
 
 impl ConstEvalScope {
-    fn enter(prog: &Program, d: DefId) -> ConstEvalScope {
+    /// `limited`: the step limit applies at a deny level of the lint. Not when the check-mode
+    /// interpreter evaluated the constant: its count is rustc's, the native one only follows it.
+    fn enter(prog: &Program, d: DefId, limited: bool) -> ConstEvalScope {
+        use relax_types::const_eval::interp::{LINT_TERMINATOR_LIMIT, TINY_LINT_TERMINATOR_LIMIT};
         let level = relax_types::lint::level(prog, d, &relax_types::lint::LONG_RUNNING_CONST_EVAL);
-        let limit = if level >= relax_types::lint::Level::Deny { LINT_TERMINATOR_LIMIT } else { u64::MAX };
-        let saved_fuel = CONST_FUEL.try_with(|c| c.replace((0, limit))).unwrap_or((0, LINT_TERMINATOR_LIMIT));
+        let at = if prog.session.options.tiny_const_eval_limit { TINY_LINT_TERMINATOR_LIMIT } else { LINT_TERMINATOR_LIMIT };
+        let limit = if limited && level >= relax_types::lint::Level::Deny { at } else { u64::MAX };
+        let saved_fuel = CONST_FUEL.try_with(|c| c.replace((0, limit, 0))).unwrap_or((0, u64::MAX, 0));
         let _ = CONST_EVAL_DEPTH.try_with(|g| g.set(g.get() + 1));
         let saved_coverage = crate::coverage::on().then(|| unsafe {
             let mask = (rt_tls_block() + TLS_COVERAGE_DISABLED as u64) as *mut u64;
@@ -7001,7 +7048,7 @@ impl Unit {
             }
             FnKey::Inst(_, args) => args.iter_mut().for_each(|t| *t = self.tcx.tys.erase_regions(*t)),
             FnKey::Glue(_, t) => *t = self.tcx.tys.erase_regions(*t),
-            FnKey::Closure(..) | FnKey::Sandbox(_) | FnKey::Plain(_) => {}
+            FnKey::Closure(..) | FnKey::Sandbox(_) | FnKey::Plain(_) | FnKey::Ctfe(_) => {}
         }
         key
     }
@@ -7142,7 +7189,7 @@ impl Unit {
             FnKey::Shim(_) | FnKey::Glue(..) => 0,
             FnKey::Sandbox(b) if *b == u32::MAX => 0,
             FnKey::Sandbox(b) => self.fns[*b as usize].file,
-            FnKey::Plain(b) => self.fns[*b as usize].file,
+            FnKey::Plain(b) | FnKey::Ctfe(b) => self.fns[*b as usize].file,
         }
     }
 
@@ -7165,7 +7212,7 @@ impl Unit {
         // Generated glue and sandbox entries are conservatively not local-linkage. A
         // definition's own entry/export markers are read only by single_ref (declared_entry):
         // most slots (the startup image's thousands) are never asked.
-        let entry_ref = matches!(key, FnKey::Shim(_) | FnKey::Glue(..) | FnKey::Sandbox(_) | FnKey::Plain(_)) && !matches!(key, FnKey::Glue(GLUE_UNNAMED, _));
+        let entry_ref = matches!(key, FnKey::Shim(_) | FnKey::Glue(..) | FnKey::Sandbox(_) | FnKey::Plain(_) | FnKey::Ctfe(_)) && !matches!(key, FnKey::Glue(GLUE_UNNAMED, _));
         // Copy explicitly: converting an existing String can keep its old allocation.
         // Clone also copies both Inst's and Shim's owned type arguments.
         let (key, name) = crate::zone_alloc::slots_with(|| (key.clone(), Box::<str>::from(name)));
@@ -7177,7 +7224,7 @@ impl Unit {
     fn slot_named(&self, id: u32, key: &FnKey) {
         if relax_codegen::exec_census::active() {
             let mut owner = key;
-            while let FnKey::Closure(_, _, parent) | FnKey::Sandbox(parent) | FnKey::Plain(parent) = owner {
+            while let FnKey::Closure(_, _, parent) | FnKey::Sandbox(parent) | FnKey::Plain(parent) | FnKey::Ctfe(parent) = owner {
                 if *parent as usize >= self.fns.len() { break; }
                 owner = &self.fns[*parent as usize].key;
             }
@@ -7202,6 +7249,7 @@ impl Unit {
     /// Slot `id` (named `key`, pushed) goes to the lowering-ahead helpers' queue. Not under
     /// fn_create: is_cold_def reads the signature (a query, which may wait).
     fn slot_ahead(&self, id: u32, key: &FnKey) {
+        if matches!(key, FnKey::Ctfe(_)) { return; }
         // after the first present only the slots the program's own builds make (their callees),
         // not a speculative or tier-up build's, and no cold callee (panics, formatting): what
         // the UI thread's next calls most likely meet
@@ -7833,6 +7881,8 @@ impl Unit {
                 cx.finish();
                 if let Some(err) = cx.errors.first() { return Err(err.clone()); }
                 cx.f.verify()?;
+                // its own evaluation (rustc: a promoted is a constant): its calls count steps
+                crate::ctfe_twin::steps(self, &mut cx.f);
                 let code = relax_codegen::native::compile(&self.prog.session.options, &cx.f, &self.env)?;
                 let entry = self.emit_or_redirect(&code.code, &code.relocs, "promoted initializer")?;
                 let entry = if crate::harness::live::enabled() && !self.aux {
@@ -7846,7 +7896,7 @@ impl Unit {
                 } else { entry };
                 let buf = self.rw_data(l.size.max(1) as u64, l.align.max(8) as u64);
                 let result = {
-                    let _scope = ConstEvalScope::enter(&self.prog, body.def);
+                    let _scope = ConstEvalScope::enter(&self.prog, body.def, true);
                     unsafe { call_jit(self as *mut Unit, entry, buf) }
                 };
                 if BUSY_PENDING.with(|b| b.replace(false)) {
@@ -8195,12 +8245,14 @@ impl Unit {
     }
 
     /// relax_types::const_eval::interp for a non-generic constant, static or anonymous constant of a
-    /// validated crate; false when it reported an error.
-    fn check_initializer(&mut self, d: DefId) -> bool {
+    /// validated crate: its verdict.
+    fn check_initializer(&mut self, d: DefId) -> InterpVerdict {
         use relax_types::const_eval::interp::{check_item, Outcome};
         let def = self.prog.def(d);
-        if !self.prog.crates[def.krate as usize].validate || !matches!(def.kind, DefKind::Const | DefKind::Static | DefKind::AnonConst) { return true; }
+        if !self.prog.crates[def.krate as usize].validate || !matches!(def.kind, DefKind::Const | DefKind::Static | DefKind::AnonConst) { return InterpVerdict::None; }
         let checked = match self.interp_ahead.remove(&d) { Some(o) => o, None => check_item(&self.prog, &self.tcx, d) };
+        #[cfg(test)]
+        if matches!(checked.outcome, Outcome::Ok) { INTERP_STEPS.with(|c| c.set(Some((d, checked.steps)))); }
         // its long_running_const_eval lint and progress warnings, in the order the evaluation met them
         for r in &checked.long_running {
             use relax_types::const_eval::interp::{LongRunning, LONG_RUNNING_MESSAGE};
@@ -8212,17 +8264,17 @@ impl Unit {
         }
         match checked.outcome {
             // the deny-level lint, reported above: no value, as rustc stops there
-            Outcome::LongRunning => false,
+            Outcome::LongRunning => InterpVerdict::Rejected,
             Outcome::Error(span, msg) => {
                 let e = if msg.starts_with('E') { self.prog.record_error(span.file, span.lo, "typeck", msg) } else { self.prog.record_uncoded_error(span.file, span.lo, "typeck", msg) };
                 self.errors.push(e);
-                false
+                InterpVerdict::Rejected
             }
             Outcome::Unsupported(why) => {
                 if interp_trace() { eprintln!("interp: {}: unsupported: {why}", self.prog.def_path(d)); }
-                true
+                InterpVerdict::None
             }
-            Outcome::Ok => true,
+            Outcome::Ok => InterpVerdict::Accepted,
         }
     }
 
@@ -8242,28 +8294,14 @@ impl Unit {
         }
         // `makepad check`: the check-mode interpreter first (rustc's CTFE undefined-behaviour,
         // mutable-global and final-value checks; diagnostics only). An evaluation it rejects is not
-        // run here, as rustc stops at the error.
+        // run here, as rustc stops at the error; one it accepted runs with no step limit.
         let t_interp = cpu_ns();
-        let checked = !(self.prog.session.options.const_fuel && args.is_empty()) || self.check_initializer(d);
+        let verdict = if self.prog.session.options.const_fuel && args.is_empty() { self.check_initializer(d) } else { InterpVerdict::None };
         INIT_NS[0].fetch_add(cpu_ns() - t_interp, Ordering::Relaxed);
-        if !checked { return None; }
+        if verdict == InterpVerdict::Rejected { return None; }
+        let limited = verdict == InterpVerdict::None;
         let _census_context = self.exec_context(false);
         let options = &self.prog.session.clone().options;
-        // Initializers outside the CTFE subset already have cached executable
-        // code. Trying CTFE first would type-check them on every warm launch.
-        // Verification mode still evaluates both implementations as before.
-        if !crate::ctfe::check_mode(options)
-            && self.cache.as_ref().is_some_and(|c| c.mode != crate::cache::Mode::Verify)
-            && crate::reload::edited_crates().is_empty()
-        {
-            let id = self.fn_id(FnKey::Inst(d, args.clone()));
-            let mut cache = self.cache.take();
-            let cached = cache.as_mut().is_some_and(|c| c.has(self, id));
-            self.cache = cache;
-            if cached {
-                return self.run_init_code(d, args, buf);
-            }
-        }
         // tables and other plain-data initializers: evaluated to bytes, no code (ctfe.rs)
         let t0 = cpu_ns();
         if crate::ctfe::check_mode(options) {
@@ -8275,22 +8313,23 @@ impl Unit {
                 self.stats.ctfe_ns += cpu_ns() - t0;
                 if ok {
                     self.stats.ctfe_data += 1;
-                    let id = self.fn_id(FnKey::Inst(d, args.clone()));
+                    let base = self.fn_id(FnKey::Inst(d, args.clone()));
+                    let id = crate::ctfe_twin::twin(self, base);
                     let entry = self.entry(id);
                     self.exec_note(id, crate::exec_profile::CALL);
                     self.exec_event(id, "call");
-                    let result = { let _scope = ConstEvalScope::enter(&self.prog, d); unsafe { call_jit(self as *mut Unit, entry, buf) } };
+                    let result = { let _scope = ConstEvalScope::enter(&self.prog, d, limited); unsafe { call_jit(self as *mut Unit, entry, buf) } };
                     match result {
                         Ok(_) if crate::ctfe::same_value(self, t, tmp, buf, 0) => return Some(buf),
                         Ok(_) => self.note_error(format!("CTFE MISMATCH in {}", self.prog.def_path(d))),
                         // Use the normal deferred-initialization retry and error path.
-                        Err(_) => return self.run_init_code(d, args, buf),
+                        Err(_) => return self.run_init_code(d, args, buf, limited),
                     }
                     return None;
                 }
                 // A failed check-mode evaluation already checked this initializer. Do not
                 // repeat the same evaluation before falling back to its executable body.
-                return self.run_init_code(d, args, buf);
+                return self.run_init_code(d, args, buf, limited);
             }
         }
         let ok = self.ctfe_eval_into(d, &args, buf);
@@ -8301,7 +8340,7 @@ impl Unit {
             return Some(buf);
         }
         let t1 = cpu_ns();
-        let r = self.run_init_code(d, args, buf);
+        let r = self.run_init_code(d, args, buf, limited);
         INIT_NS[2].fetch_add(cpu_ns() - t1, Ordering::Relaxed);
         r
     }
@@ -8327,20 +8366,29 @@ impl Unit {
         }
     }
 
-    fn run_init_code(&mut self, d: DefId, args: Vec<TyId>, buf: u64) -> Option<u64> {
+    /// Runs the initializer of const/static `d` as code (its constant-evaluation twin, ctfe_twin.rs)
+    /// into `buf`; `limited`: ConstEvalScope's.
+    fn run_init_code(&mut self, d: DefId, args: Vec<TyId>, buf: u64, limited: bool) -> Option<u64> {
         self.stats.ctfe_code += 1;
         cert_note_code();
         if crate::ctfe::trace_on() {
             eprintln!("ctfe: compiled {}", self.prog.def_path(d));
         }
-        let id = self.fn_id(FnKey::Inst(d, args));
+        let base = self.fn_id(FnKey::Inst(d, args));
+        let id = crate::ctfe_twin::twin(self, base);
         let mut r;
         loop {
             let entry = self.entry(id);
             self.exec_note(id, crate::exec_profile::CALL);
             self.exec_event(id, "call");
             compile_watch(Some((&format!("running initializer {}", self.prog.def_path(d)), 0)));
-            r = { let _scope = ConstEvalScope::enter(&self.prog, d); unsafe { call_jit(self as *mut Unit, entry, buf) } };
+            r = {
+                let _scope = ConstEvalScope::enter(&self.prog, d, limited);
+                let r = unsafe { call_jit(self as *mut Unit, entry, buf) };
+                #[cfg(test)]
+                note_native_steps(&self.prog, d);
+                r
+            };
             compile_watch(None);
             // a compile the code reached was cancelled (a nested request blocked by an earlier
             // one): no value and no error -- the request is cancelled here, in Rust frames
@@ -8373,8 +8421,9 @@ impl Unit {
                 None
             }
             Err(p) => {
-                // the deny-by-default lint, not an evaluation error: no code
-                let code = if p.kind == LONG_RUNNING_KIND { "" } else { "E0080: " };
+                // the deny-by-default lint, not an evaluation error: no code (an error of the
+                // program all the same, not one of Relax's)
+                let code = if p.kind == LONG_RUNNING_KIND { relax_front::diagnostics::UNCODED_PREFIX } else { "E0080: " };
                 let m = format!("{}: {}{} [in {}]", self.ctfe_error_location(d, id, &p), code, if p.kind == LONG_RUNNING_KIND { p.message.clone() } else { ctfe_error_message(&p.message) }, self.prog.def_path(d));
                 // rustc rejects a program whose constant or static cannot be evaluated (E0080);
                 // `makepad run` ends here instead of running on with a zeroed or null value
@@ -8880,7 +8929,7 @@ impl Unit {
     pub(crate) fn verdict_owner(&self, id: u32) -> Option<DefId> {
         match &self.fns[id as usize].key {
             FnKey::Inst(d, _) => Some(*d),
-            FnKey::Closure(_, _, parent) => self.verdict_owner(*parent),
+            FnKey::Closure(_, _, parent) | FnKey::Ctfe(parent) => self.verdict_owner(*parent),
             _ => None,
         }
     }
@@ -8931,7 +8980,7 @@ impl Unit {
                     None => pending,
                 }
             }
-            FnKey::Closure(_, _, parent) => self.verdict_state(*parent),
+            FnKey::Closure(_, _, parent) | FnKey::Ctfe(parent) => self.verdict_state(*parent),
             // the unverified-mode twin is never promoted: it exists to run under aliasing; its base's
             // rejection is its own (code that inlined the twin is built again without it)
             FnKey::Plain(b) => match self.verdict_state(*b) {
@@ -9061,6 +9110,7 @@ impl Unit {
     }
 
     pub(crate) fn o3_allowed(&self, id: u32) -> bool {
+        if matches!(self.fns[id as usize].key, FnKey::Ctfe(_)) { return false; }
         // (a forwarder's own body is an older version: it gets no code of its own)
         if self.forward_of(id).is_some() { return false; }
         if self.refresh_verified(id) { return true; }
@@ -10311,7 +10361,7 @@ unsafe fn compile_slot_locked(up: *mut Unit, id: u32, outer: bool) -> Compiled {
     let is_foreign = match &u.fns[id as usize].key {
         FnKey::Inst(d, _) => u.prog.def(*d).kind == DefKind::ForeignFn || crate::sandbox::is_wrapper_crate(u, u.prog.def(*d).krate),
         // twins (and wrappers) take the plain path: their code is made from other slots' RIR
-        FnKey::Sandbox(_) => true,
+        FnKey::Sandbox(_) | FnKey::Ctfe(_) => true,
         _ => false,
     };
     main_how(if outer && !is_foreign && pipelined() { 4 } else { 5 });
@@ -10454,7 +10504,8 @@ unsafe fn install_compiled(up: *mut Unit, id: u32, code: &[u8], map: Vec<(u32, u
     }
     // built while an earlier request's slot was open (it was left out): no cache record
     if record && TAINTED.with(|t| t.get()) { crate::cache::trace_lookup(&*up, id, "norecord:tainted"); }
-    let record = record && !TAINTED.with(|t| t.get());
+    let ctfe = matches!((&*up).fns[id as usize].key, FnKey::Ctfe(_));
+    let record = record && !ctfe && !TAINTED.with(|t| t.get());
     // a slot marked O2 (`#[relax(O2)]`, a closure of a hinted fn, a slot found hot) gets its O2
     // build from the O2 worker, whose code replaces its entry (record_o2). Its O1 code is still
     // recorded: that worker runs at the lowest priority and a run can end before it gets there,
@@ -10463,7 +10514,7 @@ unsafe fn install_compiled(up: *mut Unit, id: u32, code: &[u8], map: Vec<(u32, u
     let marked = marked_hot(&*up, id);
     // baseline code (built this run, or a TIER_BASE entry linked from the cache): it may keep
     // running (note_base)
-    let base = if record {
+    let base = if record || ctfe {
         (&*up).fns[id as usize].rir.as_ref().is_some_and(|r| r.baseline)
     } else {
         (&mut *up).cache.as_mut().is_some_and(|c| c.base_linked.remove(&id))
@@ -10502,7 +10553,7 @@ unsafe fn install_compiled(up: *mut Unit, id: u32, code: &[u8], map: Vec<(u32, u
             // warm launch links all of it ahead after its first present, not on a program thread
             // at its first call (a Play's ~30,000 lazy links in the click frame)
             let before_present = !FIRST_PRESENT.load(Ordering::Acquire);
-            if u.fns[id as usize].patch_gen == 0 && !u.fns[id as usize].compiled {
+            if !ctfe && u.fns[id as usize].patch_gen == 0 && !u.fns[id as usize].compiled {
                 crate::zone_alloc::kept_with(|| u.start_order.push(id));
                 // RELAX_PRESENT_FILES=1: the source file of every fn installed before the first
                 // present (what startup executes, per file)
@@ -10515,7 +10566,7 @@ unsafe fn install_compiled(up: *mut Unit, id: u32, code: &[u8], map: Vec<(u32, u
                     ORDER_PRESENT_LEN.store(u.start_order.len(), Ordering::Relaxed);
                 }
             }
-            let linked_from_cache = !record && !u.fns[id as usize].compiled && !u.fns[id as usize].o3.load(Ordering::Relaxed);
+            let linked_from_cache = !record && !ctfe && !u.fns[id as usize].compiled && !u.fns[id as usize].o3.load(Ordering::Relaxed);
             // fresh code of a marked slot gets its O2 build, and so does O1 code linked for one (an
             // earlier run ended before that build); linked baseline code gets it by running
             // (base_running), and an O2 entry's slot is queued already (o2_cached)
@@ -10826,11 +10877,16 @@ pub unsafe fn compile_fn(up: *mut Unit, id: u32) -> Result<(Vec<u8>, Vec<(u32, u
             };
         }
     }
-    // a sandboxed twin: its base slot's RIR, transformed (sandbox.rs)
+    // A transformed twin: sandboxed RIR, or the constant-evaluation lowering.
     let twin_func = match (&*up).fns[id as usize].key {
         FnKey::Sandbox(base) => {
             let f = crate::sandbox::twin_rir(up, id, base)?;
             // O3 must start from confined RIR, never from the base slot's host RIR.
+            (&mut *up).set_rir(id, f.clone());
+            Some(f)
+        },
+        FnKey::Ctfe(base) => {
+            let f = crate::ctfe_twin::twin_rir(up, id, base)?;
             (&mut *up).set_rir(id, f.clone());
             Some(f)
         },
@@ -10849,7 +10905,9 @@ pub unsafe fn compile_fn(up: *mut Unit, id: u32) -> Result<(Vec<u8>, Vec<(u32, u
     main_rec(|r| r.cpu[0] += t0 - tb);
     let rir = twin_func.as_ref().unwrap_or_else(|| u.fns[id as usize].rir.as_ref().unwrap());
     let cg = tier0_codegen_rir(options, rir, u.opt.fold, u.opt.layout);
-    crate::wasm_export::capture(u.wasm_export_id, id, &cg);
+    if !matches!(u.fns[id as usize].key, FnKey::Ctfe(_)) {
+        crate::wasm_export::capture(u.wasm_export_id, id, &cg);
+    }
     let cg = with_loop_counters(cg, loop_syms(u, id));
     let func = &cg;
     // without O3 these are the only compiles: allocate thoroughly
@@ -10898,6 +10956,7 @@ pub(crate) unsafe fn install_instrumented(up: *mut Unit, id: u32, gen: u32, base
     let runtime = &session.runtime;
     match (&*up).fns[id as usize].key.clone() {
         FnKey::Sandbox(_) => return Err("a sandboxed twin cannot be instrumented".into()),
+        FnKey::Ctfe(_) => return Err("a constant-evaluation twin cannot be instrumented".into()),
         FnKey::Inst(d, _) if (&*up).prog.def(d).kind == crate::program::DefKind::ForeignFn => return Err("a foreign fn has no body".into()),
         _ => {}
     }
@@ -11182,7 +11241,7 @@ pub fn src_size(u: &Unit, id: u32) -> u32 {
         }
         // (an unverified-mode twin is its base's body)
         FnKey::Plain(b) => return src_size(u, *b),
-        FnKey::Sandbox(_) => return u32::MAX,
+        FnKey::Sandbox(_) | FnKey::Ctfe(_) => return u32::MAX,
         FnKey::Closure(file, ce, _) => {
             let e = u.prog.files[*file as usize].ast.expr(crate::ast::ExprId(*ce));
             (*file, e.lo, e.hi)
@@ -11291,8 +11350,8 @@ fn callee_attrs(sb: &crate::sandbox::State, prog: &crate::program::Program, tcx:
         // The build holds it as unverified code (O3Assembled::unverified_in): a failed verdict of
         // the base builds it again. Never into verified code (which never calls twins).
         FnKey::Plain(b) if into_unverified => return callee_attrs(sb, prog, tcx, fns, core_crate, *b, inline_all, core_hint, true),
-        // sandbox twins are never inlined into anything (their callers are twins built from RIR)
-        FnKey::Sandbox(_) | FnKey::Plain(_) => return Err("not inlinable: twin"),
+        // Sandbox and constant-evaluation twins are never inlined into anything.
+        FnKey::Sandbox(_) | FnKey::Plain(_) | FnKey::Ctfe(_) => return Err("not inlinable: twin"),
     })
 }
 
@@ -11345,11 +11404,11 @@ pub(crate) fn inline_attrs(prog: &crate::program::Program, d: DefId) -> u8 {
 }
 
 /// The crate an O3 root is code of (rustc: the crate whose codegen units hold it): its fn's or,
-/// for a closure, its parent's. None for generated slots (glue, shims, twins).
+/// for a closure or constant-evaluation twin, its parent's. None for other generated slots.
 fn slot_crate(prog: &crate::program::Program, fns: &crate::conc::AppendVec<FnEntry>, id: u32) -> Option<u32> {
     match &fns[id as usize].key {
         FnKey::Inst(d, _) => Some(prog.def(*d).krate),
-        FnKey::Closure(_, _, parent) => slot_crate(prog, fns, *parent),
+        FnKey::Closure(_, _, parent) | FnKey::Ctfe(parent) => slot_crate(prog, fns, *parent),
         _ => None,
     }
 }
@@ -11416,6 +11475,7 @@ const INLINE_HINT_SRC_TOKS: u32 = 200;
 /// block: 2 = O2, 3 = O3, 4 = O3 always; 0 = none. Closures follow their enclosing fn; Relax core
 /// fns called by marked code, and slots found hot (o2_hot), are O2 (hot_hint).
 fn relax_level(u: &Unit, id: u32) -> u8 {
+    if matches!(u.fns[id as usize].key, FnKey::Ctfe(_)) { return 0; }
     let l = relax_mark(u, id);
     if l == 0 && u.fns[id as usize].hot_hint.load(Ordering::Relaxed) {
         return 2;
@@ -11484,6 +11544,9 @@ fn dump_ship() -> Option<&'static str> {
 /// The RIR a wasm export emits for slot `id`, built even if tracing never called
 /// it. Shipping uses normal O1; explicit block mode retains its captured tier.
 pub unsafe fn export_rir(up: *mut Unit, id: u32, optimized: bool) -> Result<relax_backend::rir::Func, String> {
+    if matches!((&*up).fns[id as usize].key, FnKey::Ctfe(_)) {
+        return Err("a constant-evaluation twin cannot be exported".into());
+    }
     // Shipping is an AOT consumer: even a cold, baseline-only trace body needs
     // normal O1 inlining, constant propagation and DCE before its edges are read.
     // Normal upgrades inline candidates too; it never specializes from trace hits.
@@ -11790,7 +11853,7 @@ fn o2_take_dropped(up: *mut Unit, id: u32) {
             owner::publish(|| unsafe {
                 let u = &*up;
                 let n = |x: u32| if (x as usize) < u.fns.len() { u.fns[x as usize].name.to_string() } else { String::new() };
-                let k = if (slot as usize) < u.fns.len() { match u.fns[slot as usize].key { FnKey::Inst(..) => "inst", FnKey::Closure(..) => "closure", FnKey::Plain(_) => "twin", FnKey::Glue(..) => "glue", _ => "other" } } else { "" };
+                let k = if (slot as usize) < u.fns.len() { match u.fns[slot as usize].key { FnKey::Inst(..) => "inst", FnKey::Closure(..) => "closure", FnKey::Plain(_) => "twin", FnKey::Ctfe(_) => "ctfe", FnKey::Glue(..) => "glue", _ => "other" } } else { "" };
                 (n(id), n(slot), k)
             })
         };
@@ -11824,7 +11887,7 @@ pub(crate) unsafe fn o2_cached(up: *mut Unit, id: u32) {
 /// of the O1 code their start runs until O3 replaces it (O3 code is not cached). On the owner thread.
 unsafe fn o2_hot(up: *mut Unit, id: u32) {
     let u = &*up;
-    if (id as usize) >= u.fns.len() || matches!(u.fns[id as usize].key, FnKey::Glue(..) | FnKey::Sandbox(_) | FnKey::Plain(_)) || u.cache.is_none() {
+    if (id as usize) >= u.fns.len() || matches!(u.fns[id as usize].key, FnKey::Glue(..) | FnKey::Sandbox(_) | FnKey::Plain(_) | FnKey::Ctfe(_)) || u.cache.is_none() {
         return;
     }
     u.fns[id as usize].hot_hint.store(true, Ordering::Relaxed);
@@ -11835,6 +11898,7 @@ unsafe fn o2_hot(up: *mut Unit, id: u32) {
 /// builds queued at their first calls (a game start queues a thousand of those; on a headset's
 /// starved worker a hot audio loop waited minutes behind them in baseline code).
 unsafe fn o2_enqueue_front(up: *mut Unit, id: u32) {
+    if matches!((&*up).fns[id as usize].key, FnKey::Ctfe(_)) { return; }
     {
         let mut seen = O2_SEEN.lock().unwrap_or_else(|e| e.into_inner());
         if !seen.get_or_insert_with(Default::default).insert((up as usize, id)) {
@@ -11879,6 +11943,7 @@ fn o2_offer_hottest() {
 
 /// Queues slot `id` (marked O2 or higher) for its O2 build on the O2 worker, once.
 unsafe fn o2_enqueue(up: *mut Unit, id: u32) {
+    if matches!((&*up).fns[id as usize].key, FnKey::Ctfe(_)) { return; }
     {
         let mut seen = O2_SEEN.lock().unwrap_or_else(|e| e.into_inner());
         if !seen.get_or_insert_with(Default::default).insert((up as usize, id)) {
@@ -11909,6 +11974,7 @@ unsafe fn note_base(up: *mut Unit, id: u32) {
 
 /// Baseline slot `id` keeps running (unit lock held): its O2 build.
 unsafe fn base_running(up: *mut Unit, id: u32) {
+    if matches!((&*up).fns[id as usize].key, FnKey::Ctfe(_)) { return; }
     if !(&*up).fns[id as usize].base_code.swap(false, Ordering::Relaxed) {
         return;
     }
@@ -12300,7 +12366,7 @@ unsafe fn release_base(up: *mut Unit) {
 /// True: queued now.
 unsafe fn o2_base(up: *mut Unit, id: u32) -> bool {
     let u = &*up;
-    if (id as usize) >= u.fns.len() || matches!(u.fns[id as usize].key, FnKey::Glue(..) | FnKey::Sandbox(_) | FnKey::Plain(_)) || u.cache.is_none() {
+    if (id as usize) >= u.fns.len() || matches!(u.fns[id as usize].key, FnKey::Glue(..) | FnKey::Sandbox(_) | FnKey::Plain(_) | FnKey::Ctfe(_)) || u.cache.is_none() {
         return false;
     }
     {
@@ -12332,7 +12398,7 @@ static O1V_STANDALONE: relax_session::sync::Mutex<Option<std::collections::HashS
 
 unsafe fn o1v_enqueue(up: *mut Unit, id: u32, inlined: bool) -> bool {
     let u = &*up;
-    if (id as usize) >= u.fns.len() || matches!(u.fns[id as usize].key, FnKey::Sandbox(_) | FnKey::Plain(_)) || u.cache.is_none() {
+    if (id as usize) >= u.fns.len() || matches!(u.fns[id as usize].key, FnKey::Sandbox(_) | FnKey::Plain(_) | FnKey::Ctfe(_)) || u.cache.is_none() {
         return false;
     }
     {
@@ -12408,7 +12474,7 @@ unsafe fn o1v_begin(up: *mut Unit, id: u32) -> Option<O2Work> {
         return dropped();
     }
     let f = &(&*up).fns[id as usize];
-    if f.build_err.is_some() || f.building || matches!(f.key, FnKey::Sandbox(_) | FnKey::Plain(_)) || f.o3.load(Ordering::Relaxed) {
+    if f.build_err.is_some() || f.building || matches!(f.key, FnKey::Sandbox(_) | FnKey::Plain(_) | FnKey::Ctfe(_)) || f.o3.load(Ordering::Relaxed) {
         return dropped();
     }
     // a lazy compile's back end for the slot is running: again later
@@ -12568,7 +12634,7 @@ unsafe fn o2_begin(up: *mut Unit, id: u32) -> Option<O2Work> {
     }
     let f = &(&*up).fns[id as usize];
     // O3 code installed: an O2 build after the present is still the slot's cache entry
-    if f.build_err.is_some() || matches!(f.key, FnKey::Sandbox(_) | FnKey::Plain(_)) || (snapshot && f.o3.load(Ordering::Relaxed)) || (&*up).forward_of(id).is_some() {
+    if f.build_err.is_some() || matches!(f.key, FnKey::Sandbox(_) | FnKey::Plain(_) | FnKey::Ctfe(_)) || (snapshot && f.o3.load(Ordering::Relaxed)) || (&*up).forward_of(id).is_some() {
         o2_drop(D_KEY, up, id);
         return None;
     }
@@ -12884,7 +12950,7 @@ fn open_here(id: u32) -> bool {
 /// earlier request lower on the owner's stack (this one was served inside its wait): this
 /// request is cancelled (owner::busy_if_nested), so the slot never gets an error stub that
 /// depends on that timing.
-unsafe fn begin_build(up: *mut Unit, id: u32) -> Result<(), String> {
+pub(crate) unsafe fn begin_build(up: *mut Unit, id: u32) -> Result<(), String> {
     let f = &mut (&mut *up).fns[id as usize];
     if f.building {
         // open in an earlier request lower on the owner's stack: this nested one is cancelled
@@ -13035,7 +13101,7 @@ impl Drop for CloseBuildsAbove {
     }
 }
 
-unsafe fn end_build(up: *mut Unit, id: u32) {
+pub(crate) unsafe fn end_build(up: *mut Unit, id: u32) {
     let at = BUILD_STACK.try_with(|s| s.borrow().iter().rposition(|x| *x == id)).ok().flatten();
     if let Some(i) = at {
         // builds opened above it that a caught panic left open: closed with it
@@ -13576,7 +13642,7 @@ fn lowering_wanted(f: &FnEntry) -> bool {
 }
 
 unsafe fn build_rir_unguarded(up: *mut Unit, id: u32, mode: RirMode) -> Result<(), String> {
-    let normal = mode == RirMode::Normal;
+    let normal = mode == RirMode::Normal && !matches!((&*up).fns[id as usize].key, FnKey::Ctfe(_));
     (&mut *up).check_before_lowering(id);
     // SPEC-V: no upgrade of a body without a clean verdict (its RIR stays baseline)
     if normal && !(&*up).refresh_verified(id) {
@@ -13622,6 +13688,11 @@ unsafe fn build_rir_unguarded(up: *mut Unit, id: u32, mode: RirMode) -> Result<(
         (&mut *up).set_rir(id, f);
         return Ok(());
     }
+    if let FnKey::Ctfe(base) = (&*up).fns[id as usize].key {
+        let f = crate::ctfe_twin::twin_rir(up, id, base)?;
+        (&mut *up).set_rir(id, f);
+        return Ok(());
+    }
     if lowered.is_none() && !fresh && !relower && (&*up).fns[id as usize].rir.is_some() {
         return Ok(());
     }
@@ -13658,7 +13729,7 @@ unsafe fn build_rir_body(up: *mut Unit, id: u32, lowered: Option<relax_backend::
     let (func, inlined) = optimize_rir(options, id, prep.0)?;
     let dt = cpu_ns() - t0;
     if owner::is_owner() && owner::serving().0 == owner::Class::Publish {
-        let k = match (&*up).fns[id as usize].key { FnKey::Shim(_) => 0, FnKey::Inst(..) => 1, FnKey::Closure(..) => 2, FnKey::Glue(..) => 3, FnKey::Sandbox(_) => 4, FnKey::Plain(_) => 5 };
+        let k = match (&*up).fns[id as usize].key { FnKey::Shim(_) => 0, FnKey::Inst(..) => 1, FnKey::Closure(..) => 2, FnKey::Glue(..) => 3, FnKey::Sandbox(_) => 4, FnKey::Plain(_) => 5, FnKey::Ctfe(_) => 6 };
         let i = (k * 2 + given as usize) * 3 + mode as usize;
         let mut m = PUB_OPT.lock().unwrap_or_else(|e| e.into_inner());
         let e = crate::zone_alloc::kept_with(|| m.get_or_insert_with(Default::default).entry((owner::serving_line(), BUILD_WHY.with(|w| w.get()) as usize * 100 + i)).or_insert((0, 0)) as *mut (u64, u64));
@@ -13697,7 +13768,7 @@ impl Drop for BuildWhy {
 
 /// The run summary's line for PUB_OPT.
 pub(crate) fn publish_opt_summary() -> String {
-    const KINDS: [&str; 6] = ["shim", "inst", "closure", "glue", "sandbox", "plain"];
+    const KINDS: [&str; 7] = ["shim", "inst", "closure", "glue", "sandbox", "plain", "ctfe"];
     const MODES: [&str; 3] = ["tier0", "baseline", "normal"];
     let mut rows: Vec<(u64, String)> = Vec::new();
     let m = PUB_OPT.lock().unwrap_or_else(|e| e.into_inner());
@@ -13931,7 +14002,7 @@ unsafe fn prepare_rir_from(up: *mut Unit, id: u32, defer: bool, lowered: Option<
                 // now (settle drops it once its closures are built): a closure without RIR checks
                 // the parent again in its own build, which a take fronts as any other front
                 FnKey::Closure(..) | FnKey::Shim(_) | FnKey::Glue(..) => true,
-                FnKey::Sandbox(_) | FnKey::Plain(_) => continue,
+                FnKey::Sandbox(_) | FnKey::Plain(_) | FnKey::Ctfe(_) => continue,
             };
             if !builtin && !cfg.inline_all {
                 if relax_codegen::opt::inline_trace(&u.fns[id as usize].name) {
@@ -14352,7 +14423,7 @@ unsafe fn o3_nocapture_facts(up: *mut Unit, id: u32, asks: &[(u32, u32)]) -> (Ve
     let missing = std::cell::RefCell::new(Vec::new());
     let have = |c: u32| -> Option<std::sync::Arc<relax_backend::rir::Func>> {
         let u = &*up;
-        if (c as usize) >= u.fns.len() || matches!(u.fns[c as usize].key, FnKey::Sandbox(_) | FnKey::Plain(_)) {
+        if (c as usize) >= u.fns.len() || matches!(u.fns[c as usize].key, FnKey::Sandbox(_) | FnKey::Plain(_) | FnKey::Ctfe(_)) {
             return None;
         }
         let e = &u.fns[c as usize];
@@ -14387,7 +14458,7 @@ unsafe fn o3_nocapture_facts(up: *mut Unit, id: u32, asks: &[(u32, u32)]) -> (Ve
 /// verdict pending: None) or is provisional itself goes to `unknown`: the asking body is
 /// provisional (Func::pending), and completes once the slot is final.
 unsafe fn rir_for_fact(up: *mut Unit, c: u32, unknown: &std::cell::RefCell<Vec<u32>>) -> Option<std::sync::Arc<relax_backend::rir::Func>> {
-    if (c as usize) >= (&*up).fns.len() || matches!((&*up).fns[c as usize].key, FnKey::Sandbox(_) | FnKey::Plain(_)) {
+    if (c as usize) >= (&*up).fns.len() || matches!((&*up).fns[c as usize].key, FnKey::Sandbox(_) | FnKey::Plain(_) | FnKey::Ctfe(_)) {
         return None;
     }
     let stale = |e: &FnEntry| e.rir.as_ref().is_none_or(|r| upgradable(r)) || needs_normal(e);
@@ -14523,7 +14594,7 @@ fn inline_cycle(u: &Unit, id: u32, c: u32, full: bool) -> bool {
 /// preparation's source_wanted without the verdict): the path of an inline cycle (inline_cycle).
 fn cycle_member(u: &Unit, c: u32, full: bool) -> bool {
     match u.fns[c as usize].key {
-        FnKey::Sandbox(_) | FnKey::Plain(_) => false,
+        FnKey::Sandbox(_) | FnKey::Plain(_) | FnKey::Ctfe(_) => false,
         FnKey::Glue(..) => true,
         _ => inline_source_wanted(u, c, full),
     }
@@ -15160,9 +15231,9 @@ pub unsafe fn lower_for_audit(up: *mut Unit, id: u32) -> Result<(), String> {
     build_rir_inner(up, id).map(|_| ())
 }
 
-/// Canonical, uninlined RIR for deterministic sandbox metering. Never take the
-/// tier-dependent optimized base-slot RIR as the meter's input.
-pub(crate) unsafe fn sandbox_source_rir(up: *mut Unit, id: u32) -> Result<relax_backend::rir::Func, String> {
+/// Slot `id`'s canonical, uninlined RIR as lowered: a twin's source (sandbox metering, constant
+/// evaluation's step count). Never the tier-dependent optimized base-slot RIR.
+pub(crate) unsafe fn source_rir(up: *mut Unit, id: u32) -> Result<relax_backend::rir::Func, String> {
     build_rir_inner(up, id)
 }
 
@@ -15885,7 +15956,8 @@ unsafe fn build_rir_lowered_as(up: *mut Unit, id: u32) -> Result<relax_backend::
     }
     // Bridge, virtual and derived bodies above always keep their usual selection. Ahead
     // helpers only supply the source-body lowering below.
-    if let Some(f) = if plain { None } else { take_lowered_ahead(&mut *up, id) } {
+    // (not for a constant-evaluation twin: the ahead lowering has no step counts)
+    if let Some(f) = if plain || crate::ctfe_twin::lowering(id) { None } else { take_lowered_ahead(&mut *up, id) } {
         return Ok(f);
     }
     // the type check and lowering on the owner: never inside a publish (rule I-PUB; a background
@@ -15974,6 +16046,7 @@ unsafe fn build_rir_lowered_as(up: *mut Unit, id: u32) -> Result<relax_backend::
         }
         FnKey::Shim(_) | FnKey::Glue(..) => return Err("glue".to_string()),
         FnKey::Sandbox(_) => return Err("sandbox twins are built from their base slot's RIR".to_string()),
+        FnKey::Ctfe(_) => return Err("constant-evaluation twins are built from their base slot's lowering".to_string()),
         FnKey::Plain(_) => return Err("unverified-mode twins are lowered as their base slot".to_string()),
     };
     if !body.errors.is_empty() {
@@ -16100,7 +16173,7 @@ fn lower_checked_body(u: &Unit, id: u32, key: &FnKey, body: &Body) -> Result<(re
     match key {
         FnKey::Inst(d, _) => lcx.lower_fn_body(*d),
         FnKey::Closure(_, ce, _) => lcx.lower_closure_body(*ce),
-        FnKey::Shim(_) | FnKey::Glue(..) | FnKey::Sandbox(_) | FnKey::Plain(_) => {}
+        FnKey::Shim(_) | FnKey::Glue(..) | FnKey::Sandbox(_) | FnKey::Plain(_) | FnKey::Ctfe(_) => {}
     }
     lcx.finish();
     // (every value it was missing is noted now: the front makes it again after the owner's drain)
@@ -16117,7 +16190,7 @@ fn lower_checked_body(u: &Unit, id: u32, key: &FnKey, body: &Body) -> Result<(re
         match key {
             FnKey::Inst(d, _) => lcx.lower_fn_body(*d),
             FnKey::Closure(_, ce, _) => lcx.lower_closure_body(*ce),
-            FnKey::Shim(_) | FnKey::Glue(..) | FnKey::Sandbox(_) | FnKey::Plain(_) => {}
+            FnKey::Shim(_) | FnKey::Glue(..) | FnKey::Sandbox(_) | FnKey::Plain(_) | FnKey::Ctfe(_) => {}
         }
         lcx.finish();
     }
@@ -17234,6 +17307,7 @@ impl Unit {
     /// body, which ran in the base's place while its verdict was out (counts_for maps it by
     /// source position).
     fn profile_of(&self, id: u32) -> Option<&FrequencyProfile> {
+        if matches!(self.fns[id as usize].key, FnKey::Ctfe(_)) { return None; }
         self.frequency_profiles.get(&id).or_else(|| self.plain_twin_of(id).and_then(|t| self.frequency_profiles.get(&t)))
     }
 
@@ -17247,6 +17321,7 @@ impl Unit {
     /// for makepad inspect `asm` (None: the slot has no counted build). The positions are the
     /// counted (pre-O3) RIR's: the fn's own code, not what O3 inlines into it later.
     pub(crate) fn pgo_counts(&self, id: u32) -> Option<Vec<(u64, u64)>> {
+        if matches!(self.fns[id as usize].key, FnKey::Ctfe(_)) { return None; }
         let p = self.frequency_profiles.get(&id)?;
         Some(p.pos_blocks.iter().filter(|(_, b)| p.counted.get(*b as usize).copied().unwrap_or(false)).map(|&(pos, b)| (pos, p.counters[b as usize].load(Ordering::Relaxed))).collect())
     }
@@ -17919,6 +17994,7 @@ static TIER_STOP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool:
 /// Queues slot `id` for its O3 build now, ahead of its counts (if it is still counting): marked
 /// `#[relax(O3)]` (Q_MARKED, rate 0).
 unsafe fn queue_now(u: &Unit, id: u32, why: u8, rate: u64) {
+    if matches!(u.fns[id as usize].key, FnKey::Ctfe(_)) { return; }
     let rec = tier_rec(&u.slots, id);
     let code = (*rec.add(1)).load(Ordering::Relaxed);
     let stub = (*rec.add(2)).load(Ordering::Relaxed);
@@ -18070,6 +18146,7 @@ pub(crate) fn counted_key(u: &Unit, key: &FnKey) -> bool {
         FnKey::Inst(d, _) => u.prog.def(*d).kind != DefKind::ForeignFn,
         FnKey::Closure(..) | FnKey::Plain(_) => true,
         FnKey::Sandbox(base) => *base != u32::MAX,
+        FnKey::Ctfe(_) => false,
         FnKey::Shim(_) | FnKey::Glue(..) => false,
     }
 }
@@ -19967,7 +20044,7 @@ fn twin_callers(u: &Unit, cands: &[u32], twin: Option<u32>) -> TwinCallers {
     let mut out = TwinCallers::default();
     let classify = |out: &mut TwinCallers, c: u32| {
         let f = &u.fns[c as usize];
-        if !f.compiled || matches!(f.key, FnKey::Plain(_) | FnKey::Sandbox(_) | FnKey::Glue(..) | FnKey::Shim(_)) || out.o3.contains(&c) || out.below.contains(&c) || out.unverified.contains(&c) {
+        if !f.compiled || matches!(f.key, FnKey::Plain(_) | FnKey::Sandbox(_) | FnKey::Ctfe(_) | FnKey::Glue(..) | FnKey::Shim(_)) || out.o3.contains(&c) || out.below.contains(&c) || out.unverified.contains(&c) {
             return;
         }
         if f.unverified.load(Ordering::Relaxed) {
@@ -20078,7 +20155,7 @@ unsafe fn drain_twin_pending(up: *mut Unit) {
     let mut tc = TwinCallers::default();
     for c in ids {
         let f = &u.fns[c as usize];
-        if !f.compiled || matches!(f.key, FnKey::Plain(_) | FnKey::Sandbox(_) | FnKey::Glue(..) | FnKey::Shim(_)) {
+        if !f.compiled || matches!(f.key, FnKey::Plain(_) | FnKey::Sandbox(_) | FnKey::Ctfe(_) | FnKey::Glue(..) | FnKey::Shim(_)) {
             continue;
         }
         if f.unverified.load(Ordering::Relaxed) { tc.unverified.push(c) } else if f.o3.load(Ordering::Relaxed) { tc.o3.push(c) } else { tc.below.push(c) }
@@ -20143,7 +20220,7 @@ unsafe fn prioritize_verdicts(up: *mut Unit, ids: &[u32]) {
                 }
             }
         }
-        let mut v: Vec<u32> = ids.iter().map(|&c| match u.fns[c as usize].key { FnKey::Plain(b) if (b as usize) < u.fns.len() => b, _ => c })
+        let mut v: Vec<u32> = ids.iter().map(|&c| match u.fns[c as usize].key { FnKey::Plain(b) | FnKey::Ctfe(b) if (b as usize) < u.fns.len() => b, _ => c })
             .filter(|&c| matches!(u.verdict_state(c), Verdict::Pending)).collect();
         v.sort_unstable();
         v.dedup();
@@ -21023,6 +21100,7 @@ impl Unit {
         let mut stubs = Vec::with_capacity(ids.len());
         unsafe {
             for &(id, code) in ids {
+                if matches!(self.fns[id as usize].key, FnKey::Ctfe(_)) { continue; }
                 let rec = tier_rec(&self.slots, id);
                 if (*rec.add(3)).load(Ordering::Relaxed) != 0 {
                     continue;
@@ -21066,6 +21144,7 @@ impl Unit {
     /// A counting slot whose code `code` replaced the code its count stub jumps to: a new count
     /// stub to `code` (weighed by its size) goes into the slot, its cost so far as it is.
     fn rearm_counter(&mut self, id: u32, code: u64) {
+        if matches!(self.fns[id as usize].key, FnKey::Ctfe(_)) { return; }
         let rec = tier_rec(&self.slots, id);
         unsafe {
             // (a forwarder's calls are not counted: it takes no code of its own)
@@ -21097,6 +21176,7 @@ impl Unit {
     /// arm_counter for a slot whose kind the caller knows (`counted`: an instance that is not
     /// a foreign fn, a closure or a sandbox twin).
     fn arm_counter_as(&mut self, id: u32, code: u64, counted: bool) {
+        if matches!(self.fns[id as usize].key, FnKey::Ctfe(_)) { return; }
         self.frequency_profiles.remove(&id);
         let threshold = match &self.tier1 {
             Some(t) => t.threshold,
@@ -21201,6 +21281,7 @@ impl Unit {
     /// is built at that pick (PICK_RECOUNTED). False: the slot takes no count stub (a forwarder,
     /// its record not tiered) or other code went in meanwhile: it is built now.
     unsafe fn retier_recount(&mut self, id: u32, threshold: u64, cost: u64, now: u64, wall: u64) -> bool {
+        if matches!(self.fns[id as usize].key, FnKey::Ctfe(_)) { return false; }
         if self.forward_of(id).is_some() {
             return false;
         }
@@ -21236,6 +21317,7 @@ impl Unit {
 
     #[track_caller]
     fn retier_as(&mut self, id: u32, fix: bool) {
+        if matches!(self.fns[id as usize].key, FnKey::Ctfe(_)) { return; }
         if tier1_trace() { eprintln!("O3 retier #{} from line {} (n={}{})", id, std::panic::Location::caller().line(), self.retiers.get(&id).copied().unwrap_or(0), if fix { ", for correctness" } else { "" }); }
         if !fix && self.tier1.is_some() && unsafe { retier_waiting(tier_rec(&self.slots, id)) } {
             if tier1_trace() { eprintln!("O3 retier #{}: waits in its count stub", id); }
@@ -21598,7 +21680,11 @@ pub(crate) unsafe fn counted_build(up: *mut Unit, id: u32, lukewarm: bool) -> bo
     // a SPEC-V twin too: it runs in its base's place, whose O3 build takes its counts. Its code is
     // unverified for good: baseline RIR calling other twins, which no verified rebuild replaces
     // (its O3 build starts from it too). RELAX_OPT=-twinpgo: not
-    let twin = !twin_pgo_off(options) && owner::publish(|| matches!((&*up).fns[id as usize].key, FnKey::Plain(_)));
+    let (ctfe, twin) = owner::publish(|| {
+        let key = &(&*up).fns[id as usize].key;
+        (matches!(key, FnKey::Ctfe(_)), !twin_pgo_off(options) && matches!(key, FnKey::Plain(_)))
+    });
+    if ctfe { return false; }
     let to_upgrade = |r: &relax_backend::rir::Func| !twin && upgradable(r);
     // code linked from the disk cache has no RIR: its front end runs here first, off the unit,
     // as compile_tier1 does it (so warm launches count too)
@@ -22141,7 +22227,7 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
     };
     let runtime = &session.runtime;
     // a forwarder gets no code of its own (Unit::forward_of): no verdict changes that
-    if owner::publish(|| (&*up).forward_of(id).is_some()) {
+    if owner::publish(|| matches!((&*up).fns[id as usize].key, FnKey::Ctfe(_)) || (&*up).forward_of(id).is_some()) {
         return false;
     }
     // SPEC-V: unverified code gets O3 code too, built as it is (Unit::o3_allowed)
@@ -23928,6 +24014,7 @@ pub(crate) fn ahead_running() -> u64 {
 
 /// Queues the not-inlined direct callees of slot `id` (lock held), one level deeper.
 unsafe fn spec_enqueue(up: *mut Unit, id: u32, depth: u8) {
+    if matches!((&*up).fns[id as usize].key, FnKey::Ctfe(_)) { return; }
     if pipelined() && defer_startup_root(up, id, depth) { return; }
     let session = unsafe { crate::jit::unit_session(up) };
     let options = &session.options;
@@ -23986,6 +24073,7 @@ fn slot_key_inner(u: &Unit, id: u32) -> String {
         FnKey::Sandbox(b) if *b == u32::MAX => "sandbox<invalid>".to_string(),
         FnKey::Sandbox(b) => format!("sandbox<{}>", slot_key(u, *b)),
         FnKey::Plain(b) => format!("plain<{}>", slot_key(u, *b)),
+        FnKey::Ctfe(b) => format!("ctfe<{}>", slot_key(u, *b)),
     }
 }
 
@@ -24055,6 +24143,7 @@ pub fn aot_drain() {
 
 /// Queues the slots `func` (slot `id`'s RIR) calls (but not `skip`) at depth + 1 (lock held).
 unsafe fn spec_enqueue_calls(up: *mut Unit, id: u32, func: &relax_backend::rir::Func, skip: &[u32], depth: u8) {
+    if matches!((&*up).fns[id as usize].key, FnKey::Ctfe(_)) { return; }
     if startup_phase() || !ahead_policy().spec_calls { return; }
     // nor in a burst of the UI thread's lazy compiles after the present: the ahead helpers check
     // and lower the callees its builds make (cheaper than whole speculative builds, of which
@@ -24137,7 +24226,7 @@ unsafe fn spec_enqueue_calls(up: *mut Unit, id: u32, func: &relax_backend::rir::
                 let ok = match &f.key {
                     FnKey::Inst(d, _) => u.prog.def(*d).kind != DefKind::ForeignFn,
                     FnKey::Closure(cf, _, parent) => u.has_body(*parent, *cf),
-                    FnKey::Shim(_) | FnKey::Glue(..) | FnKey::Sandbox(_) | FnKey::Plain(_) => false,
+                    FnKey::Shim(_) | FnKey::Glue(..) | FnKey::Sandbox(_) | FnKey::Plain(_) | FnKey::Ctfe(_) => false,
                 };
                 if !ok {
                     continue;
@@ -24194,7 +24283,7 @@ pub unsafe fn spec_seed(up: *mut Unit, ids: &[u32]) {
     let max = spec_depth_max(options);
     let mut add = Vec::new();
     for &id in ids {
-        if skip_initializer_seed(u, id) { continue; }
+        if skip_initializer_seed(u, id) || matches!(u.fns[id as usize].key, FnKey::Ctfe(_)) { continue; }
         let f = &mut u.fns[id as usize];
         if f.building {
             SEED_RECURSIVE_SKIPPED.fetch_add(1, Ordering::Relaxed);
@@ -24553,14 +24642,14 @@ pub(crate) fn cand_skip_summary() -> String {
 /// Slots whose O1 build (`upgrade`: of their baseline RIR to normal RIR) o3_candidates_begin
 /// prepares in a take and the caller optimises off the owner: fn instances, closures and
 /// unverified-mode twins (their fronts are made ahead: prefront_slot); an upgrade also of glue
-/// and shims (it reuses their RIR). Not sandbox twins (twin_rir), not instances past the depth limit.
+/// and shims (it reuses their RIR). Not sandbox/CTFE twins, not instances past the depth limit.
 fn splits_off_owner(u: &Unit, c: u32, upgrade: bool) -> bool {
     match &u.fns[c as usize].key {
         FnKey::Inst(d, args) => matches!(u.prog.def(*d).kind, DefKind::Fn | DefKind::AssocFn)
             && !args.iter().any(|t| u.tcx.tys.depth(*t) > INSTANCE_DEPTH_LIMIT),
         FnKey::Closure(..) | FnKey::Plain(_) => true,
         FnKey::Glue(..) | FnKey::Shim(_) => upgrade,
-        FnKey::Sandbox(_) => false,
+        FnKey::Sandbox(_) | FnKey::Ctfe(_) => false,
     }
 }
 
@@ -26213,6 +26302,7 @@ pub(crate) unsafe fn compile_batch_off_lock(up: *mut Unit, ids: &[u32], threads:
 /// would make again (calls to twins, missing disjoint-index checks) and sandbox twins are upgraded
 /// here as before.
 unsafe fn split_upgrade(up: *mut Unit, id: u32) -> Option<Prep> {
+    if matches!((&*up).fns[id as usize].key, FnKey::Ctfe(_)) { return None; }
     (&mut *up).check_before_lowering(id);
     if !(&*up).refresh_verified(id) {
         return None;
@@ -26254,7 +26344,7 @@ unsafe fn split_normal(up: *mut Unit, id: u32) -> Option<Prep> {
         return None;
     }
     let f = &(&*up).fns[id as usize];
-    if !needs_normal(f) || f.building || f.inflight || f.build_err.is_some() || matches!(f.key, FnKey::Sandbox(_)) {
+    if !needs_normal(f) || f.building || f.inflight || f.build_err.is_some() || matches!(f.key, FnKey::Sandbox(_) | FnKey::Ctfe(_)) {
         return None;
     }
     begin_build(up, id).ok()?;
@@ -26285,6 +26375,9 @@ unsafe fn split_front(up: *mut Unit, id: u32) -> Result<Front, String> {
 }
 
 unsafe fn split_front_as(up: *mut Unit, id: u32, mode: RirMode) -> Result<Front, String> {
+    if matches!((&*up).fns[id as usize].key, FnKey::Ctfe(_)) {
+        return Err("constant-evaluation twins must be built on the owner thread".into());
+    }
     {
         let u = &mut *up;
         if let Some(r) = &u.fns[id as usize].rir {
@@ -26837,6 +26930,7 @@ fn prefront_slot_once(front: &FrontShared, id: u32) -> bool {
     match front.slot_keys.get(&id) {
         Some(FnKey::Closure(..)) => return prefront_closure(front, id),
         Some(FnKey::Plain(base)) => return prefront_twin(front, id, base),
+        Some(FnKey::Ctfe(_)) => return prefront_fail(AF_NOT_BODY),
         _ => {}
     }
     let Some(FnKey::Inst(d, args)) = front.slot_keys.get(&id) else {
@@ -27063,7 +27157,7 @@ fn take_prefronted<R>(front: &FrontShared, leave_out: Option<u32>, mut take: imp
                     if o2_trace() {
                         let at = if af == AF_NEEDS_UNIT { NEEDS_UNIT_AT.try_with(|a| a.get()).ok().flatten().map(|l| format!(" at {}:{}", l.file(), l.line())).unwrap_or_default() } else { String::new() };
                         let whose = if s == root { "own front".to_string() } else {
-                            let kind = match front.slot_keys.get(&s) { Some(FnKey::Inst(..)) => "inst", Some(FnKey::Closure(..)) => "closure", Some(FnKey::Plain(_)) => "twin", Some(FnKey::Glue(..)) => "glue", _ => "other" };
+                            let kind = match front.slot_keys.get(&s) { Some(FnKey::Inst(..)) => "inst", Some(FnKey::Closure(..)) => "closure", Some(FnKey::Plain(_)) => "twin", Some(FnKey::Ctfe(_)) => "ctfe", Some(FnKey::Glue(..)) => "glue", _ => "other" };
                             format!("candidate #{} ({}) front", s, kind)
                         };
                         eprintln!("relax O2: #{} {} not made off the owner: {}{}", root, whose, if front_failed { PREFRONT_FAIL_NAMES[af as usize] } else { "fronted 3 times" }, at);
@@ -27689,6 +27783,7 @@ fn canon_slots(d: String) -> String {
             FnKey::Glue(g, t) => format!("glue{}:{}", g, crate::typeck::ty_to_string(false, prog, tcx, t)),
             FnKey::Sandbox(b) => format!("sandbox:{}", b),
             FnKey::Plain(b) => format!("plain:{}", b),
+            FnKey::Ctfe(b) => format!("ctfe:{}", b),
         })
     };
     // `Fn(N)` / `CFn(N, ..)` callees and `FnAddr(VReg(v), N)`; a closure's name carries its parent's
@@ -28332,7 +28427,7 @@ fn take_lowered_ahead(u: &mut Unit, id: u32) -> Option<relax_backend::rir::Func>
         // (a twin's lowering notes its callees' twins under the base: note_twin_user)
         let caller = match u.fns[id as usize].key { FnKey::Plain(base) => base, _ => id };
         for mut key in lowered.callees {
-            if let FnKey::Closure(_, _, parent) | FnKey::Sandbox(parent) | FnKey::Plain(parent) = &mut key {
+            if let FnKey::Closure(_, _, parent) | FnKey::Sandbox(parent) | FnKey::Plain(parent) | FnKey::Ctfe(parent) = &mut key {
                 *parent = resolved(*parent, &ids);
             }
             let twin = matches!(key, FnKey::Plain(_));
@@ -28912,6 +29007,7 @@ pub fn count_cache_ahead() {
 
 /// The disk cache's code for slot `id`, linked (unit lock held); None: compile it.
 pub(crate) unsafe fn cache_lookup(up: *mut Unit, id: u32) -> Option<(Vec<u8>, Vec<(u32, u64)>, Vec<relax_backend::rir::RelocAt>)> {
+    if matches!((&*up).fns[id as usize].key, FnKey::Ctfe(_)) { return None; }
     let _mem = crate::memstat::tag(crate::memstat::Tag::CacheLoad);
     let u = &mut *up;
     if matches!(u.fns[id as usize].key, FnKey::Inst(d, _) if u.prog.def(d).kind == DefKind::ForeignFn) {
@@ -29151,7 +29247,7 @@ pub(crate) unsafe fn ensure_parent_body(up: *mut Unit, id: u32, file: u32, depth
                 }
             }
         }
-        FnKey::Sandbox(_) | FnKey::Plain(_) => return Err("internal compiler error: closure parent is a twin".to_string()),
+        FnKey::Sandbox(_) | FnKey::Plain(_) | FnKey::Ctfe(_) => return Err("internal compiler error: closure parent is a twin".to_string()),
         FnKey::Closure(_, _, grand) => {
             ensure_parent_body(up, grand, file, depth + 1)?;
             match (&*up).body_of(grand, file) {
@@ -29616,7 +29712,9 @@ mod own_work_tests {
         let mut tcx = Tcx::new();
         tcx.collect(&prog);
         let mut u = Unit::new(prog, tcx, 0);
+        // (the slot the initializer's code calls: `triple`'s constant-evaluation twin, ctfe_twin.rs)
         let f = u.fn_id(FnKey::Inst(triple, Vec::new()));
+        let f = crate::ctfe_twin::twin(&u, f);
         let up = &mut *u as *mut Unit as usize;
         // the drain's build of `triple`, open while it waits (as a front's query latch makes it)
         *crate::owner::OWN_WORK_TEST.lock().unwrap() = Some(Box::new(move || unsafe {
@@ -31578,7 +31676,7 @@ unsafe fn realtime_top_tier(up: *mut Unit, ids: &[u32]) {
     let (mut base, mut o3, mut o2, mut o1) = (0, 0, 0, 0);
     for &id in ids {
         let u = &*up;
-        if (id as usize) >= u.fns.len() || !u.fns[id as usize].compiled || matches!(u.fns[id as usize].key, FnKey::Glue(..) | FnKey::Sandbox(_)) {
+        if (id as usize) >= u.fns.len() || !u.fns[id as usize].compiled || matches!(u.fns[id as usize].key, FnKey::Glue(..) | FnKey::Sandbox(_) | FnKey::Ctfe(_)) {
             continue;
         }
         if u.fns[id as usize].o3.load(Ordering::Relaxed) {

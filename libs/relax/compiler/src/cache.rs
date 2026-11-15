@@ -743,7 +743,7 @@ fn tls_shape(pl: &crate::jit::TlsPlace) -> u8 {
 fn record_deps(u: &Unit, id: u32, extra: &[u32]) -> Vec<u32> {
     // a sandboxed twin's code is its base's lowered body transformed: the base's inputs are its own
     let src = match u.fns[id as usize].key {
-        FnKey::Sandbox(b) if (b as usize) < u.fns.len() => b,
+        FnKey::Sandbox(b) | FnKey::Ctfe(b) if (b as usize) < u.fns.len() => b,
         _ => id,
     };
     let mut stack: Vec<u32> = extra.iter().copied().chain(u.body_deps.get(&src).into_iter().flatten().copied()).collect();
@@ -2786,6 +2786,8 @@ impl Cache {
                 }
                 self.enc_tys(u, &shim.args, e, crates, 0)
             }
+            // Compiler-only code has no persistent key.
+            FnKey::Ctfe(_) => None,
             // a sandboxed twin: its domain and its base's key. Its code names what it holds of the
             // run's sandbox by symbols (sandbox.rs thunk_sym ..), linked again here; the domain
             // keeps code one policy made out of another domain's units, and the kind keeps
@@ -3896,6 +3898,7 @@ impl Cache {
     /// the tier and the dependency slots can change or be reclaimed before the encoding runs.
     /// None: `record` would store nothing.
     pub(crate) fn defer_record(&self, u: &Unit, id: u32, code: &[u8], relocs: &[RelocAt], pc_map: &[(u32, u64)]) -> Option<PendingRecord> {
+        if matches!(u.fns[id as usize].key, FnKey::Ctfe(_)) { return None; }
         if self.mode == Mode::ReadOnly || u.fns[id as usize].patch_gen != 0 || self.linked.contains(&id) {
             return None;
         }
@@ -3920,6 +3923,7 @@ impl Cache {
     /// `record_o3`'s inputs for an encoding later (the O3 install is a publish: the record's key and
     /// certificate encoding runs in the bounded record batches instead). None: it would store nothing.
     pub(crate) fn defer_record_o3(&self, u: &Unit, id: u32, code: &[u8], relocs: &[RelocAt], pc_map: &[(u32, u64)], inlined: &[u32], nounwind: &[(u32, bool)]) -> Option<PendingRecord> {
+        if matches!(u.fns[id as usize].key, FnKey::Ctfe(_)) { return None; }
         if self.mode == Mode::ReadOnly || u.fns[id as usize].patch_gen != 0 {
             return None;
         }
@@ -4024,6 +4028,7 @@ impl Cache {
 
     #[allow(clippy::too_many_arguments)]
     fn record_entry(&mut self, u: &Unit, id: u32, code: &[u8], relocs: &[RelocAt], pc_map: &[(u32, u64)], o3: Option<(&[u32], &[(u32, bool)])>, kind: RecKind, pending: Option<&PendingRecord>) {
+        if matches!(u.fns[id as usize].key, FnKey::Ctfe(_)) { return; }
         let _mem = crate::memstat::tag(crate::memstat::Tag::CacheStore);
         let o2 = kind == RecKind::O2;
         // O3 and O2 code replace the slot's entry, verified O1 code a baseline one; O1 code is
@@ -4476,6 +4481,7 @@ impl Cache {
 
     /// Looks slot `id` up and links it.
     pub fn lookup(&mut self, u: &mut Unit, id: u32) -> Option<LinkedCode> {
+        if matches!(u.fns[id as usize].key, FnKey::Ctfe(_)) { return None; }
         unsafe { Linker::new(self).lookup(u, id) }
     }
 
@@ -5807,7 +5813,7 @@ fn key_defs(u: &Unit, key: &FnKey) -> Vec<DefId> {
     for _ in 0..32 {
         match k {
             FnKey::Inst(d, _) => { out.push(d); break; }
-            FnKey::Closure(_, _, parent) | FnKey::Plain(parent) | FnKey::Sandbox(parent) if (parent as usize) < u.fns.len() => k = u.fns[parent as usize].key.clone(),
+            FnKey::Closure(_, _, parent) | FnKey::Plain(parent) | FnKey::Sandbox(parent) | FnKey::Ctfe(parent) if (parent as usize) < u.fns.len() => k = u.fns[parent as usize].key.clone(),
             _ => break,
         }
     }
@@ -6323,7 +6329,7 @@ pub(crate) fn trace_keyed(u: &Unit, id: u32, what: &str, code_key: Option<u128>)
     let krate = match &u.fns[id as usize].key {
         FnKey::Inst(d, _) => u.prog.syms.str(u.prog.crates[u.prog.def(*d).krate as usize].name).to_string(),
         FnKey::Closure(f, _, _) => u.prog.file_crate.get(*f as usize).map_or("-".to_string(), |c| u.prog.syms.str(u.prog.crates[*c as usize].name).to_string()),
-        FnKey::Shim(_) | FnKey::Glue(..) | FnKey::Sandbox(_) | FnKey::Plain(_) => "-".to_string(),
+        FnKey::Shim(_) | FnKey::Glue(..) | FnKey::Sandbox(_) | FnKey::Plain(_) | FnKey::Ctfe(_) => "-".to_string(),
     };
     let on_main = crate::owner::for_main();
     // the code key and the identity of the fn (its key bytes without interfaces and bodies): the same
@@ -11414,6 +11420,7 @@ impl Linker {
     }
 
     pub fn lookup(&mut self, u: &mut Unit, id: u32) -> Option<LinkedCode> {
+        if matches!(u.fns[id as usize].key, FnKey::Ctfe(_)) { return None; }
         if !self.cache().linking.insert(id) {
             relax_codegen::warm::reason(id, "cache lookup already in progress");
             return None;

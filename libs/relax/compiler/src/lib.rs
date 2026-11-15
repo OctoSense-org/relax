@@ -247,6 +247,7 @@ pub mod provided;
 pub mod pmhost;
 mod native_macros;
 pub mod ctfe;
+mod ctfe_twin;
 mod valtrees;
 pub mod syms;
 pub mod wasm_export;
@@ -1556,6 +1557,7 @@ pub unsafe fn reset_statics() {
     cache::reset_statics();
     check::reset_statics();
     coverage::reset_statics();
+    ctfe_twin::reset_statics();
     domain::reset_statics();
     domain_res::reset_statics();
     first_frame::reset_statics();

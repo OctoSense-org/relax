@@ -383,7 +383,7 @@ pub fn run(up: *mut Unit, root: u32) -> (String, usize) {
                 // drop glue: a provided type's Drop impl (and what it calls) runs from here
                 // when JIT-compiled code drops a value of it (a handle's release, a guard)
                 FnKey::Glue(..) => true,
-                FnKey::Shim(_) | FnKey::Sandbox(_) | FnKey::Plain(_) => false,
+                FnKey::Shim(_) | FnKey::Sandbox(_) | FnKey::Plain(_) | FnKey::Ctfe(_) => false,
             };
             if !lower_it {
                 continue;

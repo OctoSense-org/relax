@@ -1718,7 +1718,8 @@ fn check_crate_impl(u: &mut Unit, root: u32, crates: &[u32], front: Vec<String>,
             st.rir_insts,
             st.code_bytes / 1024
         );
-        eprintln!("relax check: constant initializers: {} evaluated to data, {} compiled and run; evaluation cpu {:.1} ms", st.ctfe_data, st.ctfe_code, st.ctfe_ns as f64 / 1e6);
+        let (twins, bytes, ms) = crate::ctfe_twin::census(unsafe { &*up });
+        eprintln!("relax check: constant initializers: {} evaluated to data, {} compiled and run ({} constant-evaluation twins, {:.1} KB, built in {:.1} ms); evaluation cpu {:.1} ms", st.ctfe_data, st.ctfe_code, twins, bytes as f64 / 1024.0, ms, st.ctfe_ns as f64 / 1e6);
     }
     unsafe { crate::jit::backend_bench(up) };
     if std::env::var("RELAX_PASS_TIMES").is_ok() || std::env::var("RELAX_OPT_HIST").is_ok() {
@@ -1921,7 +1922,7 @@ fn function_origin(u: &Unit, mut id: u32) -> Option<(u32,u32)> {
         match &u.fns[id as usize].key {
             FnKey::Inst(d,_) => { let d = u.prog.def(*d); return Some((d.file,u.prog.files[d.file as usize].ast.item(d.item).lo)); }
             FnKey::Closure(f,e,_) => return Some((*f,u.prog.files[*f as usize].ast.expr(crate::ast::ExprId(*e)).lo)),
-            FnKey::Sandbox(parent) | FnKey::Plain(parent) => id = *parent,
+            FnKey::Sandbox(parent) | FnKey::Plain(parent) | FnKey::Ctfe(parent) => id = *parent,
             FnKey::Shim(shim) => { let d = u.prog.def(shim.kind.def_id()); return Some((d.file, u.prog.files[d.file as usize].ast.item(d.item).lo)); }
             FnKey::Glue(_,t) => {
                 if let crate::types::TyKind::Adt(d,_, _) = u.tcx.tys.kind(*t) {

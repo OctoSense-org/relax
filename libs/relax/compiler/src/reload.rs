@@ -3671,7 +3671,7 @@ fn lay_out_stored_holders(u: &Unit, d: DefId, visible: &[bool]) -> Result<(), St
             }
             // a closure's body is checked with its owner's
             let mut k = i as u32;
-            while let FnKey::Closure(_, _, p) | FnKey::Sandbox(p) | FnKey::Plain(p) = u.fns[k as usize].key {
+            while let FnKey::Closure(_, _, p) | FnKey::Sandbox(p) | FnKey::Plain(p) | FnKey::Ctfe(p) = u.fns[k as usize].key {
                 k = p;
             }
             if !done.insert(k) {
@@ -4016,7 +4016,7 @@ fn stored_vtable_holds(u: &Unit, a: u64, s: &[DefId]) -> bool {
                     owner = true;
                     sl = *p;
                 }
-                FnKey::Sandbox(p) | FnKey::Plain(p) => sl = *p,
+                FnKey::Sandbox(p) | FnKey::Plain(p) | FnKey::Ctfe(p) => sl = *p,
                 FnKey::Inst(f, args) => break args.iter().any(held) || !owner && u.tcx.fn_sig(&u.prog, *f).is_some_and(|g| g.params.first().is_some_and(held)),
                 FnKey::Glue(k, t) => break *k != crate::jit::GLUE_UNNAMED && held(t),
                 FnKey::Shim(sh) => break sh.args.iter().any(held),
@@ -4293,7 +4293,7 @@ unsafe fn initializer_deps_changed(up: *mut Unit, root: u32, changed: &[DefId], 
                 FnKey::Inst(d, args) => break changed.contains(d) || args.iter().any(|t| ty_mentions(u, *t, layout_defs, 0)),
                 FnKey::Glue(_, t) => break ty_mentions(u, *t, layout_defs, 0),
                 FnKey::Shim(shim) => break shim.args.iter().any(|t| ty_mentions(u, *t, layout_defs, 0)),
-                FnKey::Closure(_, _, parent) | FnKey::Sandbox(parent) | FnKey::Plain(parent) => k = *parent,
+                FnKey::Closure(_, _, parent) | FnKey::Sandbox(parent) | FnKey::Plain(parent) | FnKey::Ctfe(parent) => k = *parent,
             }
         };
         if hit { return Ok(true); }
@@ -4301,7 +4301,8 @@ unsafe fn initializer_deps_changed(up: *mut Unit, root: u32, changed: &[DefId], 
         // that completed: nothing it reaches is a dependency of the value (an indirect call in
         // core's panic machinery made every edit a restart: relax issue 137). An edit of the
         // callee itself is still one (`hit` above).
-        if let FnKey::Inst(d, _) = &u.fns[s as usize].key {
+        let body = match u.fns[s as usize].key { FnKey::Ctfe(base) => base, _ => s };
+        if let FnKey::Inst(d, _) = &u.fns[body as usize].key {
             if u.tcx.fn_sig(&u.prog, *d).is_some_and(|sig| matches!(u.tcx.tys.kind(sig.ret), crate::types::TyKind::Never)) {
                 continue;
             }
@@ -4471,7 +4472,7 @@ unsafe fn compile_reachable_in(up: *mut Unit, roots: Vec<u32>, seeds: Vec<u32>, 
                 continue;
             }
             let f = &(&*up).fns[id as usize];
-            if f.compiled || f.building || f.inflight || crate::sandbox::is_sandboxed_slot(&*up, id) {
+            if f.compiled || f.building || f.inflight || matches!(f.key, FnKey::Ctfe(_)) || crate::sandbox::is_sandboxed_slot(&*up, id) {
                 continue;
             }
             wave.push(id);
@@ -4555,13 +4556,13 @@ unsafe fn compile_reachable_in(up: *mut Unit, roots: Vec<u32>, seeds: Vec<u32>, 
 
 /// A sandboxed module's own functions: its twins and wrappers.
 pub(crate) fn module_own(u: &Unit, id: u32) -> bool {
-    under_lock(u, id)
+    !matches!(u.fns[id as usize].key, FnKey::Ctfe(_)) && under_lock(u, id)
 }
 
-/// Slots whose build must stay on the owner thread: sandbox twins and module wrappers.
+/// Slots whose build must stay on the owner thread: sandbox/CTFE twins and module wrappers.
 fn under_lock(u: &Unit, id: u32) -> bool {
     match &u.fns[id as usize].key {
-        FnKey::Sandbox(_) => true,
+        FnKey::Sandbox(_) | FnKey::Ctfe(_) => true,
         FnKey::Inst(d, _) => crate::sandbox::is_wrapper_crate(u, u.prog.def(*d).krate),
         _ => false,
     }
@@ -5612,6 +5613,7 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
         let inl = u.fns[s as usize].history().inlined_into.len();
         let mut deps = u.fns[s as usize].history().inlined_into.clone();
         deps.extend(crate::sandbox::twin_of(u, s));
+        deps.extend(crate::ctfe_twin::twin_of(u, s));
         // SPEC-V: the slot's unverified-mode twin is its old text too, and unverified code inlines
         // it as it would the slot (jit::callee_attrs): the twin's flag is set with the slot's and
         // the code that inlined it is rebuilt. The twin itself is built again below (`plain`).
@@ -6464,6 +6466,10 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
                 errs.push(format!("`{}` has sandboxed code, which does not take a forwarder -- restart the app", u.fns[s as usize].name));
                 as_restart = true;
             }
+            // a constant-evaluation twin runs the target's twin
+            if let Some(tw) = crate::ctfe_twin::twin_of(u, s) {
+                twins.push((tw, crate::ctfe_twin::twin(u, t)));
+            }
             // an unverified-mode twin runs the target's twin
             if let Some(tw) = u.plain_twin_of(s) {
                 twins.push((tw, u.plain_twin(t)));
@@ -6524,6 +6530,7 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
             let inl = u.fns[s as usize].history().inlined_into.len();
             let mut deps = u.fns[s as usize].history().inlined_into.clone();
             deps.extend(crate::sandbox::twin_of(u, s));
+            deps.extend(crate::ctfe_twin::twin_of(u, s));
             // (its unverified-mode twin: flagged and walked, built again with `plain`)
             let plain_twin = u.plain_twin_of(s);
             deps.extend(plain_twin);
@@ -6739,7 +6746,7 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
         // closure above; rebuild compiled twins and leave cold twins for first use.
         let targets: Vec<u32> = slots.iter().chain(fresh.iter()).copied().chain(plain.iter().copied().filter(|&id| u.fns[id as usize].compiled)).filter(|&id| {
             !crate::sandbox::is_sandboxed_slot(u, id)
-                && (!matches!(u.fns[id as usize].key, FnKey::Sandbox(_)) || u.fns[id as usize].compiled)
+                && (!matches!(u.fns[id as usize].key, FnKey::Sandbox(_) | FnKey::Ctfe(_)) || u.fns[id as usize].compiled)
         }).collect();
         // host slots: front ends under the lock, back ends without it (program threads keep
         // running and compiling); twins under the lock (their transform places sandbox data)
@@ -7954,7 +7961,7 @@ pub(crate) fn settle_verdicts(up: *mut Unit, pending: &mut Vec<PendingPatch>, un
                 for &id in &p.ids {
                     // an unverified-mode twin is its base's body, never promoted: the base's verdict
                     // is the one to wait for and report (it said "did not check" of every twin)
-                    let of = match u.fns[id as usize].key { FnKey::Plain(b) => b, _ => id };
+                    let of = match u.fns[id as usize].key { FnKey::Plain(b) | FnKey::Ctfe(b) => b, _ => id };
                     match u.verdict_state(of) {
                         Verdict::Clean => {}
                         Verdict::Failed(events) => failed.extend(events),

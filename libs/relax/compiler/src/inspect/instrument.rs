@@ -203,12 +203,12 @@ enum Shape {
     Other,
 }
 
-/// A slot's fn key, through a SPEC-V twin (`FnKey::Plain`, named `[unverified]`) to the slot it
+/// A slot's fn key, through a SPEC-V or constant-evaluation twin to the slot it
 /// twins: the twin is the same fn body, so its item, scope and signature are the base's. (Probes
 /// and line hooks of unverified code -- most of a relaxed app -- refused "not a fn instance".)
 pub(super) fn base_key(u: &crate::jit::Unit, id: u32) -> &crate::jit::FnKey {
     match &u.fns[id as usize].key {
-        crate::jit::FnKey::Plain(b) => &u.fns[*b as usize].key,
+        crate::jit::FnKey::Plain(b) | crate::jit::FnKey::Ctfe(b) => &u.fns[*b as usize].key,
         k => k,
     }
 }
@@ -390,7 +390,7 @@ pub(super) fn fn_spans_line(u: &crate::jit::Unit, id: u32, line: u32) -> bool {
         }
         let f = &u.fns[id as usize];
         match &f.key {
-            crate::jit::FnKey::Plain(b) | crate::jit::FnKey::Sandbox(b) if *b != u32::MAX => id = *b,
+            crate::jit::FnKey::Plain(b) | crate::jit::FnKey::Sandbox(b) | crate::jit::FnKey::Ctfe(b) if *b != u32::MAX => id = *b,
             crate::jit::FnKey::Closure(file, e, _) => {
                 let Some(pf) = u.prog.files.get(*file as usize) else { return false };
                 let x = pf.ast.expr(crate::ast::ExprId(*e));

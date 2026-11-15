@@ -76,6 +76,7 @@ fn check_code_as(lib: &str, bins: &[&str], harness: bool, uses: Uses, post_mono:
     let mut sess = crate::Session::default();
     sess.options.const_fuel = true;
     sess.options.tiny_const_eval_limit = std::env::var_os("RELAX_TINY_CONST_EVAL_LIMIT").is_some_and(|v| v == "1");
+    if std::env::var_os("RELAX_CTFE").is_some_and(|v| v == "0") { sess.options.ctfe = crate::options::Ctfe::Off; }
     sess.options.post_mono = post_mono;
     let sess = std::sync::Arc::new(sess);
     // as run.rs sets up a check: import and macro uses are recorded, every crate keeps the
@@ -813,4 +814,28 @@ fn a_constants_steps_reach_long_running_const_eval_where_rustcs_do() {
         format!("21:49: warning: {lint}"), format!("21:49: warning: {progress}"),
     ];
     assert_eq!(got, expected, "the check's long_running_const_eval reports are not rustc's\n{stderr}");
+}
+
+/// The native count of a constant's code (ctfe_twin.rs) against the interpreter's, rustc's: for
+/// every constant of STEP_TABLE that both evaluate (each initializer runs as code: RELAX_CTFE=0),
+/// native <= interpreter (more would make a run reject what rustc accepts) and native >=
+/// interpreter / 8 (a run's consult of the interpreter at 2M / 8 native steps relies on it).
+#[test]
+fn a_constants_native_steps_follow_the_interpreters() {
+    if std::env::var_os(CHILD).is_some() {
+        let _ = check_code(STEP_TABLE, &[], false);
+        let steps = std::mem::take(&mut *crate::jit::CONST_STEPS.lock().unwrap_or_else(|e| e.into_inner()));
+        assert!(steps.len() >= 12, "too few constants ran both ways: {steps:?}");
+        let off: Vec<_> = steps.iter().filter(|(_, interp, native)| native > interp || native * 8 < *interp).collect();
+        assert!(off.is_empty(), "(constant, interpreter steps, native steps) outside [interpreter / 8, interpreter]: {off:?}");
+        return;
+    }
+    let out = crate::test_child::output(std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "check_lint_tests::a_constants_native_steps_follow_the_interpreters", "--nocapture", "--test-threads=1", "--format=terse"])
+        .env(CHILD, "1")
+        .env("RELAX_TINY_CONST_EVAL_LIMIT", "1")
+        .env("RELAX_CTFE", "0")
+        .env_remove("RELAX_LINT_FLAGS"));
+    let (stdout, stderr) = (String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    assert!(out.status.success() && stdout.contains("1 passed"), "{stdout}\n{stderr}");
 }
