@@ -614,7 +614,7 @@ unsafe fn place(up: *mut Unit, sym: u32, depth: u32) -> Result<u32, String> {
             let (start, len, align, mutable) = u.syms.obj_info(i).ok_or("unknown data object")?;
             if mutable {
                 let b = initial_bytes(u, sym)?;
-                let words = provenance_words(u, &b);
+                let words = pointer_words(u, sym, &b);
                 (b, align, true, words)
             } else {
                 let words = crate::syms::obj_pointer_words(u, i).ok_or_else(|| format!("data object `{}` holds pointers the sandbox cannot relocate", crate::syms::describe(u, Sym::new(sym))))?;
@@ -625,7 +625,7 @@ unsafe fn place(up: *mut Unit, sym: u32, depth: u32) -> Result<u32, String> {
             let t = u.tcx.const_ty(&u.prog, d).ok_or("static without a type")?;
             let align = u.layout_of(t).align.max(1) as u64;
             let b = initial_bytes(u, sym)?;
-            let words = provenance_words(u, &b);
+            let words = pointer_words(u, sym, &b);
             (b, align, true, words)
         }
         SymKind::Rw(i) => {
@@ -633,7 +633,7 @@ unsafe fn place(up: *mut Unit, sym: u32, depth: u32) -> Result<u32, String> {
             // Lowered promotions are filled by code when it runs. Only promotions filled
             // by a const initializer have nonzero initial bytes; never copy host writes.
             let b = initial_bytes(u, sym).unwrap_or_else(|_| vec![0; size.max(1) as usize]);
-            let words = provenance_words(u, &b);
+            let words = pointer_words(u, sym, &b);
             (b, align.max(1), true, words)
         }
         k => return Err(format!("{:?} is not data a sandboxed module can reach", k)),
@@ -713,6 +713,36 @@ pub(crate) fn initial_bytes(u: &Unit, sym: u32) -> Result<Vec<u8>, String> {
         .ok_or_else(|| format!("sandbox: missing declared initializer for {}", crate::syms::describe(u, Sym::new(sym))))
 }
 
+/// Pointer words of a placed value from its type. An integer equal to an address is no
+/// reference, and one equal to no known address costs a dlsym per foreign declaration.
+/// Fall back to provenance when the type cannot tell (a union).
+fn pointer_words(u: &Unit, sym: u32, b: &[u8]) -> Vec<(u32, Sym)> {
+    let Some(offsets) = crate::syms::pointer_offsets(u, u.syms.addr(Sym::new(sym)), b) else {
+        return provenance_words(u, b);
+    };
+    let mut out = Vec::new();
+    let pw = u.ptr_bytes() as usize;
+    for o in offsets {
+        if o as usize + pw <= b.len() {
+            if let Some(s) = word_symbol(u, b, o as usize) {
+                out.push((o, s));
+            }
+        }
+    }
+    out
+}
+
+/// The symbol the pointer word at offset `i` of `b` is the address of, if any (none for a
+/// small word, which is never an address).
+fn word_symbol(u: &Unit, b: &[u8], i: usize) -> Option<Sym> {
+    let w = crate::syms::word_in(u, b, i);
+    if (if u.ptr_bytes() == 4 { w & 0xffff_ffff } else { w }) > 0x10000 {
+        u.syms.symbol_at(w, u)
+    } else {
+        None
+    }
+}
+
 /// Pointer words of initializer bytes by provenance (a word equal to the address of a
 /// known data object, static or thunk). Never inspect a running host static here.
 pub(crate) fn provenance_words(u: &Unit, b: &[u8]) -> Vec<(u32, Sym)> {
@@ -720,11 +750,8 @@ pub(crate) fn provenance_words(u: &Unit, b: &[u8]) -> Vec<(u32, Sym)> {
     let pw = u.ptr_bytes() as usize;
     let mut i = 0;
     while i + pw <= b.len() {
-        let w = crate::syms::word_in(u, b, i);
-        if (if pw == 4 { w & 0xffff_ffff } else { w }) > 0x10000 {
-            if let Some(s) = u.syms.symbol_at(w, u) {
-                out.push((i as u32, s));
-            }
+        if let Some(s) = word_symbol(u, b, i) {
+            out.push((i as u32, s));
         }
         i += pw;
     }
@@ -2570,5 +2597,60 @@ mod tests {
         assert_eq!(ret_in(base, host), 0, "a host address becomes NULL, never the window's bytes at its masked offset");
         assert_eq!(ret_in(base, base + WINDOW), 0, "the next window is not this one");
         assert_eq!(ret_in(0, host), 0, "with no arena nothing is handed back");
+    }
+}
+
+#[cfg(test)]
+mod pointer_words_tests {
+    use super::*;
+
+    #[test]
+    fn a_placed_value_takes_its_pointer_words_from_its_type() {
+        isolated_test!(a_placed_value_takes_its_pointer_words_from_its_type);
+        // (with std: a slice, a trait object and an Option need core's items to be evaluated)
+        std::env::set_var("RELAX_STD", concat!(env!("CARGO_MANIFEST_DIR"), "/std"));
+        let sess = &Arc::new(crate::Session::default());
+        let root = std::env::temp_dir().join(format!("relax-sandbox-words-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let source = root.join("fixture.rs");
+        std::fs::write(&source, r#"
+static S: u64 = 7;
+static INTS: [u64; 2] = [1, 2];
+static REFS: [&u64; 2] = [&S, &S];
+static DYN: &(dyn std::fmt::Debug + Sync) = &S;
+static FNP: fn() = main;
+static SLICE: &[u64] = &[1, 2];
+static OPT: Option<&u64> = Some(&S);
+union U { a: [u64; 2], b: &'static u64 }
+static UN: U = U { a: [1, 2] };
+fn main() {}
+"#).unwrap();
+        let (prog, core, krate) = crate::load_with_std(sess, source.to_str().unwrap(), "fixture", false).unwrap();
+        let mut tcx = crate::tcx::Tcx::new();
+        tcx.collect(&prog);
+        let mut u = Unit::new(prog, tcx, core);
+        let [s, ints, refs, dyn_ref, fnp, slice, opt, un] =
+            ["S", "INTS", "REFS", "DYN", "FNP", "SLICE", "OPT", "UN"].map(|name| {
+                let def = crate::program::DefId(u.prog.defs.iter().position(|d| d.krate == krate && u.prog.syms.str(d.name) == name).unwrap() as u32);
+                let sym = u.static_sym(def);
+                assert_ne!(u.syms.addr(sym), 0, "static `{name}` has no storage: its initializer did not run");
+                sym
+            });
+        let at = u.syms.addr(s);
+        let bytes = |words: &[u64]| words.iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<_>>();
+        let mixed = bytes(&[1, at]);
+        let both = bytes(&[at, at]);
+        let one = at.to_le_bytes();
+        let pairs = |words: Vec<(u32, Sym)>| words.into_iter().map(|(o, s)| (o, s.id)).collect::<Vec<_>>();
+
+        assert_eq!(pairs(provenance_words(&u, &mixed)), vec![(8, s.id)], "provenance finds the word equal to the static's address");
+        assert_eq!(pairs(pointer_words(&u, ints.id, &mixed)), vec![], "an integer equal to an address is no reference");
+        assert_eq!(pairs(pointer_words(&u, refs.id, &both)), vec![(0, s.id), (8, s.id)], "a reference array has two pointer words");
+        assert_eq!(pairs(pointer_words(&u, dyn_ref.id, &both)), vec![(0, s.id), (8, s.id)], "a trait object reference has a data pointer and a vtable pointer");
+        assert_eq!(pairs(pointer_words(&u, fnp.id, &one)), vec![(0, s.id)], "a function pointer has one pointer word");
+        assert_eq!(pairs(pointer_words(&u, slice.id, &both)), vec![(0, s.id)], "a slice length is no reference");
+        assert_eq!(pairs(pointer_words(&u, opt.id, &one)), vec![(0, s.id)], "an optional reference has one pointer word");
+        assert_eq!(pairs(pointer_words(&u, un.id, &both)), vec![(0, s.id), (8, s.id)], "a union falls back to the provenance scan");
+        std::fs::remove_dir_all(root).unwrap();
     }
 }
