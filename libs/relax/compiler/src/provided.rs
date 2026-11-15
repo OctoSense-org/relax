@@ -90,6 +90,15 @@ impl Clone for ProvidedCrate {
 
 static REGISTRY: Mutex<Vec<ProvidedCrate>> = Mutex::new(Vec::new());
 
+/// The binary's const-verified Option layouts, keyed by normalised type name.
+/// Collected once before crate registration; not yet consulted for boundary trust.
+static OPTION_LAYOUTS: std::sync::OnceLock<HashMap<String, [u64; 6]>> = std::sync::OnceLock::new();
+
+/// Installs the loader's complete Option table before any provided crate is registered.
+pub fn register_option_layouts(layouts: HashMap<String, [u64; 6]>) {
+    OPTION_LAYOUTS.set(layouts).unwrap_or_else(|_| panic!("Option layouts already registered"));
+}
+
 pub(crate) fn registered(name: &str) -> bool {
     let name = name.replace('-', "_");
     REGISTRY.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|p| p.name == name)
@@ -120,8 +129,9 @@ pub fn register(
 /// bound and their rustc signatures and argument layouts (the bridge bodies, lower.rs
 /// bridge_func, call shims by symbol), the opaque handles' rustc size, align, drop and field
 /// offsets, the plain types' rustc layouts, and the per-side/shared statics with shared rustc
-/// sizes and alignments (never addresses, which differ per process). The program's copy of the
-/// crate is the loader's own source (check_sources), so a change of these follows a source
+/// sizes and alignments (never addresses, which differ per process), and the binary's Option
+/// layout table. The program's copy of the crate is the loader's own source (check_sources),
+/// so a change of these follows a source
 /// change; a change of the crate's native fn bodies alone (a HAL fix) keeps them, and with them
 /// every stored build of the code above the crate.
 fn binding_identity(
@@ -186,6 +196,16 @@ fn binding_identity(
         h.str(k);
         h.u64(*size);
         h.u64(*align);
+    }
+    let options = OPTION_LAYOUTS.get();
+    let mut keys: Vec<&String> = options.into_iter().flat_map(|m| m.keys()).collect();
+    keys.sort_unstable();
+    h.u32(keys.len() as u32);
+    if let Some(options) = options {
+        for k in keys {
+            h.str(k);
+            for word in options[k] { h.u64(word); }
+        }
     }
     h.finish128() as u64
 }

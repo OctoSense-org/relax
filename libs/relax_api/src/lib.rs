@@ -147,8 +147,76 @@ pub const PLAIN: u32 = 3;
 pub const PER_SIDE: u32 = 4;
 /// A static whose one instance is the loader's: JIT code reads and writes it at the loader's address.
 pub const SHARED: u32 = 5;
+/// A const-verified `Option<X>` layout; `Entry::enum_layout` holds [`option_layout`]'s six words.
+pub const OPTION: u32 = 6;
 
-/// One marked item, as the attribute lays it down in the `relax_api` link section.
+/// `[size, align, payload_off, tag_bytes, none_tag, some_tag]` for `Option<X>`.
+/// When rustc niche-encodes it (`size_of::<Option<X>>() == size_of::<X>()`),
+/// `tag_bytes` is zero and no layout agreement is stated.
+///
+/// Generated host entries evaluate this in a const: reading rustc's tags proves the
+/// stated width is not too large, and matching images with poisoned padding proves
+/// it is not too small or at the wrong offset. A changed layout is a compile error.
+#[cfg(feature = "host-shims")]
+pub const fn option_layout<X>() -> [u64; 6] {
+    // Even a non-const caller must have rustc validate the raw reads and images.
+    const {
+        use core::mem::{ManuallyDrop, MaybeUninit, align_of, size_of};
+        let size = size_of::<Option<X>>();
+        let align = align_of::<Option<X>>();
+        if size == size_of::<X>() {
+            [size as u64, align as u64, 0, 0, 0, 0]
+        } else {
+            // The tagged class admitted at the provided boundary has no payload niche:
+            // zero inhabits X. ManuallyDrop keeps even owning payloads from running drop.
+            let none = ManuallyDrop::new(None::<X>);
+            let some = ManuallyDrop::new(Some(unsafe { MaybeUninit::<X>::zeroed().assume_init() }));
+            let none_ptr = (&none as *const ManuallyDrop<Option<X>>).cast::<u8>();
+            let some_ptr = (&some as *const ManuallyDrop<Option<X>>).cast::<u8>();
+            let payload_off = match unsafe { &*some_ptr.cast::<Option<X>>() } {
+                Some(payload) => unsafe { (payload as *const X).cast::<u8>().offset_from(some_ptr) as usize },
+                None => panic!("Some became None"),
+            };
+            // Integer::for_align on the JIT's hosts: integer alignment equals its size.
+            let w = match align_of::<X>() {
+                1 | 2 | 4 | 8 | 16 => align_of::<X>(),
+                _ => 1,
+            };
+            assert!(w <= payload_off);
+            assert!(size == payload_off + size_of::<X>());
+            let mut none_tag = 0u128;
+            let mut some_tag = 0u128;
+            let mut i = 0;
+            while i < w {
+                let shift = if cfg!(target_endian = "little") { i * 8 } else { (w - 1 - i) * 8 };
+                none_tag |= (unsafe { *none_ptr.add(i) } as u128) << shift;
+                some_tag |= (unsafe { *some_ptr.add(i) } as u128) << shift;
+                i += 1;
+            }
+            assert!(none_tag <= u64::MAX as u128 && some_tag <= u64::MAX as u128);
+            let mut none_image = MaybeUninit::<Option<X>>::uninit();
+            let mut some_image = MaybeUninit::<Option<X>>::uninit();
+            let none_bytes = none_image.as_mut_ptr().cast::<u8>();
+            let some_bytes = some_image.as_mut_ptr().cast::<u8>();
+            unsafe {
+                none_bytes.write_bytes(0xff, size);
+                some_bytes.write_bytes(0xff, size);
+                some_bytes.add(payload_off).write_bytes(0, size_of::<X>());
+                i = 0;
+                while i < w {
+                    *none_bytes.add(i) = *none_ptr.add(i);
+                    *some_bytes.add(i) = *some_ptr.add(i);
+                    i += 1;
+                }
+                assert!(matches!(&*none_image.as_ptr(), None));
+                assert!(matches!(&*some_image.as_ptr(), Some(_)));
+            }
+            [size as u64, align as u64, payload_off as u64, w as u64, none_tag as u64, some_tag as u64]
+        }
+    }
+}
+
+/// One marked item or an Option spelling it uses, laid down in the `relax_api` link section.
 #[repr(C)]
 pub struct Entry {
     pub kind: u32,
@@ -157,7 +225,7 @@ pub struct Entry {
     /// OP: `core::any::type_name` of the fn item (`<f32 as krate::traits::ScriptNew>::script_new`,
     /// `krate::heap::ScriptHeap::value`); HANDLE/PLAIN: the type's path; a handle's trait ops:
     /// `<path as Clone>::clone`, `<path as PartialEq>::eq`, `<path as Hash>::hash_into`,
-    /// `<path as Fmt>::fmt_into`
+    /// `<path as Fmt>::fmt_into`; OPTION: `core::any::type_name::<Option<X>>()`
     pub key: fn() -> &'static str,
     /// OP: `core::any::type_name` of the op's fn pointer type (`fn(&krate::heap::ScriptHeap) -> u32`):
     /// Relax compares it with its own reading of the same source; "" for a handle's trait ops
@@ -175,6 +243,8 @@ pub struct Entry {
     /// declaration order: tag_value, field_count, field_offsets..]. Signed tags are cast
     /// through their repr type and i64 to u64. Empty for structs and enums without a
     /// primitive repr; independent of the struct-only `offsets` table.
+    /// OPTION: [`option_layout`]'s six words, evaluated in a const. Its other layout,
+    /// signature and operation fields are zero, empty or None.
     pub enum_layout: &'static [u64],
     /// HANDLE: rustc's drop_in_place, when the type needs drop
     pub drop: Option<DropFn>,

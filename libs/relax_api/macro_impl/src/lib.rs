@@ -4,6 +4,7 @@
 
 use makepad_micro_proc_macro::proc_macro::{Delimiter, Group, Spacing, TokenStream, TokenTree};
 use makepad_micro_proc_macro::TokenBuilder;
+use std::collections::BTreeMap;
 
 /// The attribute: `attr` its arguments, `item` the marked item.
 pub fn relax_api_impl(attr: TokenStream, item: TokenStream) -> TokenStream {
@@ -215,6 +216,7 @@ struct Sig {
     generic: bool,
     /// the fn's own `#[relax_api]` mark (inside an impl)
     marked: bool,
+    cfg: Vec<String>,
 }
 
 /// Parses a fn item from `toks[i..]` (attributes included); returns the sig and the index
@@ -351,7 +353,7 @@ fn parse_fn(toks: &[TokenTree], start: usize) -> Option<(Sig, usize, Vec<(usize,
         let Some(c) = first_colon(&p) else { return None };
         params.push(p[c + 1..].to_vec());
     }
-    let sig = Sig { name, is_unsafe, params, ret, never, generic, marked };
+    let sig = Sig { name, is_unsafe, params, ret, never, generic, marked, cfg: layout_conditions(&toks[start..]) };
     Some((sig, i, strip))
 }
 
@@ -410,6 +412,125 @@ fn key_code(o: &Owner, name: &str) -> String {
 const CFG: &str = "#[cfg(feature = \"host-shims\")]";
 const SECTION: &str = "#[used] #[cfg_attr(target_vendor = \"apple\", link_section = \"__DATA,__relax_api\")] #[cfg_attr(all(not(target_vendor = \"apple\"), not(windows)), link_section = \"relax_api\")] #[cfg_attr(windows, link_section = \".relaxapi$m\")]";
 
+/// Payload spelling -> the cfg predicates of each occurrence in this marked item.
+type OptionSpellings = BTreeMap<String, Vec<String>>;
+
+fn option_nameable(toks: &[TokenTree]) -> bool {
+    toks.iter().enumerate().all(|(i, t)| match t {
+        TokenTree::Ident(id) => is_punct(i.checked_sub(1).and_then(|n| toks.get(n)), '\'')
+            || !matches!(id.to_string().as_str(), "Self" | "impl" | "_"),
+        TokenTree::Group(g) => option_nameable(&g.stream().into_iter().collect::<Vec<_>>()),
+        _ => true,
+    })
+}
+
+/// Instantiate higher-ranked lifetimes too: rewriting `for<'a>` as
+/// `for<'static>` would declare a reserved lifetime instead of naming a type.
+fn option_static(toks: &[TokenTree]) -> String {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < toks.len() {
+        if is_ident(toks.get(i), "for") && is_punct(toks.get(i + 1), '<') {
+            i += 2;
+            while i < toks.len() && !is_punct(toks.get(i), '>') { i += 1; }
+        } else if let TokenTree::Group(g) = &toks[i] {
+            let inner = option_static(&g.stream().into_iter().collect::<Vec<_>>());
+            let mut group = Group::new(g.delimiter(), inner.parse().expect("Option type tokens"));
+            group.set_span(g.span());
+            out.push(TokenTree::Group(group));
+        } else {
+            out.push(toks[i].clone());
+        }
+        i += 1;
+    }
+    text_static(&out)
+}
+
+/// Scan type tokens, including nested generic arguments, tuples, arrays and fn types.
+/// Generic ops/types have already been excluded by the item expander. Keep Self
+/// unsubstituted here: an associated type cannot be named outside its impl.
+fn collect_options(toks: &[TokenTree], cfg: &[String], out: &mut OptionSpellings) {
+    for (i, t) in toks.iter().enumerate() {
+        if let TokenTree::Group(g) = t {
+            collect_options(&g.stream().into_iter().collect::<Vec<_>>(), cfg, out);
+        }
+        if !is_ident(Some(t), "Option") || !is_punct(toks.get(i + 1), '<') { continue; }
+        let mut depth = 1usize;
+        for end in i + 2..toks.len() {
+            if is_punct(toks.get(end), '<') {
+                depth += 1;
+            } else if is_punct(toks.get(end), '>') && !is_punct(toks.get(end - 1), '-') {
+                depth -= 1;
+                if depth == 0 {
+                    let payload = &toks[i + 2..end];
+                    if !payload.is_empty() && option_nameable(payload) {
+                        let spelling = option_static(payload);
+                        let condition = format!("all({})", cfg.join(", "));
+                        let conditions = out.entry(spelling).or_default();
+                        if !conditions.contains(&condition) { conditions.push(condition); }
+                    }
+                    break;
+                }
+            }
+        }
+    }
+}
+
+fn option_code(id: u64, options: &OptionSpellings) -> String {
+    let mut extra = String::new();
+    for (n, (payload, conditions)) in options.iter().enumerate() {
+        extra.push_str(&format!(
+            "\n{CFG} #[cfg(any({conditions}))] {SECTION} #[doc(hidden)] #[allow(non_upper_case_globals)]
+static __relax_api_o{id:016x}_{n}: ::relax_api::Entry = ::relax_api::Entry {{
+  kind: ::relax_api::OPTION, module: module_path!(),
+  key: {{ fn k() -> &'static str {{ ::core::any::type_name::<::core::option::Option<{payload}>>() }} k }},
+  sig: {{ fn s() -> &'static str {{ \"\" }} s }},
+  shim: None, slots: &[], size: 0, align: 0, offsets: &[],
+  enum_layout: {{ const TABLE: [u64; 6] = ::relax_api::option_layout::<{payload}>(); &TABLE }},
+  drop: None, addr: None }};\n",
+            conditions = conditions.join(", "),
+        ));
+    }
+    extra
+}
+
+fn collect_field_options(fields: &Group, cfg: &[String], out: &mut OptionSpellings) {
+    for field in split_commas(&fields.stream().into_iter().collect::<Vec<_>>()) {
+        let mut conditions = cfg.to_vec();
+        conditions.extend(layout_conditions(&field));
+        let mut at = skip_attrs(&field, 0);
+        if fields.delimiter() == Delimiter::Brace {
+            let Some(colon) = first_colon(&field[at..]) else { continue; };
+            at += colon + 1;
+        } else if is_ident(field.get(at), "pub") {
+            at += 1;
+            if matches!(field.get(at), Some(TokenTree::Group(g)) if g.delimiter() == Delimiter::Parenthesis) { at += 1; }
+        }
+        collect_options(&field[at..], &conditions, out);
+    }
+}
+
+fn type_option_code(toks: &[TokenTree], body_start: usize, is_struct: bool, id: u64) -> String {
+    let mut options = OptionSpellings::new();
+    let cfg = layout_conditions(toks);
+    if let Some(TokenTree::Group(g)) = toks[body_start..].iter().find(|t| matches!(t, TokenTree::Group(g) if g.delimiter() == Delimiter::Brace || g.delimiter() == Delimiter::Parenthesis)) {
+        if is_struct {
+            collect_field_options(g, &cfg, &mut options);
+        } else {
+            for variant in enum_variants(&g.stream().into_iter().collect::<Vec<_>>()) {
+                let mut conditions = cfg.clone();
+                conditions.extend(layout_conditions(&variant));
+                if let Some(TokenTree::Group(fields)) = variant.get(skip_attrs(&variant, 0) + 1) {
+                    if matches!(fields.delimiter(), Delimiter::Brace | Delimiter::Parenthesis) {
+                        collect_field_options(fields, &conditions, &mut options);
+                    }
+                }
+            }
+        }
+    }
+    option_code(id, &options)
+}
+
 /// The wrapper's first statement: whose heap the op allocates in. `#[relax_api(run)]`: the
 /// program's, so its end takes what the op made, whatever state it died in (a crate whose objects
 /// are the program's, such as a script VM, says `run` on every attribute). Without `run`: the
@@ -427,6 +548,10 @@ fn op_phase(args: &[String]) -> &'static str {
 fn op_code(o: &Owner, s: &Sig, phase: &str) -> String {
     let path = call_path(o, &s.name);
     let id = fnv(&format!("{} {} {}", text(&o.self_ty, None), o.trait_.as_ref().map_or(String::new(), |t| text(t, None)), s.name));
+    let mut options = OptionSpellings::new();
+    for ty in s.params.iter().chain(std::iter::once(&s.ret)) {
+        collect_options(ty, &s.cfg, &mut options);
+    }
     let w = format!("__relax_api_w{:016x}", id);
     let params: Vec<Vec<TokenTree>> = s.params.iter().map(|p| subst_self(p, &o.self_ty)).collect();
     let ret = subst_self(&s.ret, &o.self_ty);
@@ -479,7 +604,7 @@ fn op_code(o: &Owner, s: &Sig, phase: &str) -> String {
         fnptr_params.join(", "),
         if ret.is_empty() { String::new() } else { format!(" -> {}", text_static(&ret)) }
     );
-    format!(
+    let mut extra = format!(
         "{CFG} #[doc(hidden)] #[allow(non_snake_case, unused_unsafe, clippy::all)] unsafe extern \"C\" fn {w}(a: *const *mut u8, r: *mut u8) -> u32 {{ let _ = r; {phase} {body} }}
 {CFG} {SECTION} #[doc(hidden)] #[allow(non_upper_case_globals)] static {w}_E: ::relax_api::Entry = ::relax_api::Entry {{
   kind: ::relax_api::OP, module: module_path!(),
@@ -488,7 +613,9 @@ fn op_code(o: &Owner, s: &Sig, phase: &str) -> String {
   shim: Some({w}), slots: &[{slots}], size: 0, align: 0, offsets: &[], enum_layout: &[], drop: None, addr: None }};",
         key = key_code(o, &s.name),
         slots = slots.join(", "),
-    )
+    );
+    extra.push_str(&option_code(id, &options));
+    extra
 }
 
 fn expand_fn(toks: &[TokenTree], args: &[String]) -> Result<(TokenStream, String), String> {
@@ -745,13 +872,18 @@ fn cfg_conditions(attr: &[TokenTree]) -> Vec<String> {
     }
 }
 
-fn layout_cfg(toks: &[TokenTree]) -> (String, String) {
+fn layout_conditions(toks: &[TokenTree]) -> Vec<String> {
     let mut conditions = Vec::new();
     for attr in toks[..skip_attrs(toks, 0)].chunks_exact(2) {
         if let TokenTree::Group(g) = &attr[1] {
             conditions.extend(cfg_conditions(&g.stream().into_iter().collect::<Vec<_>>()));
         }
     }
+    conditions
+}
+
+fn layout_cfg(toks: &[TokenTree]) -> (String, String) {
+    let conditions = layout_conditions(toks);
     if conditions.is_empty() {
         (String::new(), String::new())
     } else {
@@ -945,6 +1077,7 @@ fn expand_type(toks: &[TokenTree], args: &[String]) -> Result<(TokenStream, Stri
     } else {
         expand_enum_layout(toks, &name, id, &generics, &lifetimes, body_start)?
     };
+    extra.push_str(&type_option_code(toks, body_start, is_struct, id));
     // field offsets of a struct, in declaration order: a plain type's are checked against
     // Relax's; a handle's let Relax use rustc's layout when it is its own (provided.rs verify)
     let mut offsets = Vec::new();
