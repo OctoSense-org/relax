@@ -913,6 +913,8 @@ pub struct Cache {
     /// every definition by crate (built once, on the first decode)
     crate_defs: Vec<Vec<DefId>>,
     crate_defs_n: usize,
+    /// definitions from `crate_defs_n` to here are run-time modules' (`defs_mapped`); 0: none seen
+    module_defs_n: usize,
     /// per def: its key (memo, hierarchical)
     def_keys: HashMap<DefId, u128>,
     mapped_definitions: Option<collected::MappedDefinitions>,
@@ -1385,6 +1387,7 @@ impl Cache {
             def_maps: HashMap::new(),
             crate_defs: Vec::new(),
             crate_defs_n: 0,
+            module_defs_n: 0,
             def_keys: HashMap::new(),
             mapped_definitions: None,
             collected_boot: None,
@@ -2025,11 +2028,26 @@ impl Cache {
 
     // ------------------------------------------------------------ stable identities
 
+    /// The maps and restored tables still describe the program: nothing was added since, or
+    /// only definitions of crates loaded after the cache opened (a run-time module's), which
+    /// have no identity, so no key names them and none decodes to one. (Dropped at a module's
+    /// load, the first twin it linked from the cache built core's map again.)
+    fn defs_mapped(&mut self, u: &Unit) -> bool {
+        let n = u.prog.defs.len();
+        if self.crate_defs_n == n { return true; }
+        // (the run of modules' definitions is remembered, so a later program definition past
+        // them is found at once, not by walking them again on every key)
+        let mut i = self.crate_defs_n.max(self.module_defs_n);
+        while i < n && u.prog.def(DefId(i as u32)).krate as usize >= self.crate_ident.len() { i += 1; }
+        self.module_defs_n = i;
+        i == n
+    }
+
     /// A definition's key: its parent's key (the crate's identity at the root), name, kind,
     /// defining file (and, unless its path names it, its offset). Hierarchical, so a crate's
     /// whole map is cheap.
     fn def_key(&mut self, u: &Unit, d: DefId) -> u128 {
-        if self.crate_defs_n == u.prog.defs.len() {
+        if self.defs_mapped(u) {
             if let Some(k) = self.mapped_definitions.as_ref().and_then(|m| m.key(d)) { return k; }
         }
         if let Some(&k) = self.def_keys.get(&d) {
@@ -2062,6 +2080,7 @@ impl Cache {
             }
         }
         self.crate_defs_n = u.prog.defs.len();
+        self.module_defs_n = 0;
         let mut order: Vec<usize> = (first..by.len()).filter(|c| !by[*c].is_empty()).collect();
         order.sort_by_key(|c| std::cmp::Reverse(by[*c].len()));
         let n = std::thread::available_parallelism().map_or(4, |x| x.get()).clamp(1, 8);
@@ -2239,8 +2258,9 @@ impl Cache {
         let k = dd.u128()?;
         let c = *self.crate_by_ident.get(&ci)?;
         // definitions added since the maps were built (a live edit): build them again
-        if self.crate_defs_n != u.prog.defs.len() {
+        if !self.defs_mapped(u) {
             self.crate_defs_n = u.prog.defs.len();
+            self.module_defs_n = 0;
             self.crate_defs.clear();
             self.def_maps.clear();
             self.mapped_definitions = None;
@@ -10228,6 +10248,52 @@ mod data_tests {
         let mut c = Cache::open_in(u, Mode::ReadOnly, root.to_path_buf()).unwrap();
         c.mode = Mode::On;
         c
+    }
+
+    #[test]
+    fn a_run_time_crates_definitions_keep_the_definition_maps() {
+        isolated_test!(a_run_time_crates_definitions_keep_the_definition_maps);
+        let _unit = CACHE_UNIT.lock().unwrap_or_else(|e| e.into_inner());
+        let mut session = crate::Session::default();
+        session.options.tier1 = false;
+        session.options.tyck_ahead = false;
+        let sess = &std::sync::Arc::new(session);
+        let root = std::env::temp_dir().join(format!("relax-defmaps-{}", std::process::id()));
+        pack::ensure_private_dir(&root).unwrap();
+        let source = root.join("fixture.rs");
+        let module_path = root.join("module.rs");
+        std::fs::write(&source, "pub fn f() {}\nfn main() {}\n").unwrap();
+        std::fs::write(&module_path, "pub fn g() {}\n").unwrap();
+        let mut prog = crate::program::Program::new(sess);
+        prog.load_crate("fixture", source.to_str().unwrap(), 2021, crate::cfg::CfgSet::host(sess, &[]), Vec::new()).unwrap();
+        let f = DefId(prog.defs.iter().position(|d| prog.syms.str(d.name) == "f").unwrap() as u32);
+        let mut tcx = crate::tcx::Tcx::new();
+        tcx.collect(&prog);
+        let mut u = Unit::new(prog, tcx, 0);
+        let mut c = open_test_cache(&u, &root);
+        let mut e = E::default();
+        c.enc_def(&u, f, &mut e, &mut Vec::new());
+        assert_eq!(c.dec_def(&u, &mut D { b: &e.0, p: 0 }), Some(f), "the program definition must decode before a module loads");
+        let maps = (c.crate_defs_n, c.def_maps.len());
+        assert_eq!(maps, (u.prog.defs.len(), 1), "the first decode must build the program crate's definition map");
+
+        u.prog.load_crate("module", module_path.to_str().unwrap(), 2021, crate::cfg::CfgSet::host(sess, &[]), Vec::new()).unwrap();
+        let g = DefId(u.prog.defs.iter().position(|d| u.prog.syms.str(d.name) == "g").unwrap() as u32);
+        assert!(u.prog.def(g).krate as usize >= c.crate_ident.len(), "the run-time module must have no cache identity");
+        assert_eq!(c.dec_def(&u, &mut D { b: &e.0, p: 0 }), Some(f), "the program definition must still decode after a module loads");
+        assert_eq!((c.crate_defs_n, c.def_maps.len()), maps, "loading a run-time module must keep the definition maps");
+        let mut module_e = E::default();
+        c.enc_def(&u, g, &mut module_e, &mut Vec::new());
+        assert_eq!(c.dec_def(&u, &mut D { b: &module_e.0, p: 0 }), None, "a run-time module's definition must not decode from a cache key");
+
+        // A live edit adds a definition to a crate the cache can name.
+        let added = *u.prog.def(f);
+        u.prog.defs.push(added);
+        let _ = c.dec_def(&u, &mut D { b: &e.0, p: 0 });
+        assert_eq!(c.crate_defs_n, u.prog.defs.len(), "adding a program definition must rebuild the definition maps");
+        assert_eq!(c.module_defs_n, 0, "rebuilding the definition maps must reset the module definition count");
+        drop(c);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
