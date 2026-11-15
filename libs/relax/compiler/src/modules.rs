@@ -1584,4 +1584,8 @@ pub(crate) unsafe fn reset_statics() {
     reset(&MODULES, relax_session::sync::Mutex::new(Vec::new()));
     reset(&MODULE_CRATES, relax_session::sync::Mutex::new(Vec::new()));
     reset(&ANY_MODULE_CRATE, std::sync::atomic::AtomicBool::new(false));
+    reset(&CHECKING_FROM, std::sync::atomic::AtomicU32::new(u32::MAX));
+    reset(&FRONT_REFUSALS, relax_session::sync::Mutex::new(Vec::new()));
+    // (keyed by crate and file numbers, which the next run's program numbers anew)
+    reset(&SYNTAX_VERDICTS, relax_session::sync::Mutex::new(Vec::new()));
 }
