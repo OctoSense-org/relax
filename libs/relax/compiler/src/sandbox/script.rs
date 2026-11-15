@@ -458,7 +458,7 @@ mod files {
                 Opened::Null => Fd::Null,
                 Opened::File { fd, write } => Fd::File { fd, write },
             };
-            Ok(b.add_fd(fd, 0) as i64)
+            b.add_fd(fd, 0).map(i64::from)
         }) as i32
     }
 
@@ -610,6 +610,9 @@ mod files {
                 _ => Err(c::EINVAL),
             },
             c::F_DUPFD | c::F_DUPFD_CLOEXEC => {
+                // (the lowest number is a C int: a negative one is EINVAL, as one at or past the
+                // open-file limit: add_fd)
+                let min = usize::try_from(arg as u32 as i32).map_err(|_| c::EINVAL)?;
                 let copy = match o {
                     On::Null => Fd::Null,
                     On::Std(h) => Fd::Std(h),
@@ -621,7 +624,7 @@ mod files {
                         Fd::File { fd: unsafe { OwnedFd::from_raw_fd(d) }, write }
                     }
                 };
-                with(|b| Ok(b.add_fd(copy, (arg as u32).min(i32::MAX as u32) as usize) as i64))
+                with(|b| b.add_fd(copy, min).map(i64::from))
             }
             _ => Err(c::EINVAL),
         });
@@ -797,7 +800,17 @@ mod files {
                 }
             }
             let [r, w] = ends;
-            let (r, w) = with(|b| Ok((b.add_fd(Fd::Pipe(r), 0), b.add_fd(Fd::Pipe(w), 0))))?;
+            let (r, w) = with(|b| {
+                let r = b.add_fd(Fd::Pipe(r), 0)?;
+                // (both ends or neither)
+                match b.add_fd(Fd::Pipe(w), 0) {
+                    Ok(w) => Ok((r, w)),
+                    Err(e) => {
+                        drop(b.take_fd(r));
+                        Err(e)
+                    }
+                }
+            })?;
             unsafe { std::ptr::copy_nonoverlapping([r, w].as_ptr() as *const u8, out as *mut u8, 8) };
             Ok(0)
         })();
@@ -859,7 +872,7 @@ mod files {
         if fd < 0 {
             return fail(last_errno()) as i32;
         }
-        with(|b| Ok(b.add_fd(Fd::File { fd: unsafe { OwnedFd::from_raw_fd(fd) }, write: true }, 0))).unwrap_or_else(|e| fail(e) as i32)
+        with(|b| b.add_fd(Fd::File { fd: unsafe { OwnedFd::from_raw_fd(fd) }, write: true }, 0)).unwrap_or_else(|e| fail(e) as i32)
     }
 
     // ---- `$RUSTC` questions (tool.rs): only an option-led question of the `rustc` the script was

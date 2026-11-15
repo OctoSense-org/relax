@@ -56,6 +56,7 @@ pub(crate) mod c {
         pub const AT_SYMLINK_NOFOLLOW: c_int = 0x100;
         pub const AT_REMOVEDIR: c_int = 0x200;
         pub const F_DUPFD_CLOEXEC: c_int = 1030;
+        pub const RLIMIT_NOFILE: c_int = 7;
         pub const ELOOP: i32 = 40;
         pub const ENAMETOOLONG: i32 = 36;
         pub const ENOSYS: i32 = 38;
@@ -80,6 +81,7 @@ pub(crate) mod c {
         pub const AT_SYMLINK_NOFOLLOW: c_int = 0x20;
         pub const AT_REMOVEDIR: c_int = 0x80;
         pub const F_DUPFD_CLOEXEC: c_int = 67;
+        pub const RLIMIT_NOFILE: c_int = 8;
         pub const ELOOP: i32 = 62;
         pub const ENAMETOOLONG: i32 = 63;
         pub const ENOSYS: i32 = 78;
@@ -106,6 +108,7 @@ pub(crate) mod c {
     pub const ENOTDIR: i32 = 20;
     pub const EISDIR: i32 = 21;
     pub const EINVAL: i32 = 22;
+    pub const EMFILE: i32 = 24;
     pub const ENOTTY: i32 = 25;
     pub const ESPIPE: i32 = 29;
     pub const ERANGE: i32 = 34;
@@ -128,6 +131,8 @@ extern "C" {
     fn readlinkat(dir: c_int, path: *const c_char, buf: *mut u8, len: usize) -> isize;
     fn mkdirat(dir: c_int, path: *const c_char, mode: ModeT) -> c_int;
     fn unlinkat(dir: c_int, path: *const c_char, flags: c_int) -> c_int;
+    /// (struct rlimit: the soft and the hard limit, rlim_t a u64 on the 64-bit hosts)
+    fn getrlimit(resource: c_int, rlim: *mut [u64; 2]) -> c_int;
     fn renameat(from_dir: c_int, from: *const c_char, to_dir: c_int, to: *const c_char) -> c_int;
     fn fchmod(fd: c_int, mode: ModeT) -> c_int;
     #[cfg_attr(all(target_vendor = "apple", target_arch = "x86_64"), link_name = "fdopendir$INODE64")]
@@ -285,6 +290,15 @@ pub(crate) struct Broker {
     /// what the script asked for and was refused, once each (`withhold`): "read <path>",
     /// "write <path>", "run <program>"
     withheld: std::cell::RefCell<Vec<String>>,
+}
+
+/// The fd numbers this process may hold: its soft RLIMIT_NOFILE (an fd is a C int).
+fn fd_limit() -> Result<usize, i32> {
+    let mut l = [0u64; 2];
+    if unsafe { getrlimit(c::RLIMIT_NOFILE, &mut l) } != 0 {
+        return Err(std::io::Error::last_os_error().raw_os_error().unwrap_or(c::EINVAL));
+    }
+    Ok(l[0].min(i32::MAX as u64) as usize)
 }
 
 fn host_open(path: &[u8], flags: c_int) -> Result<OwnedFd, String> {
@@ -748,20 +762,27 @@ impl Broker {
 
     // ------------------------------------------------------------------ the fd table
 
-    /// Adds `fd` at the lowest free number from `min`.
-    pub(crate) fn add_fd(&mut self, fd: Fd, min: usize) -> i32 {
-        let i = match self.fds.iter().skip(min).position(|f| f.is_none()) {
-            Some(i) => min + i,
-            None => {
-                if self.fds.len() < min {
-                    self.fds.resize_with(min, || None);
-                }
-                self.fds.push(None);
-                self.fds.len() - 1
-            }
-        };
+    /// Adds `fd` at the lowest free number from `min`, within the numbers the kernel gives this
+    /// process (its soft RLIMIT_NOFILE, read at each call, as the kernel reads it): a `min` at or
+    /// past the limit is EINVAL (F_DUPFD's answer; only a dup asks for a `min`), a table with no
+    /// free number from `min` below it EMFILE. The table grows only to the number it hands out.
+    pub(crate) fn add_fd(&mut self, fd: Fd, min: usize) -> Result<i32, i32> {
+        self.add_fd_below(fd, min, fd_limit()?)
+    }
+
+    fn add_fd_below(&mut self, fd: Fd, min: usize, limit: usize) -> Result<i32, i32> {
+        if min >= limit {
+            return Err(c::EINVAL);
+        }
+        let i = self.fds.iter().skip(min).position(|f| f.is_none()).map_or(self.fds.len().max(min), |i| min + i);
+        if i >= limit {
+            return Err(c::EMFILE);
+        }
+        if i >= self.fds.len() {
+            self.fds.resize_with(i + 1, || None);
+        }
         self.fds[i] = Some(fd);
-        i as i32
+        Ok(i as i32)
     }
 
     pub(crate) fn fd(&self, n: i32) -> Option<&Fd> {
@@ -882,6 +903,33 @@ mod tests {
         assert_eq!(br.chdir(&b(&out)), Ok(()));
         assert_eq!(br.cwd(), b(&std::fs::canonicalize(&out).unwrap()));
         assert_eq!(br.chdir(&b(&t.join("outside"))), Err(c::ENOENT));
+        let _ = std::fs::remove_dir_all(&t);
+    }
+
+    /// The script's fd numbers are bounded as the kernel bounds a process's: a dup's lowest number
+    /// at or past the open-file limit is EINVAL and leaves the table as it was (an
+    /// `fcntl(fd, F_DUPFD, 0x7fffffff)` grew it to 2^31 entries), a table with no free number below
+    /// the limit is EMFILE, and a new fd takes the lowest free number.
+    #[test]
+    fn the_fd_table_stays_within_the_open_file_limit() {
+        let t: PathBuf = std::env::temp_dir().join(format!("relax-broker-fds-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&t);
+        std::fs::create_dir_all(&t).unwrap();
+        let spec = Roots { read: vec![b(&t)], write: Vec::new(), excluded: Vec::new(), store: Vec::new(), alias: Vec::new(), cwd: b(&t) };
+        let mut br = Broker::new(&spec).unwrap();
+        let limit = fd_limit().unwrap();
+        assert!(limit > 10, "control: the process may hold more than 10 fds (its limit: {limit})");
+        assert_eq!(br.add_fd(Fd::Null, 0x7fff_ffff), Err(c::EINVAL), "a dup from 2^31-1");
+        assert_eq!(br.add_fd(Fd::Null, limit), Err(c::EINVAL), "a dup from the limit itself");
+        assert_eq!(br.fds.len(), 3, "a refused dup grows no table");
+        assert_eq!(br.add_fd(Fd::Null, 10), Ok(10), "a dup from 10 below the limit");
+        assert_eq!(br.add_fd(Fd::Null, 0), Ok(3), "a new fd takes the lowest free number");
+        assert_eq!(br.fds.len(), 11, "the table holds up to the highest number handed out");
+        // (a limit of 12, of the table itself: 10 and 11 taken, so a dup from 10 has none)
+        assert_eq!(br.add_fd_below(Fd::Null, 11, 12), Ok(11));
+        assert_eq!(br.add_fd_below(Fd::Null, 10, 12), Err(c::EMFILE), "no free number from 10 below 12");
+        assert_eq!(br.fds.len(), 12, "a full table grows no further");
+        assert_eq!(br.add_fd_below(Fd::Null, 0, 12), Ok(4), "the numbers below stay free");
         let _ = std::fs::remove_dir_all(&t);
     }
 }
