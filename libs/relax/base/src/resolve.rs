@@ -321,8 +321,18 @@ enum Patch {
     Git(GitSrc),
 }
 
+/// A package in Cargo.lock, with its source and dependency entries.
+struct LockPkg {
+    name: String,
+    version: String,
+    /// the full source string, or None for a path package
+    source: Option<String>,
+    /// the dependency entries as Cargo.lock spells them
+    deps: Vec<String>,
+}
+
 /// The workspace: root manifest dir, `[workspace.dependencies]`, `[workspace.package]`,
-/// `[patch.crates-io]` / `[patch."<git url>"]`, Cargo.lock's registry versions and git commits.
+/// `[patch.crates-io]` / `[patch."<git url>"]`, Cargo.lock's packages, registry versions and git commits.
 struct Workspace {
     root: String,
     ws_deps: TomlTable,
@@ -332,6 +342,10 @@ struct Workspace {
     lock: HashMap<String, Vec<String>>,
     /// Cargo.lock's git sources with their commits
     lock_git: Vec<(GitSrc, crate::gitstore::Oid)>,
+    /// all packages in Cargo.lock, including their dependency edges
+    lock_pkgs: Vec<LockPkg>,
+    /// package name to indices in lock_pkgs
+    lock_by_name: HashMap<String, Vec<usize>>,
     members: Vec<String>,
     excludes: Vec<String>,
     /// the root manifest has a `[package]`: cargo makes the root package a member
@@ -376,6 +390,9 @@ pub struct Resolver {
     /// crates-io's replacement (a vendored directory or a git repository) and the config file
     /// that names it
     vendor: Option<(Vendor, String)>,
+    /// the registry/src folder of CARGO_HOME, or $HOME/.cargo without it, where locked registry
+    /// packages are unpacked; a field so tests can give their own
+    registry_src: String,
     /// registry packages fetched for a program with neither a vendored directory nor a locked
     /// version: name -> (version, sources, the requirements that chose it)
     fetched: std::cell::RefCell<HashMap<String, (String, String, Vec<String>)>>,
@@ -424,6 +441,8 @@ impl Workspace {
         }
         let mut lock: HashMap<String, Vec<String>> = HashMap::new();
         let mut lock_git = Vec::new();
+        let mut lock_pkgs = Vec::new();
+        let mut lock_by_name: HashMap<String, Vec<usize>> = HashMap::new();
         if let Ok(l) = read_toml(&format!("{}/Cargo.lock", root)) {
             if let Some(pkgs) = l.get("package").and_then(|p| p.as_array_of_tables()) {
                 for p in pkgs {
@@ -436,6 +455,11 @@ impl Workspace {
                         if !lock_git.iter().any(|x: &(GitSrc, crate::gitstore::Oid)| x.0.same(&g.0)) {
                             lock_git.push(g);
                         }
+                    }
+                    if let (Some(name), Some(version)) = (s(p, "name"), s(p, "version")) {
+                        let pkg = LockPkg { name, version, source: src, deps: strs(p, "dependencies") };
+                        lock_by_name.entry(pkg.name.clone()).or_default().push(lock_pkgs.len());
+                        lock_pkgs.push(pkg);
                     }
                 }
             }
@@ -450,6 +474,8 @@ impl Workspace {
             patches,
             lock,
             lock_git,
+            lock_pkgs,
+            lock_by_name,
         })
     }
 
@@ -553,29 +579,77 @@ impl Resolver {
     pub fn with(sess: &std::sync::Arc<crate::Session>, dir: &str, git: GitPlaces) -> Result<Resolver, String> {
         let offline = crate::git::cargo::offline(std::path::Path::new(dir))?;
         let git = std::cell::RefCell::new(GitDeps { places: git, pins: None, mounts: Vec::new(), found: HashMap::new() });
-        Ok(Resolver { ws: std::rc::Rc::new(Workspace::load(&find_root(dir)?)?), git, offline, owners: HashMap::new(), vendor: vendor_dir(dir)?, fetched: Default::default(), manifests: Vec::new(), by_dir: HashMap::new(), cfg: crate::cfg::CfgSet::host(sess, &[]), // a check resolves C-compiling packages too: their scripts are not run without --allow-c
+        let home = std::env::var("CARGO_HOME").ok().or_else(|| std::env::var("HOME").ok().map(|h| format!("{}/.cargo", h))).unwrap_or_default();
+        let registry_src = format!("{}/registry/src", home);
+        Ok(Resolver { ws: std::rc::Rc::new(Workspace::load(&find_root(dir)?)?), git, offline, owners: HashMap::new(), vendor: vendor_dir(dir)?, registry_src, fetched: Default::default(), manifests: Vec::new(), by_dir: HashMap::new(), cfg: crate::cfg::CfgSet::host(sess, &[]), // a check resolves C-compiling packages too: their scripts are not run without --allow-c
             // (unitgraph::run_build_scripts) and a check links nothing (`const_fuel` is check-only)
             allow_c: sess.options.allow_c || sess.options.const_fuel, metadata: false })
     }
 
-    fn registry_dir(&self, name: &str, req: &str) -> Result<String, String> {
+    /// The registry version the requesting package's Cargo.lock edge names, if unambiguous and
+    /// accepted by the requirement. Missing or ambiguous edges leave requirement-based resolution.
+    fn locked_edge(&self, from: (&str, &str), dep: &str, req: &str) -> Option<String> {
+        let mut parents = self.ws.lock_by_name.get(from.0)?.iter().map(|&i| &self.ws.lock_pkgs[i]).filter(|p| p.version == from.1);
+        let parent = parents.next()?;
+        if parents.next().is_some() {
+            return None;
+        }
+        let targets = self.ws.lock_by_name.get(dep)?;
+        let mut versions = BTreeSet::new();
+        for edge in &parent.deps {
+            let (id, source) = match edge.split_once(" (") {
+                Some((id, source)) => {
+                    let Some(source) = source.strip_suffix(')') else { continue };
+                    (id, Some(source))
+                }
+                None => (edge.as_str(), None),
+            };
+            let mut parts = id.split_whitespace();
+            if parts.next() != Some(dep) {
+                continue;
+            }
+            let version = parts.next();
+            if parts.next().is_some() {
+                continue;
+            }
+            let mut named = targets.iter().map(|&i| &self.ws.lock_pkgs[i]).filter(|p| {
+                p.source.as_deref().is_some_and(|s| s.starts_with("registry+"))
+                    && (version.is_none() || version == Some(p.version.as_str()))
+                    && (source.is_none() || source == p.source.as_deref())
+            });
+            let Some(pkg) = named.next() else { continue };
+            if named.next().is_some() {
+                continue;
+            }
+            if crate::registry::Version::parse(&pkg.version).is_some_and(|ver| crate::registry::matches(req, &ver)) {
+                versions.insert(pkg.version.as_str());
+            }
+        }
+        if versions.len() == 1 { versions.into_iter().next().map(str::to_string) } else { None }
+    }
+
+    fn registry_dir(&self, name: &str, req: &str, from: Option<(&str, &str)>) -> Result<String, String> {
+        let exact = from.and_then(|from| self.locked_edge(from, name, req));
         match &self.vendor {
-            Some((Vendor::Dir(vdir), config)) => return self.vendored_dir(vdir, config, name),
+            Some((Vendor::Dir(vdir), config)) => return self.vendored_dir(vdir, config, name, req, exact.as_deref()),
             // the repository's package of that name (cargo's discovery, as for a git dependency)
             Some((Vendor::Git(src), config)) => return self.git_dir(src, name).map_err(|e| format!("{} (crates-io's replacement, {})", e, config)),
             None => {}
         }
-        let Some(vers) = self.ws.lock.get(name) else {
-            return self.fetched_dir(name, req);
+        let vers = if let Some(v) = exact {
+            vec![v]
+        } else {
+            let Some(vers) = self.ws.lock.get(name) else {
+                return self.fetched_dir(name, req);
+            };
+            // Cargo.lock may hold several versions of one package (bitflags 1 and 2 in one graph):
+            // only the ones the requirement accepts are candidates; without a parsable match, all.
+            let matching: Vec<String> = vers.iter().filter(|v| crate::registry::Version::parse(v).is_some_and(|ver| crate::registry::matches(req, &ver))).cloned().collect();
+            if matching.is_empty() { vers.clone() } else { matching }
         };
-        // Cargo.lock may hold several versions of one package (bitflags 1 and 2 in one graph):
-        // only the ones the requirement accepts are candidates; without a parsable match, all.
-        let matching: Vec<String> = vers.iter().filter(|v| crate::registry::Version::parse(v).is_some_and(|ver| crate::registry::matches(req, &ver))).cloned().collect();
-        let vers: &Vec<String> = if matching.is_empty() { vers } else { &matching };
-        let home = std::env::var("CARGO_HOME").ok().or_else(|| std::env::var("HOME").ok().map(|h| format!("{}/.cargo", h))).unwrap_or_default();
-        let src = format!("{}/registry/src", home);
-        for v in vers {
-            if let Ok(rd) = std::fs::read_dir(&src) {
+        let src = &self.registry_src;
+        for v in &vers {
+            if let Ok(rd) = std::fs::read_dir(src) {
                 for e in rd.flatten() {
                     let d = format!("{}/{}/{}-{}", src, e.file_name().to_string_lossy(), name, v);
                     if std::path::Path::new(&d).join("Cargo.toml").is_file() {
@@ -586,7 +660,7 @@ impl Resolver {
         }
         // the locked version from the crates.io index (registry.rs: cache first)
         let mut last = String::new();
-        for v in vers {
+        for v in &vers {
             match crate::registry::exact(name, v, self.offline).and_then(|r| crate::registry::sources(name, &r, self.offline)) {
                 Ok(d) => return Ok(d),
                 Err(e) => last = e,
@@ -613,9 +687,9 @@ impl Resolver {
     }
 
     /// Registry package `name` in the vendored directory `vdir`: `<name>` (one version) or
-    /// `<name>-<version>` (cargo vendor's names when it holds several); with Cargo.lock, the locked
-    /// version, without, the only one there.
-    fn vendored_dir(&self, vdir: &str, config: &str, name: &str) -> Result<String, String> {
+    /// `<name>-<version>` (cargo vendor's names when it holds several); only versions the requirement
+    /// accepts, with Cargo.lock, the locked version, without, the only matching one there.
+    fn vendored_dir(&self, vdir: &str, config: &str, name: &str, req: &str, exact: Option<&str>) -> Result<String, String> {
         let mut found: Vec<(String, String)> = Vec::new();
         for (entry, is_dir) in crate::vfs::read_dir(vdir).map_err(|e| format!("{} (crates-io's replacement, {}): {}", vdir, config, e))? {
             if !is_dir || !(entry == name || entry.strip_prefix(name).is_some_and(|r| r.starts_with('-') && r[1..].starts_with(|c: char| c.is_ascii_digit()))) {
@@ -629,6 +703,13 @@ impl Resolver {
                     }
                 }
             }
+        }
+        found.retain(|(v, _)| crate::registry::Version::parse(v).is_some_and(|ver| crate::registry::matches(req, &ver)));
+        if let Some(v) = exact {
+            return found.iter().find(|(version, _)| version == v).map(|(_, d)| d.clone()).ok_or_else(|| format!(
+                "registry package `{}` locked at {} is not vendored in {} (crates-io's replacement, {}): a vendored workspace never fetches from crates.io",
+                name, v, vdir, config
+            ));
         }
         let locked = self.ws.lock.get(name);
         let pick: Vec<&(String, String)> = match locked {
@@ -991,7 +1072,7 @@ impl Resolver {
     /// The package directory a dependency entry names, and the package's source. A path inside a
     /// mounted repository is part of that git source (cargo: a git package's path dependencies
     /// in its repository share its source id).
-    fn dep_dir(&self, d: &Dep) -> Result<(String, Source), String> {
+    fn dep_dir(&self, d: &Dep, from: Option<(&str, &str)>) -> Result<(String, Source), String> {
         if let Some(p) = &d.path {
             let g = self.git.borrow();
             return Ok(match g.mounts.iter().find(|m| *p == m.1 || p.starts_with(&format!("{}/", m.1))) {
@@ -1002,7 +1083,7 @@ impl Resolver {
         if let Some(src) = &d.git {
             return self.git_dir(src, &d.package).map(|r| (r, Source::Git(src.clone())));
         }
-        self.registry_dir(&d.package, &d.req).map(|r| (r, Source::Registry))
+        self.registry_dir(&d.package, &d.req, from).map(|r| (r, Source::Registry))
     }
 
     /// The folder of package `package` in the git source `src` (fetched and mounted once).
@@ -2248,7 +2329,8 @@ impl<'a> Feat<'a> {
                 return Err(format!("registry package `{}` {} compiles C or C++ (build-dependency `{}`): it {}", m.name, m.version, c, relax_session::options::C_GATE));
             }
         }
-        let (dir, mut source) = self.r.dep_dir(d)?;
+        let m = &self.r.manifests[k.0];
+        let (dir, mut source) = self.r.dep_dir(d, Some((&m.name, &m.version)))?;
         // a path dependency a third-party manifest names is third-party too: a registry package's
         // in its vendored folder is a registry package (its build script and macros confined as
         // its owner's are); one anywhere else, or a git package's outside its repository (a mount
@@ -3516,6 +3598,73 @@ required-features = ["b", "manual"]
         let _ = std::fs::write(format!("{root}/vendor/shares/Cargo.toml"), "[package]\nname = \"shares\"\nversion = \"6.0.1\"\nedition = \"2021\"\n[features]\ndefault = [\"nope/alloc\"]\n");
         let e = unit_graph(sess, &root, "app", &[]).err().unwrap();
         assert!(e.contains("names no dependency"), "{e}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Vendored versions must meet each dependency's requirement, even when several majors are locked.
+    #[test]
+    fn vendored_majors_resolve_per_requirement() {
+        let sess = &std::sync::Arc::new(crate::Session::default());
+        let app = "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[dependencies]\nold = { package = \"bitflags\", version = \"1\" }\nnew = { package = \"bitflags\", version = \"2\" }\n";
+        let root = tree("vendored-majors", &[
+            ("Cargo.toml", "[workspace]\nresolver = \"2\"\nmembers = [\"app\"]\n"),
+            (".cargo/config.toml", "[source.crates-io]\nreplace-with = \"v\"\n[source.v]\ndirectory = \"vendor\"\n"),
+            ("Cargo.lock", "version = 3\n\n[[package]]\nname = \"app\"\nversion = \"0.1.0\"\ndependencies = [\"bitflags 1.3.2\", \"bitflags 2.4.0\"]\n\n[[package]]\nname = \"bitflags\"\nversion = \"1.3.2\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\n\n[[package]]\nname = \"bitflags\"\nversion = \"2.4.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\n"),
+            ("app/Cargo.toml", app),
+            ("app/src/lib.rs", ""),
+            ("vendor/bitflags-1.3.2/Cargo.toml", "[package]\nname = \"bitflags\"\nversion = \"1.3.2\"\nedition = \"2021\"\n"),
+            ("vendor/bitflags-1.3.2/.cargo-checksum.json", "{\"files\":{},\"package\":null}"),
+            ("vendor/bitflags-1.3.2/src/lib.rs", ""),
+            ("vendor/bitflags-2.4.0/Cargo.toml", "[package]\nname = \"bitflags\"\nversion = \"2.4.0\"\nedition = \"2021\"\n"),
+            ("vendor/bitflags-2.4.0/.cargo-checksum.json", "{\"files\":{},\"package\":null}"),
+            ("vendor/bitflags-2.4.0/src/lib.rs", ""),
+        ]);
+        let g = unit_graph(sess, &root, "app", &[]).unwrap_or_else(|e| panic!("vendored majors did not resolve: {e}"));
+        let paths: BTreeSet<_> = g.units.iter().filter(|u| u.name == "bitflags").map(|u| u.src_path.clone()).collect();
+        assert_eq!(paths, BTreeSet::from([
+            normalize(&format!("{root}/vendor/bitflags-1.3.2/src/lib.rs")),
+            normalize(&format!("{root}/vendor/bitflags-2.4.0/src/lib.rs")),
+        ]), "each renamed dependency must resolve to its requested major");
+        std::fs::write(format!("{root}/app/Cargo.toml"), app.replace("version = \"2\"", "version = \"3\"")).unwrap();
+        assert!(unit_graph(sess, &root, "app", &[]).is_err(), "a vendored version that does not satisfy the requirement must not be a fallback");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A package's lock edge chooses among matching registry versions, in the vendor folder and cache.
+    #[test]
+    fn a_lock_edge_picks_among_matching_versions() {
+        let sess = &std::sync::Arc::new(crate::Session::default());
+        let one = "[package]\nname = \"dep\"\nversion = \"1.0.0\"\nedition = \"2021\"\n";
+        let two = "[package]\nname = \"dep\"\nversion = \"2.0.0\"\nedition = \"2021\"\n";
+        let root = tree("lock-edge", &[
+            ("Cargo.toml", "[workspace]\nresolver = \"2\"\nmembers = [\"app\"]\n"),
+            (".cargo/config.toml", "[source.crates-io]\nreplace-with = \"v\"\n[source.v]\ndirectory = \"vendor\"\n"),
+            ("Cargo.lock", "version = 3\n\n[[package]]\nname = \"app\"\nversion = \"0.1.0\"\ndependencies = [\"dep 2.0.0\"]\n\n[[package]]\nname = \"dep\"\nversion = \"1.0.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\n\n[[package]]\nname = \"dep\"\nversion = \"2.0.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\n"),
+            ("app/Cargo.toml", "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[dependencies]\ndep = \">=1, <3\"\n"),
+            ("app/src/lib.rs", ""),
+            ("vendor/dep-1.0.0/Cargo.toml", one),
+            ("vendor/dep-1.0.0/.cargo-checksum.json", "{\"files\":{},\"package\":null}"),
+            ("vendor/dep-1.0.0/src/lib.rs", ""),
+            ("vendor/dep-2.0.0/Cargo.toml", two),
+            ("vendor/dep-2.0.0/.cargo-checksum.json", "{\"files\":{},\"package\":null}"),
+            ("vendor/dep-2.0.0/src/lib.rs", ""),
+            ("cache/index.test-0/dep-1.0.0/Cargo.toml", one),
+            ("cache/index.test-0/dep-2.0.0/Cargo.toml", two),
+        ]);
+        let g = unit_graph(sess, &root, "app", &[]).unwrap_or_else(|e| panic!("the vendored lock edge did not resolve: {e}"));
+        let paths: Vec<_> = g.units.iter().filter(|u| u.name == "dep").map(|u| u.src_path.clone()).collect();
+        assert_eq!(paths, vec![normalize(&format!("{root}/vendor/dep-2.0.0/src/lib.rs"))], "the vendored dependency must use the version named by the requesting package's lock edge");
+
+        std::fs::remove_file(format!("{root}/.cargo/config.toml")).unwrap();
+        let mut r = Resolver::new(sess, &root).unwrap();
+        r.registry_src = format!("{root}/cache");
+        assert_eq!(r.registry_dir("dep", ">=1, <3", Some(("app", "0.1.0"))).unwrap(), format!("{root}/cache/index.test-0/dep-2.0.0"), "the cached dependency must use the version named by the requesting package's lock edge");
+        assert_eq!(r.registry_dir("dep", ">=1, <3", None).unwrap(), format!("{root}/cache/index.test-0/dep-1.0.0"), "without a requesting package the first matching locked version must still win");
+
+        std::fs::write(format!("{root}/Cargo.lock"), "version = 3\n\n[[package]]\nname = \"app\"\nversion = \"0.1.0\"\ndependencies = [\"dep\"]\n\n[[package]]\nname = \"dep\"\nversion = \"1.0.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\n").unwrap();
+        let mut r = Resolver::new(sess, &root).unwrap();
+        r.registry_src = format!("{root}/cache");
+        assert_eq!(r.registry_dir("dep", ">=1, <3", Some(("app", "0.1.0"))).unwrap(), format!("{root}/cache/index.test-0/dep-1.0.0"), "a bare dependency name must resolve to its only locked registry package");
         let _ = std::fs::remove_dir_all(&root);
     }
 
