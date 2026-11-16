@@ -1,6 +1,6 @@
 //! The runner (the `makepad` binary, tools/run, is this plus its [`Host`]; the `relax` binary,
 //! bin/relax.rs, is this with none; the Android host library, tools/run/android_host, is the
-//! `makepad` one as a shared object): Relax (the Rust JIT; makepad's proc macros JIT-compiled by
+//! `makepad` one as a shared object): Relax (the JIT for Rust code; makepad's proc macros JIT-compiled by
 //! its host, macros.rs sets the lexer's `script_mod!` extension). Same commands and flags as `makepad` (`run <package> [cargo flags]
 //! [-- args]` in a workspace), plus `run <git url>[#ref] [--mount <dir>=<git url>[#ref]]...
 //! [--cached] <package> ...` and `fetch <spec>` (generic git fetching, fetch.rs). Which
