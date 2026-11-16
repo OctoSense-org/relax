@@ -224,10 +224,19 @@ pub(crate) struct Reuse {
 /// What a check's crates' keys rest on beyond the crates: the Relax build and options, the policy
 /// for third-party compile-time code, the
 /// variables that steer the check (every `RELAX_*` one but run.rs RUN_STATE_VARS and
-/// RUN_LOCATING_VARS, the store's mode RELAX_CACHE: how the verdicts are used, not what they rest
-/// on, so a Verify or read-only check finds what an ordinary one stored, and the store's own
+/// RUN_LOCATING_VARS, `RUN_RESOURCE_VARS`, the store's mode RELAX_CACHE: how the verdicts are used,
+/// not what they rest on, so a Verify or read-only check finds what an ordinary one stored, and the
+/// store's own
 /// `RELAX_CHECK_REUSE_*` ones: its traces and its tests' store, child and hooks, which must find
 /// what a check without them stored).
+/// How a check runs, not what it rests on: the threads it checks on (`RELAX_JOBS`: the check and
+/// the boot hand every pass's results back in item order) and whom the run works for
+/// (`RELAX_RUN_OWNER`: a build farm's job or lease, which names it in the build-script claims it
+/// holds). So a store one lease filled, on any number of cores, serves the next. Only the variables
+/// named here leave the keys: any other `RELAX_*` one, one the keys do not know among them, checks
+/// again (a cold check is safe, a stale verdict is not).
+pub(crate) const RUN_RESOURCE_VARS: [&str; 2] = ["RELAX_JOBS", "RELAX_RUN_OWNER"];
+
 pub(crate) fn env_key(prog: &Program) -> u128 {
     let mut h = Sip128::new();
     h.str("relax-check-env");
@@ -239,7 +248,7 @@ pub(crate) fn env_key(prog: &Program) -> u128 {
     h.u8((crate::sandbox::policy() == crate::sandbox::Policy::Sandboxed) as u8);
     let mut vars: Vec<(String, String)> = std::env::vars_os()
         .filter_map(|(k, v)| Some((k.into_string().ok()?, v.to_string_lossy().into_owned())))
-        .filter(|(k, _)| k.starts_with("RELAX_") && k != "RELAX_CACHE" && !k.starts_with("RELAX_CHECK_REUSE_") && !crate::run::RUN_STATE_VARS.contains(&k.as_str()) && !crate::run::RUN_LOCATING_VARS.contains(&k.as_str()))
+        .filter(|(k, _)| k.starts_with("RELAX_") && k != "RELAX_CACHE" && !k.starts_with("RELAX_CHECK_REUSE_") && !crate::run::RUN_STATE_VARS.contains(&k.as_str()) && !crate::run::RUN_LOCATING_VARS.contains(&k.as_str()) && !RUN_RESOURCE_VARS.contains(&k.as_str()))
         // the mount table as vfs describes it for keys: a folder mount's root, not the checkout it
         // reads (vfs.rs SHARE: a second checkout of the same text checks nothing again)
         .map(|(k, v)| if k == "RELAX_VFS" { (k, crate::vfs::mounts_key_text()) } else { (k, v) })

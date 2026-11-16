@@ -571,6 +571,23 @@ fn a_lint_flag_checks_again() {
     changed("lintflag", &[("lib.rs", LIB), ("bin.rs", BIN)], &[], |_| {}, &[("RELAX_LINT_FLAGS", "-A dead_code")], 0);
 }
 
+/// How a check runs is no part of its keys (check_reuse.rs RUN_RESOURCE_VARS): a store filled under
+/// one owner and job count serves a check under another, every verdict reused. A `RELAX_*` variable
+/// the keys do not know still checks again.
+#[test]
+fn a_store_serves_another_owner_and_job_count() {
+    if std::env::var_os(CHILD).is_some() { return; }
+    let dir = package("runner", &[("lib.rs", LIB), ("bin.rs", BIN)]);
+    let first = check_in_child(&dir, true, &[("RELAX_JOBS", "1"), ("RELAX_RUN_OWNER", "L1")]);
+    assert_eq!(first.hits, 0, "{first:?}");
+    let other = [("RELAX_JOBS", "3"), ("RELAX_RUN_OWNER", "L2")];
+    let (reused, _) = reused_and_verified(&dir, &other, "another owner and job count");
+    assert!(reused.full && reused.hits == 2, "a store one owner and job count filled serves another: {reused:?}");
+    let unknown = check_in_child(&dir, true, &[other[0], other[1], ("RELAX_CHECK_KEY_PROBE", "1")]);
+    assert_eq!(unknown.hits, 0, "a RELAX_* variable the keys do not know checks again: {unknown:?}");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
 /// Under `-D warnings` a warning fails the check: nothing is stored, the next check checks all.
 #[test]
 fn a_check_denying_its_warnings_stores_nothing() {
