@@ -1039,6 +1039,11 @@ pub enum Inst {
     AtomicCas(Mem, AtomOrd, AtomOrd, VReg, VReg, VReg, VReg), // ok ord, fail ord, d, addr, expected, new
     /// memory fence; `true` = compiler-only (single-thread) fence
     Fence(AtomOrd, bool),
+    /// In a coroutine body before its transform only (lower.rs): every borrow of what lived in
+    /// this slot has ended (the end of its local's or its temporary's scope). It does not say the
+    /// slot's bytes are dead to lowering's own by-value uses. The coroutine transform reads and
+    /// removes every one, so no pass after it and no backend sees one.
+    StorageDead(u32),
     /// the thread's floating-point control register: `FpEnv(false, d)` reads it into d,
     /// `FpEnv(true, x)` writes x to it (x64: MXCSR, 32 bits; arm64: FPCR). Flush-to-zero,
     /// denormals-are-zero, rounding: an effect, ordered like a call
@@ -1189,7 +1194,7 @@ impl Inst {
             Inst::FpEnv(_, v) => f(*v),
             Inst::Cpuid(ds, a, b) => { ds.iter().for_each(|d| f(*d)); f(*a); f(*b); }
             Inst::Xgetbv(d, a) => { f(*d); f(*a); }
-            Inst::Store(..) | Inst::Copy(..) | Inst::VStore(..) | Inst::VStoreX(..) | Inst::AtomicStore(..) | Inst::StoreX(..) | Inst::Fence(..) | Inst::Coverage { .. } => {}
+            Inst::Store(..) | Inst::Copy(..) | Inst::VStore(..) | Inst::VStoreX(..) | Inst::AtomicStore(..) | Inst::StoreX(..) | Inst::Fence(..) | Inst::Coverage { .. } | Inst::StorageDead(..) => {}
         }
     }
 
@@ -1234,7 +1239,7 @@ impl Inst {
                 args.iter_mut().for_each(&mut f);
                 rets.iter_mut().for_each(&mut f);
             }
-            Inst::Fence(..) | Inst::Coverage { .. } => {}
+            Inst::Fence(..) | Inst::Coverage { .. } | Inst::StorageDead(..) => {}
             Inst::FpEnv(_, v) => f(v),
             Inst::Cpuid(ds, a, b) => {
                 ds.iter_mut().for_each(&mut f);
@@ -2030,7 +2035,7 @@ impl Func {
                         regs.push(*a);
                         regs.push(*b);
                     }
-                    Inst::Fence(..) | Inst::Coverage { .. } => {}
+                    Inst::Fence(..) | Inst::Coverage { .. } | Inst::StorageDead(..) => {}
                     Inst::FpEnv(_, v) => regs.push(*v),
                     Inst::Cpuid(ds, a, b) => { regs.extend_from_slice(ds); regs.push(*a); regs.push(*b); }
                     Inst::Xgetbv(d, a) => { regs.push(*d); regs.push(*a); }

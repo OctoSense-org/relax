@@ -4529,6 +4529,8 @@ impl<'a> Gen<'a> {
                     o += 1;
                 }
             }
+            // (removed by the coroutine transform before any pass)
+            Inst::StorageDead(..) => {}
             Inst::Coverage { word, mask, disabled } => {
                 // Reserved scratch registers: coverage adds no program live
                 // ranges or spills. The NOP is patched only after this bit

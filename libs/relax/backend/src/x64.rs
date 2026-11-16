@@ -3403,6 +3403,8 @@ impl<'a> Gen<'a> {
             Inst::VX3(op, d, a, b, c) => self.vx3(*op, *d, *a, *b, *c),
             Inst::FMulAdd(np, na, w, d, a, b, c) => self.fma(options, *np, *na, *w, *d, *a, *b, *c),
             Inst::Coverage { .. } => unreachable!("coverage lowered before native emission"),
+            // (removed by the coroutine transform before any pass)
+            Inst::StorageDead(..) => {}
             Inst::AtomicLoad(..) | Inst::AtomicStore(..) | Inst::AtomicRmw(..) | Inst::AtomicCas(..) | Inst::Fence(..) => self.atomic(options, i),
             Inst::TlsAddr(d, off) => self.tls_addr(*d, *off),
             Inst::TlsStatic(d, off) => self.tls_static(*d, *off),

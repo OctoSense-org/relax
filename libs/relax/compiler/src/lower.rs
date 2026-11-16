@@ -271,6 +271,16 @@ pub struct Lcx<'a> {
     drop_flags: Vec<Option<VReg>>,
     /// scope depth a `let` declared each local at (its drop flag registers there)
     decl_depth: Vec<Option<usize>>,
+    /// a coroutine body's slots whose type holds a coroutine by value, in creation order: (the
+    /// slot, the address it was made with, the scope depth its storage lives to; None: a
+    /// temporary of the statement that made it). Where that storage ends, lowering emits
+    /// `Inst::StorageDead` (rustc's StorageDead), which the coroutine transform reads to leave the
+    /// slot out of the frame where nothing reaches it any more
+    sd: Vec<(u32, VReg, Option<usize>)>,
+    /// per scope: `sd`'s length when it was pushed
+    sd_scope_marks: Vec<usize>,
+    /// a type -> whether it holds a coroutine by value
+    holds_coro_memo: HashMap<TyId, bool>,
     /// an async fn's pattern parameter's bindings, declared right after the parameter's whole
     /// argument rather than at their own number (typeck numbers them after every parameter):
     /// binding local -> (the argument's local, its order among the pattern's bindings)
@@ -561,6 +571,9 @@ impl<'a> Lcx<'a> {
             scopes: vec![Vec::new()],
             drop_flags: vec![None; n],
             decl_depth: vec![None; n],
+            sd: Vec::new(),
+            sd_scope_marks: vec![0],
+            holds_coro_memo: HashMap::default(),
             decl_after: HashMap::default(),
             decl_follow: None,
             entry_inits: Vec::new(),
@@ -1304,7 +1317,92 @@ impl<'a> Lcx<'a> {
         sl.ret = ret;
         let d = self.f.vreg(Cls::I);
         self.emit(Inst::SlotAddr(d, s));
+        self.track_storage(s, d, t);
         (d, s)
+    }
+
+    /// A coroutine body's slot of type `t` made at address `a`: its storage ends are marked when
+    /// it holds a coroutine by value (`sd`).
+    fn track_storage(&mut self, s: u32, a: VReg, t: TyId) {
+        if self.coro.is_none() {
+            return;
+        }
+        // a layout so far is a coroutine's (or a type holding one): its slot must be tracked, or
+        // the frame would save it where its storage has ended (E0733 where rustc accepts)
+        let partial = self.partial_slots.contains_key(&s);
+        let holds = self.holds_coro(t, 0);
+        debug_assert!(!partial || holds, "a slot of a layout so far whose type holds no coroutine");
+        if partial || holds {
+            self.sd.push((s, a, None));
+        }
+    }
+
+    /// Does a value of type `t` hold a coroutine by value (in a field, an element or a capture,
+    /// at any depth, not behind a pointer)? A type the walk does not see into answers yes.
+    fn holds_coro(&mut self, t: TyId, depth: u32) -> bool {
+        if let Some(&x) = self.holds_coro_memo.get(&t) {
+            return x;
+        }
+        if depth > 24 {
+            return true;
+        }
+        let u = self.u;
+        let r = match u.tcx.tys.kind(t).clone() {
+            TyKind::Closure(file, ce, _) if u.tcx.coroutines.contains(&(file, ce)) => true,
+            TyKind::Closure(..) => u.closure_storage(t).fields.iter().any(|&x| self.holds_coro(x, depth + 1)),
+            TyKind::Adt(d, args, _) => match u.tcx.adts.get(&d) {
+                Some(adt) => {
+                    let shape: Vec<usize> = adt.variants.iter().map(|v| v.fields.len()).collect();
+                    let args = u.tcx.tys.list(args);
+                    let env = crate::tcx::TypingEnv::fully_monomorphized(&u.prog);
+                    shape.iter().enumerate().any(|(vi, &nf)| (0..nf).any(|fi| {
+                        let ft = u.tcx.field_ty(&u.prog, env, d, vi as u32, fi as u32, args);
+                        self.holds_coro(ft, depth + 1)
+                    }))
+                }
+                None => true,
+            },
+            TyKind::Tuple(v) => u.tcx.tys.list(v).iter().any(|&x| self.holds_coro(x, depth + 1)),
+            TyKind::Array(e, _) | TyKind::Slice(e) => self.holds_coro(e, depth + 1),
+            TyKind::Bool | TyKind::Char | TyKind::Str | TyKind::Int(_) | TyKind::Float(_) | TyKind::Never | TyKind::Ref(..) | TyKind::Ptr(..) | TyKind::FnPtr(..) | TyKind::FnDef(..) | TyKind::Foreign(_) | TyKind::Dyn(..) => false,
+            _ => true,
+        };
+        self.holds_coro_memo.insert(t, r);
+        r
+    }
+
+    /// The storage of the tracked slot made at address `a` lives to scope depth `depth` (a
+    /// local's, a temporary a local takes over whole: `whole` its size), unless it has a depth.
+    fn storage_lives_to(&mut self, a: VReg, depth: usize, whole: Option<u32>) {
+        let slots = &self.f.slots;
+        if let Some(e) = self.sd.iter_mut().rev().find(|e| e.1 == a) {
+            if e.2.is_none() && whole.map_or(true, |n| slots[e.0 as usize].size == n) {
+                e.2 = Some(depth);
+            }
+        }
+    }
+
+    /// The storage of the tracked slots made since `from` (`sd`'s length then) whose depth
+    /// `ends` names ends here, after the drops (none in a cleanup pad, which only unwinds).
+    fn end_storage(&mut self, from: usize, ends: impl Fn(Option<usize>) -> bool) {
+        if self.coro.is_none() || self.building_pad || self.dead_blk == Some(self.cur) || from >= self.sd.len() {
+            return;
+        }
+        for j in (from..self.sd.len()).rev() {
+            let (s, _, life) = self.sd[j];
+            if ends(life) {
+                self.emit(Inst::StorageDead(s));
+            }
+        }
+    }
+
+    /// Leaving the scopes from depth `from` on: the storage of the tracked slots made in them
+    /// that live no longer ends, and with `exit` (a break, continue or return out of them) that
+    /// of their statements' temporaries too. A scope's normal end leaves its temporaries to
+    /// their statement's end (a pre-2024 block tail's live to the enclosing statement's).
+    fn end_scope_storage(&mut self, from: usize, exit: bool) {
+        let lo = self.sd_scope_marks.get(from).copied().unwrap_or(self.sd.len());
+        self.end_storage(lo, |life| life.map_or(exit, |l| l >= from));
     }
 
     // ------------------------------------------------------------ values and places
@@ -1715,6 +1813,9 @@ impl<'a> Lcx<'a> {
             (Some(leaves), false) => LocalSt::Regs(self.fresh_leaves(leaves)),
             _ => {
                 let a = self.new_slot_for(t);
+                if let Some(d) = self.decl_depth[li as usize] {
+                    self.storage_lives_to(a, d, None);
+                }
                 LocalSt::Slot(a)
             }
         };
@@ -1947,10 +2048,7 @@ impl<'a> Lcx<'a> {
                             // yet: no frame now (jit.rs coro_frame lowers it again once they are),
                             // unless those wait for this one, a future that holds itself
                             if crate::jit::coro_defer(self.u, c.ct, deps).is_err() {
-                                // (the clause goes with the storage-dead points: the transform saves
-                                // a slot borrowed in a scope that ended before the suspension point,
-                                // rustc does not; KNOWN_GAPS.md)
-                                self.err(self.pos, "recursion in an async fn or block requires boxing: the future would contain itself (E0733) (Relax also reports this, where rustc does not, when a future of the cycle is borrowed in a block that ends before the await: see Relax's KNOWN_GAPS.md)".to_string());
+                                self.err(self.pos, "recursion in an async fn or block requires boxing: the future would contain itself (E0733)".to_string());
                             }
                         } else {
                             match self.u.tcx.coro_frames.get(&c.ct) {
@@ -3138,6 +3236,9 @@ impl<'a> Lcx<'a> {
             }
             // this statement's temporaries (an enclosing statement's stay pending)
             let mark = self.stmt_temps.len();
+            let sd_mark = self.sd.len();
+            // the depth a `let` extends its temporaries to (and a `super let`'s)
+            let mut sd_extend: Option<usize> = None;
             if i + 1 == n && matches!(s, Stmt::Expr(false, _)) && edition < 2024 {
                 if let Some(t) = self.tail_marks.last_mut() {
                     *t = Some(mark);
@@ -3160,6 +3261,9 @@ impl<'a> Lcx<'a> {
                     let extended = if *super_ { self.extended_super_lets.remove(&(blk.stmts.lo + i as u32)) } else { None };
                     let extend = !*super_ || extended.is_some();
                     let depth = extended.unwrap_or(self.scopes.len() - 1);
+                    if *super_ {
+                        sd_extend = Some(depth);
+                    }
                     if *super_ && !extend {
                         // the enclosing temporary scope is the statement's, not a scope of locals: only
                         // the formatting macros write `super let`, and their bindings have no drop glue
@@ -3259,6 +3363,9 @@ impl<'a> Lcx<'a> {
                             }
                             for x in &ext {
                                 self.extend_ops.insert(*x, depth);
+                            }
+                            if !ext.is_empty() {
+                                sd_extend = Some(depth);
                             }
                             let sc_mark = self.scope_temps.last().map_or(0, |v| v.len());
                             let place_else = if else_.is_some()
@@ -3467,11 +3574,21 @@ impl<'a> Lcx<'a> {
             // a `super let` has no statement scope: its temporaries belong to the enclosing one
             // (rustc region.rs resolve_stmt)
             let super_let = matches!(s, Stmt::Let(r) if ast.row(*r).super_);
+            // a `let` that extends temporaries: every tracked slot it made lives to its scope's
+            // end, not the statement's
+            if let Some(d) = sd_extend {
+                for e in &mut self.sd[sd_mark..] {
+                    if e.2.is_none() {
+                        e.2 = Some(d);
+                    }
+                }
+            }
             if (!is_tail || edition >= 2024) && !super_let {
                 if is_tail {
                     result = self.settle_before_temp_drop(result, self.body_ty(match s { Stmt::Expr(_, e) => *e, _ => ExprId(0) }), mark);
                 }
                 self.drop_stmt_temps_from(mark);
+                self.end_storage(sd_mark, |life| life.is_none());
             }
         }
         result
@@ -4426,6 +4543,7 @@ impl<'a> Lcx<'a> {
             self.scope_drop_acts(i, &mut seq);
         }
         self.emit_drop_seq(seq);
+        self.end_scope_storage(from, false);
     }
 
     /// An early exit to scope depth `scope_from` / statement-temporary depth `temps_from`:
@@ -4438,6 +4556,7 @@ impl<'a> Lcx<'a> {
         }
         let acts = self.exit_actions(scope_from, temps_from);
         self.emit_drop_seq(acts);
+        self.end_scope_storage(scope_from, true);
     }
 
     /// The drops an exit to scope depth `scope_from` / statement-temporary depth `temps_from`
@@ -4586,6 +4705,7 @@ impl<'a> Lcx<'a> {
         self.scope_temp_pos.push(Vec::new());
         self.scope_marks.push(self.stmt_temps.len());
         self.tail_marks.push(None);
+        self.sd_scope_marks.push(self.sd.len());
     }
 
     fn pop_scope(&mut self) {
@@ -4596,6 +4716,7 @@ impl<'a> Lcx<'a> {
         self.scope_temp_pos.pop();
         self.scope_marks.pop();
         self.tail_marks.pop();
+        self.sd_scope_marks.pop();
     }
 
     /// `&` operands in extending position of a `let` initializer (rustc's temporary lifetime
@@ -4734,6 +4855,10 @@ impl<'a> Lcx<'a> {
                     if let (Val::M(base, off), None) = (&v, &self.locals[li as usize]) {
                         let l = self.layout(t);
                         if l.leaves.is_none() {
+                            if *off == 0 {
+                                let depth = self.decl_depth[li as usize].unwrap_or(self.scopes.len() - 1);
+                                self.storage_lives_to(*base, depth, Some(l.size));
+                            }
                             let a = self.addr_add(*base, *off);
                             self.locals[li as usize] = Some(LocalSt::Slot(a));
                             self.own_local(li);
@@ -7529,6 +7654,7 @@ impl<'a> Lcx<'a> {
                 self.scope_temp_pos.truncate(outer);
                 self.scope_marks.truncate(outer);
                 self.tail_marks.truncate(outer);
+                self.sd_scope_marks.truncate(outer);
                 self.switch(exit);
                 self.unit()
             }
@@ -7945,6 +8071,7 @@ impl<'a> Lcx<'a> {
                     }
                     let address = self.f.vreg(Cls::I);
                     self.emit(Inst::SlotAddr(address, slot));
+                    self.track_storage(slot, address, t);
                     address
                 } else {
                     self.new_slot_for(t)
@@ -10313,6 +10440,7 @@ impl<'a> Lcx<'a> {
             self.scope_temp_pos.truncate(depth);
             self.scope_marks.truncate(depth);
             self.tail_marks.truncate(depth);
+            self.sd_scope_marks.truncate(depth);
         }
         if known == Some(true) {
             self.term(Term::Unreachable);
@@ -14419,6 +14547,27 @@ fn coroutine_transform(f: &mut Func, c: &Coro, ptr_bytes: u32, tys: &(std::colle
     let t_start = std::time::Instant::now();
     let mut t_ph: Vec<(&str, f64)> = Vec::new();
     let mut mark = |name: &'static str| if tr { t_ph.push((name, t_start.elapsed().as_secs_f64() * 1e3)); };
+    // the storage ends lowering marked (`Inst::StorageDead`) are read here and removed, so no
+    // other pass sees one: per block, (the index of the inst each stood before, its slot)
+    let mut dead_at: Vec<Vec<(usize, u32)>> = vec![Vec::new(); f.blocks.len()];
+    let mut marked = vec![false; f.slots.len()];
+    for (bi, b) in f.blocks.iter_mut().enumerate() {
+        if !b.insts.iter().any(|i| matches!(i, Inst::StorageDead(_))) {
+            continue;
+        }
+        let pos = std::mem::take(&mut b.pos);
+        for (k, i) in std::mem::take(&mut b.insts).into_iter().enumerate() {
+            if let Inst::StorageDead(s) = i {
+                dead_at[bi].push((b.insts.len(), s));
+                marked[s as usize] = true;
+                continue;
+            }
+            if let Some(&p) = pos.get(k) {
+                b.pos.push(p);
+            }
+            b.insts.push(i);
+        }
+    }
     // drop flags whose value is known where they are tested (a value moved out before a
     // suspension point: rustc's maybe-initialized analysis) -- the dead drop would keep the
     // value's slot saved across it
@@ -14997,6 +15146,127 @@ fn coroutine_transform(f: &mut Func, c: &Coro, ptr_bytes: u32, tys: &(std::colle
         seen
     };
     mark("gen/kill");
+    // rustc's StorageDead: once a slot's storage has ended (its local's scope, its temporary's
+    // statement), every borrow of it has too, and what still points into it is never used again;
+    // only lowering's own values reach it after that, through its address and offsets from it.
+    // `direct`: the slot a vreg holds such an address in (NO_SLOT; MANY: any of its points-to
+    // set). `alive_in`: per block, the marked slots touched through one since their storage last
+    // ended, on some path to it (a may-dataflow from the entry, along the suspension edges too)
+    const NO_SLOT: u32 = u32::MAX;
+    const MANY: u32 = u32::MAX - 1;
+    let marked_list: Vec<usize> = (0..ns).filter(|s| marked[*s]).collect();
+    let mut midx = vec![usize::MAX; ns];
+    for (j, &s) in marked_list.iter().enumerate() {
+        midx[s] = j;
+    }
+    let mw = (marked_list.len() + 63) / 64;
+    let mut direct = vec![NO_SLOT; if marked_list.is_empty() { 0 } else { nv }];
+    let mut alive_in = vec![0u64; nb * mw];
+    if !marked_list.is_empty() {
+        let join = |x: &mut u32, y: u32| -> bool {
+            if y == NO_SLOT || *x == y || *x == MANY {
+                return false;
+            }
+            *x = if *x == NO_SLOT { y } else { MANY };
+            true
+        };
+        let mut grow = true;
+        while grow {
+            grow = false;
+            for b in &f.blocks {
+                for i in &b.insts {
+                    let (d, a, x) = match *i {
+                        Inst::SlotAddr(d, s) => {
+                            grow |= join(&mut direct[d.0 as usize], s);
+                            continue;
+                        }
+                        Inst::Mov(d, a) => (d, a, None),
+                        Inst::IBinI(_, it, d, a, _) if it.bits as u32 >= ptr_bytes * 8 => (d, a, None),
+                        Inst::IBin(_, it, d, a, x) if it.bits as u32 >= ptr_bytes * 8 => (d, a, Some(x)),
+                        Inst::Sel(d, _, a, x) => (d, a, Some(x)),
+                        _ => continue,
+                    };
+                    let y = direct[a.0 as usize];
+                    grow |= join(&mut direct[d.0 as usize], y);
+                    if let Some(x) = x {
+                        let y = direct[x.0 as usize];
+                        grow |= join(&mut direct[d.0 as usize], y);
+                    }
+                }
+            }
+        }
+        // per block: the marked slots whose last event in it is a touch (gen) or an end (kill)
+        fn ev(on: &mut [u64], off: &mut [u64], j: usize) {
+            on[j / 64] |= 1 << (j % 64);
+            off[j / 64] &= !(1 << (j % 64));
+        }
+        let mut bgen = vec![0u64; nb * mw];
+        let mut bkill = vec![0u64; nb * mw];
+        for (bi, b) in f.blocks.iter().enumerate() {
+            let (g, kl) = (&mut bgen[bi * mw..][..mw], &mut bkill[bi * mw..][..mw]);
+            let touch = |v: VReg, g: &mut [u64], kl: &mut [u64]| match direct[v.0 as usize] {
+                NO_SLOT => {}
+                MANY => {
+                    for s in bits(&pts[v.0 as usize * wd..][..wd]) {
+                        if midx[s] != usize::MAX {
+                            ev(g, kl, midx[s]);
+                        }
+                    }
+                }
+                s => {
+                    if midx[s as usize] != usize::MAX {
+                        ev(g, kl, midx[s as usize]);
+                    }
+                }
+            };
+            let de = &dead_at[bi];
+            let mut e = 0;
+            for (k, i) in b.insts.iter().enumerate() {
+                while e < de.len() && de[e].0 <= k {
+                    ev(kl, g, midx[de[e].1 as usize]);
+                    e += 1;
+                }
+                if let Inst::SlotAddr(_, s) = i {
+                    if midx[*s as usize] != usize::MAX {
+                        ev(g, kl, midx[*s as usize]);
+                    }
+                }
+                uses_defs(i, &mut us, &mut ds);
+                for u in &us {
+                    touch(*u, g, kl);
+                }
+            }
+            for &(_, s) in &de[e..] {
+                ev(kl, g, midx[s as usize]);
+            }
+            term_uses(&b.term, &mut us);
+            for u in &us {
+                touch(*u, g, kl);
+            }
+        }
+        let mut out = vec![0u64; nb * mw];
+        let mut queued = vec![true; nb];
+        let mut work: Vec<usize> = (0..nb).rev().collect();
+        let mut cur = vec![0u64; mw];
+        while let Some(b) = work.pop() {
+            queued[b] = false;
+            for w in 0..mw {
+                cur[w] = (alive_in[b * mw + w] & !bkill[b * mw + w]) | bgen[b * mw + w];
+            }
+            if cur[..] == out[b * mw..][..mw] {
+                continue;
+            }
+            out[b * mw..][..mw].copy_from_slice(&cur);
+            for t in f.blocks[b].term.succs().into_iter().chain(susp_to[b].iter().copied()) {
+                let t = t as usize;
+                if or(&mut alive_in[t * mw..][..mw], &cur) && !queued[t] {
+                    queued[t] = true;
+                    work.push(t);
+                }
+            }
+        }
+    }
+    mark("storage");
     // RELAX_CORO_TRACE=2: why each slot is saved at each point (3: slots of 1 MB and more)
     let coro_why = coro_trace_level();
     for (k, &(pend, resume, cancel)) in c.suspends.iter().enumerate() {
@@ -15042,6 +15312,38 @@ fn coroutine_transform(f: &mut Func, c: &Coro, ptr_bytes: u32, tys: &(std::colle
                 }
             }
         }
+        // the marked slots whose storage ended on every path here and that no value live across
+        // the point reaches directly: not saved (what still points into them is a borrow that
+        // ended with them)
+        let mut dead_here = vec![0u64; if marked_list.is_empty() { 0 } else { wd }];
+        if !marked_list.is_empty() {
+            let mut reached = vec![0u64; wd];
+            for v in &vs {
+                match direct[v.0 as usize] {
+                    NO_SLOT => {}
+                    MANY => {
+                        let _ = or(&mut reached, &pts[v.0 as usize * wd..][..wd]);
+                    }
+                    s => reached[s as usize / 64] |= 1 << (s % 64),
+                }
+            }
+            let a = &alive_in[pend as usize * mw..][..mw];
+            for (j, &s) in marked_list.iter().enumerate() {
+                if a[j / 64] & (1 << (j % 64)) == 0 && reached[s / 64] & (1 << (s % 64)) == 0 {
+                    dead_here[s / 64] |= 1 << (s % 64);
+                }
+            }
+        }
+        let drop_dead = |sv: &mut [u64], how: &str| {
+            for s in bits(&dead_here) {
+                if sv[s / 64] & (1 << (s % 64)) != 0 {
+                    sv[s / 64] &= !(1 << (s % 64));
+                    if coro_why == 2 {
+                        eprintln!("coro {:?} point {} slot {} size {}: not saved, its storage ended ({})", c.ct, k, s, f.slots[s].size, how);
+                    }
+                }
+            }
+        };
         // the suspension is at the start of `pend`: what runs before it are its predecessors
         let before = reach(&preds[pend as usize].clone(), true);
         for s in 0..ns {
@@ -15058,6 +15360,7 @@ fn coroutine_transform(f: &mut Func, c: &Coro, ptr_bytes: u32, tys: &(std::colle
                 if f.slots[s].size >= 1 << 20 || coro_why == 2 { for &bi in written[s].iter().chain(touched[s].iter()).take(6) { eprintln!("  b{}: {:?} -> {:?}", bi, f.blocks[bi as usize].insts.iter().filter(|i| format!("{:?}", i).contains("Call") || format!("{:?}", i).contains("SlotAddr")).take(12).collect::<Vec<_>>(), f.blocks[bi as usize].term); } }
             }
         }
+        drop_dead(&mut sv, "saved for itself");
         let mut grow = true;
         while grow {
             grow = false;
@@ -15065,6 +15368,7 @@ fn coroutine_transform(f: &mut Func, c: &Coro, ptr_bytes: u32, tys: &(std::colle
                 grow |= or(&mut sv, &content[s * wd..][..wd]);
             }
         }
+        drop_dead(&mut sv, "a saved slot holds its address");
         for s in bits(&sv) {
             saved_at[s].push(k);
         }
