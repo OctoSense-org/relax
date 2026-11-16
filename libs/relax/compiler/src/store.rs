@@ -420,18 +420,23 @@ fn decode_index(b: &[u8]) -> Vec<Ix> {
         .collect()
 }
 
-/// Store files this process opened or wrote (generation 0 paths). The cap never evicts them,
-/// nor any of their generations (cache.rs prune_root): evicting a store the run just restored
-/// from made every dependent re-parse on the next run.
+/// Store files this process opened or wrote (generation 0 paths). Prune never evicts them, nor
+/// any of their generations (cache.rs prune_root): evicting a store the run just restored from
+/// made every dependent re-parse on the next run.
 static LIVE: relax_session::sync::Mutex<Option<std::collections::HashSet<PathBuf>>> = relax_session::sync::Mutex::new(None);
 
-/// Records the store `base` as used by this run. The first time, an opened store's file also
-/// gets its modification time stamped: the order the cap evicts in, and how another run sees it
-/// in use.
+/// Records the store `base` as used by this run, in this process and in its pass's record
+/// (note_in_pass: no running pass's store is evicted). The first time, an opened store's file also
+/// gets its modification time stamped: when a run last used it, the order prune evicts in.
 fn mark_live(base: &Path, file: &Path, stamp: bool) {
     let _k = crate::zone_alloc::kept();
     OPEN_FILES.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(Default::default).insert(file.to_path_buf());
     let new = LIVE.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(Default::default).insert(base.to_path_buf());
+    if new {
+        if let (Some(dir), Some(name)) = (base.parent(), base.file_name()) {
+            note_in_pass(dir, Some(&name.to_string_lossy()));
+        }
+    }
     if new && stamp {
         let _ = std::fs::File::options().write(true).open(file).and_then(|f| f.set_modified(std::time::SystemTime::now()));
     }
@@ -790,10 +795,21 @@ pub fn append<T: Entry>(path: &Path, entries: Vec<T>, drop_all: bool) -> std::io
 fn append_as<T: Entry>(path: &Path, entries: Vec<T>, drop_all: bool, ordered: bool) -> std::io::Result<()> {
     let base = base_path(path);
     let r = append_inner(&base, entries, drop_all, ordered, None).map(|_| ());
-    if r.is_ok() {
-        mark_live(&base, &base, false);
+    match &r {
+        Ok(()) => mark_live(&base, &base, false),
+        Err(e) => write_failed(&base, e),
     }
     r
+}
+
+/// A store write failed (a full volume, a folder it cannot write): the run goes on without what
+/// it could not store -- a later run misses it and makes it again, nothing fails. Said once a
+/// process, the first failure's store and error.
+pub fn write_failed(path: &Path, e: &std::io::Error) {
+    static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        crate::progress::say(&format!("relax cache: a store write failed ({}: {e}): this run goes on without storing it, a later run makes it again", path.display()));
+    }
 }
 
 /// The merge of a store's ledger under its lock (append_ledgered): its key, and what makes the
@@ -808,8 +824,10 @@ pub type LedgerMerge<'a, T> = (u128, &'a mut dyn FnMut(Option<&[u8]>) -> Option<
 pub fn append_ledgered<T: Entry>(path: &Path, entries: Vec<T>, ledger_key: u128, merge: &mut dyn FnMut(Option<&[u8]>) -> Option<T>) -> std::io::Result<Option<Vec<T>>> {
     let base = base_path(path);
     let r = append_inner(&base, entries, false, ordered(), Some((ledger_key, merge)));
-    if matches!(r, Ok(None)) {
-        mark_live(&base, &base, false);
+    match &r {
+        Ok(None) => mark_live(&base, &base, false),
+        Ok(Some(_)) => {}
+        Err(e) => write_failed(&base, e),
     }
     r
 }
@@ -1087,6 +1105,14 @@ impl RunStore {
     pub fn create(dir: &Path, prefix: &str, cap: u32) -> std::io::Result<RunStore> {
         let name = format!("{}-{:016x}.rcs", prefix, crate::pack::nonce());
         let path = dir.join(&name);
+        let r = Self::create_at(dir, name, path.clone(), cap);
+        if let Err(e) = &r {
+            write_failed(&path, e);
+        }
+        r
+    }
+
+    fn create_at(dir: &Path, name: String, path: PathBuf, cap: u32) -> std::io::Result<RunStore> {
         hold_build(dir);
         let mut o = std::fs::OpenOptions::new();
         o.read(true).write(true).create_new(true);
@@ -1148,7 +1174,10 @@ impl RunStore {
                 Appended::Done(key, bytes)
             }
             // the reserved range stays a hole: no index entry names it
-            Err(e) => Appended::Failed(e),
+            Err(e) => {
+                write_failed(&self.path, &e);
+                Appended::Failed(e)
+            }
         }
     }
 
@@ -1167,7 +1196,11 @@ impl RunStore {
     /// commit, unless the first `n` payloads written are committed already (by a commit that
     /// covered them, perhaps made for another writer meanwhile): one sync covers many writers.
     pub fn commit_upto(&self, n: usize) -> std::io::Result<()> {
-        self.commit_as(n, ordered())
+        let r = self.commit_as(n, ordered());
+        if let Err(e) = &r {
+            write_failed(&self.path, e);
+        }
+        r
     }
 
     /// `commit_upto`; `ordered`: with the write barrier before the commit (else as an exit commits).
@@ -1406,6 +1439,105 @@ pub fn retire_build(dir: &Path, build: u64, retire: impl FnOnce()) -> bool {
     let _ = std::fs::remove_file(&p);
     let _ = f.unlock();
     true
+}
+
+/// Passes: the stores a pass touched stay while it runs (cache.rs prune). A pass is one command:
+/// a `check -p` command and all its children (RELAX_CHECK_GROUP, the command's pid: the command
+/// holds the pass from its first child to its last, hold_pass), else one process. In
+/// each store folder a pass uses, `passes/<pass>` lists the stores it touched (a name a line,
+/// appended by each of its processes) and `passes/<pass>.held` is held (a shared lock) by each of
+/// them until it exits (the OS drops the lock with the process, also on a crash). A record whose
+/// lock nobody holds is of a pass that ended: the next prune removes it.
+static PASSES: relax_session::sync::Mutex<Option<std::collections::HashMap<PathBuf, Option<(std::fs::File, std::fs::File)>>>> = relax_session::sync::Mutex::new(None);
+
+/// This process's pass: RELAX_CHECK_GROUP (set by a `check -p` command for its children), else
+/// this process's pid.
+pub fn pass_token() -> String {
+    std::env::var("RELAX_CHECK_GROUP").ok()
+        .filter(|g| !g.is_empty() && g.len() <= 64 && g.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'.'))
+        .unwrap_or_else(|| std::process::id().to_string())
+}
+
+/// Holds this process's pass in store folder `dir` (until it exits) and appends `name` to the
+/// stores its record lists. The pass's first process (the command: its own pid is the pass)
+/// starts the list empty. A folder it cannot write is used unrecorded.
+fn note_in_pass(dir: &Path, name: Option<&str>) {
+    let _k = crate::zone_alloc::kept();
+    let mut guard = PASSES.lock().unwrap_or_else(|e| e.into_inner());
+    let held = guard.get_or_insert_with(Default::default);
+    if !held.contains_key(dir) {
+        // None: the folder takes no record (read-only), tried once
+        held.insert(dir.to_path_buf(), open_pass(dir));
+    }
+    if let (Some(name), Some(Some((_, list)))) = (name, held.get(dir)) {
+        // one write per name: appends of the pass's processes interleave by whole lines
+        let _ = std::io::Write::write_all(&mut &*list, format!("{name}\n").as_bytes());
+    }
+}
+
+/// The pass record of this process's pass in `dir`: its held lock and its list (opened to append).
+fn open_pass(dir: &Path) -> Option<(std::fs::File, std::fs::File)> {
+    let token = pass_token();
+    let passes = dir.join("passes");
+    let held = passes.join(format!("{token}.held"));
+    if !dir.exists() && crate::pack::ensure_private_dir(dir).is_err() {
+        return None;
+    }
+    let lock = loop {
+        std::fs::create_dir_all(&passes).ok()?;
+        let f = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).open(&held).ok()?;
+        f.lock_shared().ok()?;
+        // a prune that found the pass ended removed the file between the open and the lock
+        if still_at(&f, &held) {
+            break f;
+        }
+    };
+    let first = token == std::process::id().to_string();
+    let list = std::fs::OpenOptions::new().read(true).append(true).create(true).open(passes.join(&token)).ok()?;
+    if first {
+        let _ = list.set_len(0);
+    }
+    Some((lock, list))
+}
+
+/// Holds this process's pass in store folder `dir` before any store there is touched: a `check
+/// -p` command, whose children use the stores, holds their pass from the first to the last.
+pub fn hold_pass(dir: &Path) {
+    note_in_pass(dir, None);
+}
+
+/// The lists of the running passes of store folder `dir` (pass_lists reads them); the records of
+/// passes that ended go. A process that is its pass alone is left out: what it touched is its
+/// live set (prune's `live`).
+pub fn running_passes(dir: &Path) -> Vec<PathBuf> {
+    let passes = dir.join("passes");
+    let me = std::process::id().to_string();
+    let alone = pass_token() == me;
+    let mut lists = Vec::new();
+    for e in std::fs::read_dir(&passes).into_iter().flatten().flatten() {
+        let n = e.file_name().to_string_lossy().into_owned();
+        let Some(token) = n.strip_suffix(".held") else { continue };
+        if alone && token == me {
+            continue;
+        }
+        let (held, list) = (passes.join(&n), passes.join(token));
+        let Ok(f) = std::fs::OpenOptions::new().read(true).write(true).open(&held) else { continue };
+        if f.try_lock().is_ok() {
+            // ended: no process of it holds the record (one starting now finds the file gone
+            // and makes it again: open_pass)
+            let _ = std::fs::remove_file(&list);
+            let _ = std::fs::remove_file(&held);
+            let _ = f.unlock();
+            continue;
+        }
+        lists.push(list);
+    }
+    lists
+}
+
+/// The store names the pass lists `lists` (running_passes) hold.
+pub fn pass_lists(lists: &[PathBuf]) -> std::collections::HashSet<String> {
+    lists.iter().flat_map(|l| std::fs::read_to_string(l).unwrap_or_default().lines().map(str::to_string).collect::<Vec<_>>()).collect()
 }
 
 /// The programs this process runs (each one's root crate identity, cache.rs open) with the
@@ -1723,8 +1855,8 @@ mod tests {
         assert!(after.get(42).is_none());
         // A failed rewrite must leave the original inode and no temporary file behind.
         assert!(append(&p, vec![Fails], true).is_err());
-        // (the store and this process's live lock folder, hold_build)
-        assert_eq!(std::fs::read_dir(&d).unwrap().flatten().filter(|e| e.file_name() != "live").count(), 1);
+        // (the store, this process's live lock folder (hold_build) and its pass record (note_in_pass))
+        assert_eq!(std::fs::read_dir(&d).unwrap().flatten().filter(|e| e.file_name() != "live" && e.file_name() != "passes").count(), 1);
         assert!(Store::open(&p).unwrap().get(2).is_some());
         // Corrupt a retained payload and force capacity growth; only that entry is dropped.
         let mut file = std::fs::OpenOptions::new().write(true).open(&p).unwrap();

@@ -20,10 +20,11 @@
 //!
 //! RELAX_CACHE=on (default) | off | verify | readonly;
 //! Stores live in `<cargo target dir>/relax/cache` (dirs.rs); RELAX_CACHE_DIR replaces
-//! the run dir for tests and measurement. RELAX_CACHE_MAX (MB) caps them (default: twice
-//! what the run uses, at least 4096; prune_root). The `--allow-c` builds beside them
-//! (`relax/native`) have no cap: what the last build of each slot uses stays, the rest goes
-//! (native.rs, roots).
+//! the run dir for tests and measurement. No size caps them: a store goes when no run used it
+//! for a week, or while its volume has less than a tenth free, least recently used first, never
+//! one a running pass uses (prune_root). The `--allow-c` builds beside them (`relax/native`) are
+//! kept by reachability: what the last build of each slot uses stays, the rest goes (native.rs,
+//! roots).
 
 use crate::borrowck::lazy::StoredVerdict;
 use crate::types::AliasTyKind;
@@ -1634,8 +1635,8 @@ impl Cache {
             }
             crate::store::note_program(*root as u64, &roles);
         }
-        // other Relax builds' files and the cap: pruned off the start's critical path, after
-        // this run's stores are open (so marked live: store::live)
+        // replaced and unused stores, and room on the volume: pruned off the start's critical
+        // path, after this run's stores are open (so marked live: store::live)
         if mode != Mode::ReadOnly {
             let r = root.clone();
             // the shared code folder too (by size alone: prune_shared)
@@ -4556,7 +4557,7 @@ impl Cache {
     // ------------------------------------------------------------ writing
 
     /// Writes the entries recorded this run as one new pack (with this run's late macro inputs),
-    /// then trims the cache to its size cap. Called at exit.
+    /// then prunes the cache (prune_root). Called at exit.
     fn manifest_key(&self, root: u32) -> Option<u128> {
         let mut h = Sip128::new();
         h.str("startup slots");
@@ -5939,11 +5940,16 @@ pub fn app_store_files(dir: &std::path::Path, krate: &str) -> Vec<PathBuf> {
     files
 }
 
-/// The cap's floor (MB) when RELAX_CACHE_MAX is unset.
-const CAP_FLOOR_MB: u64 = 4096;
-/// A store stamped this recently is taken to be in use by another run (every run stamps the
-/// stores it opens: store::mark_live).
-const IN_USE_BY_OTHERS: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+/// Relax keeps a tenth of the store folder's volume free (prune): room for every other program's
+/// writes between two runs. Under it, stores go, least recently used first.
+const FREE_SHARE: u64 = 10;
+/// A store no run used for this long goes (prune): what a cache holds is what its runs used in
+/// the last week, not every build and crate version it ever saw. A run uses one again cold.
+const UNUSED_FOR: std::time::Duration = std::time::Duration::from_secs(7 * 24 * 3600);
+/// A build script's output folder or a `--allow-c` build's that no root names stays this long
+/// after its last use (native.rs, unitgraph.rs prune_build: a run that started meanwhile may be
+/// about to name it).
+const UNNAMED_KEPT: std::time::Duration = std::time::Duration::from_secs(10 * 60);
 
 /// Keeps the cache: first every store's older generations go (store.rs: a rewrite leaves the
 /// generation it replaced for readers that still have it open), except one this process
@@ -5951,20 +5957,23 @@ const IN_USE_BY_OTHERS: std::time::Duration = std::time::Duration::from_secs(10 
 /// start. Other Relax builds' stores stay for when that build runs again: store names hash the
 /// codegen identity (codegen_id.rs), so no other build ever reads them, and a box whose lanes run
 /// several builds went cold each time one of them pruned (the Windows node lost a stopped app's
-/// 109 code stores to a test of another build, 11-04). While `<root>/cache` holds more than the
-/// cap (RELAX_CACHE_MAX megabytes, else twice what this run uses (its live stores), at least
-/// CAP_FLOOR_MB), whole store files go, least recently used first, whichever build wrote them (a
-/// run stamps the files it uses; other crate versions' files are never stamped again) -- never
-/// one this process opened or wrote, nor one another run stamped in the last IN_USE_BY_OTHERS,
-/// nor one of a build running right now (every running process holds its build's live lock). A
-/// build with no store left loses its sets and its lock file. Only checked store files are ever
-/// deleted. Returns (bytes before, after).
+/// 109 code stores to a test of another build, 11-04). Whole store files go, whichever build wrote
+/// them (a run stamps the files it uses: store::mark_live), when no run used them for UNUSED_FOR,
+/// and, while the volume holding `<root>/cache` has less than FREE_SHARE of it free, least
+/// recently used first until it has -- never one a running pass touched (store::running_passes: a
+/// `check -p` command's stores stay from its first package to its last), nor one this process
+/// opened or wrote, nor one of a build running right now (every running process holds its
+/// build's live lock). No size of the cache is a reason: a fixed or run-derived cap evicted what
+/// the next pass of the same packages needed (a 317-package check reused nothing, 11-16). What
+/// went, and why, is kept in `<root>/cache/evicted.log`; on a volume under its floor the run also
+/// says so. A build with no store left loses its sets and its lock file. Only checked store files
+/// are ever deleted. Returns (bytes before, after).
 /// `--allow-c` build outputs (`<root>/native`) are kept by reachability, not by size: what a
 /// slot's last build uses stays (native.rs prune). So are the outputs of the build scripts Relax
 /// runs (`<root>/build`): what a script pass's last run used stays (unitgraph.rs prune_build).
 pub fn prune_root(root: &std::path::Path) -> (u64, u64) {
-    let sizes = prune(root, &crate::store::live(), &crate::store::open_files(), &crate::store::programs(), cache_max());
-    let since = std::time::SystemTime::now().checked_sub(IN_USE_BY_OTHERS).unwrap_or(std::time::UNIX_EPOCH);
+    let sizes = prune(root, &crate::store::live(), &crate::store::open_files(), &crate::store::programs(), None);
+    let since = std::time::SystemTime::now().checked_sub(UNNAMED_KEPT).unwrap_or(std::time::UNIX_EPOCH);
     let native = crate::native::prune(&root.join("native"), since, false);
     if native > 0 && std::env::var_os("RELAX_CACHE_TRACE").is_some() {
         eprintln!("relax cache: pruned {native} native build director(ies) no root names");
@@ -5976,27 +5985,33 @@ pub fn prune_root(root: &std::path::Path) -> (u64, u64) {
     sizes
 }
 
-/// RELAX_CACHE_MAX in bytes (None: unset, the default cap).
-fn cache_max() -> Option<u64> {
-    std::env::var("RELAX_CACHE_MAX").ok().and_then(|v| v.parse::<u64>().ok()).map(|mb| mb << 20)
-}
-
-/// Keeps a shared code folder (SharedCode, Target B) by size alone: prune with no programs, so no
+/// Keeps a shared code folder (SharedCode, Target B) by use alone: prune with no programs, so no
 /// store sets and no retiring list there (a program's set is named by the program's identity, the
 /// same in two checkouts of one app: one checkout's set would retire the stores of the other's
-/// views), and the cap on this folder alone (RELAX_CACHE_MAX, else twice this run's stores there,
-/// at least CAP_FLOOR_MB). Replaced generations go; then whole stores, least recently used first,
-/// never one this process uses, one another run stamped in the last IN_USE_BY_OTHERS or one of a
-/// running build (its live lock in the folder). An evicted entry is compiled again: a miss, never a
-/// failure. Returns (bytes before, after).
+/// views). Replaced generations go; then whole stores no run used for UNUSED_FOR, and while the
+/// folder's volume is under its floor the least recently used, never one a running pass touched,
+/// one this process uses or one of a running build (its live lock in the folder). An evicted entry
+/// is compiled again: a miss, never a failure. Returns (bytes before, after).
 pub fn prune_shared(root: &std::path::Path) -> (u64, u64) {
-    prune_shared_with(root, &crate::store::live(), &crate::store::open_files(), cache_max())
+    prune_shared_with(root, &crate::store::live(), &crate::store::open_files(), None)
 }
 
-/// prune_shared with this run's stores `live`, the generation files it opened `open` and the cap
-/// in bytes (None: the default).
-fn prune_shared_with(root: &std::path::Path, live: &HashSet<PathBuf>, open: &HashSet<PathBuf>, cap: Option<u64>) -> (u64, u64) {
-    prune(root, live, open, &[], cap)
+/// prune_shared with this run's stores `live`, the generation files it opened `open` and the
+/// bytes to free (None: what the volume's floor asks for).
+fn prune_shared_with(root: &std::path::Path, live: &HashSet<PathBuf>, open: &HashSet<PathBuf>, need: Option<u64>) -> (u64, u64) {
+    prune(root, live, open, &[], need)
+}
+
+/// What the volume holding store folder `dir` lacks of its floor (FREE_SHARE of it free), in
+/// bytes, with what it has free and its floor; 0 where the system does not say.
+fn below_floor(dir: &std::path::Path) -> (u64, u64, u64) {
+    match crate::dirs::volume_space(dir) {
+        Some((free, size)) => {
+            let floor = size / FREE_SHARE;
+            (floor.saturating_sub(free), free, floor)
+        }
+        None => (0, 0, 0),
+    }
 }
 
 /// At exit: every store's replaced generations go, including the ones this process itself
@@ -6027,8 +6042,8 @@ pub fn retire_replaced_in_use() {
 }
 
 /// prune_root with this run's stores `live` (generation 0 paths), the generation files it opened
-/// `open`, and the cap in bytes (None: the default).
-fn prune(root: &std::path::Path, live: &HashSet<PathBuf>, open: &HashSet<PathBuf>, programs: &[(u64, std::collections::BTreeMap<String, String>)], cap: Option<u64>) -> (u64, u64) {
+/// `open`, and the bytes to free (None: what the volume's floor asks for, below_floor).
+fn prune(root: &std::path::Path, live: &HashSet<PathBuf>, open: &HashSet<PathBuf>, programs: &[(u64, std::collections::BTreeMap<String, String>)], need: Option<u64>) -> (u64, u64) {
     let mut before = 0u64;
     let dir = root.join("cache");
     let mut files: Vec<(std::time::SystemTime, PathBuf, u64)> = match std::fs::read_dir(&dir) {
@@ -6070,13 +6085,17 @@ fn prune(root: &std::path::Path, live: &HashSet<PathBuf>, open: &HashSet<PathBuf
         .map(|f| f.1.clone())
         .collect();
     let now = std::time::SystemTime::now();
-    let recent = |t: &std::time::SystemTime| now.duration_since(*t).map_or(true, |age| age < IN_USE_BY_OTHERS);
+    // the stores running passes touched (their records, read once a store could go); the records
+    // of passes that ended go now
+    let passes = crate::store::running_passes(&dir);
+    let pass_names: std::cell::OnceCell<HashSet<String>> = std::cell::OnceCell::new();
+    let in_pass = |n: &str| pass_names.get_or_init(|| crate::store::pass_lists(&passes)).contains(n);
     // this build's replaced crate stores (store sets, write_sets): one a program's set named and
-    // its current set no longer names goes once no set or demand part names it, this run does
-    // not use it and no run stamped it recently (until then it stays on the retiring list)
+    // its current set no longer names goes once no set or demand part names it and no running
+    // pass uses it (until then it stays on the retiring list)
     let name = |p: &PathBuf| crate::store::base_path(p).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
     let keep = |f: &(std::time::SystemTime, PathBuf, u64)| builds.get(&f.1).copied().flatten() != Some(me)
-        || live.contains(&crate::store::base_path(&f.1)) || open.contains(&f.1) || recent(&f.0);
+        || live.contains(&crate::store::base_path(&f.1)) || open.contains(&f.1) || in_pass(&name(&f.1));
     let (named, retiring) = write_sets(&sets, me, programs);
     let mut part_named: HashSet<String> = HashSet::new();
     // the front stores demand parts take images from (each graph store lists them); a graph
@@ -6115,21 +6134,72 @@ fn prune(root: &std::path::Path, live: &HashSet<PathBuf>, open: &HashSet<PathBuf
         }); }
     }
     let mut total: u64 = files.iter().map(|f| f.2).sum();
-    let live_bytes: u64 = files.iter().filter(|f| live.contains(&crate::store::base_path(&f.1))).map(|f| f.2).sum();
-    let cap = cap.unwrap_or((CAP_FLOOR_MB << 20).max(2 * live_bytes));
+    // whole stores: the ones no run used for UNUSED_FOR (run stores go by reference, above), and
+    // while the volume lacks room the least recently used -- never one in use
+    let (lack, free, floor) = match need {
+        Some(n) => (n, 0, 0),
+        None => below_floor(&dir),
+    };
     files.sort();
     let mut evicted: HashSet<&PathBuf> = HashSet::new();
+    let (mut freed, mut unused, mut pressed) = (0u64, (0usize, 0u64), (0usize, 0u64));
+    let mut lines: Vec<String> = Vec::new();
     for (t, p, len) in &files {
-        if total <= cap {
+        let age = now.duration_since(*t).unwrap_or_default();
+        let old = age >= UNUSED_FOR;
+        // stamps ascend: once neither rule applies, none applies to a later store
+        if !old && freed >= lack {
             break;
         }
-        let in_use = live.contains(&crate::store::base_path(p)) || recent(t) || running.contains(p);
-        if !in_use && crate::store::delete_checked(p) {
-            total -= len;
-            evicted.insert(p);
+        let n = name(p);
+        let aged = old && family(&n) != RUN_STORE_FAMILY;
+        if (!aged && freed >= lack) || live.contains(&crate::store::base_path(p)) || running.contains(p) || in_pass(&n) {
+            continue;
+        }
+        if !crate::store::delete_checked(p) {
+            continue;
+        }
+        total -= len;
+        freed += len;
+        evicted.insert(p);
+        let why = if aged {
+            unused.0 += 1;
+            unused.1 += len;
+            format!("no run used it for {} days", age.as_secs() / 86400)
+        } else {
+            pressed.0 += 1;
+            pressed.1 += len;
+            match need {
+                Some(_) => format!("asked to free {lack} bytes"),
+                None => format!("the volume has {} MB free, under the {} MB (1/{FREE_SHARE} of it) kept free", free >> 20, floor >> 20),
+            }
+        };
+        lines.push(format!("{n} {} MB, last used {} h ago: {why}", len >> 20, age.as_secs() / 3600));
+    }
+    if !lines.is_empty() {
+        note_evicted(&dir, &lines);
+        let what = |(n, b): (usize, u64)| format!("{n} store(s), {} MB", b >> 20);
+        if unused.0 > 0 {
+            crate::progress::log(&format!("relax cache: {} no run used for {} days went ({}/evicted.log)", what(unused), UNUSED_FOR.as_secs() / 86400, dir.display()));
+        }
+        if pressed.0 > 0 {
+            // a person may want to make room: said, not only logged
+            crate::progress::say(&format!("relax cache: the volume holding {} has {} MB free, under the {} MB (1/{FREE_SHARE} of it) Relax keeps free: {} went, least recently used first (evicted.log there)",
+                dir.display(), free >> 20, floor >> 20, what(pressed)));
+        }
+        if std::env::var_os("RELAX_CACHE_TRACE").is_some() {
+            for l in &lines {
+                eprintln!("relax cache: evicted {l}");
+            }
         }
     }
-    // a build the cap took the last store of (or that left only its lock file)
+    static SHORT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if need.is_none() && freed < lack && !SHORT.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        // what is left is in use: the run goes on, its writes may fail (a miss, never a failure)
+        crate::progress::say(&format!("relax cache: the volume holding {} has {} MB free, under the {} MB (1/{FREE_SHARE} of it) Relax keeps free; the {} MB left in the cache is in use",
+            dir.display(), (free + freed) >> 20, floor >> 20, total >> 20));
+    }
+    // a build prune took the last store of (or that left only its lock file)
     let holding: HashSet<u64> = files.iter().filter(|f| !evicted.contains(&f.1)).filter_map(|f| builds[&f.1]).collect();
     for b in crate::store::lock_builds(&dir) {
         if b != me && !holding.contains(&b) {
@@ -6141,24 +6211,41 @@ fn prune(root: &std::path::Path, live: &HashSet<PathBuf>, open: &HashSet<PathBuf
             });
         }
     }
-    static REPORTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    if total > cap && crate::run::VERBOSE.load(std::sync::atomic::Ordering::Relaxed) && !REPORTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-        // what stayed over the cap, and why: this run's stores, then other running builds'
-        // stores, then stores another run of this build stamped recently
-        let (mut other_running, mut other_runs) = (0u64, 0u64);
-        for (t, p, len) in files.iter().filter(|f| !evicted.contains(&f.1) && !live.contains(&crate::store::base_path(&f.1))) {
-            if running.contains(p) {
-                other_running += len;
-            } else if recent(t) {
-                other_runs += len;
-            }
-        }
-        eprintln!(
-            "relax cache: {} MB stays over the cap ({} MB): this run's stores {} MB, running other builds' {} MB, stores other runs used in the last {} min {} MB",
-            total >> 20, cap >> 20, live_bytes >> 20, other_running >> 20, IN_USE_BY_OTHERS.as_secs() / 60, other_runs >> 20
-        );
-    }
     (before, total)
+}
+
+/// Appends what prune evicted (`lines`) to `<dir>/evicted.log`, each line with the time (UTC),
+/// this process and its pass (one write: two processes' lines do not interleave). Past
+/// EVICTED_LOG_MAX bytes the log keeps its newer half.
+fn note_evicted(dir: &std::path::Path, lines: &[String]) {
+    const EVICTED_LOG_MAX: u64 = 1 << 20;
+    let path = dir.join("evicted.log");
+    let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+    let head = format!("{} pid {} pass {}:", utc_text(secs), std::process::id(), crate::store::pass_token());
+    let text: String = lines.iter().map(|l| format!("{head} {l}\n")).collect();
+    let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) else { return };
+    let _ = std::io::Write::write_all(&mut f, text.as_bytes());
+    if f.metadata().map_or(0, |m| m.len()) > EVICTED_LOG_MAX {
+        let old = std::fs::read_to_string(&path).unwrap_or_default();
+        let half = old.len() / 2;
+        let from = old[half..].find('\n').map_or(old.len(), |i| half + i + 1);
+        let _ = pack::write_atomic_with(dir, "evicted.log", |f| std::io::Write::write_all(f, old[from..].as_bytes()));
+    }
+}
+
+/// `secs` after the Unix epoch as `YYYY-MM-DDTHH:MM:SSZ` (the civil calendar from days).
+fn utc_text(secs: u64) -> String {
+    let (days, rem) = ((secs / 86400) as i64, secs % 86400);
+    let z = days + 719468;
+    let era = z.div_euclid(146097);
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    format!("{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z", rem / 3600, rem / 60 % 60, rem % 60)
 }
 
 /// The run stores' family (front_run.rs): file images, kept while a store refers to them.
@@ -7576,7 +7663,7 @@ impl FrontImages {
             pf.sink = sink.clone();
             if f.prep.idents.iter().any(|&(lo, hi)| lo > hi || hi as usize > pf.src.len()) { return None; }
             let used = crate::macros::MacroUse::from_replay(f.used.local, f.used.uses, &f.replay.0)?;
-            // (a store an image is taken from is in use: the cap keeps it)
+            // (a store an image is taken from is in use: prune keeps it)
             st.mark_used();
             Some(crate::preload::Preparsed {
                 error: None,
@@ -9845,14 +9932,15 @@ mod data_tests {
         std::fs::remove_dir_all(&a2).unwrap();
         std::fs::rename(&a, &a2).unwrap();
         assert_eq!(run(&mut ua2, &a2_ids, a2_path, &a2, fresh, home), (first, [6, 0, 0, 1, 1]), "the moved checkout links only the shared code");
-        // the shared folder's cap evicts the store (not stamped lately, used by no run of this
-        // process now): the next run compiles that code again and shares it, a miss and no failure
+        // short of room on its volume, prune evicts the shared store (used by no running pass, nor
+        // by a run of this process now): the next run compiles that code again and shares it, a
+        // miss and no failure
         let shared_dir = top.join("home/code");
         for e in std::fs::read_dir(shared_dir.join("cache")).unwrap().flatten().filter(|e| e.path().is_file()) {
             std::fs::File::options().write(true).open(e.path()).unwrap().set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(3600)).unwrap();
         }
-        let (before, after) = prune_shared_with(&shared_dir, &HashSet::new(), &HashSet::new(), Some(1));
-        assert!(before > 0 && after == 0, "the cap took the shared store ({before} -> {after} bytes)");
+        let (before, after) = prune_shared_with(&shared_dir, &HashSet::new(), &HashSet::new(), Some(u64::MAX));
+        assert!(before > 0 && after == 0, "prune took the shared store ({before} -> {after} bytes)");
         assert_eq!(run(&mut ua2, &a2_ids, a2_path, &a2, fresh, home), ([false, false, true, true, true, true, true, true], [1, 1, 1, 0, 1]),
             "after the eviction dep::same::<u32> misses, is compiled again and shared again; a2's own code hits");
         drop((ua, ub, ub2, ua2));
@@ -12363,9 +12451,24 @@ mod prune_tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// A running pass `token` that touched the stores `names` in store folder `dir`, as
+    /// store::open_pass records one: running while the returned lock lives.
+    fn other_pass(dir: &std::path::Path, token: &str, names: &[&str]) -> std::fs::File {
+        let passes = dir.join("passes");
+        std::fs::create_dir_all(&passes).unwrap();
+        std::fs::write(passes.join(token), names.iter().map(|n| format!("{n}\n")).collect::<String>()).unwrap();
+        let held = std::fs::File::create(passes.join(format!("{token}.held"))).unwrap();
+        held.lock_shared().unwrap();
+        held
+    }
+
+    /// Prune: with room on the volume only a store no run used for UNUSED_FOR goes; short of room
+    /// the least recently used go first, never this run's nor one a running pass touched, however
+    /// old its stamp; an ended pass's record goes and protects nothing; evicted.log says what went
+    /// and why; a rewritten store's older generation goes.
     #[test]
-    fn a_runs_stores_survive_a_tiny_cap_and_stale_ones_go_first() {
-        isolated_test!(a_runs_stores_survive_a_tiny_cap_and_stale_ones_go_first);
+    fn a_runs_and_a_running_pass_stores_stay_and_stale_ones_go_first() {
+        isolated_test!(a_runs_and_a_running_pass_stores_stay_and_stale_ones_go_first);
         let root = std::env::temp_dir().join(format!("relax-prune-{}-{}", std::process::id(), crate::clock::wall_ns()));
         let dir = root.join("cache");
         std::fs::create_dir_all(&dir).unwrap();
@@ -12378,27 +12481,42 @@ mod prune_tests {
             p
         };
         // this run's stores carry the oldest stamps, and still are never evicted
-        let used = [store("bitflags-0000000000000001.rcs", 3 * day), store("memchr-0000000000000002.rcs", 3 * day)];
+        let used = [store("bitflags-0000000000000001.rcs", 9 * day), store("memchr-0000000000000002.rcs", 3 * day)];
         let stale_old = store("bitflags-00000000000000aa.rcs", 2 * day);
         let stale_new = store("memchr-00000000000000bb.rcs", day);
-        // stamped a minute ago by another run
-        let other_run = store("amp-00000000000000cc.rcs", 60);
+        // touched by another pass that still runs (a `check -p` package checked an hour ago)
+        let pass_used = store("amp-00000000000000cc.rcs", 3600);
+        let unused = store("unused-00000000000000ee.rcs", 8 * day);
+        let pass = other_pass(&dir, "4242", &["amp-00000000000000cc.rcs"]);
         let live: HashSet<PathBuf> = used.iter().cloned().collect();
-        let all: u64 = [&used[0], &used[1], &stale_old, &stale_new, &other_run].iter().map(|p| std::fs::metadata(p).unwrap().len()).sum();
-        // one store over the cap: the least recently used one not in use goes
-        let (before, after) = prune(&root, &live, &HashSet::new(), &[], Some(all - 1));
+        let all: u64 = [&used[0], &used[1], &stale_old, &stale_new, &pass_used, &unused].iter().map(|p| std::fs::metadata(p).unwrap().len()).sum();
+        // room on the volume: only what no run used for a week goes (not this run's, 9 days old)
+        let (before, after) = prune(&root, &live, &HashSet::new(), &[], Some(0));
         assert_eq!(before, all);
+        assert!(!unused.exists(), "no run used it for 8 days");
+        assert!(used.iter().all(|p| p.exists()) && stale_old.exists() && stale_new.exists() && pass_used.exists());
+        // short of a byte: the least recently used one not in use goes
+        prune(&root, &live, &HashSet::new(), &[], Some(1));
         assert!(!stale_old.exists());
         assert!(stale_new.exists());
-        assert!(after < all);
-        // a tiny cap: every unused store goes; the run's own and the other run's stay (reported)
-        let (_, after) = prune(&root, &live, &HashSet::new(), &[], Some(1));
+        // short of everything: every unused store goes; the run's own and the running pass's stay
+        let (_, after_all) = prune(&root, &live, &HashSet::new(), &[], Some(u64::MAX));
         assert!(!stale_new.exists());
-        assert!(used.iter().all(|p| p.exists()));
-        assert!(other_run.exists());
-        assert!(after > 1);
-        // the default cap (floor, or twice the run's stores) keeps what is left
-        assert_eq!(prune(&root, &live, &HashSet::new(), &[], None).1, after);
+        assert!(used.iter().all(|p| p.exists()), "this run's");
+        assert!(pass_used.exists(), "a running pass's");
+        assert!(after_all < after);
+        // the pass ends: its record goes at the next prune, and its stores may go
+        drop(pass);
+        prune(&root, &live, &HashSet::new(), &[], Some(0));
+        assert!(!dir.join("passes/4242").exists() && !dir.join("passes/4242.held").exists(), "an ended pass's record goes");
+        assert!(pass_used.exists(), "with room, used an hour ago: it stays");
+        prune(&root, &live, &HashSet::new(), &[], Some(u64::MAX));
+        assert!(!pass_used.exists());
+        let log = std::fs::read_to_string(dir.join("evicted.log")).unwrap();
+        let line = |n: &str| log.lines().find(|l| l.contains(n)).unwrap_or_else(|| panic!("{n} in evicted.log:\n{log}")).to_string();
+        assert!(line("unused-00000000000000ee.rcs").ends_with("no run used it for 8 days"), "{log}");
+        assert!(line("bitflags-00000000000000aa.rcs").ends_with("asked to free 1 bytes"), "{log}");
+        assert!(line("amp-00000000000000cc.rcs").contains(&format!("pid {} pass {}:", std::process::id(), crate::store::pass_token())), "{log}");
         // a rewritten store's older generation goes at the next prune (also a store this run
         // uses), unless this run itself reads that generation file
         let stale_gen = store("serde-00000000000000dd.rcs", 60);
@@ -12408,23 +12526,19 @@ mod prune_tests {
         let used_gen1 = crate::store::gen_path(&used[1], 1);
         std::fs::copy(&used[1], &used_gen1).unwrap();
         let open: HashSet<PathBuf> = [used[0].clone()].into_iter().collect();
-        prune(&root, &live, &open, &[], None);
+        prune(&root, &live, &open, &[], Some(0));
         assert!(!stale_gen.exists() && crate::store::gen_path(&stale_gen, 1).exists());
         assert!(used[0].exists() && used_gen.exists());
         assert!(!used[1].exists() && used_gen1.exists());
-        for p in [crate::store::gen_path(&stale_gen, 1), used_gen, used_gen1, used[0].clone(), other_run] {
-            std::fs::remove_file(p).unwrap();
-        }
-        // the folder also holds this process's live lock (store::hold_build)
-        std::fs::remove_dir_all(&dir).unwrap();
-        std::fs::remove_dir(&root).unwrap();
+        // the folder also holds this process's live lock (store::hold_build) and pass record
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     /// Store sets: a program's run names its store per role; a crate store the previous run's set
     /// named that the program's set no longer names (an edit changed the crate's fingerprint, a
     /// crate left the program) goes unless another program's set or a graph's demand parts name it
-    /// -- once no run stamped it recently, also at a later prune (the retiring list); a run store
-    /// no store refers to goes; a store no set ever named stays (the cap's business).
+    /// -- once no running pass uses it, also at a later prune (the retiring list); a run store
+    /// no store refers to goes; a store no set ever named stays (age and room decide).
     #[test]
     fn replaced_crate_stores_retire_by_store_sets() {
         isolated_test!(replaced_crate_stores_retire_by_store_sets);
@@ -12465,42 +12579,42 @@ mod prune_tests {
         let roles: std::collections::BTreeMap<String, String> = [("code w", "widgets-0000000000000011.rcs"), ("front w", "widgets-0000000000000031.rcs"),
             ("code s", "shared-0000000000000015.rcs"), ("front p", "parted-0000000000000017.rcs"), ("graph", "front_graph-0000000000000008.rcs")].into_iter().map(|(a, b)| (a.to_string(), b.to_string())).collect();
         let live: HashSet<PathBuf> = [code_v2.clone(), front_v2.clone(), parted_v2.clone(), graph.clone()].into_iter().collect();
-        // a replaced store another run stamped recently stays for now
-        stamp(&removed, std::time::SystemTime::now());
-        prune(&root, &live, &HashSet::new(), &[(prog, roles.clone())], Some(u64::MAX));
+        // a replaced store another running pass uses stays for now
+        let pass = other_pass(&dir, "4243", &["removed-0000000000000004.rcs"]);
+        prune(&root, &live, &HashSet::new(), &[(prog, roles.clone())], Some(0));
         assert!(!code_v1.exists() && !front_v1.exists(), "replaced crate stores go");
         assert!(parted_v1.exists(), "a demand part takes images from it");
-        assert!(removed.exists(), "stamped recently");
+        assert!(removed.exists(), "a running pass uses it");
         assert!(shared_v1.exists(), "another program's set names it");
         assert!(code_v2.exists() && front_v2.exists() && shared_v2.exists());
-        assert!(unnamed.exists(), "never named: the cap's business");
+        assert!(unnamed.exists(), "never named: age and room decide");
         assert!(!run_kept.exists() && !run_dead.exists(), "run stores: go once no store refers to them (front_v1 went)");
         let set = std::fs::read_to_string(sets.join(format!("{me:016x}-{prog:016x}"))).unwrap();
         assert_eq!(set, "code s shared-0000000000000015.rcs\ncode w widgets-0000000000000011.rcs\nfront p parted-0000000000000017.rcs\nfront w widgets-0000000000000031.rcs\ngraph front_graph-0000000000000008.rcs\n");
         assert_eq!(std::fs::read_to_string(sets.join(format!("{me:016x}.retiring"))).unwrap(), "parted-0000000000000007.rcs\nremoved-0000000000000004.rcs\n");
-        // later: the retiring store is no longer recent and goes; the other program dropping `shared` too lets it go
-        stamp(&removed, old);
+        // later: the pass that used the retiring store ended, and it goes; the other program dropping `shared` too lets it go
+        drop(pass);
         std::fs::write(sets.join(format!("{me:016x}-{other:016x}")), "code s shared-0000000000000015.rcs\n").unwrap();
         let roles2 = roles.clone();
-        prune(&root, &live, &HashSet::new(), &[(prog, roles)], Some(u64::MAX));
+        prune(&root, &live, &HashSet::new(), &[(prog, roles)], Some(0));
         assert!(!removed.exists());
         assert!(shared_v1.exists(), "dropped by the other program without a run of it here: not on the list");
         // the part was encoded again against the new store: the old one goes
         crate::store::append(&graph, vec![NewEntry { key: 3, kind: KIND_DEMAND_STORES, payload: b"parted-0000000000000017.rcs\n".to_vec() }], true).unwrap();
         stamp(&graph, old);
-        prune(&root, &live, &HashSet::new(), &[(prog, roles2)], Some(u64::MAX));
+        prune(&root, &live, &HashSet::new(), &[(prog, roles2)], Some(0));
         assert!(!parted_v1.exists());
         assert_eq!(std::fs::read_to_string(sets.join(format!("{me:016x}.retiring"))).unwrap(), "");
         std::fs::remove_dir_all(&root).unwrap();
     }
 
-    /// A shared code folder is kept by size alone (prune_shared): two checkouts of one program that
+    /// A shared code folder is kept by use alone (prune_shared): two checkouts of one program that
     /// name different views of a crate (their store sets would retire each other's store) keep both
-    /// stores, and no store set is written there; under the cap every build's stores stay; over it
-    /// the least recently used go first, never this run's or a running build's.
+    /// stores, and no store set is written there; with room every build's stores stay; short of
+    /// room the least recently used go first, never this run's or a running build's.
     #[test]
-    fn a_shared_code_folder_is_pruned_by_size_alone() {
-        isolated_test!(a_shared_code_folder_is_pruned_by_size_alone);
+    fn a_shared_code_folder_is_pruned_by_use_alone() {
+        isolated_test!(a_shared_code_folder_is_pruned_by_use_alone);
         let root = std::env::temp_dir().join(format!("relax-shared-prune-{}-{}", std::process::id(), crate::clock::wall_ns()));
         let dir = root.join("cache");
         std::fs::create_dir_all(&dir).unwrap();
@@ -12529,29 +12643,28 @@ mod prune_tests {
         for view in [&view_a, &view_b, &view_a] {
             let roles: std::collections::BTreeMap<String, String> = [("code dep".to_string(), name(view))].into_iter().collect();
             crate::store::note_program(0x5eed, &roles);
-            prune_shared_with(&root, &live, &HashSet::new(), Some(u64::MAX));
+            prune_shared_with(&root, &live, &HashSet::new(), Some(0));
         }
         assert!(view_a.exists() && view_b.exists(), "neither checkout's view of dep retires the other's");
         assert!(!dir.join("sets").exists(), "no store sets in a shared folder");
-        assert!(other.exists() && running.exists() && used.exists(), "under the cap every build's stores stay");
-        let size = |p: &PathBuf| std::fs::metadata(p).unwrap().len();
-        let all: u64 = [&view_a, &view_b, &other, &running, &used].iter().map(|p| size(p)).sum();
-        prune_shared_with(&root, &live, &HashSet::new(), Some(all - 1));
-        assert!(!other.exists(), "over the cap the least recently used store not in use goes first");
-        assert!(view_a.exists() && view_b.exists());
+        assert!(other.exists() && running.exists() && used.exists(), "with room every build's stores stay");
         prune_shared_with(&root, &live, &HashSet::new(), Some(1));
+        assert!(!other.exists(), "short of room the least recently used store not in use goes first");
+        assert!(view_a.exists() && view_b.exists());
+        prune_shared_with(&root, &live, &HashSet::new(), Some(u64::MAX));
         assert!(!view_a.exists() && !view_b.exists(), "down to what is in use");
         assert!(used.exists() && running.exists(), "this run's store and a running build's stay");
         drop(lock);
         std::fs::remove_dir_all(&root).unwrap();
     }
 
-    /// Another build's stores stay until the cap needs their room, as this build's do: least
+    /// Another build's stores stay until the volume needs their room, as this build's do: least
     /// recently used first, never while a process of that build runs (it holds that build's live
-    /// lock, store::hold_build). A build with no store left loses its sets and lock file.
+    /// lock, store::hold_build) nor while a running pass uses them. A build with no store left
+    /// loses its sets and lock file.
     #[test]
-    fn other_builds_stores_stay_until_the_cap_needs_their_room() {
-        isolated_test!(other_builds_stores_stay_until_the_cap_needs_their_room);
+    fn other_builds_stores_stay_until_the_volume_needs_their_room() {
+        isolated_test!(other_builds_stores_stay_until_the_volume_needs_their_room);
         let root = std::env::temp_dir().join(format!("relax-retire-{}-{}", std::process::id(), crate::clock::wall_ns()));
         let dir = root.join("cache");
         std::fs::create_dir_all(&dir).unwrap();
@@ -12574,6 +12687,8 @@ mod prune_tests {
         let unnamed = store("std-00000000000000a2.rcs", 4000, Some(0));
         let other_running = store("core-00000000000000b1.rcs", 5000, Some(alive));
         let other_stamped = store("core-00000000000000c1.rcs", 60, Some(me ^ 0x4444));
+        // a pass of that build runs and uses it
+        let pass = other_pass(&dir, "4244", &["core-00000000000000c1.rcs"]);
         assert_eq!(crate::store::build_of(&mine_old), Some(me));
         assert_eq!(crate::store::build_of(&other_running), Some(alive));
         // a process of build `alive` (its lock, as hold_build takes it)
@@ -12590,30 +12705,28 @@ mod prune_tests {
         std::fs::write(&ended_set, "").unwrap();
         std::fs::write(&idle_set, "").unwrap();
         let live: HashSet<PathBuf> = [mine_used.clone()].into_iter().collect();
-        prune(&root, &live, &HashSet::new(), &[], Some(u64::MAX));
-        assert!(other_old.exists() && unnamed.exists() && other_running.exists() && other_stamped.exists(), "under the cap every build's stores stay");
+        prune(&root, &live, &HashSet::new(), &[], Some(0));
+        assert!(other_old.exists() && unnamed.exists() && other_running.exists() && other_stamped.exists(), "with room every build's stores stay");
         assert!(idle_set.exists(), "and what names them");
         assert!(mine_old.exists() && mine_used.exists());
         assert!(dir.join("live").join(format!("{me:016x}")).exists(), "this process holds its build's lock");
         assert!(!ended_set.exists(), "an ended build's sets go with its last store");
         #[cfg(unix)]
         assert!(!ended.exists(), "and its lock file");
-        // the cap takes the least recently used first, whichever build wrote them
-        let size = |p: &PathBuf| std::fs::metadata(p).unwrap().len();
-        let all = [&mine_old, &mine_used, &other_old, &unnamed, &other_running, &other_stamped].iter().map(|p| size(p)).sum::<u64>();
-        prune(&root, &live, &HashSet::new(), &[], Some(all - 1));
+        // short of room, the least recently used go first, whichever build wrote them
+        prune(&root, &live, &HashSet::new(), &[], Some(1));
         assert!(!unnamed.exists(), "the oldest not running goes first");
         assert!(other_old.exists() && mine_old.exists());
         assert!(other_running.exists(), "older, but its build runs");
-        // down to what is in use: this run's, another run's stamped just now, a running build's
-        prune(&root, &live, &HashSet::new(), &[], Some(1));
+        // down to what is in use: this run's, a running pass's, a running build's
+        prune(&root, &live, &HashSet::new(), &[], Some(u64::MAX));
         assert!(!other_old.exists() && !mine_old.exists());
-        assert!(!idle_set.exists(), "the cap took that build's last store: its sets go");
+        assert!(!idle_set.exists(), "prune took that build's last store: its sets go");
         assert!(mine_used.exists() && other_stamped.exists() && other_running.exists());
-        // that build's process ends: the cap may take its stores now
-        drop(lock);
-        prune(&root, &live, &HashSet::new(), &[], Some(1));
-        assert!(!other_running.exists());
+        // that build's process and the pass end: prune may take their stores now
+        drop((lock, pass));
+        prune(&root, &live, &HashSet::new(), &[], Some(u64::MAX));
+        assert!(!other_running.exists() && !other_stamped.exists());
         #[cfg(unix)]
         assert!(!dir.join("live").join(format!("{alive:016x}")).exists());
         std::fs::remove_dir_all(&root).unwrap();

@@ -412,7 +412,9 @@ fn connect(start: bool) -> Result<PathBuf, String> {
 /// Only the ordinary package invocation auto-connects: flags changing compilation retain
 /// their one-shot meaning. An explicit --serve with such flags is rejected, never ignored.
 /// `-p <package>`: a package like one named plainly. Several: each checked by a process of its own,
-/// all of them whatever one says; the exit is the worst.
+/// all of them whatever one says; the exit is the worst. They are one pass (`RELAX_CHECK_GROUP`,
+/// this command's pid): the command holds the pass from the first child to the last, so no store a
+/// child touched is evicted while a later one runs (store.rs passes, cache.rs prune).
 fn check_packages(args: &[String], grants: &[String]) -> Result<Vec<String>, i32> {
     let mut runs = package_args(args)?;
     if runs.len() < 2 {
@@ -422,9 +424,10 @@ fn check_packages(args: &[String], grants: &[String]) -> Result<Vec<String>, i32
         eprintln!("relax check: the loader's own path: {e}");
         2
     })?;
+    crate::store::hold_pass(&crate::dirs::cache_dir());
     let mut worst = 0;
     for (p, args) in runs {
-        let status = std::process::Command::new(&exe).arg("check").args(grants).args(&args).status();
+        let status = std::process::Command::new(&exe).arg("check").args(grants).args(&args).env("RELAX_CHECK_GROUP", crate::store::pass_token()).status();
         let code = status.ok().and_then(|s| s.code()).unwrap_or(2);
         if code != 0 {
             eprintln!("relax check: {p}: exit {code}");
