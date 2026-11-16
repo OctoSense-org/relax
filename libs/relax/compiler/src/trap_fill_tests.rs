@@ -65,10 +65,14 @@ fn slot(u: &mut Unit, name: &str) -> (u32, DefId) {
 /// Per case a process, which ends by its stale access as an unattended run does (the report,
 /// then the fault's signal): `call` calls the dead range, `odd` jumps into its middle, `closed`
 /// reads a chunk nothing lives in any more. Every case first fills 100 ranges in the page a
-/// looping thread runs its neighbour in. Each access comes from code of the unit (the dead
-/// range's own, or a reader of another generation's arena), as in a run: under the JIT this
-/// test's own code is the JIT's, which contains a fault in its code before any handler the
-/// program installed (jit.rs `containment`), so a read made here ended as the JIT's fault.
+/// looping thread runs its neighbour in, the thread seen running before the first fill. Then a
+/// fault seen only after its fill ended is that fill's: the same instruction's fault in the next
+/// fill runs again too (taken for the next fill's, the neighbour's fault in that fill was taken
+/// for a repeat and ended the process with no report).
+/// Each access comes from code of the unit (the dead range's own, or a reader of another
+/// generation's arena), as in a run: under the JIT this test's own code is the JIT's, which
+/// contains a fault in its code before any handler the program installed (jit.rs
+/// `containment`), so a read made here ended as the JIT's fault.
 #[test]
 fn a_trap_filled_range_traps_at_any_offset_while_its_page_neighbour_runs_on() {
     const CHILD: &str = "RELAX_TRAP_FILL_CASE";
@@ -79,7 +83,7 @@ fn a_trap_filled_range_traps_at_any_offset_while_its_page_neighbour_runs_on() {
                 .env(CHILD, case).env("RELAX_CACHE", "off").env_remove("RELAX_STALE_PARK"));
             let all = format!("{}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
             // the access it makes and the verdict that access must get, as the child said them
-            let expect = all.lines().find_map(|l| l.strip_prefix("trap fill expects: ")).unwrap_or_else(|| panic!("{case}: the child did not get to its stale access:\n{all}"));
+            let expect = all.lines().find_map(|l| l.strip_prefix("trap fill expects: ")).unwrap_or_else(|| panic!("{case}: the child did not get to its stale access (it ended: {}):\n{all}", output.status));
             assert!(all.lines().any(|l| l.starts_with("relax: stale access: ") && l.contains(expect)), "{case}: no stale access report with {expect:?}:\n{all}");
             assert!(!output.status.success() && !all.contains("test result: ok"), "{case}: the process ends by the stale access:\n{all}");
         }
@@ -104,6 +108,12 @@ fn a_trap_filled_range_traps_at_any_offset_while_its_page_neighbour_runs_on() {
             CALLS.fetch_add(1, Ordering::Relaxed);
         }
     });
+    // the loop runs before the first fill
+    let t0 = std::time::Instant::now();
+    while CALLS.load(Ordering::Relaxed) == 0 {
+        assert!(t0.elapsed().as_secs() < 30, "the neighbour's loop never ran");
+        std::thread::yield_now();
+    }
     // (each fill holds the pages out of reach long enough that the loop surely meets them)
     invalid::TRANSIT_HOLD_US.store(200, Ordering::Relaxed);
     let mut same_page = 0;
@@ -129,6 +139,47 @@ fn a_trap_filled_range_traps_at_any_offset_while_its_page_neighbour_runs_on() {
     assert_eq!(call_at(live_at), 7, "the neighbour runs on");
     assert!(invalid::PROT_BYTES.load(Ordering::Relaxed) == 0 && invalid::FILLED_BYTES.load(Ordering::Relaxed) == 100 * 16 && stats.contains("in 100 fills"), "100 ranges filled, nothing inaccessible: {stats}");
     eprintln!("{} calls of the neighbour; {stats}", CALLS.load(Ordering::Relaxed));
+    // A fault whose handler reads the fill state only after its fill ended: a thread asks as the
+    // handler does (jit.rs `transit_retry`, the neighbour's fetch at `live_at`), then asks on
+    // until one of its asks met the next fill and waited for it. Both must run the instruction
+    // again. Fills go on until it met one; nothing else runs into their pages meanwhile.
+    static LATE: AtomicBool = AtomicBool::new(false);
+    static MET: AtomicU64 = AtomicU64::new(0);
+    let fill = |u: &mut Unit, k: u32| {
+        let g = Group::Patch { slot: 3_000_000 + k, gen: 1 };
+        let at = u.emit_grouped(Some(g), &ret_code(k), &[]).unwrap();
+        assert_eq!(at & !(page - 1), live_at & !(page - 1), "fill {k} is in the neighbour's page");
+        invalid::invalidate(u, |x| x == g, 2, "invalidated code", None, "a test's layout patch");
+    };
+    fill(&mut u, 0);
+    let asking = std::thread::spawn(move || {
+        let late = crate::jit::transit_retry(live_at, live_at);
+        LATE.store(true, Ordering::SeqCst);
+        loop {
+            let waits = invalid::TRANSIT_WAITS.load(Ordering::SeqCst);
+            let again = crate::jit::transit_retry(live_at, live_at);
+            if invalid::TRANSIT_WAITS.load(Ordering::SeqCst) != waits {
+                MET.store(if again { 1 } else { 2 }, Ordering::SeqCst);
+                return late;
+            }
+        }
+    });
+    let t0 = std::time::Instant::now();
+    while !LATE.load(Ordering::SeqCst) {
+        assert!(t0.elapsed().as_secs() < 30, "the asking thread never asked");
+        std::thread::yield_now();
+    }
+    invalid::TRANSIT_HOLD_US.store(200, Ordering::Relaxed);
+    let mut k = 1;
+    while MET.load(Ordering::SeqCst) == 0 {
+        assert!(t0.elapsed().as_secs() < 30, "the asking thread met none of {k} fills");
+        fill(&mut u, k);
+        k += 1;
+    }
+    invalid::TRANSIT_HOLD_US.store(0, Ordering::Relaxed);
+    let late = asking.join().unwrap();
+    assert!(late, "a fault seen after its fill ended runs again");
+    assert_eq!(MET.load(Ordering::SeqCst), 1, "the same instruction's fault in the next fill runs again (fills: {k})");
     // the stale access of this case
     let dead_g = Group::Patch { slot: dead, gen: 1 };
     let dead_at = u.emit_grouped(Some(dead_g), &ret_code(5), &[]).unwrap();

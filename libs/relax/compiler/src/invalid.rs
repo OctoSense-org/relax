@@ -499,9 +499,10 @@ fn trap_fill(ranges: &mut [(u64, u64, u64)]) {
 
 /// A fault at data address `addr`, pc `pc` (the fault side, signal context: atomic loads and a
 /// spin, no lock, no allocation): Some(the fill's number) when it touched pages a trap fill has
-/// out of reach -- or just had: the fault may be seen after the fill ended -- once no fill has
-/// them; the instruction then runs again (jit.rs `transit_retry`). The wait is one fill's length
-/// (microseconds: a few KB written, three protection changes).
+/// out of reach -- or just had: the fault may be seen after the fill ended, and is then that
+/// fill's, never the next one's -- once no fill has them; the instruction then runs again (jit.rs
+/// `transit_retry`). The wait is one fill's length (microseconds: a few KB written, three
+/// protection changes).
 pub(crate) fn transit_wait(addr: u64, pc: u64) -> Option<u64> {
     let s = TRANSIT_SEQ.load(Ordering::SeqCst);
     if s == 0 {
@@ -524,8 +525,11 @@ pub(crate) fn transit_wait(addr: u64, pc: u64) -> Option<u64> {
         }
         TRANSIT_WAITS.fetch_add(1, Ordering::Relaxed);
         TRANSIT_WAIT_MAX_NS.fetch_max(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        return Some(s);
     }
-    Some(s | 1)
+    // (seen after its fill ended: that fill's. Named the next one's, the same instruction's
+    // fault in the next fill would be taken for one after it ran again, and end the process)
+    Some(s - 1)
 }
 
 /// The patch generations recorded in the flight recorder (`reload.patch`): gen -> (wall ns, text),
