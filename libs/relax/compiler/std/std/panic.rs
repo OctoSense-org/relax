@@ -49,8 +49,10 @@ impl<'a> PanicHookInfo<'a> {
     pub fn location(&self) -> Option<&Location<'_>> {
         Some(self.location)
     }
+    /// rustc's: whether the panic may unwind. A Relax panic unwinds to its catch point (a panic
+    /// raised while one is being handled runs no hook).
     pub fn can_unwind(&self) -> bool {
-        false
+        true
     }
 }
 
@@ -65,7 +67,7 @@ impl<'a> fmt::Debug for PanicHookInfo<'a> {
         f.debug_struct("PanicHookInfo")
             .field("payload", &self.payload_as_str())
             .field("location", &self.location)
-            .field("can_unwind", &false)
+            .field("can_unwind", &true)
             .field("force_no_backtrace", &false)
             .finish()
     }
