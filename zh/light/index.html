@@ -5,8 +5,8 @@
 <script>document.documentElement.classList.add("jsp");try{if(localStorage.getItem("relax-theme")==="dark"){document.documentElement.style.visibility="hidden";location.replace("../"+location.hash)}}catch(e){}</script>
 <style>.jsp #plain{display:none}</style>
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Relax：Rust，告别等待</title>
-<meta name="description" content="Relax 是用 Rust 写的 Rust 实时编译器与 JIT 运行时，直接从源码运行 Cargo 包，全程不经过 rustc、LLVM 或链接器。">
+<title>Relax：运行 Rust 代码，无需等待</title>
+<meta name="description" content="Relax 是用 Rust 写的、面向 Rust 代码的实时编译器与 JIT 运行时，直接从源码运行 Cargo 包，全程不经过 rustc、LLVM 或链接器。">
 <meta name="color-scheme" content="light">
 <meta name="theme-color" content="#f5f7f4">
 <link rel="icon" href="../../favicon.ico" sizes="32x32">
@@ -17,8 +17,8 @@
 <link rel="alternate" hreflang="zh-CN" href="https://makepad.github.io/relax/zh/">
 <link rel="alternate" hreflang="x-default" href="https://makepad.github.io/relax/">
 <meta property="og:type" content="website">
-<meta property="og:title" content="Relax：Rust，告别等待">
-<meta property="og:description" content="Relax 是用 Rust 写的 Rust 实时编译器与 JIT 运行时，直接从源码运行 Cargo 包，全程不经过 rustc、LLVM 或链接器。">
+<meta property="og:title" content="Relax：运行 Rust 代码，无需等待">
+<meta property="og:description" content="Relax 是用 Rust 写的、面向 Rust 代码的实时编译器与 JIT 运行时，直接从源码运行 Cargo 包，全程不经过 rustc、LLVM 或链接器。">
 <meta property="og:url" content="https://makepad.github.io/relax/zh/">
 <meta property="og:locale" content="zh_CN">
 <meta property="og:locale:alternate" content="en_US">
@@ -596,10 +596,10 @@ h3.h{letter-spacing:0;line-height:1.3}
 <body>
 <a class="skip" href="#main">跳到正文</a>
 <div id="prog" aria-hidden="true"></div>
-<div class="xp" role="note"><div class="wrap"><b>实验性</b> · Relax 与 Rust 项目及 Rust 基金会无关，也未获其认可。它是由 AI 生成的、对 Rust 编程语言的重新实现，旨在降低大语言模型处理 Rust 代码时的延迟，仅应视为实验性开发工具：运行时可能存在任意数量的缺陷，也不会自动继承 Rust 的安全保证。Relax 用于开发迭代。任何发布版本请使用 Rust 本身构建（<code>cargo build --release</code>）。目前它主要在 Makepad 自身的编辑-运行迭代中测试过，在其他项目上测试还很少；在别处使用时可能遇到问题，欢迎反馈。</div></div>
+<div class="xp" role="note"><div class="wrap"><b>实验性</b> · Relax 与 Rust 项目及 Rust 基金会无关，也未获其认可。Rust 是 Rust 基金会的商标。它是由 AI 生成的、对 Rust 编程语言的重新实现，旨在降低大语言模型处理 Rust 代码时的延迟，仅应视为实验性开发工具：运行时可能存在任意数量的缺陷，也不会自动继承 Rust 的安全保证。Relax 用于开发迭代。任何发布版本请使用 Rust 本身构建（<code>cargo build --release</code>）。目前它主要在 Makepad 自身的编辑-运行迭代中测试过，在其他项目上测试还很少；在别处使用时可能遇到问题，欢迎反馈。</div></div>
 <div id="plain">
 <p>本页的文字由 JavaScript 填充。以下是同一内容的纯 HTML 版，供不运行 JavaScript 的读者使用；英文原文见 <a href="https://github.com/makepad/relax#readme">README</a> 和 <a href="../../retro/">纯 HTML 版</a>。</p>
-<h1>Rust，告别等待。</h1>
+<h1>运行 Rust 代码，无需等待。</h1>
 <p><b>rustc：先构建，再运行。Relax：边构建，边运行。</b></p>
 <ul>
 <li><b>11 s</b> 大型 3D 游戏：从全新检出到首帧（M4 MacBook）
@@ -653,7 +653,7 @@ cd hello
 ../relax/target/release/relax check hello          # 只做类型检查和借用检查</pre>
 <p>在包的目录里运行 <code>relax</code>，参数给包名；别移动 <code>relax</code> 的检出目录，std 从那里读取。在一台 16 核 x86-64 Linux 机器上构建用了 53 s；<code>hello</code> 随后 0.24 s 启动，之后不到 0.1 s。已在 Linux x86-64 和 macOS arm64 上测试。</p>
 <p>没有依赖的包不需要联网；crates.io 依赖取自 <code>~/.cargo</code>，或下载后按索引的 SHA-256 校验。更多见 <a href="https://github.com/makepad/relax#readme">README</a>。</p>
-<h2><a name="plain-toolchain">一套全新的 Rust 工具链，从源码字节到机器码。</a></h2>
+<h2><a name="plain-toolchain">一套用于 Rust 代码的新工具链，从源码字节到机器码。</a></h2>
 <p>Relax 不是 rustc 的套壳，也不是 LLVM 的插件：<b>它把两者都换掉了</b>，连同 Cargo 和链接器夹在中间的那部分。</p>
 <table border="1" cellpadding="4" cellspacing="0">
 <tr valign="top"><td>词法分析、语法分析、宏展开（<code>macro_rules!</code> 与过程宏）</td><td>rustc</td><td>relax-lex、relax-front</td></tr>
@@ -719,7 +719,7 @@ cd hello
 </ul>
 <p>换成 rustc，同样的改动意味着：重新构建 crate、重新链接、重启。</p>
 <p>MIT 许可证，见 <a href="https://github.com/makepad/relax/blob/main/LICENSE">LICENSE</a>。Relax 编译的 std 源码带有各自的版权声明，见 <code>libs/relax/compiler/std/CREDITS.md</code> 及其旁边的许可证文件。</p>
-<h2>Rust，告别等待。</h2>
+<h2>运行 Rust 代码，无需等待。</h2>
 </div>
 
 <header class="nav">
@@ -747,7 +747,7 @@ cd hello
 
 <section class="hero" id="top" aria-labelledby="h-hero">
   <div class="wrap">
-    <h1 id="h-hero"><span class="w" style="--i:0">Rust<span class="pc">，</span></span><wbr><span class="nw"><span class="w" style="--i:1">告别</span><span class="w glow" style="--i:2">等待。</span></span></h1>
+    <h1 id="h-hero"><span class="w" style="--i:0">运行 Rust 代码<span class="pc">，</span></span><wbr><span class="nw"><span class="w" style="--i:1">无需</span><span class="w glow" style="--i:2">等待。</span></span></h1>
     <div class="hero-grid">
       <div>
         <p class="lede"><span>rustc<span class="pc">：</span>先构建<span class="pc">，</span>再运行<span class="pc">。</span></span>Relax<span class="pc">：</span>边构建<span class="pc">，</span>边运行。</p>
@@ -763,7 +763,7 @@ cd hello
           <div class="ml r"><b>Relax <span>边构建，边运行</span></b><div class="mt" aria-hidden="true"><i></i></div></div>
           <p>示意图，未按比例。实测竞速见下文。</p>
         </aside>
-        <p class="sub"><strong>用 Rust 写的 Rust 实时编译器与 JIT 运行时。</strong> Relax 直接从源码运行 Cargo 包，全程不经过 rustc、LLVM 或链接器。每个函数在第一次被调用时才编译，热点函数在程序运行期间被优化，你的修改被热补丁进正在运行的进程。</p>
+        <p class="sub"><strong>用 Rust 写的、面向 Rust 代码的实时编译器与 JIT 运行时。</strong> Relax 直接从源码运行 Cargo 包，全程不经过 rustc、LLVM 或链接器。每个函数在第一次被调用时才编译，热点函数在程序运行期间被优化，你的修改被热补丁进正在运行的进程。</p>
       </div>
     </div>
     <div class="stats" id="heroStats"></div>
@@ -854,7 +854,7 @@ cd hello
 <section id="toolchain" aria-labelledby="h-took">
   <div class="wrap">
     <p class="kicker reveal">背后的工程</p>
-    <h2 class="title reveal" id="h-took">一套全新的 Rust 工具链<span class="pc">，</span><em>从源码字节<wbr>到机器码。</em></h2>
+    <h2 class="title reveal" id="h-took">一套用于 Rust 代码的新工具链<span class="pc">，</span><em>从源码字节<wbr>到机器码。</em></h2>
     <p class="intro reveal" data-rich="took.intro"></p>
     <div class="took mt48">
       <div class="card pipe reveal" id="pipeBox">
@@ -931,7 +931,7 @@ cd hello
 
 <section class="final" aria-labelledby="h-final">
   <div class="wrap">
-    <h2 id="h-final" class="reveal">Rust<span class="pc">，</span><wbr>告别等待。</h2>
+    <h2 id="h-final" class="reveal">运行 Rust 代码<span class="pc">，</span><wbr>无需等待。</h2>
     <div class="cta reveal">
       <a class="btn primary" href="https://github.com/makepad/relax">GitHub</a>
       <a class="btn" href="#top">回到顶部</a>

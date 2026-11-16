@@ -5,7 +5,7 @@
 <script>document.documentElement.classList.add("jsp");try{if(localStorage.getItem("relax-theme")==="light"){document.documentElement.style.visibility="hidden";location.replace("light/"+location.hash)}}catch(e){}</script>
 <style>.jsp #plain{display:none}</style>
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Relax: Rust without the wait</title>
+<title>Relax: run Rust code without the wait</title>
 <meta name="description" content="Relax is a live compiler and JIT runtime for Rust, written in Rust. It runs a Cargo package straight from source, with no rustc, LLVM or linker in the loop.">
 <meta name="color-scheme" content="dark">
 <link rel="icon" href="favicon.ico" sizes="32x32">
@@ -536,11 +536,11 @@ footer .lang{vertical-align:middle;color:var(--muted)}
 <body>
 <a class="skip" href="#main">Skip to content</a>
 <div id="prog" aria-hidden="true"></div>
-<div class="xp" role="note"><div class="wrap"><b>Experimental</b> · Relax is not affiliated with or endorsed by the Rust project or the Rust Foundation. It is an AI-generated re-implementation of the Rust programming language, designed to minimise latency for LLMs working with Rust code: an experimental developer tool that can contain any number of runtime bugs and does not automatically inherit Rust's safety guarantees. Relax is for development iteration. Use Rust itself (<code>cargo build --release</code>) for any release build. So far it has been tested mostly in Makepad's own edit-run loop and only lightly on other projects, so expect rough edges elsewhere and please report them.</div></div>
+<div class="xp" role="note"><div class="wrap"><b>Experimental</b> · Relax is not affiliated with or endorsed by the Rust project or the Rust Foundation. Rust is a trademark of the Rust Foundation. It is an AI-generated re-implementation of the Rust programming language, designed to minimise latency for LLMs working with Rust code: an experimental developer tool that can contain any number of runtime bugs and does not automatically inherit Rust's safety guarantees. Relax is for development iteration. Use Rust itself (<code>cargo build --release</code>) for any release build. So far it has been tested mostly in Makepad's own edit-run loop and only lightly on other projects, so expect rough edges elsewhere and please report them.</div></div>
 <div id="plain">
 <p>This is the page's full text as plain HTML, for readers without JavaScript. The same text is in the <a href="https://github.com/makepad/relax#readme">README</a> and on the <a href="retro/">plain HTML page</a>.</p>
 <h1>Relax</h1>
-<p><b>Rust without the wait.</b></p>
+<p><b>Run Rust code without the wait.</b></p>
 <p><b>rustc builds your program, then you run it. Relax runs your program while it builds it.</b></p>
 <p>Relax is a live compiler and JIT runtime for Rust, written in Rust. It runs a Cargo package straight from source, with no rustc, LLVM or linker in the loop: it compiles each function when it is first called, optimises the hot ones while the program runs, and patches your edits into the running process.</p>
 <h2><a name="plain-relax-vs-cargo-and-rustc">Relax vs cargo and rustc</a></h2>
@@ -594,7 +594,7 @@ cd hello
 <p>Measured from a fresh clone: building <code>relax</code> took 53 s on a 16-core x86-64 Linux box and 78 s on a 10-core arm64 Mac with cargo held to 4 jobs. The first <code>relax run</code> of <code>hello</code> took 0.24 s and 0.97 s, the next ones 0.01 to 0.07 s. Relax keeps what it compiles in the package's <code>target/relax</code> (<code>relax clean</code> removes it), so each new package starts cold.</p>
 <p><b>Network.</b> A package with no dependencies, like <code>hello</code>, needs none. For a crates.io dependency Relax takes the package from <code>~/.cargo</code>'s registry when it is there, and otherwise downloads it from crates.io itself, checked against the index's SHA-256. With <code>RELAX_OFFLINE=1</code> or cargo's <code>CARGO_NET_OFFLINE</code> it never downloads. <code>relax fetch &lt;git-url&gt;</code> (<code>tools/run/runner/src/fetch.rs</code>) stores a git repository as one file under <code>~/.relax</code>.</p>
 <hr>
-<h2><a name="plain-what-it-took-a-new-rust-toolchain">What it took: a new Rust toolchain</a></h2>
+<h2><a name="plain-what-it-took-a-new-rust-toolchain">What it took: a new toolchain for Rust code</a></h2>
 <p>Relax isn't a wrapper around rustc or a plugin for LLVM. It replaces both, and the parts of Cargo and the linker in between, with one Rust library.</p>
 <table border="1" cellpadding="4" cellspacing="0">
 <tr><th>The job</th><th>In the usual toolchain</th><th><b>In Relax</b></th></tr>
@@ -752,7 +752,7 @@ libs/ platform/ tools/ widgets/         the small support crates Relax links: to
     <div class="hero-grid">
       <div>
         <p class="eyebrow"><i class="pulse"></i>A live compiler and JIT runtime for Rust, written in Rust</p>
-        <h1 id="h-hero"><span class="w" style="--i:0">Rust</span> <span class="w" style="--i:1">without</span> <span class="w" style="--i:2">the</span> <span class="w glow" style="--i:3">wait.</span></h1>
+        <h1 id="h-hero"><span class="w" style="--i:0">Run</span> <span class="w" style="--i:1">Rust</span> <span class="w" style="--i:2">code</span> <span class="w" style="--i:3">without</span> <span class="w" style="--i:4">the</span> <span class="w glow" style="--i:5">wait.</span></h1>
         <p class="lede"><span>rustc builds your program, then you run it.</span> Relax runs your program while it builds it.</p>
         <p class="sub">Relax runs a Cargo package straight from source, with no rustc, LLVM or linker in the loop. It compiles each function when it is first called, optimises the hot ones while the program runs, and patches your edits into the running process.</p>
         <div class="cta">
@@ -855,7 +855,7 @@ libs/ platform/ tools/ widgets/         the small support crates Relax links: to
 <section id="toolchain" aria-labelledby="h-took">
   <div class="wrap">
     <p class="kicker reveal">What it took</p>
-    <h2 class="title reveal" id="h-took">A new Rust toolchain, <em>from source bytes to machine code.</em></h2>
+    <h2 class="title reveal" id="h-took">A new toolchain for Rust code, <em>from source bytes to machine code.</em></h2>
     <p class="intro reveal" data-rich="took.intro"></p>
     <div class="took mt48">
       <div class="card pipe reveal" id="pipeBox">
@@ -932,7 +932,7 @@ libs/ platform/ tools/ widgets/         the small support crates Relax links: to
 
 <section class="final" aria-labelledby="h-final">
   <div class="wrap">
-    <h2 id="h-final" class="reveal">Rust without the wait.</h2>
+    <h2 id="h-final" class="reveal">Run Rust code without the wait.</h2>
     <div class="cta reveal">
       <a class="btn primary" href="https://github.com/makepad/relax">GitHub <span aria-hidden="true">&nearr;</span></a>
       <a class="btn" href="#top">Back to top</a>

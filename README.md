@@ -7,7 +7,7 @@
 >
 > Relax is for development iteration: running, testing and live-editing your program while you work on it. Build anything you release with Rust itself: `cargo build --release` with rustc. So far it has been tested mostly in Makepad's own edit-run loop and only lightly on other projects, so expect rough edges elsewhere and please report them.
 
-### Rust without the wait.
+### Run Rust code without the wait.
 
 **rustc builds your program, then you run it. Relax runs your program while it builds it.**
 
@@ -105,7 +105,7 @@ stores a git repository as one file under `~/.relax`.
 
 ---
 
-## What it took: a new Rust toolchain
+## What it took: a new toolchain for Rust code
 
 Relax isn't a wrapper around rustc or a plugin for LLVM. It replaces both, and the parts of Cargo and
 the linker in between, with one Rust library.

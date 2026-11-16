@@ -55,3 +55,16 @@ carry it in the same commit.
 
 See `README.md` ("Try it") and `libs/relax/CONTRIBUTING.md`. From a fresh clone the repository builds
 and its tests pass on Linux x86-64 and macOS arm64.
+
+## Naming Rust
+
+Relax is not affiliated with or endorsed by the Rust project or the Rust Foundation. In the README,
+the website and any other text about Relax:
+
+- Describe Relax as "a developer JIT for Rust code". Never use "Rust JIT", "Rust toolchain" or "Rust
+  compiler" as a name for Relax.
+- Never put "official", "original" or "only" next to the Rust or Cargo marks.
+- Use no Rust or Cargo logo.
+- Keep the non-affiliation line and "Rust is a trademark of the Rust Foundation." on every site page
+  and in `README.md`.
+- Make speed and compatibility claims only when they are measured and reproducible.
