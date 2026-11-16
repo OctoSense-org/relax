@@ -4815,14 +4815,23 @@ impl Cache {
             if i % 1024 == 1023 && stop() { return false; }
             new += !old.contains(b.0.as_slice()) as usize;
         }
+        // The manifest and its image are the union of recent startups: a start whose slots the
+        // loaded ones already hold is not recorded again, whichever of the recent starts it was (a
+        // suite's tests, an app opened on another tab), and a new one is recorded with the slots
+        // of the loaded ones added. Two tests that started differently each rebuilt the 38 MB image
+        // for their own start, which the next test rebuilt back: 175-315 ms on the owner and up
+        // to half a second of the exit, every session. The image's slots no call reached are
+        // dropped once they outnumber the ones calls reached (`lean`): a start that moved on
+        // prelinks no dead weight. (A loaded manifest that is not valid is not kept either.)
+        let lean = !self.startup_manifest_valid() || crate::jit::not_called_at_present() * 2 > self.image_slots;
         // the same start as before (within 2%), the loaded manifest still valid and its image
-        // current (within 2%, covering all but 2% of its cached slots, and at most 2% of its slots
-        // ones no call reached while its window was open: jit::startup_set_called): no new one
+        // current (within 2%, covering all but 2% of its cached slots, and not mostly slots no
+        // call reached while its window was open: jit::startup_set_called): no new one
         let (replaced, _) = self.image_replaced();
         let image_current = !self.image_rewrite && match &self.image_built {
             // this run's image: its slots replaced since it was built
             Some((_, n, _)) => replaced * 50 <= *n,
-            None => self.image_slots == 0 || ((self.image_stale + replaced) * 50 <= self.image_slots && self.image_slots * 50 >= self.manifest_present_cached * 49 && crate::jit::not_called_at_present() * 50 <= self.image_slots),
+            None => self.image_slots == 0 || ((self.image_stale + replaced) * 50 <= self.image_slots && self.image_slots * 50 >= self.manifest_present_cached * 49 && !lean),
         };
         if self.startup_manifest_valid() && new * 50 <= list.len() && image_current {
             self.manifest_done = true; self.manifest_len = order.len();
@@ -4832,6 +4841,28 @@ impl Cache {
         if self.verbose {
             eprintln!("relax cache: startup manifest rewritten: valid {} (missing {}), {} new of {}, image rewrite {} (replacements without a stored entry {}, tier-ups {}; of the image's own slots {}), image slots {} stale {} cached at present {}",
                 self.startup_manifest_valid(), self.manifest_missing, new, list.len(), self.image_rewrite, self.stats.rewrite_why[0], self.stats.rewrite_why[1], replaced, self.image_slots, self.image_stale, self.manifest_present_cached);
+        }
+        // the union: the loaded manifest's own slots this start did not install, after this start's
+        // (their code entries as the loaded manifest named them, while the index holds them), and
+        // the slots its image installed ahead in this run's image
+        let mut image_ids = present_ids;
+        let mut carried = (0, 0);
+        if !lean {
+            let mine: HashSet<u128> = list.iter().map(|(b, _)| identity_hash(b)).collect();
+            for (i, b) in self.manifest[..self.manifest_main.min(self.manifest.len())].iter().enumerate() {
+                if i % 1024 == 1023 && stop() { return false; }
+                if mine.contains(&identity_hash(b)) { continue; }
+                let k = self.manifest_old_keys.get(i).copied().filter(|k| *k != 0 && (self.has_index(k) || self.pending_keys.contains(k))).unwrap_or(0);
+                list.push((b.clone(), k));
+                carried.0 += 1;
+            }
+            let have: HashSet<u32> = image_ids.iter().copied().collect();
+            let ahead: Vec<u32> = crate::jit::prelinked_ahead().into_iter().filter(|id| !have.contains(id)).collect();
+            carried.1 = ahead.len();
+            image_ids.extend(ahead);
+        }
+        if self.verbose {
+            eprintln!("relax cache: startup manifest {}: {} slots of the loaded manifest and {} its image installed ahead kept with this start's", if lean { "lean (this start's slots only)" } else { "the union of recent startups" }, carried.0, carried.1);
         }
         crate::run::yield_section("manifest image");
         // the image an earlier try built and then gave way after (a busy session's tries each
@@ -4846,7 +4877,7 @@ impl Cache {
             None => {
                 let at = self.replaced.len();
                 let img = if self.mode != Mode::Verify {
-                    match self.build_image(u, &present_ids, stop) { Err(()) => return false, Ok(img) => img }
+                    match self.build_image(u, &image_ids, stop) { Err(()) => return false, Ok(img) => img }
                 } else { None };
                 (img, at)
             }

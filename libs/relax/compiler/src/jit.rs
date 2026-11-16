@@ -1967,6 +1967,12 @@ pub(crate) fn prelinked_not_called(u: &Unit) -> crate::fxhash::HashSet<u32> {
     ids.iter().copied().filter(|&id| unsafe { not_called_since_armed(u, id) }).collect()
 }
 
+/// The slots the startup image installed ahead this run (PRELINKED_AHEAD): a manifest written
+/// as the union of recent startups keeps them in its image (cache.rs record_manifest).
+pub(crate) fn prelinked_ahead() -> Vec<u32> {
+    PRELINKED_AHEAD.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
 /// NOT_CALLED_AT_PRESENT, once the startup image's window has closed (run_tick: atomics and the
 /// two locks; a brief pass over the image's slots, once per run).
 fn note_startup_calls() {
