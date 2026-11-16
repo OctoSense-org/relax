@@ -254,7 +254,7 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
     ("hal", "pump|pace|lose", "HAL pump loop per session: turns and wake causes, totals and per second since the last call (an idle app shows none); pace: the WM-hosted shell's frame pacing; lose: the GPU device is taken for lost, as a driver reset would (the run and the app recover on a new one)"),
     ("writes", "<Type::field> | (none: the watches) | W<n> [n=20] | rm <W<n>|all>", "who writes a struct field: the compiled fns that assign `x.field` (`=`, `op=`) are rebuilt to record every write: its site (fn, file:line), the value written and the field's address; `writes W<n>` reads the sites and the latest writes"),
     ("vms", "", "every live Splash VM: label, thread, heap objects / strings / arrays and bytes, GC runs and time, errors, evaluations"),
-    ("live", "[after=<next>]", "an instant look for live graphs (no window, no sleep), one JSON line: now_ms, frames presented, live patches installed and the ones the newest presented window frame was built with (frame_patch), finished builds so far per kind (lazy, ahead, o2, o3, linked; diff two looks for a rate), queues [ahead,o2,o3], UI ms waited on the JIT; with after=<the last answer's next>: the UI frames since then (the last minute at most) as ft [[ms before now_ms the frame ended, ms it worked], ...]"),
+    ("live", "[after=<next>]", "an instant look for live graphs (no window, no sleep), one JSON line: now_ms, frames presented, live patches installed and the ones the newest presented window frame was built with (frame_patch), whether the live watcher is on a save (editing: 1 from the change it saw to its verdict) and the patch groups that run while their check has not reported (unverified), finished builds so far per kind (lazy, ahead, o2, o3, linked; diff two looks for a rate), queues [ahead,o2,o3], UI ms waited on the JIT; with after=<the last answer's next>: the UI frames since then (the last minute at most) as ft [[ms before now_ms the frame ended, ms it worked], ...]"),
     ("cpu", "", "the shared CPU budget: running and queued app/JIT jobs per class, waits and checkpoint warnings, who holds and waits for the tokens"),
     ("jit", "[ms=250] | spent [n=20]","live compile activity in one line (what the JIT ring shows): busy or idle, the jobs running now, the queues per tier (ahead, O2, O3), builds finished and their rate over ms, the UI thread's JIT duty; spent: the CPU the compile jobs took so far by tier, and the slots whose O2 and O3 jobs took the most"),
     ("jit queue", "[n=10]","running JIT jobs, then the unified queue in admission order: class, heat, UI path, wait, function"),
@@ -1413,6 +1413,10 @@ fn cmd_jit(req: &Req, out: &mut Out) {
 
 /// `live [after=<next>]`: one instant look for a live view polled many times a second (devhub's
 /// graphs): the monotonic counters a rate is diffed from and the UI frames since the last look.
+/// `editing` and `unverified` say whether the JIT is still on an edit: its watcher round (the save
+/// to its verdict) and the patch groups that run while their check has not reported. devhub's
+/// watch on an edit's verdict waits while either is on, however long: a two-file Fab edit took
+/// 70 s to compile, and a fixed 60 s watch said the edit was not applied (11-16).
 fn cmd_live(req: &Req, out: &mut Out) {
     use std::fmt::Write;
     let a = crate::postframe::activity();
@@ -1432,11 +1436,13 @@ fn cmd_live(req: &Req, out: &mut Out) {
         None => flightrec::frames_head(),
     };
     out.line(&format!(
-        "{{\"now_ms\":{:.1},\"frames\":{frames},\"patches\":{},\"frame_patch\":{},\"restart_pending\":{},{},\"lazy\":{},\"ahead\":{},\"o2\":{},\"o3\":{},\"linked\":{},\"q\":[{},{},{}],\"ui_wait_ms\":{},\"next\":{next},\"ft\":[{ft}]}}",
+        "{{\"now_ms\":{:.1},\"frames\":{frames},\"patches\":{},\"frame_patch\":{},\"restart_pending\":{},\"editing\":{},\"unverified\":{},{},\"lazy\":{},\"ahead\":{},\"o2\":{},\"o3\":{},\"linked\":{},\"q\":[{},{},{}],\"ui_wait_ms\":{},\"next\":{next},\"ft\":[{ft}]}}",
         now as f64 / 1e6,
         crate::reload::patches_installed(),
         crate::postframe::FRAME_PATCH.load(Relaxed),
         crate::reload::restart_pending().len(),
+        crate::reload::save_seen() as u8,
+        crate::reload::UNVERIFIED_PATCHES.load(Relaxed),
         runs_what(),
         a.demand(),
         a.ahead_done,
