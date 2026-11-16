@@ -3436,9 +3436,12 @@ fn run_dir_receipt(name: &str, receipt: String, run_dir: &str) -> Option<String>
 
 pub(crate) const RUN_STATE_VARS: [&str; 8] = ["RELAX_STARTUP_T0", "RELAX_MAIN_MS", "RELAX_CACHE_STATE", "RELAX_LIVE_LOG", "RELAX_REPORT_TO", "RELAX_SELF_EXEC", "RELAX_SELF_EXEC_SILENT_ADDED", "RELAX_RUN_NATIVE"];
 
-/// Locations only: anchors_key covers workspace, run and std dirs, VFS content hashes cover
-/// edits, and the read log changes no checked input. Their spellings can leave env_key.
-pub(crate) const RUN_LOCATING_VARS: [&str; 5] = ["RELAX_WORKSPACE", "RELAX_EDITS", "RELAX_CACHE_DIR", "RELAX_READ_LOG", "RELAX_STD"];
+/// Locations only: the keys hold the workspace's, the run dir's and std's paths in their anchored
+/// spelling (a crate's root and files, std's among them), VFS content hashes cover edits, the read
+/// log changes no checked input, RELAX_STD_AUTO is RELAX_STD's spelling of an automatic choice, and
+/// the loader's executable is where its build lies (codegen_id is the build). Their spellings can
+/// leave env_key.
+pub(crate) const RUN_LOCATING_VARS: [&str; 7] = ["RELAX_WORKSPACE", "RELAX_EDITS", "RELAX_CACHE_DIR", "RELAX_READ_LOG", "RELAX_STD", "RELAX_STD_AUTO", "RELAX_LOADER"];
 
 static HAL_RUN: AtomicBool = AtomicBool::new(false);
 static APP_DOMAIN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);

@@ -147,26 +147,44 @@ fn changed(name: &str, files: &[(&str, &str)], before: &[(&str, &str)], change: 
 const LIB: &str = "pub fn f() -> u32 { 1 }\nfn unused_in_lib() {}\n";
 const BIN: &str = "fn main() { let x = pkg::f(); }\nfn unused_in_bin() {}\n";
 
-/// A verdict stored in one worktree never prints another worktree's paths; when Target B
-/// anchors the stored texts this test's hits become 2 with the same diagnostics.
+/// A copy of the package in another worktree, over the same store, reuses every verdict and prints
+/// its own paths (check_reuse.rs Stow), and the file it includes is its own: an edit of the copy's
+/// checks the crate that reads it again. A diagnostic that names the first worktree's folder
+/// outside a place (a value written in the source) binds its verdict to that worktree: the copy
+/// checks that crate again and prints what a check of every crate prints there.
 #[test]
-fn a_copy_in_another_worktree_prints_its_own_paths() {
+fn a_copy_in_another_worktree_reuses_its_verdicts_with_its_own_paths() {
     if std::env::var_os(CHILD).is_some() { return; }
-    let lib = format!("{LIB}fn another_unused() {{}}\n");
-    let files = [("lib.rs", lib.as_str()), ("bin.rs", BIN), ("Cargo.toml", "[workspace]\n")];
+    let lib = format!("{LIB}fn another_unused() {{}}\npub fn data() -> usize {{ include_str!(\"data.txt\").len() }}\n");
+    let files = [("lib.rs", lib.as_str()), ("bin.rs", BIN), ("data.txt", "one"), ("Cargo.toml", "[workspace]\n")];
     let a = package("wt-a", &files);
     let b = package("wt-b", &files);
     let store = a.join("store");
     let (a_path, b_path) = (a.to_str().unwrap(), b.to_str().unwrap());
-    let first = check_in_child_store(&a, true, &store, &[("RELAX_WORKSPACE", a_path)]);
+    let (in_a, in_b) = ([("RELAX_WORKSPACE", a_path)], [("RELAX_WORKSPACE", b_path)]);
+    let verify = [("RELAX_WORKSPACE", b_path), ("RELAX_CACHE", "verify")];
+    let first = check_in_child_store(&a, true, &store, &in_a);
     assert_eq!((first.hits, first.code), (0, 0), "{first:?}");
-    let env = [("RELAX_WORKSPACE", b_path)];
-    let reused = check_in_child_store(&b, true, &store, &env);
-    let cold = check_in_child_store(&b, false, &store, &env);
-    assert_eq!((reused.hits, reused.code, cold.code), (0, 0, 0), "{reused:?}, {cold:?}");
-    assert_eq!(reused.diags, cold.diags, "{reused:?}, {cold:?}");
-    assert!(reused.diags.iter().any(|d| d.contains(b_path)), "{reused:?}");
-    assert!(reused.diags.iter().all(|d| !d.contains(a_path)), "{reused:?}");
+    let reused = check_in_child_store(&b, true, &store, &in_b);
+    let cold = check_in_child_store(&b, false, &store, &in_b);
+    assert!(reused.full && reused.hits == 2 && (reused.code, cold.code) == (0, 0), "the copy reuses every verdict: {reused:?}, {cold:?}");
+    assert_eq!(reused.diags, cold.diags, "the copy prints what its check of every crate prints: {reused:?}, {cold:?}");
+    assert!(reused.diags.iter().any(|d| d.contains(b_path)) && reused.diags.iter().all(|d| !d.contains(a_path)), "its own paths: {reused:?}");
+    std::fs::write(b.join("data.txt"), "two!").unwrap();
+    let reused = check_in_child_store(&b, true, &store, &in_b);
+    assert_eq!((reused.hits, &reused.diags), (1, &cold.diags), "the copy's included file edited: the library checked again: {reused:?}");
+    let note = format!("#[deprecated(note = \"see {a_path}/notes\")]\npub fn old() {{}}\n");
+    let bin = BIN.replace("let x = pkg::f();", "let x = pkg::f(); pkg::old();");
+    for d in [&a, &b] {
+        std::fs::write(d.join("data.txt"), "two!").unwrap();
+        std::fs::write(d.join("lib.rs"), format!("{lib}{note}")).unwrap();
+        std::fs::write(d.join("bin.rs"), &bin).unwrap();
+    }
+    let first = check_in_child_store(&a, true, &store, &in_a);
+    let reused = check_in_child_store(&b, true, &store, &in_b);
+    let cold = check_in_child_store(&b, true, &store, &verify);
+    assert!(first.code == 0 && cold.diags.iter().any(|d| d.contains(&format!("see {a_path}/notes"))), "the note as written: {first:?}, {cold:?}");
+    assert_eq!((reused.hits, &reused.diags), (1, &cold.diags), "a diagnostic naming the first worktree's folder: the binary checked again in the copy: {reused:?}, {cold:?}");
     std::fs::remove_dir_all(&a).unwrap();
     std::fs::remove_dir_all(&b).unwrap();
 }
@@ -469,14 +487,16 @@ fn an_included_file_edit_checks_again() {
 /// A late input only a hole body reads (a fn body no caller's check sees: not const, not async, no
 /// `impl Trait` return) is the library's own: changed, the library is checked again, not the
 /// binary above it, and the body that read it is checked again too (its stored verdict rests on
-/// the value: here an array length's). Read in a const fn's body, or by an item as well (the hole's
-/// read of the same file does not hide it), it reaches the binary, whose array length rests on it.
+/// the value: here the length in an `include_bytes!` literal's type). Read in a const fn's body, or
+/// by an item as well (the hole's read of the same file does not hide it), it reaches the binary,
+/// whose array length rests on it (the other bodies other crates' checks see:
+/// a_late_input_a_body_other_checks_see_checks_them_again).
 /// A body that includes a file (`include!`) has no stored verdict: an edit of another body of its
 /// crate replays the others, and checks it again. The package's variable is an ordinary one: every
 /// `RELAX_*` variable steers the whole check (env_key).
 #[test]
 fn a_late_input_only_a_body_reads_checks_only_its_crate() {
-    let hole = format!("{LIB}pub fn g() -> usize {{\n    let a: [u8; include_str!(\"data.txt\").len()] = [0; 3];\n    a.len() + env!(\"CHECK_REUSE_V\").len()\n}}\n");
+    let hole = format!("{LIB}pub fn g() -> usize {{\n    let a: &[u8; 3] = include_bytes!(\"data.txt\");\n    a.len() + env!(\"CHECK_REUSE_V\").len()\n}}\n");
     changed("late-hole", &[("lib.rs", &hole), ("bin.rs", BIN), ("data.txt", "one")], &[("CHECK_REUSE_V", "a")],
         |d| std::fs::write(d.join("data.txt"), "four").unwrap(), &[("CHECK_REUSE_V", "b")], 1);
     let konst = format!("{LIB}pub const fn g() -> usize {{ env!(\"CHECK_REUSE_V\").len() }}\n");
@@ -496,6 +516,36 @@ fn a_late_input_only_a_body_reads_checks_only_its_crate() {
     // replayed (k was edited, h includes a file); verified: those two, k's verdict the reused
     // check stored, and the binary's unused_in_bin (main's facts have a position)
     assert_eq!((reused.hits, reused.replayed, cold.verified), (1, 2, 4), "a body edit beside an include!: {reused:?}, {cold:?}");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// A late input read in a body another crate's check can see stays in the keys of the crates above
+/// (sip.rs LATE_HOLE, parser.rs anon_const): edited, the binary is checked again too, for an opaque
+/// return type's body (its hidden type holds the array's length), an async fn's, and a constant in
+/// a fn body (an array length, an inline const). A const fn's body:
+/// a_late_input_only_a_body_reads_checks_only_its_crate.
+#[test]
+fn a_late_input_a_body_other_checks_see_checks_them_again() {
+    if std::env::var_os(CHILD).is_some() { return; }
+    let lib = format!("{LIB}pub fn bytes() -> impl Sized {{ *include_bytes!(\"data.txt\") }}\n\
+        pub async fn later() -> usize {{ env!(\"CHECK_REUSE_V\").len() }}\n\
+        pub fn sized() -> usize {{\n    let a: [u8; include_str!(\"n.txt\").len()] = [0; 3];\n    a.len() + const {{ env!(\"CHECK_REUSE_W\").len() }}\n}}\n");
+    let dir = package("late-seen", &[("lib.rs", &lib), ("bin.rs", BIN), ("data.txt", "one"), ("n.txt", "abc")]);
+    let mut env = [("CHECK_REUSE_V", "a"), ("CHECK_REUSE_W", "a")];
+    let first = check_in_child(&dir, true, &env);
+    assert_eq!((first.hits, first.code), (0, 0), "{first:?}");
+    std::fs::write(dir.join("data.txt"), "four").unwrap();
+    let (reused, _) = reused_and_verified(&dir, &env, "an opaque return type's body");
+    assert_eq!(reused.hits, 0, "an opaque return type's body: {reused:?}");
+    env[0].1 = "bb";
+    let (reused, _) = reused_and_verified(&dir, &env, "an async fn's body");
+    assert_eq!(reused.hits, 0, "an async fn's body: {reused:?}");
+    std::fs::write(dir.join("n.txt"), "xyz").unwrap();
+    let (reused, _) = reused_and_verified(&dir, &env, "an array length in a fn body");
+    assert_eq!(reused.hits, 0, "an array length in a fn body: {reused:?}");
+    env[1].1 = "bb";
+    let (reused, _) = reused_and_verified(&dir, &env, "an inline const in a fn body");
+    assert_eq!(reused.hits, 0, "an inline const in a fn body: {reused:?}");
     std::fs::remove_dir_all(&dir).unwrap();
 }
 

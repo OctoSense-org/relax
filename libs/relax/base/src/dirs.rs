@@ -103,6 +103,47 @@ impl Anchors {
         key_of(&self.dirs)
     }
 
+    /// The anchors: (tag, absolute normalized folder).
+    pub fn dirs(&self) -> impl Iterator<Item = (&'static str, &str)> {
+        self.dirs.iter().map(|(tag, dir)| (*tag, dir.as_str()))
+    }
+
+    /// `path` in its anchored spelling under these anchors (as `anchored` spells it). None: it lies
+    /// under none of them.
+    pub fn anchored(&self, path: &str) -> Option<String> {
+        anchor_in(path, &self.dirs)
+    }
+
+    /// The path an anchored spelling names under these anchors: its anchor's folder, then the
+    /// rest. Any other path as it is. None: the marker of an anchor these do not have.
+    pub fn unanchored<'a>(&self, path: &'a str) -> Option<std::borrow::Cow<'a, str>> {
+        let Some(marked) = path.strip_prefix('\0') else { return Some(std::borrow::Cow::Borrowed(path)) };
+        let (tag, rel) = marked.split_once('\0')?;
+        let dir = self.dir_of(tag)?;
+        Some(std::borrow::Cow::Owned(if rel.is_empty() { dir.to_string() } else { format!("{}/{rel}", dir.trim_end_matches('/')) }))
+    }
+
+    /// `text` with each anchor's marker in it (`\0tag\0`, which an anchored path's rest follows)
+    /// read as that anchor's folder and a `/`. None: a NUL that starts no marker of these anchors.
+    pub fn unanchored_text<'a>(&self, text: &'a str) -> Option<std::borrow::Cow<'a, str>> {
+        if !text.contains('\0') { return Some(std::borrow::Cow::Borrowed(text)); }
+        let mut out = String::with_capacity(text.len() + 64);
+        let mut rest = text;
+        while let Some(i) = rest.find('\0') {
+            out.push_str(&rest[..i]);
+            let (tag, after) = rest[i + 1..].split_once('\0')?;
+            out.push_str(self.dir_of(tag)?.trim_end_matches('/'));
+            out.push('/');
+            rest = after;
+        }
+        out.push_str(rest);
+        Some(std::borrow::Cow::Owned(out))
+    }
+
+    fn dir_of(&self, tag: &str) -> Option<&str> {
+        self.dirs.iter().find(|(t, _)| *t == tag).map(|(_, dir)| dir.as_str())
+    }
+
     /// The key of the places no checkout owns (the cargo home, std's folder): what a sealed
     /// crate's code is keyed by in place of key(), the same in every checkout over them.
     pub fn machine_key(&self) -> u128 {
@@ -325,6 +366,14 @@ mod tests {
         assert_eq!(super::anchor_in("/b/f.rs", &anchors), None);
         assert_eq!(super::anchor_in("/a/wsx/f.rs", &anchors), None);
         assert_eq!(super::anchor_in("C:/a/ws/f.rs", &[("ws", "C:/a/ws".to_string())]).as_deref(), Some("\0ws\0f.rs"));
+        // read back under another checkout's anchors: its own folders
+        let other = super::Anchors::of(&[("ws", "/b/ws"), ("run", "/b/ws/target/run")], "/s");
+        assert_eq!(other.unanchored("\0ws\0src/f.rs").as_deref(), Some("/b/ws/src/f.rs"), "a path");
+        assert_eq!(other.unanchored("\0run\0").as_deref(), Some("/b/ws/target/run"), "an anchor's own folder");
+        assert_eq!(other.unanchored("/b/f.rs").as_deref(), Some("/b/f.rs"), "an unanchored path");
+        assert_eq!(other.unanchored("\0cargo\0f.rs"), None, "an anchor it lacks");
+        assert_eq!(other.unanchored_text("\0ws\0f.rs:3:9: warning: x\n  --> \0run\0g.rs:1:2").as_deref(), Some("/b/ws/f.rs:3:9: warning: x\n  --> /b/ws/target/run/g.rs:1:2"), "a text");
+        assert_eq!((other.unanchored_text("a \0 b"), other.unanchored_text("\0cargo\0f.rs")), (None, None), "a NUL that starts no marker of its anchors");
     }
 
     /// A run's link (its runs' folder beside it) and a launch link are no loader; each names the

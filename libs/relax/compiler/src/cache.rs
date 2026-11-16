@@ -5306,7 +5306,7 @@ struct SharedSpill {
 /// Windows ignore it), and Relax's anchored form (`\0ws\0`, `\0run\0`). Code keyed by no checkout
 /// (code_key_bytes) holds none of them (data_entry).
 #[derive(Default)]
-struct CheckoutText {
+pub(crate) struct CheckoutText {
     /// the spellings, ASCII-lowercased, sorted (those of one first byte in a row)
     forms: Vec<Vec<u8>>,
     /// the first bytes of `forms`, a bit each
@@ -5343,7 +5343,7 @@ fn dir_spellings(dir: &str) -> Option<Vec<Vec<u8>>> {
 impl CheckoutText {
     /// None: a folder whose spellings cannot all be listed (non-ASCII: its NFC and NFD spellings
     /// differ byte by byte), where no crate is sealed.
-    fn of(anchors: &crate::dirs::Anchors) -> Option<CheckoutText> {
+    pub(crate) fn of(anchors: &crate::dirs::Anchors) -> Option<CheckoutText> {
         let mut forms: Vec<Vec<u8>> = vec![b"\0ws\0".to_vec(), b"\0run\0".to_vec()];
         for dir in anchors.checkout_dirs().filter(|d| !d.is_empty()) {
             forms.extend(dir_spellings(dir)?);
@@ -5364,7 +5364,7 @@ impl CheckoutText {
     /// pass, a spelling compared only where a byte starts one (it runs over each data object
     /// sealed code names, once a run). A spelling that continues past the root's (a value made
     /// from the checkout's folder and more text) still counts.
-    fn found_in(&self, bytes: &[u8]) -> bool {
+    pub(crate) fn found_in(&self, bytes: &[u8]) -> bool {
         let at = |j: usize, f: &[u8]| bytes[j..].get(..f.len()).is_some_and(|w| w.eq_ignore_ascii_case(f));
         (0..bytes.len()).any(|i| {
             let b = bytes[i].to_ascii_lowercase();

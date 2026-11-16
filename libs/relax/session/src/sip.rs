@@ -148,7 +148,9 @@ pub const LATE_ENV: u8 = 2;
 /// LATE_ENV value can fall through to).
 pub const LATE_CONFIG_ENV: u8 = 3;
 /// Or'ed into a late input's kind when read while parsing a hole body: a fn body that is not
-/// const, not async and returns no `impl Trait`; no other crate's check sees it.
+/// const, not async and returns no `impl Trait`, outside the items and constants in it (array
+/// lengths, repeat counts, inline consts, const arguments: front parser.rs anon_const); no other
+/// crate's check sees it.
 pub const LATE_HOLE: u8 = 0x80;
 /// Or'ed into a late input's kind when read while expanding an item-position macro call (an
 /// `include!` of items and its arguments): the expansion is the crate's interface text, so another

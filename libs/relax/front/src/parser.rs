@@ -4367,7 +4367,24 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// A const generic argument: a constant's body (`anon_const`).
     fn const_arg(&mut self) -> PResult<ExprId> {
+        self.anon_const(Self::const_arg_here)
+    }
+
+    /// `f` parsing a constant's body: an array length, a repeat count, an inline `const` block, a
+    /// const generic argument. Inside a fn body it is evaluated apart from the body (a generic
+    /// fn's inline const where the fn is instantiated, in whichever crate), so the late inputs it
+    /// reads are no hole reads (sip LATE_HOLE), as an item's are not (`item`): they stay in the
+    /// check verdict keys of the crates above.
+    fn anon_const<R>(&mut self, f: impl FnOnce(&mut Self) -> PResult<R>) -> PResult<R> {
+        let outer = std::mem::replace(&mut self.hole_body, false);
+        let r = f(self);
+        self.hole_body = outer;
+        r
+    }
+
+    fn const_arg_here(&mut self) -> PResult<ExprId> {
         let lo = self.lo();
         match self.kind() {
             T::OpenBrace => {
@@ -4534,7 +4551,7 @@ impl<'a> Parser<'a> {
                 self.pos += 1;
                 let elem = self.ty_plus()?;
                 if self.eat(T::Semi) {
-                    let n = self.expr()?;
+                    let n = self.anon_const(Self::expr)?;
                     self.expect(T::CloseBracket)?;
                     Ty::Array(elem, n)
                 } else {
@@ -5750,7 +5767,7 @@ impl<'a> Parser<'a> {
                 let first = self.list_elem(0, false)?;
                 if let Some(f) = first {
                     if self.eat(T::Semi) {
-                        let n = self.expr()?;
+                        let n = self.anon_const(Self::expr)?;
                         self.expect(T::CloseBracket)?;
                         return Ok(self.mk_expr(ExprKind::Repeat(f, n), lo));
                     }
@@ -5780,7 +5797,7 @@ impl<'a> Parser<'a> {
             }
             T::KwConst if self.nth(1) == T::OpenBrace => {
                 self.pos += 1;
-                let b = self.block()?;
+                let b = self.anon_const(Self::block)?;
                 Ok(self.mk_expr(ExprKind::ConstBlock(b), lo))
             }
             // (`try` is a keyword from 2018 on; feature_gate.rs gates the block)
