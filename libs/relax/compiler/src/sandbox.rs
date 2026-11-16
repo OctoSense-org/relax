@@ -1044,6 +1044,13 @@ pub(crate) fn fuel_spent() -> bool {
     sb_ready() && unsafe { *words() != 0 && *words().add((W_FUEL / 8) as usize) < 0 }
 }
 
+/// This thread runs the code of a module the program loaded (std::relax::Module): its call into
+/// the module has not returned. Not the proc-macro world's arena (u32::MAX) nor a confined build
+/// script's (script::SCRIPT_MODULE).
+pub(crate) fn in_loaded_module() -> bool {
+    sb_ready() && cur_arena().is_some_and(|a| a.module < script::SCRIPT_MODULE)
+}
+
 fn cur_arena() -> Option<&'static Arena> {
     let p = unsafe { *words().add(3) } as *const Arena;
     if p.is_null() {
@@ -2027,6 +2034,9 @@ fn c_policy(allow: Allow, name: &str) -> Option<Option<(&'static str, u64)>> {
         // calls into twins; their panics record their payload through core's hook in the arena,
         // and a runtime check's failure in a twin is a contained fault
         "relax_set_panic_hook" | "relax_set_payload_end" => Some(("sb_unrecorded", sb_unrecorded as *const () as u64)),
+        // std's default hook (install_core_hook): none, a module's std has no stdio; its panics
+        // reach the host as their payload
+        "relax_std_default_hook" => Some(("sb_no_symbol", sb_no_symbol as *const () as u64)),
         // std's handle_alloc_error (the runtime's message and abort): a twin's call is the fault
         // an abort is, contained to the module's call
         "relax_alloc_error" => Some(("abort", 0)),

@@ -24,7 +24,7 @@ use crate::program::DefId;
 pub const SCRIPT_DOMAIN: Domain = Domain { name: "build-script", allow: script_allow, fuel: false, clean_up: true };
 
 /// The script arena's module number (the macro world's is u32::MAX).
-const SCRIPT_MODULE: u32 = u32::MAX - 1;
+pub(super) const SCRIPT_MODULE: u32 = u32::MAX - 1;
 
 /// The confined script's arena (its window base; 0: no confined script in this process).
 static ARENA_BASE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);

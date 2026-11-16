@@ -458,6 +458,8 @@ pub struct Unit {
     panic_hook: std::sync::atomic::AtomicUsize,
     /// std's end of a panic of its program that a catch_unwind of rustc's ended (caller_panic_ended)
     payload_end: std::sync::atomic::AtomicUsize,
+    /// std's default panic hook for this unit's program (relax_std_default_hook), 0 until asked
+    std_default_hook: std::sync::atomic::AtomicUsize,
     pub rt: Rt,
     /// the runtime entries as symbols (what compiled code calls; see syms.rs)
     pub rs: RtSyms,
@@ -3969,6 +3971,31 @@ extern "C" fn relax_set_panic_hook(hook: RuntimePanicHook) {
     unsafe { (*cur_unit()).panic_hook.store(hook as usize, Ordering::Release) };
 }
 
+/// std's default panic hook (std::panic::trampoline) for the calling program, which std's
+/// install_core_hook asks for instead of naming it: a sandboxed module's twins reach that fn
+/// (catch_unwind), and the hook reaches what the sandbox refuses them (sandbox.rs c_policy answers
+/// 0 there). Its lazy entry, found once per unit; 0 for a std without it.
+extern "C" fn relax_std_default_hook() -> usize {
+    let up = cur_unit();
+    let have = unsafe { (*up).std_default_hook.load(Ordering::Acquire) };
+    if have != 0 {
+        return have;
+    }
+    let e = owner::call(owner::Class::Program, || unsafe {
+        let u = &*up;
+        let Some(name) = u.prog.syms.get("trampoline") else { return 0 };
+        let found = u.prog.defs.iter().enumerate().find(|(i, d)| {
+            d.name == name && d.kind == DefKind::Fn && u.prog.def_path(DefId(*i as u32)) == "std::panic::trampoline"
+        });
+        match found {
+            Some((i, _)) => u.entry(u.fn_id(FnKey::Inst(DefId(i as u32), Vec::new()))) as usize,
+            None => 0,
+        }
+    });
+    unsafe { (*up).std_default_hook.store(e, Ordering::Release) };
+    e
+}
+
 /// Runtime checks keep their host calls; std records their payload and runs the hook here.
 fn raise_runtime_panic(mut message: String, site: u64, use_site_message: bool, regs: *const u64) -> ! {
     let (constant, file, line, col) = {
@@ -4715,7 +4742,13 @@ pub(crate) fn rt_catch_panic(f: u64, data: u64) -> u64 {
             // A compile error's report comes once a process: each test that calls the body fails
             // with std's one-line message, and the error itself was printed when its stub went in.
             let compile_error = p.kind == "panic" && p.message.starts_with("compile error in ");
-            if !(caught && program_panic) && (!compile_error || crate::run::first_report(1, &p.message)) {
+            // A panic a loaded module (std::relax::Module) catches keeps its report (tagged as
+            // caught): a module's std has no hook to print its message (relax_std_default_hook),
+            // so this line is the only trace it leaves. (A proc macro's says nothing, as rustc's.)
+            if caught && program_panic && crate::sandbox::in_loaded_module() {
+                let r = owner::call(owner::Class::Job, || unsafe { (&*u).report(&p) });
+                eprintln!("  report (caught): {}", r);
+            } else if !(caught && program_panic) && (!compile_error || crate::run::first_report(1, &p.message)) {
                 let r = owner::call(owner::Class::Job, || unsafe { (&*u).report(&p) });
                 fatal_compile_error(&p, &r);
                 // std's hook already printed the panic message (as rustc's does); add where
@@ -5715,6 +5748,7 @@ impl Unit {
             site_ix: Default::default(),
             panic_hook: std::sync::atomic::AtomicUsize::new(0),
             payload_end: std::sync::atomic::AtomicUsize::new(0),
+            std_default_hook: std::sync::atomic::AtomicUsize::new(0),
             rs: RtSyms { tls_base: relax_backend::rir::Sym::new(0), coverage_disabled: relax_backend::rir::Sym::new(0), fmt_str: relax_backend::rir::Sym::new(0), fmt_int: relax_backend::rir::Sym::new(0), fmt_float: relax_backend::rir::Sym::new(0), fmt_print: relax_backend::rir::Sym::new(0), panic_site: relax_backend::rir::Sym::new(0), panic_bounds: relax_backend::rir::Sym::new(0), str_eq: relax_backend::rir::Sym::new(0), fmod: relax_backend::rir::Sym::new(0), fmodf: relax_backend::rir::Sym::new(0), panic_impl: relax_backend::rir::Sym::new(0), thread_run: relax_backend::rir::Sym::new(0), catch_panic: relax_backend::rir::Sym::new(0), args: relax_backend::rir::Sym::new(0), memcpy: relax_backend::rir::Sym::new(0), memmove: relax_backend::rir::Sym::new(0), memset: relax_backend::rir::Sym::new(0), fmt_push: relax_backend::rir::Sym::new(0), fmt_pop: relax_backend::rir::Sym::new(0), resume: relax_backend::rir::Sym::new(0), land: relax_backend::rir::Sym::new(0), panicking: relax_backend::rir::Sym::new(0), rethrow: relax_backend::rir::Sym::new(0) },
             syms: crate::syms::Syms::new(syms_base, rw_base),
             cache: None,
@@ -26532,6 +26566,7 @@ pub(crate) fn loader_symbol(name: &[u8]) -> Option<usize> {
         b"__relax_fork_exec_done" => Some(crate::forkexec::relax_fork_exec_done as *const () as usize),
         b"relax_allocator_swap" => Some(relax_allocator_swap as *const () as usize),
         b"relax_set_panic_hook" => Some(relax_set_panic_hook as *const () as usize),
+        b"relax_std_default_hook" => Some(relax_std_default_hook as *const () as usize),
         // what observers cost the program and what the runtime's own threads run and wait for: one count for the
         // host's endpoint and every copy of makepad-remote the program runs, whichever crates bind
         b"relax_served_ns" => Some(makepad_remote::served_count() as *const std::sync::atomic::AtomicU64 as usize),

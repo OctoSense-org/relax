@@ -59,6 +59,8 @@ type RuntimePanicHook = extern "C" fn(*const u8, usize, *const u8, usize, u32, u
 extern "C" {
     fn relax_set_panic_hook(hook: RuntimePanicHook);
     fn relax_set_payload_end(end: extern "C" fn());
+    /// std's default hook (panic::trampoline) as the runtime built it for this program, 0 for none
+    fn relax_std_default_hook() -> usize;
 }
 
 /// A catch of native code (a catch_unwind of a provided crate's rustc code around a callback)
@@ -121,8 +123,22 @@ pub fn install_core_hook() {
     // std's default hook prints the message of every panic, caught or not, as rustc's does (a
     // hook the program sets replaces it: set_hook). Without it a panic the program caught said
     // nothing at all, and one it did not left its message to the runtime's report.
+    // The runtime hands it over rather than this fn naming it: a sandboxed module's twins reach
+    // this fn (catch_unwind), and the hook reaches what the sandbox refuses them (std::sync's
+    // waits, stderr), so a module that caught a panic would not load. There the runtime has none:
+    // a module's std has no stdio, and its panics reach the host as their payload.
     if unsafe { STD_HOOK }.is_none() {
-        unsafe { STD_HOOK = Some(crate::panic::trampoline) };
+        #[cfg(not(relax_web))]
+        unsafe {
+            let hook = relax_std_default_hook();
+            if hook != 0 {
+                STD_HOOK = Some(core::mem::transmute::<usize, fn(&str, &core::panic::Location<'_>)>(hook));
+            }
+        }
+        #[cfg(relax_web)]
+        unsafe {
+            STD_HOOK = Some(crate::panic::trampoline)
+        };
     }
     core::panicking::set_depth_fn(crate::panic::panic_depth_step);
     if core::panicking::hook_fn().is_none() {
