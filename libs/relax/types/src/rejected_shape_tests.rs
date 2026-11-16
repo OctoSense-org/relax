@@ -124,3 +124,19 @@ fn a_local_of_a_type_whose_bounds_fail_is_refused() {
     assert!(has(&e, "extend", ""), "{e:?}");
     assert!(!has(&e, "fine", ""), "{e:?}");
 }
+
+/// A bound that only an alias's arguments carry, `'b: 'a` from `<&'a &'b () as Trait>::Type`, is gone once the
+/// alias normalizes to `()`, and a fn item used through the `Fn` traits is called without its unnormalized
+/// signature being proven. The body may not assume it: implied bounds come from the normalized type, and an
+/// alias contributes nothing from its arguments (lifetime may not live long enough).
+#[test]
+fn a_bound_only_an_alias_argument_carries_is_not_implied() {
+    let e = errors("
+        pub trait Trait { type Type; }
+        impl<T> Trait for T { type Type = (); }
+        pub fn extend<'a, 'b, T>(_: <&'a &'b () as Trait>::Type, v: &'b T) -> &'a T { v }
+        pub fn fine<'a, 'b, T>(_: &'a &'b (), v: &'b T) -> &'a T { v }
+        pub fn rigid<'a, X: Trait>(_: &'a X::Type, v: &'a X) -> &'a X { v }");
+    assert!(has(&e, "extend", ""), "{e:?}");
+    assert!(!e.iter().any(|x| x.contains("fine") || x.contains("rigid")), "{e:?}");
+}
