@@ -56,6 +56,7 @@ want "cold: the end names the body once" 1 "$(n 'did not compile (the error is a
 # (the lib's tests, then main.rs's: the second unit finds the verdicts the first stored)
 want "cold: the background check ran, in one unit" 1 "$(n 'background type check done: [1-9][0-9]* body owners checked')"
 want "cold: the other unit's check found them stored" 1 "$(n 'background type check done: 0 body owners checked.*stored findings of 1 crate')"
+want "cold: each clean file's progress stored as it completed" 1 "$(n 'background type check done: [1-9][0-9]* body owners checked.* [1-9][0-9]* files. progress stored')"
 # 2. warm: nothing checked again, nothing said early; a call still reports the error once
 run c1 test test-dep-gaps -- --test-threads=1
 want "warm: exit code" 101 "$code"

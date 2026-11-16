@@ -3547,6 +3547,18 @@ impl Cache {
         Some(k)
     }
 
+    /// The key of one file's progress in a crate's background check (typeck_bg.rs Files): every
+    /// body owner of the file at `path` was checked clean under the crate's key `crate_key`
+    /// (crate_check_key: the crate's text, every file of it, and the Relax build). A borrowck-kind
+    /// entry in the crate's store, written once; the crate's verdict comes when all its files are in.
+    pub fn file_check_key(&mut self, crate_key: u128, path: &str) -> u128 {
+        let k = file_check_key(crate_key, path);
+        if let Some(&c) = self.key_crate.get(&crate_key) {
+            self.key_crate.insert(k, c);
+        }
+        k
+    }
+
     /// The key of the warnings of `makepad test`'s check of the crates whose check keys
     /// (crate_check_key) are `keys`, in the order checked.
     fn test_warnings_key(keys: &[u128]) -> u128 {
@@ -12638,4 +12650,13 @@ pub(crate) unsafe fn reset_statics() {
 pub(crate) unsafe fn reset_stores() {
     front_run::reset_statics();
     relax_session::reset_static(&FRONT_STORES, relax_session::sync::Mutex::new(Vec::new()));
+}
+
+/// The hash of `Cache::file_check_key`: a file of the crate whose check key is `crate_key`.
+pub(crate) fn file_check_key(crate_key: u128, path: &str) -> u128 {
+    let mut h = Sip128::new();
+    h.str("run-typeck-file");
+    h.u128(crate_key);
+    h.str(path);
+    h.finish128()
 }

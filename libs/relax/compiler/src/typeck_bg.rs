@@ -18,7 +18,8 @@
 //! one that Relax cannot compile is a Relax gap, said once when found, never the run's exit code,
 //! and stored (a Failed verdict) so a warm run checks nothing. A run no present will come to (a
 //! test run, a headless program) loads the skipped files itself, one crate at a time: the
-//! completion thread waits for a first present.
+//! completion thread waits for a first present. A crate's check stores its progress file by file
+//! (`Files`): a run that ends before a crate's verdict leaves the next run only the files not in.
 
 use crate::jit::{self, FrontShared, Unit};
 use crate::program::{DefId, DefKind, Program};
@@ -26,9 +27,10 @@ use crate::typeck::{Body, Res};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-/// body owners checked, owners with errors, crates whose clean verdict was stored, cpu ns, wall ns
-/// from its start to its end (0 while it runs)
-pub static STATS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+/// body owners checked, owners with errors, crates whose verdict was stored, cpu ns, wall ns
+/// from its start to its end (0 while it runs), files whose progress was stored, owners not checked
+/// for their files' stored progress
+pub static STATS: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
 
 /// The check is under way (started and not ended): it fills the type side for every body owner of
 /// the dependency crates, so the settle rebuild waits for its end. Rebuilt before it, the devhub
@@ -118,12 +120,110 @@ fn todo_crates(u: &Unit, scope: &Scope, skipped: &[u128]) -> (Vec<bool>, Vec<Opt
 }
 
 enum Checked {
-    /// the fns its body names (empty: it has errors, or it is no body owner)
+    /// clean (or no body owner, or one of a file whose progress is stored): the fns its body names
     Done(Vec<DefId>),
+    /// it has errors, or the checker failed on it
+    Failed,
     /// it waits on a file the lazy selection skipped: checked again once that is loaded
     Later,
     /// the run is ending
     Stop,
+}
+
+/// Where a body owner of a crate checked here stands in this run.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Owner {
+    Clean,
+    Failed,
+    /// not checked yet (or it waits on a skipped file)
+    Left,
+}
+
+/// A crate's check file by file (relax issue 231, item 7): a file whose every body owner this run
+/// checked clean stores its progress once (cache.rs file_check_key), so a run that ends before its
+/// crate's verdict (a crate of 10k owners is 2.5 s of checking, and a test run does not wait for
+/// it) leaves the next one only the files not in yet. The crate's verdict still waits for all of it.
+#[derive(Default)]
+struct Files {
+    /// per file of the crates checked here (the ones loaded so far): its entry's key, and whether
+    /// the entry is stored (by an earlier run, or by this one)
+    keys: HashMap<u32, (u128, bool)>,
+    /// per file with an entry to come: its owners not checked clean yet
+    left: HashMap<u32, usize>,
+    /// files with an owner that has errors: no entry this run
+    bad: HashSet<u32>,
+}
+
+impl Files {
+    /// Whether the owners of `file` are still to check: not when its entry is stored.
+    fn todo(&self, file: u32) -> bool {
+        !self.keys.get(&file).is_some_and(|k| k.1)
+    }
+
+    /// A pass over the crates' owners (each with its file and where it stands): what each file has
+    /// left. The keys of the files it finds complete (every owner checked clean before this pass).
+    fn pass(&mut self, owners: impl Iterator<Item = (u32, Owner)>) -> Vec<u128> {
+        self.left.clear();
+        for (file, at) in owners {
+            if !self.todo(file) || !self.keys.contains_key(&file) {
+                continue;
+            }
+            let left = self.left.entry(file).or_insert(0);
+            match at {
+                Owner::Clean => {}
+                Owner::Failed => { self.bad.insert(file); }
+                Owner::Left => *left += 1,
+            }
+        }
+        let complete: Vec<u32> = self.left.iter().filter(|(_, n)| **n == 0).map(|(f, _)| *f).collect();
+        complete.into_iter().filter_map(|f| self.complete(f)).collect()
+    }
+
+    /// An owner of `file` checked: the file's key when that completes it clean (its entry to store).
+    fn checked(&mut self, file: u32, clean: bool) -> Option<u128> {
+        if !clean {
+            self.bad.insert(file);
+            return None;
+        }
+        let left = self.left.get_mut(&file)?;
+        *left = left.saturating_sub(1);
+        if *left == 0 { self.complete(file) } else { None }
+    }
+
+    /// Its entry, once: not for a file with errors, nor one stored already.
+    fn complete(&mut self, file: u32) -> Option<u128> {
+        if self.bad.contains(&file) {
+            return None;
+        }
+        let k = self.keys.get_mut(&file)?;
+        if k.1 {
+            return None;
+        }
+        k.1 = true;
+        Some(k.0)
+    }
+}
+
+/// The progress keys of the files of `crates` (crate, its check key) not in `known` yet, and
+/// whether each one's entry is stored (on the owner: the cache is the owner's).
+fn file_keys(u: &Unit, crates: &[(u32, u128)], known: &HashSet<u32>) -> Vec<(u32, u128, bool)> {
+    use crate::borrowck::lazy::StoredVerdict;
+    let Some(c) = u.cache.as_ref() else { return Vec::new() };
+    let c = unsafe { &mut *c.get() };
+    let prog = &u.prog;
+    let crates: HashMap<u32, u128> = crates.iter().copied().collect();
+    let mut out = Vec::new();
+    let mut seen: HashSet<u32> = HashSet::new();
+    for m in prog.mods.iter() {
+        let Some(&key) = crates.get(&m.krate) else { continue };
+        if known.contains(&m.file) || !seen.insert(m.file) {
+            continue;
+        }
+        let Some(path) = prog.file_paths.get(m.file as usize) else { continue };
+        let fk = c.file_check_key(key, path);
+        out.push((m.file, fk, matches!(c.borrowck_stored(fk), Some(StoredVerdict::Clean))));
+    }
+    out
 }
 
 /// No present will come to this run (a test run, a headless program): the completion thread,
@@ -147,6 +247,19 @@ fn run(up: *mut Unit, scope: &Scope) {
     let (todo, keys, stored_findings) = crate::owner::call(crate::owner::Class::Publish, || todo_crates(unsafe { &*(upn as *const Unit) }, scope, &skipped_text));
     *STORED_FINDINGS.lock().unwrap_or_else(|p| p.into_inner()) = stored_findings;
     if !todo.contains(&true) { return finish(t0, w0); }
+    // the files' progress: the keys of the files loaded so far (more as skipped files load)
+    let crate_keys: Vec<(u32, u128)> = keys.iter().enumerate().filter_map(|(k, key)| key.filter(|_| todo[k]).map(|key| (k as u32, key))).collect();
+    let mut files = Files::default();
+    let refresh = |files: &mut Files| {
+        let known: HashSet<u32> = files.keys.keys().copied().collect();
+        let ck = &crate_keys;
+        let new = crate::owner::call(crate::owner::Class::Publish, || file_keys(unsafe { &*(upn as *const Unit) }, ck, &known));
+        files.keys.extend(new.into_iter().map(|(file, key, stored)| (file, (key, stored))));
+    };
+    refresh(&mut files);
+    // owners checked clean, and with errors (a file of one gets no entry)
+    let mut clean: HashSet<DefId> = HashSet::new();
+    let mut failed_owners: HashSet<DefId> = HashSet::new();
     let mut seen: HashSet<DefId> = HashSet::new();
     // per crate with errors: their text (stored with its verdict); `ice`: a checker panic's crate
     // (a Relax bug: no verdict stored, checked again next run)
@@ -162,8 +275,12 @@ fn run(up: *mut Unit, scope: &Scope) {
     };
     while let Some(d) = stack.pop() {
         if !seen.insert(d) { continue; }
-        match check(&f, d, &todo, scope, &mut failed, &mut ice) {
-            Checked::Done(named) => stack.extend(named.into_iter().rev().filter(|d| !seen.contains(d))),
+        match check(&f, d, &todo, &files, scope, &mut failed, &mut ice) {
+            Checked::Done(named) => {
+                clean.insert(d);
+                stack.extend(named.into_iter().rev().filter(|d| !seen.contains(d)));
+            }
+            Checked::Failed => { failed_owners.insert(d); }
             Checked::Later => { seen.remove(&d); }
             Checked::Stop => return,
         }
@@ -174,22 +291,43 @@ fn run(up: *mut Unit, scope: &Scope) {
     let todo_list: Vec<u32> = (0..todo.len() as u32).filter(|&k| todo[k as usize]).collect();
     // crates given up on: they wait on files no load brings (no verdict stored)
     let mut given_up: HashSet<u32> = HashSet::new();
+    // a file's progress goes to the cache with the borrow checker's verdicts (not once a live
+    // edit's versions are in the tables: the bodies checked were not all the boot's)
+    let store_file = |key: u128| {
+        if crate::reload::program_edits() == 0 {
+            crate::borrowck::lazy::push_verdict_key(key, crate::borrowck::lazy::StoredVerdict::Clean);
+            STATS[5].fetch_add(1, Ordering::Relaxed);
+        }
+    };
     loop {
+        refresh(&mut files);
         let (owners, skipped) = {
             let r = jit::front_read("typeck bg owners");
             let (prog, _) = r.of(&f);
-            let mut per_crate: Vec<Vec<DefId>> = todo_list.iter().map(|&k| crate::check::body_owners(prog, &[k]).into_iter().filter(|d| !seen.contains(d)).collect()).collect();
+            let all: Vec<Vec<DefId>> = todo_list.iter().map(|&k| crate::check::body_owners(prog, &[k])).collect();
+            let at = |d: &DefId| if clean.contains(d) { Owner::Clean } else if failed_owners.contains(d) { Owner::Failed } else { Owner::Left };
+            for key in files.pass(all.iter().flatten().map(|d| (prog.def(*d).file, at(d)))) {
+                store_file(key);
+            }
+            let mut per_crate: Vec<Vec<(DefId, u32)>> = all.into_iter().map(|o| o.into_iter().filter(|d| !seen.contains(d)).map(|d| (d, prog.def(d).file)).collect()).collect();
             per_crate.sort_by_key(|o| o.len());
-            let owners: Vec<DefId> = per_crate.into_iter().flatten().collect();
+            let owners: Vec<(DefId, u32)> = per_crate.into_iter().flatten().collect();
             // the skipped files of the crates checked here (another crate's do not hold this check up)
             let skipped: HashSet<u32> = prog.skipped_files.keys().map(|&m| prog.mods[m as usize].krate).filter(|&k| todo.get(k as usize).copied().unwrap_or(false)).collect();
             (owners, skipped)
         };
         let mut pending: HashSet<u32> = HashSet::new();
-        for d in owners {
+        for (d, file) in owners {
             seen.insert(d);
-            match check(&f, d, &todo, scope, &mut failed, &mut ice) {
-                Checked::Done(_) => {}
+            match check(&f, d, &todo, &files, scope, &mut failed, &mut ice) {
+                Checked::Done(_) => {
+                    clean.insert(d);
+                    if let Some(key) = files.checked(file, true) { store_file(key); }
+                }
+                Checked::Failed => {
+                    failed_owners.insert(d);
+                    files.checked(file, false);
+                }
                 Checked::Later => {
                     seen.remove(&d);
                     let r = jit::front_read("typeck bg later");
@@ -272,15 +410,19 @@ fn finish(t0: u64, w0: u64) {
         let stored = if findings.is_empty() { String::new() } else {
             format!(", stored findings of {} crate{} ({} errors) not checked again", findings.len(), if findings.len() == 1 { "" } else { "s" }, findings.iter().map(|f| f.1).sum::<usize>())
         };
-        eprintln!("relax: background type check done: {} body owners checked, {} with errors, {} crates' verdicts stored{}, cpu {:.0} ms over {:.1} s",
-            STATS[0].load(Ordering::Relaxed), STATS[1].load(Ordering::Relaxed), STATS[2].load(Ordering::Relaxed), stored,
+        let (files, skipped) = (STATS[5].load(Ordering::Relaxed), STATS[6].load(Ordering::Relaxed));
+        let files = if files == 0 && skipped == 0 { String::new() } else {
+            format!(", {} files' progress stored, {} owners not checked for their files' stored progress", files, skipped)
+        };
+        eprintln!("relax: background type check done: {} body owners checked, {} with errors, {} crates' verdicts stored{}{}, cpu {:.0} ms over {:.1} s",
+            STATS[0].load(Ordering::Relaxed), STATS[1].load(Ordering::Relaxed), STATS[2].load(Ordering::Relaxed), stored, files,
             STATS[3].load(Ordering::Relaxed) as f64 / 1e6, STATS[4].load(Ordering::Relaxed) as f64 / 1e9);
     }
 }
 
 /// Type-checks body owner `d` of a crate this check covers and reports its errors; a body of any
 /// other crate is only read when a build checked it already (the walk goes on through it).
-fn check(f: &FrontShared, d: DefId, todo: &[bool], scope: &Scope, failed: &mut HashMap<u32, Vec<String>>, ice: &mut HashSet<u32>) -> Checked {
+fn check(f: &FrontShared, d: DefId, todo: &[bool], files: &Files, scope: &Scope, failed: &mut HashMap<u32, Vec<String>>, ice: &mut HashSet<u32>) -> Checked {
     loop {
         if stopping() { return Checked::Stop; }
         // the program's own compiles go first (a burst of the UI thread's lazy compiles)
@@ -294,6 +436,11 @@ fn check(f: &FrontShared, d: DefId, todo: &[bool], scope: &Scope, failed: &mut H
         let krate = prog.def(d).krate;
         if !todo.get(krate as usize).copied().unwrap_or(false) {
             return Checked::Done(tcx.typeck_peek(prog, d).filter(|b| b.errors.is_empty()).map(|b| named_fns(prog, &b)).unwrap_or_default());
+        }
+        // an earlier run checked every owner of its file clean (the file's progress entry)
+        if !files.todo(prog.def(d).file) {
+            STATS[6].fetch_add(1, Ordering::Relaxed);
+            return Checked::Done(Vec::new());
         }
         let body = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _p = crate::preempt::Preemptible::on();
@@ -318,7 +465,7 @@ fn check(f: &FrontShared, d: DefId, todo: &[bool], scope: &Scope, failed: &mut H
                 STATS[1].fetch_add(1, Ordering::Relaxed);
                 ice.insert(krate);
                 report(&[e], None);
-                return Checked::Done(Vec::new());
+                return Checked::Failed;
             }
         };
         STATS[0].fetch_add(1, Ordering::Relaxed);
@@ -328,7 +475,7 @@ fn check(f: &FrontShared, d: DefId, todo: &[bool], scope: &Scope, failed: &mut H
         STATS[1].fetch_add(1, Ordering::Relaxed);
         failed.entry(krate).or_default().extend(body.errors.iter().cloned());
         report(&body.errors, scope.registry.get(krate as usize).and_then(|r| r.as_deref()));
-        return Checked::Done(Vec::new());
+        return Checked::Failed;
     }
 }
 
@@ -366,7 +513,43 @@ fn named_fns(prog: &Program, b: &Body) -> Vec<DefId> {
 /// What this module holds of a run, as a fresh process has it (`run_end`). Nothing of the run is left that could see it.
 pub(crate) unsafe fn reset_statics() {
     use relax_session::reset_static as reset;
-    reset(&STATS, [const { AtomicU64::new(0) }; 5]);
+    reset(&STATS, [const { AtomicU64::new(0) }; 7]);
     reset(&RUNNING, AtomicBool::new(false));
     reset(&STORED_FINDINGS, relax_session::sync::Mutex::new(Vec::new()));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Files, Owner};
+
+    /// A file's progress (relax issue 231, item 7): stored once its every owner is checked clean,
+    /// never for a file with errors, never twice; a stored file's owners are not checked again; a
+    /// file whose owners were all checked before a pass completes at that pass; and the key names
+    /// both the crate's key and the file.
+    #[test]
+    fn a_files_progress_is_stored_once_when_its_every_owner_is_clean() {
+        let (a, b, c) = (1u32, 2u32, 3u32);
+        let key = |k: u128, path: &str| crate::cache::file_check_key(k, path);
+        let mut files = Files::default();
+        files.keys.insert(a, (key(7, "src/a.rs"), false));
+        files.keys.insert(b, (key(7, "src/b.rs"), false));
+        files.keys.insert(c, (key(7, "src/c.rs"), true));
+        assert!(files.todo(a) && files.todo(b), "a file with no stored progress is checked");
+        assert!(!files.todo(c), "a file whose progress is stored is not checked again");
+        // a: two owners left; b: one checked clean before the pass (the reachability walk), one left
+        let none = files.pass([(a, Owner::Left), (a, Owner::Left), (b, Owner::Clean), (b, Owner::Left), (c, Owner::Left)].into_iter());
+        assert!(none.is_empty(), "no file is complete before its owners are checked: {none:?}");
+        assert_eq!(files.checked(a, true), None, "a file with an owner left is not complete");
+        assert_eq!(files.checked(a, true), Some(key(7, "src/a.rs")), "a file's last clean owner completes it");
+        assert_eq!(files.checked(a, true), None, "a file's progress is stored once");
+        assert_eq!(files.checked(b, false), None, "an owner with errors stores nothing");
+        assert_eq!(files.pass([(b, Owner::Failed), (b, Owner::Clean)].into_iter()), Vec::<u128>::new(), "a file with errors never completes");
+        // a file whose owners were all checked clean before the pass comes back from it
+        let d = 4u32;
+        files.keys.insert(d, (key(7, "src/d.rs"), false));
+        assert_eq!(files.pass([(d, Owner::Clean), (d, Owner::Clean)].into_iter()), vec![key(7, "src/d.rs")], "a file complete before the pass completes at it");
+        assert!(!files.todo(d), "a completed file is not checked again in this run either");
+        assert_ne!(key(7, "src/a.rs"), key(8, "src/a.rs"), "another crate key (an edit, another Relax build) is another entry");
+        assert_ne!(key(7, "src/a.rs"), key(7, "src/b.rs"), "each file has its own entry");
+    }
 }
