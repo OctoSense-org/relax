@@ -1317,7 +1317,7 @@ fn round50_initializer_reload_policy() {
         // no storage, not literal, no scalar fold: the round-51 CTFE-relevant path (full publication)
         assert!(!std::sync::Arc::ptr_eq(&other_before, &u.tcx.typeck(&u.prog, unrelated)), "an unfoldable static without storage took the per-file path");
     }
-    if let Some(undo) = outcome.undo { unsafe { crate::reload::rollback(up, undo, "test"); } }
+    if let Some(undo) = outcome.undo { unsafe { crate::reload::rollback(up, undo, "test") }.unwrap(); }
     unsafe { call_jit(up, entry, &mut result as *mut u32 as u64).unwrap_or_else(|p| panic!("{}", p.message)); }
     assert_eq!(result, 3);
     assert_eq!(u.const_addr(value, vec![]), Some(old_addr));
@@ -1420,7 +1420,7 @@ fn round50_opaque_body_invalidates_solver_answer() {
     assert_ne!(replaced, opaque);
     assert_eq!(hidden(&u, replaced), u.tcx.tys.u32_);
     assert_eq!(hidden(&u, opaque), u.tcx.tys.u8_);
-    unsafe { crate::reload::rollback(up, outcome.undo.unwrap(), "test"); }
+    unsafe { crate::reload::rollback(up, outcome.undo.unwrap(), "test") }.unwrap();
     assert_eq!(current(&u), opaque);
     assert_eq!(hidden(&u, opaque), u.tcx.tys.u8_);
     std::fs::remove_file(path).unwrap();
@@ -1679,7 +1679,7 @@ fn invalid_inliner_built_after_patch_is_in_its_group() {
     let code = u.fns[late_id as usize].code;
     assert!(u.fns[late_id as usize].compiled && u.fns[late_id as usize].patch_gen == 0);
     assert!(crate::stale::lookup(code).is_none());
-    unsafe { crate::reload::rollback(up, outcome.undo.unwrap(), "test") };
+    unsafe { crate::reload::rollback(up, outcome.undo.unwrap(), "test") }.unwrap();
     assert!(crate::stale::lookup(code).is_some(), "late's code (built after the patch, it inlined the patched helper) is invalidated by the rollback");
     assert!(!u.fns[late_id as usize].compiled, "late is back at its lazy stub");
     unsafe { call_jit(up, late_entry, &mut result as *mut u32 as u64).unwrap_or_else(|p| panic!("{}", p.message)) };

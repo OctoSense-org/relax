@@ -633,18 +633,53 @@ fn recollect_impls(u: &mut Unit, removed: &[DefId], scope: Option<&[bool]>) {
     }
 }
 
+/// A rollback that is a restart: the group superseded closures (retired them, or made their old
+/// versions forwarders), and a later installed group gave a struct its new layout. That patch left
+/// the superseded closures on code of the layout before (I3: no build takes a superseded closure
+/// as input), which nothing can run while the group stays: rolling it back makes its parents' old
+/// code make their values again. The group stays installed; its undo record comes back.
+pub struct RollbackRestart {
+    pub undo: Undo,
+    pub why: String,
+}
+
+impl std::fmt::Debug for RollbackRestart {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.why)
+    }
+}
+
+/// The lowest closure slot patch group `g` superseded that is still so: kept on old code
+/// (kept_old) or a forwarder `g` installed.
+fn superseded_by(u: &Unit, g: u32) -> Option<u32> {
+    let kept = u.kept_old.iter().filter(|(_, e)| e.0 == g).map(|(&s, _)| s).min();
+    kept.or_else(|| (0..u.fns.len() as u32).find(|&s| u.fns[s as usize].patch_gen == g && u.forward_of(s).is_some()))
+}
+
 /// Rolls back an installed patch group (a panic or fault in its code, M7): the slots return
 /// to their previous code, the files to their previous versions, the consts to their previous
 /// values. Returns the rolled-back functions' names. The caller makes a unit call.
 /// The group's code is invalidated (`why`: what rejected it): it never runs again (invalid.rs), its
 /// O3 code and unverified-mode twins included; a thread still in it parks at its next instruction.
-pub unsafe fn rollback(up: *mut Unit, undo: Undo, why: &str) -> Vec<String> {
+/// A group that superseded closures, under a later group's layout patch, is not rolled back: the
+/// answer is a restart (RollbackRestart). Rolling back newest first never meets that.
+pub unsafe fn rollback(up: *mut Unit, undo: Undo, why: &str) -> Result<Vec<String>, RollbackRestart> {
     crate::owner::call(crate::owner::Class::Program, || {
         let u = &mut *up;
+        if let Some(&later) = u.layout_groups.iter().find(|&&l| l > undo.group) {
+            if let Some(s) = superseded_by(u, undo.group) {
+                let why = format!(
+                    "patch gen {} superseded `{}`, and patch gen {} gave a struct its new layout after it, leaving that closure on code of the layout before: rolling gen {} back would run that code again -- restart the app",
+                    undo.group, u.fns[s as usize].name, later, undo.group
+                );
+                return Err(RollbackRestart { undo, why });
+            }
+        }
         u.flush_cache_records();
         jit::bump_patch_epoch();
         let ids = u.rollback_gen(undo.group);
         let group = undo.group;
+        u.layout_groups.retain(|&l| l != group);
         // a closure this group kept on old code is its parent's again once the parent's code went
         // back (rollback_gen skips a slot a later group patched again: then the entry stays)
         if u.kept_old.values().any(|e| e.0 == group) {
@@ -717,7 +752,7 @@ pub unsafe fn rollback(up: *mut Unit, undo: Undo, why: &str) -> Vec<String> {
         }
         // (the versions before the patch's: the boot text again, for a first edit)
         settle_edited_crates(up);
-        names
+        Ok(names)
     })
 }
 
@@ -3197,9 +3232,13 @@ fn slot_instance(u: &Unit, s: u32) -> Option<(DefId, &[TyId])> {
 }
 
 /// Whether slot `s` is code of a fn that is no longer the program's (`removed` by this edit, or
-/// replaced by an earlier one): code in flight, which keeps its slots and is never rebuilt against
-/// the new definitions (its old text need not check against them).
+/// replaced by an earlier one), or a closure an earlier patch superseded (Unit::superseded): code
+/// in flight, which keeps its slots and is never rebuilt against the new definitions (its old text
+/// need not check against them).
 fn in_flight_only(u: &Unit, s: u32, removed: &[DefId]) -> bool {
+    if u.superseded(s) {
+        return true;
+    }
     let Some((d, _)) = slot_instance(u, s) else { return false };
     let def = u.prog.def(d);
     if removed.contains(&d) {
@@ -6694,7 +6733,9 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
             }
         }
         users.extend(u.slots_of_defs(body_defs.iter().copied()));
-        users.extend(u.closures_of_slots(users.clone()));
+        // (the closures of a parent this patch rebuilds: only those its lowering makes now; the
+        // others are superseded once it installs, I1)
+        users.extend(u.closures_of_slots(users.clone()).into_iter().filter(|&c| lowered_now(u, c)));
         let mut seen: crate::fxhash::HashSet<u32> = Default::default();
         let mut work = users;
         while let Some(c) = work.pop() {
@@ -7051,6 +7092,23 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
             errs.push(line);
         }
         trace_count("selected_slots_rekey", slots.len() + fresh.len());
+    }
+    // JP-L T3c I3: no build takes a superseded closure as input -- one an earlier patch retired or
+    // rebound, or an old-key closure of a parent this patch rebuilds (superseded once this patch
+    // installs, I1, whatever the pairing below decides for it). It keeps its code; whether that
+    // code may still run is the K checks' question, not a rebuild from text the program no longer
+    // has (a const's new type, a field gone: old text never checked against them).
+    {
+        let rebuilt: crate::fxhash::HashSet<u32> = slots.iter().chain(fresh.iter()).copied().collect();
+        let superseded = |c: u32| match u.fns[c as usize].key {
+            FnKey::Closure(_, _, p) => u.superseded(c) || (rebuilt.contains(&p) && !lowered_now(u, c)),
+            _ => false,
+        };
+        let before = slots.len() + fresh.len();
+        slots.retain(|&c| !superseded(c));
+        fresh.retain(|&c| !superseded(c));
+        inlining_callers.retain(|&c| !superseded(c));
+        trace_count("superseded_skipped", before - slots.len() - fresh.len());
     }
     trace_sub("consts_errs");
     trace_stage("commit_collect");
@@ -7859,6 +7917,9 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
     let u = &mut *up;
     let gen = u.begin_patch();
     out.group = gen;
+    if !fresh_held.is_empty() {
+        crate::zone_alloc::kept_with(|| u.layout_groups.push(gen));
+    }
     crate::zone_alloc::kept_with(|| for &(_, n) in &news { u.file_gen.insert(n, gen); });
     // the rebound older versions run the new ones through forwarders (jit::install_forward): per
     // new slot, its lineage's cell jumps to it, and every other older version paired with it jumps
@@ -7924,6 +7985,8 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
     {
         let u = &mut *up;
         for &o in &staged_keeps {
+            // (never inlined again: no build takes a superseded body, I3)
+            u.fns[o as usize].patched.store(true, Ordering::Relaxed);
             if let Some(e) = u.kept_old.get_mut(&o) {
                 e.0 = gen;
                 eprintln!("relax live: kept `{}` on the code of a text the program no longer has (patch gen {gen}: {})", u.fns[o as usize].name, e.1);
@@ -8677,11 +8740,18 @@ pub(crate) fn settle_verdicts(up: *mut Unit, pending: &mut Vec<PendingPatch>, un
                 let mut reverted = Vec::new();
                 let mut names: Vec<String> = Vec::new();
                 let mut ok = false;
+                let mut restart = None;
                 while let Some(undo) = undos.pop() {
                     let g = undo.group;
                     let versions = undo.versions.clone();
-                    let rolled = unsafe { rollback(up, undo, "the borrow checker rejected it after it ran (SPEC-V)") };
-                    names.extend(rolled);
+                    match unsafe { rollback(up, undo, "the borrow checker rejected it after it ran (SPEC-V)") } {
+                        Ok(rolled) => names.extend(rolled),
+                        Err(r) => {
+                            restart = Some(r.why);
+                            undos.push(r.undo);
+                            break;
+                        }
+                    }
                     back.extend(versions);
                     reverted.push(g);
                     if g == group { ok = true; break; }
@@ -8708,7 +8778,11 @@ pub(crate) fn settle_verdicts(up: *mut Unit, pending: &mut Vec<PendingPatch>, un
                 eprintln!(
                     "relax live: {}: REVERTED -- the borrow checker rejected it after it ran: {} at {}:{}:{}: {}; {} fn(s) run their previous code again{}",
                     what, e.fn_path, e.file, e.line, e.col, e.message, names.len(),
-                    if ok { "" } else { " (its undo record was already dropped: not reverted)" }
+                    match (&restart, ok) {
+                        (_, true) => String::new(),
+                        (Some(r), _) => format!(" (not reverted: {r})"),
+                        (None, _) => " (its undo record was already dropped: not reverted)".to_string(),
+                    }
                 );
                 for r in &rendered { eprintln!("{}", r); }
                 let d = e.to_diagnostic();
@@ -10393,10 +10467,30 @@ unsafe fn test_edit(up: *mut Unit, paths: Vec<String>, o: &mut Outcome, undos: &
         let Some(first) = undos.iter().position(|u| faults.contains(&u.group)) else { break };
         let mut groups = Vec::new();
         let mut names = Vec::new();
-        for undo in undos.split_off(first).into_iter().rev() {
-            groups.push(undo.group);
-            back.extend_from_slice(&undo.versions);
-            names.extend(rollback(up, undo, "a fault in live test code"));
+        let mut tail = undos.split_off(first);
+        let mut restart = None;
+        while let Some(undo) = tail.pop() {
+            let (g, versions) = (undo.group, undo.versions.clone());
+            match rollback(up, undo, "a fault in live test code") {
+                Ok(n) => {
+                    groups.push(g);
+                    back.extend_from_slice(&versions);
+                    names.extend(n);
+                }
+                Err(r) => {
+                    restart = Some(r.why);
+                    tail.push(r.undo);
+                    break;
+                }
+            }
+        }
+        undos.extend(tail);
+        // (newest first, the only refusal is a later layout group with no undo record here)
+        if let Some(r) = &restart {
+            eprintln!("relax live: {what}: a faulting patch group is not rolled back: {r}");
+        }
+        if groups.is_empty() {
+            break;
         }
         crate::inspect::events::emit("patchreverted", &verdict_key(&what), &format!(
             "\"edit\":[{}],\"reverted\":true,\"groups\":{:?},\"fns\":[{}],\"error\":\"a fault in live test code\"",
@@ -10406,6 +10500,9 @@ unsafe fn test_edit(up: *mut Unit, paths: Vec<String>, o: &mut Outcome, undos: &
         edit.changed = None;
         edit.patch = None;
         edit.reverted.extend(groups);
+        if restart.is_some() {
+            break;
+        }
     }
     back
 }
@@ -11402,7 +11499,7 @@ mod round32_tests {
         assert_eq!(unit.stats.ctfe_code, runs, "{case}: the transaction must not run an initializer");
         if accept {
             assert_eq!(&values(&unit)[..2], if case == "changed" { vec![2, 3] } else { before.clone() });
-            unsafe { rollback(up, outcome.undo.unwrap(), "test"); }
+            unsafe { rollback(up, outcome.undo.unwrap(), "test") }.unwrap();
         }
         assert_eq!(values(&unit), before, "running values restored");
         assert_eq!(unit.layout_of(ty).size, layout.size);

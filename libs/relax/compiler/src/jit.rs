@@ -588,6 +588,10 @@ pub struct Unit {
     pub(crate) kept_old: crate::fxhash::HashMap<u32, (u32, &'static str)>,
     /// the same closures as their types name them: (file, expression)
     pub(crate) kept_at: crate::fxhash::HashSet<(u32, u32)>,
+    /// the installed patch groups that gave a struct its new layout, oldest first: the closures an
+    /// earlier group superseded keep code of the layout before (I3), so rolling that group back
+    /// under one of them is a restart (reload::rollback)
+    pub(crate) layout_groups: Vec<u32>,
     /// the owners of the interned closure types (preserve_closure_bodies)
     pub(crate) closure_owners: ClosureOwners,
     /// the end of this unit's last variable in the per-thread block (`tls_alloc`)
@@ -5773,6 +5777,7 @@ impl Unit {
             forwards: Default::default(),
             kept_old: Default::default(),
             kept_at: Default::default(),
+            layout_groups: Vec::new(),
             closure_owners: Default::default(),
             // slot 0 of the block: the thread's domain static block (domain.rs)
             tls_next: TLS_FIRST_FREE,
@@ -9625,10 +9630,28 @@ impl Unit {
         self.forwards.get(&f.code).copied()
     }
 
+    /// Whether closure slot `c` is superseded (JP-L T3c state C): a closure on its parent chain was
+    /// retired by a patch (kept_old) or forwards to a newer version (rebound). Code is only ever
+    /// built from text the program has (I3): a superseded closure keeps its code (a retired one the
+    /// last code built while its text was the program's, a rebound one its forwarder), and no build
+    /// takes it as input again -- no rebuild, no tier-up, no host inlining its body.
+    pub(crate) fn superseded(&self, c: u32) -> bool {
+        // (a closure's parent is the slot whose lowering made it: the chain ends at a fn)
+        let mut k = c;
+        while let FnKey::Closure(_, _, p) = self.fns[k as usize].key {
+            if self.kept_old.contains_key(&k) || self.forward_of(k).is_some() {
+                return true;
+            }
+            k = p;
+        }
+        false
+    }
+
     pub(crate) fn o3_allowed(&self, id: u32) -> bool {
         if matches!(self.fns[id as usize].key, FnKey::Ctfe(_)) { return false; }
-        // (a forwarder's own body is an older version: it gets no code of its own)
-        if self.forward_of(id).is_some() { return false; }
+        // (a forwarder's own body is an older version: it gets no code of its own; a superseded
+        // closure's text is no longer the program's)
+        if self.forward_of(id).is_some() || self.superseded(id) { return false; }
         if self.refresh_verified(id) { return true; }
         let body = match self.fns[id as usize].key { FnKey::Plain(b) => b, _ => id };
         // a body the borrow checker rejected never reaches O3 (its first-run code included: the

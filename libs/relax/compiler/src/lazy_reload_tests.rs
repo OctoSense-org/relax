@@ -2662,7 +2662,7 @@ pub fn value(out: &mut u32) {{
     assert_eq!(run(), 21);
     // edit 6 rolled back: the cell jumps to edit 5's closure again, which runs its own code
     let previous = versions(&u)[versions(&u).len() - 2];
-    unsafe { crate::reload::rollback(up, undo.take().unwrap(), "test") };
+    unsafe { crate::reload::rollback(up, undo.take().unwrap(), "test") }.unwrap();
     files.pop();
     assert_eq!(run(), 20, "after the rollback the stored box runs edit 5's closure");
     assert_eq!(u.forward_of(first), Some((previous, true)));
@@ -3208,6 +3208,91 @@ pub fn later(p: *mut u64) {
     assert_eq!(layout, (6, 8), "the calls after the field, by the new bodies in the new layout");
 }
 
+/// T3c T11 (Q2, I3): a closure a patch retired is never built again from its text. Phase 1: the
+/// closure ran in its parent only (no stored value, no frame) and an edit of its captures retired
+/// it; then a field its old text reads goes from `U`: the layout patch applies with no build
+/// error, and the retired closure keeps its code. Phase 2, not a layout: the same for a closure
+/// whose old text reads a constant, then the constant's value changes (its readers are rebuilt):
+/// the retired closure keeps its code, built while its text was the program's. The new texts run
+/// after each. T5's addition: the layout patch left the retired closure on code of the layout
+/// before, so rolling the retiring group back under it is a restart, and changes nothing; newest
+/// first, every group rolls back and the boot text runs again.
+#[test]
+fn a_retired_closure_is_never_built_again_from_its_text() {
+    isolated_test!(a_retired_closure_is_never_built_again_from_its_text);
+    let lib = r#"use std::sync::atomic::{AtomicU64, Ordering};
+pub struct U { pub a: u64, pub b: u64 }
+pub const K: u32 = 4;
+pub fn fields(p: *mut u64) {
+    let f = unsafe { &*(p as *const [AtomicU64; 4]) };
+    let k = 0u64;
+    let c = move || { let u = U { a: 2, b: 3 }; u.a + u.b + k };
+    f[2].store(c(), Ordering::SeqCst);
+}
+pub fn konst(p: *mut u64) {
+    let f = unsafe { &*(p as *const [AtomicU64; 4]) };
+    let k = 0u64;
+    let c = move || { let x = K + 1; x as u64 + k };
+    f[2].store(c(), Ordering::SeqCst);
+}
+"#;
+    use std::sync::atomic::Ordering;
+    let mut rig = KeptRig::new("retired", &[("lib.rs", lib)], &["fields", "konst"]);
+    let errors = |o: &crate::reload::Outcome| o.lines.iter().filter(|l| l.contains("error")).cloned().collect::<Vec<_>>();
+    // one phase: run `parent`, retire its closure by an edit of its captures, then `change`; what
+    // ran before and after, and the retired closure's slots (in the record, code unchanged)
+    let phase = |rig: &mut KeptRig, parent: &str, captures: &[(&str, &str)], change: &[(&str, &str)]| {
+        rig.call(parent);
+        let before = rig.flag(2);
+        let old = rig.closures(parent);
+        let mut retire = rig.edit("lib.rs", captures);
+        let retired = !old.is_empty() && old.iter().all(|o| rig.unit.kept_old.contains_key(o));
+        let code: Vec<u64> = old.iter().map(|&o| rig.unit.fns[o as usize].code).collect();
+        let mut o = rig.edit("lib.rs", change);
+        let kept_code = old.iter().zip(&code).all(|(&s, &c)| rig.unit.fns[s as usize].code == c);
+        rig.flags[2].store(0, Ordering::SeqCst);
+        rig.call(parent);
+        let undos = (retire.undo.take(), o.undo.take(), old);
+        ((before, retire.rung, retired, o.rung, errors(&o), format!("{:?}", o.lines), kept_code, rig.flag(2)), undos)
+    };
+    let (fields, (retire1, layout2, old1)) = phase(&mut rig, "fields",
+        &[("let k = 0u64;\n    let c = move || { let u", "let k = 0u64;\n    let j = 0u64;\n    let c = move || { let u"), ("u.a + u.b + k }", "u.a + u.b + k + j }")],
+        &[("pub struct U { pub a: u64, pub b: u64 }", "pub struct U { pub b: u64 }"), ("U { a: 2, b: 3 }; u.a + u.b + k + j", "U { b: 3 }; u.b + k + j")]);
+    let (konst, (retire3, const4, _)) = phase(&mut rig, "konst",
+        &[("let k = 0u64;\n    let c = move || { let x", "let k = 0u64;\n    let j = 0u64;\n    let c = move || { let x"), ("x as u64 + k }", "x as u64 + k + j }")],
+        &[("pub const K: u32 = 4;", "pub const K: u32 = 6;")]);
+    for (what, (before, retire, retired, rung, errs, lines, kept_code, after), now) in [("a field gone", fields, 3), ("a const's new value", konst, 7)] {
+        assert_eq!(before, 5, "{what}: the closure ran");
+        assert!(retire == crate::reload::Rung::Patch && retired, "{what}: the captures edit applies and retires the closure ({retire:?})");
+        assert!(rung == crate::reload::Rung::Patch && errs.is_empty(), "{what}: applies with no build error (the retired closure's old text is never built): {rung:?} {lines}");
+        assert!(kept_code, "{what}: the retired closure keeps its code");
+        assert_eq!(after, now, "{what}: the new text runs");
+    }
+    // T5's addition. Newest first down to the layout patch, then the retiring group under it
+    let run = |rig: &KeptRig, parent: &str| { rig.flags[2].store(0, Ordering::SeqCst); rig.call(parent); rig.flag(2) };
+    let back = |rig: &KeptRig, undo: Option<crate::reload::Undo>| unsafe { crate::reload::rollback(rig.up, undo.expect("an undo record"), "test") };
+    let (g1, g2) = (retire1.as_ref().map(|x| x.group), layout2.as_ref().map(|x| x.group));
+    back(&rig, const4).expect("the const's group rolls back");
+    back(&rig, retire3).expect("the second retiring group rolls back: no layout patch after it");
+    let konst_back = run(&rig, "konst");
+    let refused = back(&rig, retire1);
+    let (refused, retire1) = match refused {
+        Err(r) => (Some(r.why), Some(r.undo)),
+        Ok(names) => panic!("rolling gen {g1:?} back under the layout patch {g2:?} must be a restart, it rolled back {names:?}"),
+    };
+    let still_kept = old1.iter().all(|o| rig.unit.kept_old.contains_key(o));
+    let fields_still = run(&rig, "fields");
+    back(&rig, layout2).expect("the layout patch rolls back");
+    back(&rig, retire1).expect("then the retiring group rolls back");
+    let (fields_boot, konst_boot) = (run(&rig, "fields"), run(&rig, "konst"));
+    assert_eq!(konst_back, 5, "konst's groups rolled back: its boot text runs");
+    let why = refused.unwrap_or_default();
+    assert!(why.contains("restart the app") && why.contains(&rig.name(old1[0])), "the refusal names the retired closure and asks for a restart: {why}");
+    assert!(still_kept && fields_still == 3, "a refused rollback changes nothing: the closure stays retired ({still_kept}), the new text runs ({fields_still})");
+    assert_eq!(fields_boot, 5, "newest first, the layout patch and then the retiring group roll back: the boot text runs");
+    assert_eq!(konst_boot, 5, "konst too");
+}
+
 const KEPT_U: &str = r#"pub struct U { pub a: u64 }
 #[inline(never)]
 pub fn tick() -> u64 { let u = U { a: 1 }; u.a }
@@ -3248,10 +3333,10 @@ pub fn start(p: *mut u64) {
     assert_eq!(o2.rung, crate::reload::Rung::Patch, "edit 2 (the parent again) applies: {:?}", o2.lines);
     let o = rig.set("lib.rs", &with_field(&t2));
     let both = refused_with(&o, &["struct `U` changed its layout", &name, "patch gen 1 kept it on"]);
-    unsafe { crate::reload::rollback(rig.up, o2.undo.take().unwrap(), "test") };
+    unsafe { crate::reload::rollback(rig.up, o2.undo.take().unwrap(), "test") }.unwrap();
     let o = rig.set("lib.rs", &with_field(&t1));
     let one = refused_with(&o, &["struct `U` changed its layout", &name, "patch gen 1 kept it on"]);
-    unsafe { crate::reload::rollback(rig.up, o1.undo.take().unwrap(), "test") };
+    unsafe { crate::reload::rollback(rig.up, o1.undo.take().unwrap(), "test") }.unwrap();
     let o = rig.set("lib.rs", &with_field(&t0));
     let none = (o.rung == crate::reload::Rung::Patch, format!("{:?} {:?}", o.rung, o.lines));
     let got = rig.release();
