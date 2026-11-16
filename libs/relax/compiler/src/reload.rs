@@ -8131,9 +8131,72 @@ pub(crate) fn settle_verdicts(up: *mut Unit, pending: &mut Vec<PendingPatch>, un
 
 /// An edit the patcher cannot absorb waits for the person: a running app never restarts by itself.
 /// The first reason is the offer's headline, so a layout blocked by a frame names that holder first.
-fn restart_for_edit(what: &str, lines: &[String]) {
+/// The wait is the edit's files' (`paths`, those its lines name: `held_files`): a later patch that
+/// finds them back at the text that runs ends it (`reverted_waits`).
+fn restart_for_edit(what: &str, lines: &[String], paths: &[String]) {
     SOURCES_WAIT.store(true, Ordering::Release);
-    offer_restart(&format!("{}: {}", what, lines.first().cloned().unwrap_or_default()));
+    offer_restart_in(&format!("{}: {}", what, lines.first().cloned().unwrap_or_default()), held_files(lines, paths));
+}
+
+/// The files of an edit (`paths`) that its restart lines (`lines`) hold back: those a line names
+/// (`path:line:col: ..`, as the restart reasons and the held items' lines give it), or all of them
+/// when a line names none (a stored closure's captures, a frame that has not left the old code).
+fn held_files(lines: &[String], paths: &[String]) -> Vec<String> {
+    if lines.is_empty() {
+        return Vec::new();
+    }
+    let named = |l: &String| paths.iter().find(|p| l.strip_prefix(p.as_str()).is_some_and(|r| r.starts_with(':')));
+    if lines.iter().any(|l| named(l).is_none()) {
+        return paths.to_vec();
+    }
+    let mut files: Vec<String> = lines.iter().filter_map(named).cloned().collect();
+    files.sort_unstable();
+    files.dedup();
+    files
+}
+
+/// What an edit of `paths` (`what` their names) leaves waiting for a restart, by its outcome `o`:
+/// a restart's reasons, or a patch's held items ([`HELD`]: hold_back, a stored closure). A patch
+/// also ends the earlier waits of the files it reached and holds nothing back in
+/// (`reverted_waits`): an edit that waited for a restart and was reverted, or redone without
+/// what needed it, waits no more.
+fn edit_waits(what: &str, paths: &[String], o: &Outcome) {
+    match o.rung {
+        Rung::Restart => restart_for_edit(what, &o.lines, paths),
+        Rung::Patch => {
+            let held: Vec<String> = o.lines.iter().filter_map(|l| l.strip_prefix(HELD)).map(str::to_string).collect();
+            reverted_waits(what, paths, &held_files(&held, paths));
+            if !held.is_empty() {
+                restart_for_edit(what, &held, paths);
+            }
+        }
+        Rung::Refuse => {}
+    }
+}
+
+/// A patch of the files `paths` that held back items of only `kept` among them: an earlier edit's
+/// wait for a restart is over for each of its files this patch reached with nothing held back
+/// (they are back at the text that runs), and goes once none of its files waits. A wait that names
+/// no file (a failed edit, the crashed run's sources, makepad's own rebuild) stays.
+fn reverted_waits(what: &str, paths: &[String], kept: &[String]) {
+    let mut gone = Vec::new();
+    {
+        let mut p = RESTART_PENDING.lock().unwrap_or_else(|e| e.into_inner());
+        p.retain_mut(|(why, _, files)| {
+            if files.is_empty() {
+                return true;
+            }
+            files.retain(|f| !paths.contains(f) || kept.contains(f));
+            if files.is_empty() {
+                gone.push(std::mem::take(why));
+                return false;
+            }
+            true
+        });
+    }
+    for why in gone {
+        eprintln!("relax live: {what}: no restart waits for it any more ({why}): its files are back at the text that runs");
+    }
 }
 
 /// Source edits wait for a restart: the running program has not taken them (a mod added, a type
@@ -8558,7 +8621,12 @@ fn exec_restart(state: Option<&[u8]>) -> Result<(), String> {
 /// A restart is ready: noted for `session relaunch` (the JIT ring's Update ready notice, a click
 /// on it asks for it), and in the live log for the WM's toast (devhub follows it).
 pub(crate) fn offer_restart(why: &str) {
-    note_restart_pending(why);
+    offer_restart_in(why, Vec::new());
+}
+
+/// offer_restart for an edit of `files` (restart_for_edit): their revert ends the wait.
+fn offer_restart_in(why: &str, files: Vec<String>) {
+    note_restart_pending_in(why, files);
     eprintln!("relax live: {why}: a restart applies it; offered (Update ready on the JIT ring, the WM's toast, or `{tool} inspect <app> session relaunch`); the app keeps running meanwhile", tool = crate::tool_name());
     live_log(&format!("{{\"event\":\"restart_offered\",\"pid\":{},\"why\":{}}}", std::process::id(), json_str(why)));
 }
@@ -8583,13 +8651,27 @@ pub fn offer_restart_after_crash() {
 pub(crate) static RESTART_CONFIRMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Edits waiting for a relaunch (`session` in inspect lists them), each with when it began to
-/// wait (unix ms).
-static RESTART_PENDING: std::sync::Mutex<Vec<(String, u64)>> = std::sync::Mutex::new(Vec::new());
+/// wait (unix ms) and the edited files whose text it waits on (restart_for_edit; none: no revert
+/// ends it).
+static RESTART_PENDING: std::sync::Mutex<Vec<(String, u64, Vec<String>)>> = std::sync::Mutex::new(Vec::new());
 
 fn note_restart_pending(why: &str) {
+    note_restart_pending_in(why, Vec::new());
+}
+
+fn note_restart_pending_in(why: &str, files: Vec<String>) {
     let mut p = RESTART_PENDING.lock().unwrap_or_else(|e| e.into_inner());
-    if !p.iter().any(|x| x.0 == why) {
-        p.push((why.to_string(), unix_ms(std::time::SystemTime::now()) as u64));
+    match p.iter_mut().find(|x| x.0 == why) {
+        // (a wait no file's revert ends stays so)
+        Some(x) if x.2.is_empty() => {}
+        Some(x) => {
+            for f in files {
+                if !x.2.contains(&f) {
+                    x.2.push(f);
+                }
+            }
+        }
+        None => p.push((why.to_string(), unix_ms(std::time::SystemTime::now()) as u64, files)),
     }
 }
 
@@ -9966,7 +10048,7 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
                 if let Some(name) = old.0 {
                     let lines = vec![format!("`{name}` still runs the code from before the edit: a call made before the patch has not returned (a loop) -- restart the app")];
                     log_edit(up, &what, &paths, &Outcome { failure: None, kept: 0, pending: false, rung: Rung::Restart, files: Vec::new(), lines: lines.clone(), names: Vec::new(), changed: 0, test_changes: None, bodies: Vec::new(), first_code: Vec::new(), group: gen, ms: [0.0; 4], undo: None, work: [0; 5], deferred: Vec::new() }, None, Instant::now());
-                    restart_for_edit(&what, &lines);
+                    restart_for_edit(&what, &lines, &paths);
                     for l in &lines { eprintln!("relax live:   {}", l); }
                     patch_refused_event(&what, false, &lines);
                     landing.clear();
@@ -10527,13 +10609,11 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
             Rung::Refuse => eprintln!("relax live: {}: NOT applied (errors below); the app runs the previous code", what),
             // an edit the patcher cannot absorb: makepad restarts for real (the app is asked at its
             // next safe point and keeps its state); it runs the previous code until then
-            Rung::Restart => restart_for_edit(&what, &o.lines),
+            Rung::Restart => {}
         }
-        // what of it the patch held back waits for the restart (hold_back)
-        let held: Vec<String> = o.lines.iter().filter_map(|l| l.strip_prefix(HELD)).map(str::to_string).collect();
-        if o.rung == Rung::Patch && !held.is_empty() {
-            restart_for_edit(&what, &held);
-        }
+        // what of it waits for the restart (a restart's reasons, a patch's held items: hold_back),
+        // and the earlier waits a patch that holds nothing back of their files ends
+        edit_waits(&what, &paths, &o);
         for l in &o.lines {
             eprintln!("relax live:   {}", l);
         }
@@ -10972,6 +11052,69 @@ mod removed_module_tests {
         assert!(line.contains("STALE: 1 edit waits for a restart (main.rs: the layout of WorkStats changed)") && line.contains("\"restart_pending\":1"), "{line}");
         clear_restart_pending();
         assert_eq!(crate::inspect::stale_line(), None);
+    }
+
+    /// An edit that waits for a restart and is then reverted waits no more: the patch that finds
+    /// its file back at the text that runs ends the wait, and the restart is no longer offered (a
+    /// layout edit reverted in a running app stayed listed as waiting, 11-16). A wait that no
+    /// file's text ends (a failed edit) stays.
+    #[test]
+    fn a_reverted_edit_no_longer_waits_for_a_restart() {
+        isolated_test!(a_reverted_edit_no_longer_waits_for_a_restart);
+        use crate::jit::{FnKey, Unit};
+        crate::jit::CHECK_FIRST.store(false, Ordering::Relaxed);
+        std::env::set_var("RELAX_STD", concat!(env!("CARGO_MANIFEST_DIR"), "/std"));
+        let dir = std::env::temp_dir().join(format!("relax-reverted-wait-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let before = "pub struct Kept { pub n: u32 }\nstatic KEPT: std::sync::Mutex<Vec<Kept>> = std::sync::Mutex::new(Vec::new());\n#[inline(never)]\nfn sum() -> u32 { 2 }\npub fn value(out: &mut u32) {\n    let mut k = KEPT.lock().unwrap();\n    if k.is_empty() { k.push(Kept { n: 5 }); }\n    *out = k[0].n * 100 + sum();\n}\n";
+        std::fs::write(dir.join("lib.rs"), before).unwrap();
+        let lib = dir.join("lib.rs").to_string_lossy().into_owned();
+        let session = std::sync::Arc::new(crate::Session::default());
+        let (prog, core, krate) = crate::load_with_std(&session, &lib, "reverted_wait", false).unwrap();
+        let value = prog.defs.iter().enumerate().find_map(|(i, d)| {
+            let id = crate::program::DefId(i as u32);
+            (d.krate == krate && prog.name(id) == "value").then_some(id)
+        }).unwrap();
+        let mut tcx = crate::tcx::Tcx::new();
+        tcx.collect(&prog);
+        let mut u = Unit::new(prog, tcx, core);
+        let up = &mut *u as *mut Unit;
+        let entry = crate::owner::call(crate::owner::Class::Program, || { let f = u.fn_id(FnKey::Inst(value, vec![])); u.entry(f) });
+        let run = || {
+            let mut out = 0u32;
+            unsafe { crate::jit::call_jit(up, entry, &mut out as *mut u32 as u64) }.unwrap_or_else(|p| panic!("JIT call panicked: {}", p.message));
+            out
+        };
+        assert_eq!(run(), 502);
+        let file = u.prog.def(value).file;
+        let apply_text = |src: &str| unsafe { apply(up, vec![Edit { file, path: lib.clone(), src: src.as_bytes().to_vec() }]) };
+        let failed = "internal compiler error applying an edit: test";
+        note_restart_pending(failed);
+        // a field added to a struct a static holds values of waits for the restart
+        let held = before.replace("pub n: u32 }", "pub n: u32, pub m: u32 }").replace("Kept { n: 5 }", "Kept { n: 5, m: 1 }");
+        let o = apply_text(&held);
+        assert_eq!(o.rung, Rung::Restart, "{:?}", o.lines);
+        edit_waits("lib.rs", std::slice::from_ref(&lib), &o);
+        let waits = restart_pending();
+        assert!(waits.len() == 2 && waits[1].starts_with("lib.rs: ") && waits[1].contains("struct `Kept` changed its layout"), "the edit waits for a restart beside the failed one: {waits:?}");
+        assert_eq!(run(), 502, "the running code before the restart");
+        // reverted: its file is back at the text that runs
+        let o = apply_text(before);
+        assert_eq!(o.rung, Rung::Patch, "{:?}", o.lines);
+        edit_waits("lib.rs", std::slice::from_ref(&lib), &o);
+        assert_eq!(restart_pending(), vec![failed.to_string()], "the reverted edit waits no more; the failed edit's wait stays");
+        // held back by a patch that applies the rest (hold_back), then reverted
+        let o = apply_text(&held.replace("fn sum() -> u32 { 2 }", "fn sum() -> u32 { 3 }"));
+        edit_waits("lib.rs", std::slice::from_ref(&lib), &o);
+        assert_eq!(restart_pending().len(), 2, "{:?} {:?}", o.rung, o.lines);
+        let o = apply_text(before);
+        assert_eq!(o.rung, Rung::Patch, "{:?}", o.lines);
+        edit_waits("lib.rs", std::slice::from_ref(&lib), &o);
+        assert_eq!(restart_pending(), vec![failed.to_string()], "a held-back item reverted waits no more");
+        assert_eq!(run(), 502, "the reverted text runs");
+        clear_restart_pending();
+        std::mem::forget(u);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 
