@@ -104,6 +104,7 @@ pub unsafe fn reset_statics() {
     boot_stats::reset_statics();
     clock::reset_statics();
     diag::reset_statics();
+    pool::reset_statics();
     preempt::reset_statics();
     progress::reset_statics();
     query::reset_statics();

@@ -526,8 +526,14 @@ struct ScopeData {
     refused: Mutex<std::collections::VecDeque<(usize, Task)>>,
 }
 
-/// Whether the OS refusing a worker thread was said (once a process).
+/// Whether the OS refusing a worker thread was said (once a run).
 static REFUSAL_SAID: AtomicBool = AtomicBool::new(false);
+
+/// What this module holds of a run, as a fresh process has it (`run_end`): the next run in place
+/// says a refused thread again, in its own output. (POOL's idle workers end in retire_idle.)
+pub(crate) unsafe fn reset_statics() {
+    relax_session::reset_static(&REFUSAL_SAID, AtomicBool::new(false));
+}
 
 thread_local! {
     /// The innermost section this thread opened or runs a task of: the one `wait` helps.
