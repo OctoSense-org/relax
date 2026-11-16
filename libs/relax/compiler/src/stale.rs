@@ -514,6 +514,12 @@ fn site_of(frames: &[u64]) -> String {
 /// What the watcher told, for `makepad inspect <pid> stale`: (verdict line, report JSON).
 static ANSWERS: relax_session::sync::Mutex<Vec<(String, String)>> = relax_session::sync::Mutex::new(Vec::new());
 
+/// The verdicts of the stale accesses reported so far (a test waits for its access's).
+#[cfg(test)]
+pub(crate) fn verdicts() -> Vec<String> {
+    ANSWERS.lock().unwrap_or_else(|e| e.into_inner()).iter().map(|a| a.0.clone()).collect()
+}
+
 /// Where in a retired range `addr` was (what kind of data the stale pointer pointed to; for
 /// code, which fn's code version and what invalidated it: invalid.rs).
 fn where_in(r: &Range, addr: u64) -> String {

@@ -51,6 +51,9 @@ impl Fault {
 pub enum Action {
     /// nothing (an interrupt that found nothing to do)
     Ignore,
+    /// the faulting instruction runs again (it touched code a trap fill had out of reach:
+    /// invalid.rs, its pages are back)
+    Retry,
     /// not ours: the handler we replaced, else the default action
     PassOn,
     /// the process ends: the default action; the instruction faults again
@@ -527,7 +530,7 @@ mod imp {
             let f = Fault { kind: kind(sig), sig, pc: *gregs.add(16), sp: *gregs.add(15), fp: *gregs.add(10), addr: *(info.add(16) as *const u64), lr: 0 };
             let chained = CHAINED[sig as usize][0].load(Ordering::SeqCst) > 1;
             match crate::jit::on_fault(&f, &Hooks { prepare: &|| {}, chained, debug: &|| {} }) {
-                Action::Ignore => {}
+                Action::Ignore | Action::Retry => {}
                 Action::PassOn => {
                     if !chain(sig, info, uc) {
                         default_action(sig);
@@ -737,7 +740,7 @@ mod imp {
             let f = Fault { kind: kind(sig), sig, pc: *reg(14), sp: *reg(13), fp: *reg(11), addr: *(info.add(OFFSETS[7]) as *const u64), lr: *reg(12) };
             let chained = CHAINED[sig as usize][0].load(Ordering::SeqCst) > 1;
             match crate::jit::on_fault(&f, &Hooks { prepare: &|| {}, chained, debug: &|| {} }) {
-                Action::Ignore => {}
+                Action::Ignore | Action::Retry => {}
                 Action::PassOn => {
                     if !chain(sig, info, uc) {
                         default_action(sig);
@@ -1056,7 +1059,7 @@ mod imp {
             let debug = || fault_regs(uc);
             let chained = CHAINED[sig as usize][0].load(Ordering::SeqCst) > 1;
             match crate::jit::on_fault(&f, &Hooks { prepare: &prepare, chained, debug: &debug }) {
-                Action::Ignore => {}
+                Action::Ignore | Action::Retry => {}
                 Action::PassOn => {
                     if !chain(sig, info, uc) {
                         default_action(sig);
@@ -1238,6 +1241,11 @@ mod imp {
         }
         // (the code of a run that ended and a thread of an ending run are this runtime's whatever
         // unit is current: the normal search cannot walk their frames)
+        // (code pages a trap fill has out of reach are waited for whoever touched them: a chained
+        // library's handler would take the access for its own)
+        if rec.code == EXCEPTION_ACCESS_VIOLATION && rec.n_params >= 2 && crate::jit::transit_retry(rec.info[1] as u64, pc) {
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
         if chained && !crate::jit::in_jit_code(pc) && !crate::stale::in_ended_run(pc) && !crate::domain::current_is_ending() {
             return EXCEPTION_CONTINUE_SEARCH;
         }
@@ -1251,6 +1259,7 @@ mod imp {
         let f = Fault { kind: k, sig: rec.code as i32, pc, sp: ctx.get(CTX_RSP), fp: ctx.get(CTX_RBP), addr, lr: 0 };
         match crate::jit::on_fault(&f, &Hooks { prepare: &|| {}, chained: false, debug: &|| {} }) {
             Action::Ignore | Action::PassOn | Action::Die => EXCEPTION_CONTINUE_SEARCH,
+            Action::Retry => EXCEPTION_CONTINUE_EXECUTION,
             Action::Resume { pc, a0, a1 } => {
                 // leave(ctx, code) is Relax's convention: rdi, rsi
                 ctx.set(CTX_RIP, pc);

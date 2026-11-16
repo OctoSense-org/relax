@@ -554,7 +554,7 @@ pub struct Unit {
     /// branch veneers in the code area by target (`Unit::veneer`): the last one placed for each
     pub(crate) veneers: relax_session::sync::Mutex<HashMap<u64, u64>>,
     /// invalidatable code (invalid.rs): per group, its own page-aligned chunks of the code area
-    pub(crate) code_groups: relax_session::sync::Mutex<HashMap<crate::invalid::Group, crate::invalid::GroupCode>>,
+    pub(crate) code_groups: relax_session::sync::Mutex<crate::invalid::CodeGroups>,
     /// the O3 code chunk (`emit_hot`): next free byte, end
     hot_code: relax_session::sync::Mutex<(u64, u64)>,
     data_next: AtomicU64,
@@ -1195,6 +1195,9 @@ thread_local! {
     static STACK_BOUNDS: std::cell::Cell<(u64, u64)> = const { std::cell::Cell::new((0, 0)) };
     /// inside our fault handler on this thread: a second fault there is fatal, never handled again
     static IN_FAULT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// the last fault this thread ran again after a trap fill's transit (pc, fill): the same
+    /// instruction faulting again for the same fill is a fault of its own (`transit_retry`)
+    static TRANSIT_RETRIED: std::cell::Cell<(u64, u64)> = const { std::cell::Cell::new((0, 0)) };
     /// host code that may fault and holds nothing a fault could leave behind (no lock, no
     /// half-made value): the sandbox's arena-checked memory helpers (FaultSafe)
     static FAULT_SAFE: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
@@ -4830,6 +4833,15 @@ pub(crate) fn fn_name_at(pc: u64) -> String {
     }
 }
 
+/// A fault at data address `addr`, pc `pc` that touched code pages a trap fill has (or just had)
+/// out of reach: true once they are back, the instruction runs again. False for anything else,
+/// and for the same instruction faulting again after it ran again for the same fill (signal
+/// context: atomics, a thread-local cell, a spin).
+pub(crate) fn transit_retry(addr: u64, pc: u64) -> bool {
+    let Some(fill) = crate::invalid::transit_wait(addr, pc) else { return false };
+    TRANSIT_RETRIED.try_with(|c| c.replace((pc, fill)) != (pc, fill)).unwrap_or(false)
+}
+
 /// A fault or the watchdog's interrupt on this thread (os::fault's handler): what to do with it.
 /// The code tables are read under their own leaf lock; reports are unit calls. A watchdog kick
 /// on a thread inside the compiler (a unit call) is skipped.
@@ -4840,6 +4852,11 @@ pub(crate) fn fn_name_at(pc: u64) -> String {
 /// fault passes to a chained handler or ends the process with a raw report. A fault inside the
 /// handler itself is fatal.
 pub(crate) fn on_fault(f: &os::fault::Fault, hooks: &os::fault::Hooks) -> os::fault::Action {
+    // code pages a trap fill had out of reach (invalid.rs), whoever touched them: a live
+    // neighbour's code runs again, a dead range's then traps
+    if matches!(f.kind, os::fault::Kind::Segv | os::fault::Kind::Bus) && transit_retry(f.addr, f.pc) {
+        return os::fault::Action::Retry;
+    }
     if f.kind == os::fault::Kind::Watchdog && owner::is_owner() {
         return os::fault::Action::Ignore;
     }
@@ -4891,9 +4908,14 @@ unsafe fn on_fault_locked(f: &os::fault::Fault, hooks: &os::fault::Hooks) -> os:
     // (leaf_of_jit reads the stack: only asked when it decides)
     let leaf = || !jit && !safe && has_unit && has_ctx && leaf_of_jit(f);
     // an access into memory the JIT retired for good (an unloaded module's window, invalidated
-    // code: reserved, inaccessible, never reused): a stale pointer, never contained (stale.rs;
-    // lock-free lookup of the data address, and of the pc for a jump into retired code)
-    let stale = if matches!(f.kind, Kind::Segv | Kind::Bus) { crate::stale::lookup(fault).or_else(|| crate::stale::lookup(pc)) } else { None };
+    // code: reserved, inaccessible or trap-filled, never reused): a stale pointer, never contained
+    // (stale.rs; lock-free lookup of the data address, and of the pc for a jump into retired
+    // code; a trap-filled range's trap is an illegal instruction at the pc)
+    let stale = match f.kind {
+        Kind::Segv | Kind::Bus => crate::stale::lookup(fault).or_else(|| crate::stale::lookup(pc)),
+        Kind::Ill => crate::stale::lookup(pc),
+        _ => None,
+    };
     match containment(jit, at_leave, has_unit, has_ctx, hooks.chained, safe, stale.is_some(), leaf) {
         Containment::Stale => {
             let r = stale.expect("stale range");
@@ -30236,6 +30258,9 @@ mod tier_stuck_tests;
 #[cfg(test)]
 #[path = "code_window_tests.rs"]
 mod code_window_tests;
+#[cfg(test)]
+#[path = "trap_fill_tests.rs"]
+mod trap_fill_tests;
 
 #[cfg(test)]
 mod own_work_tests {

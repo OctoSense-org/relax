@@ -97,6 +97,55 @@ pub unsafe fn patch_code_u32(addr: u64, w: u32) {
     fill_code(addr, 4, |b| (*(b.as_mut_ptr() as *const std::sync::atomic::AtomicU32)).store(w, std::sync::atomic::Ordering::Release));
 }
 
+/// The steps of a trap fill (invalid.rs) for the code pages it overwrites dead code in.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Transit {
+    /// out of every thread's reach while the fill is written: inaccessible where code is written
+    /// through a read-write alias; read-write without execute where code has one view (the fill
+    /// writes the pages themselves). A fetch or a read faults and waits (jit.rs `transit_retry`).
+    Out,
+    /// readable, not executable: the instruction cache is told of the fill (arm64's cache
+    /// maintenance by address needs the address readable)
+    Read,
+    /// executable again, as the reservation made them
+    Back,
+}
+
+/// Sets code pages [addr, addr + len) (whole pages) to a step of a trap fill (`Transit`). A
+/// failure is fatal: the dead code would stay runnable, or live code out of reach.
+pub fn code_transit(addr: u64, len: usize, step: Transit) {
+    if no_codegen() {
+        return;
+    }
+    let single = single_code_view(addr);
+    #[cfg(unix)]
+    let ok = {
+        const PROT_READ: i32 = 1;
+        match step {
+            Transit::Out => unsafe { unix::mprotect(addr as *mut u8, len, if single { unix::PROT_RW } else { 0 }) == 0 },
+            Transit::Read => unsafe { unix::mprotect(addr as *mut u8, len, if single { unix::PROT_RW } else { PROT_READ }) == 0 },
+            Transit::Back => code_held(addr, len, false),
+        }
+    };
+    #[cfg(windows)]
+    let ok = {
+        use crate::os::win32::*;
+        let prot = match (step, single) {
+            (Transit::Out, false) => PAGE_NOACCESS,
+            (Transit::Read, false) => PAGE_READONLY,
+            (Transit::Out | Transit::Read, true) => PAGE_READWRITE,
+            (Transit::Back, false) => PAGE_EXECUTE_READ,
+            (Transit::Back, true) => PAGE_EXECUTE_READWRITE,
+        };
+        let mut old = 0u32;
+        unsafe { VirtualProtect(addr as *mut u8, len, prot, &mut old) != 0 }
+    };
+    if !ok {
+        eprintln!("relax run: code pages at {:#x} ({} bytes) could not be set to {:?} for a trap fill", addr, len, step);
+        std::process::abort();
+    }
+}
+
 /// The code [addr, addr + len) of a run that ended: nothing can execute it any more, while whatever
 /// still reads it (a thunk's word, a disassembly) can, and a compile still in flight can finish
 /// writing (through the RW alias, which stays). The whole range goes at once, also what no code was
@@ -736,6 +785,19 @@ mod imp {
         std::arch::asm!("dsb ish", "isb", options(nostack, preserves_flags));
     }
 
+    /// `write_code` in two halves, for a write while the code's pages are out of reach (a trap
+    /// fill, invalid.rs): where bytes [addr, addr + len) are written (the RW alias; with one view,
+    /// the address) ...
+    #[track_caller]
+    pub fn code_alias(addr: u64, len: usize) -> u64 {
+        writable(addr, len)
+    }
+
+    /// ... and the instruction cache told of what was written there (`addr` readable).
+    pub unsafe fn flush_code(addr: u64, len: usize) {
+        flush_icache(addr, len);
+    }
+
     /// aarch64 does not keep the instruction cache coherent with data writes (x86-64 does).
     #[inline(always)]
     unsafe fn flush_icache(addr: u64, len: usize) {
@@ -956,6 +1018,21 @@ mod imp {
         fill(std::slice::from_raw_parts_mut(w as *mut u8, len));
         sys_icache_invalidate(addr as *mut u8, len);
     }
+
+    /// `write_code` in two halves, for a write while the code's pages are out of reach (a trap
+    /// fill, invalid.rs): where bytes [addr, addr + len) are written (the RW view) ...
+    #[track_caller]
+    pub fn code_alias(addr: u64, _len: usize) -> u64 {
+        match code_rw_of(addr) {
+            Some(w) => w,
+            None => panic!("code_alias: {:#x} is not code memory", addr),
+        }
+    }
+
+    /// ... and the instruction cache told of what was written there (`addr` readable).
+    pub unsafe fn flush_code(addr: u64, len: usize) {
+        sys_icache_invalidate(addr as *mut u8, len);
+    }
 }
 
 /// Windows: one reservation (MEM_RESERVE) whose pages are committed on demand in 1 MB granules
@@ -1055,6 +1132,24 @@ mod imp {
             }
         }
         None
+    }
+
+    /// Whether code at `addr` has one read-write-execute view (written where it runs).
+    pub(super) fn single_code_view(addr: u64) -> bool {
+        code_rw_of(addr).is_none()
+    }
+
+    /// `write_code` in two halves, for a write while the code's pages are out of reach (a trap
+    /// fill, invalid.rs): where bytes [addr, addr + len) are written (the RW alias; with one view,
+    /// the address) ...
+    #[track_caller]
+    pub fn code_alias(addr: u64, _len: usize) -> u64 {
+        writable(addr)
+    }
+
+    /// ... and the instruction cache told of what was written there.
+    pub unsafe fn flush_code(addr: u64, len: usize) {
+        FlushInstructionCache(GetCurrentProcess(), addr as *const u8, len);
     }
 
     /// Where code bytes at `addr` are written: the RW alias, or (single RWX view) the address.
