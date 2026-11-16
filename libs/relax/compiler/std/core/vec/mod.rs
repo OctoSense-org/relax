@@ -123,7 +123,7 @@ fn raw_grow_to<A: Allocator>(ptr: &mut NonNull<u8>, cap: &mut Cap, new_cap: usiz
 /// handle_alloc_error.
 #[cold]
 #[inline(never)]
-fn handle_error(e: TryReserveError) -> ! {
+pub(crate) fn handle_error(e: TryReserveError) -> ! {
     match e.kind() {
         crate::collections::TryReserveErrorKind::AllocError { layout, .. } => heap::handle_alloc_error(layout),
         crate::collections::TryReserveErrorKind::CapacityOverflow => capacity_overflow(),

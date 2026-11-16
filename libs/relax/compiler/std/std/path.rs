@@ -1030,6 +1030,21 @@ impl PathBuf {
     pub fn reserve(&mut self, additional: usize) {
         self.inner.reserve(additional)
     }
+    pub fn reserve_exact(&mut self, additional: usize) {
+        self.inner.reserve_exact(additional)
+    }
+    pub fn try_reserve(&mut self, additional: usize) -> Result<(), core::collections::TryReserveError> {
+        self.inner.try_reserve(additional)
+    }
+    pub fn try_reserve_exact(&mut self, additional: usize) -> Result<(), core::collections::TryReserveError> {
+        self.inner.try_reserve_exact(additional)
+    }
+    pub fn shrink_to_fit(&mut self) {
+        self.inner.shrink_to_fit()
+    }
+    pub fn shrink_to(&mut self, min_capacity: usize) {
+        self.inner.shrink_to(min_capacity)
+    }
 }
 
 impl Deref for PathBuf {
