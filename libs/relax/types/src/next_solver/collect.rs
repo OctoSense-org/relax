@@ -460,7 +460,7 @@ impl Tcx {
                         for e in errs { self.err(cx, prog, def.file, lo, e); }
                         continue;
                     }
-                    let supertrait = if prog.def(ad).parent == td { pred.clone() } else { self.supertraits(prog, pred.clone()).into_iter().find(|p| matches!(&p.kind, PredicateKind::Clause(ClauseKind::Trait(c)) if c.trait_ref.def_id == prog.def(ad).parent)).expect("associated item's supertrait") };
+                    let supertrait = if prog.def(ad).parent == td { pred.clone() } else { self.supertraits_unfiltered(prog, pred.clone()).into_iter().find(|p| matches!(&p.kind, PredicateKind::Clause(ClauseKind::Trait(c)) if c.trait_ref.def_id == prog.def(ad).parent)).expect("associated item's supertrait") };
                     let PredicateKind::Clause(ClauseKind::Trait(c)) = supertrait.kind else { unreachable!() };
                     let mut args = Vec::new();
                     let mut rs = Vec::new();

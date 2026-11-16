@@ -164,3 +164,44 @@ fn an_impl_whose_where_clause_needs_itself_proves_nothing() {
     for f in ["itself", "pair"] { assert!(e.iter().any(|x| x.starts_with(&format!("repro::{f}: ")) && x.contains(": E0275: ")), "{f}: {e:?}"); }
     assert!(!has(&e, "tree", ""), "{e:?}");
 }
+
+/// `for<'a, 'b> Sub<'a, 'b, &'b &'a ()>` carries `'a: 'b` in its arguments. Elaborated to
+/// `for<'a, 'b> Super<'a, 'b>` it would lose that bound and let a generic call or a dyn method extend a
+/// borrow, so it is not elaborated (E0277 for the call). Retained arguments and Fn to FnMut stay valid.
+#[test]
+fn a_higher_ranked_bound_keeps_the_bounds_its_arguments_imply() {
+    let e = errors("
+        pub trait Sub<'a, 'b, R>: Super<'a, 'b> {}
+        pub trait Super<'a, 'b> { fn conv<T: ?Sized>(x: &'a T) -> &'b T; }
+        pub struct S;
+        impl<'a: 'b, 'b> Super<'a, 'b> for S {
+            fn conv<T: ?Sized>(x: &'a T) -> &'b T { x }
+        }
+        impl<'a, 'b> Sub<'a, 'b, &'b &'a ()> for S {}
+        fn via_super<'x, 'y, X: for<'a, 'b> Super<'a, 'b>, T: ?Sized>(v: &'x T) -> &'y T { X::conv(v) }
+        pub fn via_sub<'x, 'y, X: for<'a, 'b> Sub<'a, 'b, &'b &'a ()>, T: ?Sized>(v: &'x T) -> &'y T {
+            via_super::<X, T>(v)
+        }
+
+        pub trait Sub2<'a, 'b, R>: Super2<'a, 'b> {}
+        pub trait Super2<'a, 'b> { fn conv2(&self, x: &'a str) -> &'b str; }
+        impl<'a: 'b, 'b> Super2<'a, 'b> for S {
+            fn conv2(&self, x: &'a str) -> &'b str { x }
+        }
+        impl<'a, 'b> Sub2<'a, 'b, &'b &'a ()> for S {}
+        pub fn dyn_extend<'x>(v: &'x str) -> &'static str {
+            let d: &dyn for<'a, 'b> Sub2<'a, 'b, &'b &'a ()> = &S;
+            d.conv2(v)
+        }
+
+        pub trait Keep<'a, 'b, R>: KeepSuper<'a, 'b, R> {}
+        pub trait KeepSuper<'a, 'b, R> {}
+        fn via_keep_super<X: for<'a, 'b> KeepSuper<'a, 'b, &'b &'a ()>>() {}
+        pub fn via_keep<X: for<'a, 'b> Keep<'a, 'b, &'b &'a ()>>() { via_keep_super::<X>() }
+        fn via_fn_mut<G: for<'a> FnMut(&'a u8) -> &'a u8>(mut g: G, v: &u8) -> &u8 { g(v) }
+        pub fn via_fn<F: for<'a> Fn(&'a u8) -> &'a u8>(f: F, v: &u8) -> &u8 { via_fn_mut(f, v) }");
+    assert!(e.iter().any(|x| x.starts_with("repro::via_sub: ") && x.contains(": E0277: ")), "{e:?}");
+    assert!(has(&e, "dyn_extend", ""), "{e:?}");
+    for f in ["via_super", "via_keep_super", "via_keep", "via_fn_mut", "via_fn"] { assert!(!has(&e, f, ""), "{f}: {e:?}"); }
+    assert!(e.iter().all(|x| x.starts_with("repro::via_sub: ") || x.starts_with("repro::dyn_extend: ")), "{e:?}");
+}
