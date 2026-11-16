@@ -240,6 +240,8 @@ mod typeck_bg;
 mod gandalf_out;
 pub mod serve;
 mod serve_rpc;
+/// `makepad check -p a -p b ...`: a process per package, several side by side, output in order.
+mod check_packages;
 mod serve_query;
 mod serve_os;
 pub mod boundary;

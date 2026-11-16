@@ -74,6 +74,11 @@ pub fn program_stack_size() -> usize {
     })
 }
 
+/// The machine's RAM in bytes (16 GB where the system does not say).
+pub fn physical_memory() -> usize {
+    imp::physical_memory()
+}
+
 /// Runs `f` on a program stack: one large reservation (`program_stack_size`, halved until the
 /// system grants one; or one a finished thread left, `Spares`), committed as it is touched, with
 /// a no-access guard below it. A recursion that overruns it faults on the guard (reported as a
