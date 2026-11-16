@@ -71,9 +71,12 @@ fn deferred_reexport_signatures() {
 
 /// RELAX_LIVE_LOG edit items (relax issue 226): a body that ran before the edit (on its own or
 /// inlined into its caller) had code before it, one never called had none -- the edit's own
-/// install of it does not count.
+/// install of it does not count. In a process of its own: its unit tiers up as a session's does,
+/// tier-up state is one per process, and the unit it leaves would refuse the next one there (a
+/// rerun of this test in a warm test process failed with "a second unit with O3").
 #[test]
 fn live_edit_first_code_before_patch() {
+    isolated_test!(live_edit_first_code_before_patch);
     std::env::set_var("RELAX_STD", concat!(env!("CARGO_MANIFEST_DIR"), "/std"));
     let dir = std::env::temp_dir().join(format!("relax-first-code-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
