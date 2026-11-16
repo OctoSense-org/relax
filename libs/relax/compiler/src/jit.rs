@@ -1541,15 +1541,25 @@ fn raw_report_frames(f: &os::fault::Fault, raw: &[u64], scanned: bool) {
 #[cfg(unix)]
 fn raw_no_handler(sig: i32) {
     let (h, domain, changes) = os::progsig::program_disposition(sig);
+    let kernel = os::progsig::kernel_handler(sig);
     let mut l = RawLine::new();
     l.put(b"relax:   signal ").dec(sig as u64).put(b": ");
+    // a relax that is itself another relax's program (relax-compiler's tests under the JIT): its
+    // sigaction is that relax's emulation, so "the kernel" below is its own entry there
+    if cfg!(relax) {
+        l.put(b"(this relax runs as a program under another relax: what it calls the kernel's is its entry in that relax's emulation) ");
+    }
     if h == 0 {
         l.put(b"the program set no handler");
     } else {
         l.put(b"the program's handler ").hex(h as u64).put(b" (domain ").hex(domain).put(b")");
     }
-    l.put(b", its entry changed ").dec(changes as u64).put(b" time(s); the kernel runs ").hex(os::progsig::kernel_handler(sig) as u64);
-    l.put(b", the host's chain holds ").hex(os::fault::chained_handler(sig) as u64).put(b" (the trampoline is ").hex(os::progsig::trampoline_addr() as u64).put(b")");
+    l.put(b", its entry changed ").dec(changes as u64).put(b" time(s); the kernel runs ");
+    if kernel == os::fault::host_handler() {
+        l.put(b"this relax's handler ");
+    }
+    l.hex(kernel as u64);
+    l.put(b", this relax's chain holds ").hex(os::fault::chained_handler(sig) as u64).put(b" (its trampoline is ").hex(os::progsig::trampoline_addr() as u64).put(b")");
     l.flush();
 }
 
