@@ -277,7 +277,7 @@ mod type_check_tests;
 #[cfg(test)]
 mod root_cx_tests;
 #[cfg(test)]
-mod mir_source_tests;
+pub(crate) mod mir_source_tests;
 #[cfg(test)]
 mod lint_scope_tests;
 

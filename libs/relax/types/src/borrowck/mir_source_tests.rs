@@ -13,7 +13,7 @@ pub(super) fn borrowck_source_in(source: &str, edition: u16) -> (Vec<String>, Ve
 }
 
 /// The crate `source` (named `crate_name`, as `#![crate_name]` does in rustc's tests) over Relax's core, alloc and std.
-fn load_source(source: &str, edition: u16, crate_name: &str) -> (Program, Tcx, u32) {
+pub(crate) fn load_source(source: &str, edition: u16, crate_name: &str) -> (Program, Tcx, u32) {
     crate::borrowck::event::FORCE_USER_TYPES.with(|f| f.set(Some(true)));
     let sess = &std::sync::Arc::new(crate::Session::default());
     let mut prog = Program::new(sess);

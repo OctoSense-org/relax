@@ -70,7 +70,6 @@ pub const UNUSED_UNSAFE: Lint = lint("unused_unsafe");
 pub const UNSAFE_OP_IN_UNSAFE_FN: Lint = lint("unsafe_op_in_unsafe_fn");
 pub const STATIC_MUT_REFS: Lint = lint("static_mut_refs");
 pub const UNREACHABLE_PATTERNS: Lint = lint("unreachable_patterns");
-pub const UNCOVERED_PARAM_IN_PROJECTION: Lint = lint("uncovered_param_in_projection");
 pub const COHERENCE_LEAK_CHECK: Lint = lint("coherence_leak_check");
 pub const TYVAR_BEHIND_RAW_POINTER: Lint = lint("tyvar_behind_raw_pointer");
 pub const AMBIGUOUS_ASSOCIATED_ITEMS: Lint = lint("ambiguous_associated_items");

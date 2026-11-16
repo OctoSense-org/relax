@@ -557,22 +557,12 @@ impl Tcx {
                     if prog.def(td).krate == krate {
                         continue;
                     }
-                    // rustc_hir_analysis/src/coherence/orphan.rs:20-50: Proper first; a failure that
-                    // Compat mode accepts is the UNCOVERED_PARAM_IN_PROJECTION future-compat lint.
-                    use crate::next_solver::coherence::{OrphanCheckMode, OrphanCheckErr};
-                    let verdict = match self.orphan_check_impl(prog, im.def, OrphanCheckMode::Proper) {
-                        Ok(()) => Ok(()),
-                        Err(proper) => match self.orphan_check_impl(prog, im.def, OrphanCheckMode::Compat) {
-                            Ok(()) => {
-                                assert!(matches!(proper, OrphanCheckErr::UncoveredTyParams { .. }), "orphanck: non-local input types in compat mode");
-                                crate::lint::emit(prog, im.def, &crate::lint::UNCOVERED_PARAM_IN_PROJECTION, prog.def(im.def).file, pos,
-                                    &format!("type parameter covered only by a projection in an impl of `{}`", prog.def_path(td)));
-                                Ok(())
-                            }
-                            Err(compat) => Err(compat),
-                        },
-                    };
-                    match verdict {
+                    // rustc_hir_analysis/src/coherence/orphan.rs:20-50 checks in Proper mode, then accepts in Compat mode
+                    // what only an uncovered parameter inside a projection fails, behind the future-compat lint
+                    // `uncovered_param_in_projection`. Two crates can then each pass the check with impls that overlap
+                    // (rustc issue 99554): such an impl is E0210 here, as Proper mode says.
+                    use crate::next_solver::coherence::OrphanCheckErr;
+                    match self.orphan_check_impl(prog, im.def) {
                         Ok(()) => {}
                         Err(OrphanCheckErr::UncoveredTyParams { .. }) => errors.push((im.def, pos, format!("E0210: type parameter must be covered by another type when it appears before the first local type in an impl of `{}` -- implement it for a local type or a local wrapper", prog.def_path(td)))),
                         Err(OrphanCheckErr::NonLocalInputType(_)) => errors.push((im.def, pos, format!("E0117: only traits defined in the current crate can be implemented for types defined outside of the crate (`impl {} for {}`) -- implement it for a local type or a local wrapper", prog.def_path(td), crate::typeck::ty_to_string(false, prog, self, st)))),

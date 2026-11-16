@@ -819,6 +819,9 @@ impl<'a> TypeChecker<'a> {
         for (i, decl) in body.local_decls.iter().enumerate() {
             self.check_local_decl(Local(i as u32), decl);
         }
+        for (i, decl) in body.local_decls.iter().enumerate() {
+            self.prove_local_wf(Local(i as u32), decl);
+        }
         for (b, block_data) in body.basic_blocks.iter().enumerate() {
             let mut location = Location { block: BasicBlock(b as u32), statement_index: 0 };
             for stmt in &block_data.statements {
@@ -980,6 +983,18 @@ impl<'a> TypeChecker<'a> {
         if !self.infcx.unsized_fn_params() && matches!(self.local_kind(local), LocalKind::Temp | LocalKind::UserVar) {
             self.ensure_place_sized(decl.ty, decl.source_info.span);
         }
+    }
+    /// Every value the body holds is of a well-formed type: a temporary's or variable's type is proven WF
+    /// everywhere. rustc proves it only for annotated types, so subtyping can shrink a type below what its
+    /// definition requires: `let mut s = S(&STATIC); s.0 = short;` with `struct S<T: 'static>(T)` gives an
+    /// `S<&'short u8>` whose impls assume `T: 'static` (rustc issue 164250). The type check proved the trait
+    /// parts with regions erased, so a type without free regions has nothing left to prove. Arguments and the
+    /// return place have the signature's types, proven by the item's own WF check.
+    fn prove_local_wf(&mut self, local: Local, decl: &LocalDecl) {
+        if !matches!(self.local_kind(local), LocalKind::Temp) || !self.tcx.tys.flags(decl.ty).intersects(crate::types::TypeFlags::HAS_FREE_REGIONS) {
+            return;
+        }
+        self.infcx.prove_wf(&mut self.constraints, decl.ty, Locations::All(decl.source_info.span), ConstraintCategory::Boring);
     }
     fn local_kind(&self, local: Local) -> LocalKind {
         if local.0 == 0 { LocalKind::Return } else if local.0 <= self.body.arg_count { LocalKind::Arg } else { LocalKind::Temp }
