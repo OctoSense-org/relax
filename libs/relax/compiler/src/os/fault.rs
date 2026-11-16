@@ -1812,6 +1812,68 @@ pub fn raw_stderr(b: &[u8]) {
     }
 }
 
+/// A program's allocation the allocator refused (Relax std's handle_alloc_error, std/core/heap.rs):
+/// rustc's `__rust_alloc_error_handler` with std's default hook (library/std/src/alloc.rs
+/// default_alloc_error_hook and rust_oom @1.100.0): std's message on the program's stderr, then
+/// the process ends with SIGABRT, as a rustc build's does; its cause is said, so no crash report
+/// follows. No allocation and no lock: the text is built on the stack. A second failure (two
+/// threads at once) skips the backtrace note, as std skips its backtrace. A sandboxed module's
+/// call of it is the fault its abort is (sandbox.rs c_policy).
+pub(crate) extern "C" fn relax_alloc_error(size: usize) -> ! {
+    let mut out = [0u8; 160];
+    let mut k = 0;
+    let mut put = |b: &[u8]| {
+        for &c in b {
+            if k < out.len() {
+                out[k] = c;
+                k += 1;
+            }
+        }
+    };
+    let mut digits = [0u8; 20];
+    let mut i = digits.len();
+    let mut n = size;
+    loop {
+        i -= 1;
+        digits[i] = b'0' + (n % 10) as u8;
+        n /= 10;
+        if n == 0 {
+            break;
+        }
+    }
+    put(b"memory allocation of ");
+    put(&digits[i..]);
+    put(b" bytes failed\n");
+    if PREV_ALLOC_FAILURE.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        put(b"skipping backtrace printing to avoid potential recursion\n");
+    } else {
+        // (Relax prints no backtraces: std's line for RUST_BACKTRACE unset)
+        put(b"note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n");
+    }
+    // the program's own stderr, as std writes it (not the fault reports' stream)
+    #[cfg(unix)]
+    unsafe {
+        extern "C" {
+            fn write(fd: i32, buf: *const core::ffi::c_void, n: usize) -> isize;
+        }
+        let mut at = 0;
+        while at < k {
+            let w = write(2, out.as_ptr().add(at).cast(), k - at);
+            if w <= 0 {
+                break;
+            }
+            at += w as usize;
+        }
+    }
+    #[cfg(windows)]
+    raw_stderr(&out[..k]);
+    // SIGABRT (6 on Linux and macOS) by its default action
+    die_by(6)
+}
+
+/// std's PREV_ALLOC_FAILURE (default_alloc_error_hook)
+static PREV_ALLOC_FAILURE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// Ends the process by signal `sig` with its default action (exit status 128 + sig, as a
 /// rustc build's fault would), from normal context: a contained fault the policy found fatal.
 pub fn die_by(sig: i32) -> ! {

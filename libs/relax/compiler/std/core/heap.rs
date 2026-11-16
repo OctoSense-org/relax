@@ -181,79 +181,24 @@ pub unsafe fn realloc(ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 
 }
 
 /// rustc's `__rust_alloc_error_handler` with std's default hook (library/std/src/alloc.rs
-/// rust_oom, default_alloc_error_hook @1.100.0): the message on stderr, then abort(). The process
-/// ends with SIGABRT, which no catch_unwind catches. Without std's process (the web runtime) the
+/// rust_oom, default_alloc_error_hook @1.100.0): the message on stderr, then the process ends with
+/// SIGABRT, which no catch_unwind catches. The JIT's runtime does both (relax_alloc_error, its
+/// os/fault.rs), so a sandboxed module's twin of this fn reaches no C function the sandbox refuses:
+/// its call is the module's contained fault there. Without std's process (the web runtime) the
 /// error panics, which aborts there.
 #[rustc_do_not_const_check] // const evaluation: an error, as rustc's ct_error panic
 pub const fn handle_alloc_error(layout: Layout) -> ! {
     #[cfg(not(relax_web))]
     unsafe {
-        oom::abort_after_message(layout.size)
+        relax_alloc_error(layout.size)
     }
     #[cfg(relax_web)]
     crate::panicking::panic_fmt(format_args!("memory allocation of {} bytes failed", layout.size))
 }
 
 #[cfg(not(relax_web))]
-mod oom {
-    use crate::sync::atomic::{AtomicBool, Ordering};
-
-    extern "C" {
-        fn abort() -> !;
-        #[cfg(not(windows))]
-        fn write(fd: i32, buf: *const u8, n: usize) -> isize;
-        // the Universal C Runtime's name
-        #[cfg(windows)]
-        #[link_name = "_write"]
-        fn write(fd: i32, buf: *const u8, n: u32) -> i32;
-    }
-
-    /// std's default_alloc_error_hook and abort: no allocation, no lock, the text built on the
-    /// stack. A second failure (two threads at once) skips the note, as std skips its backtrace.
-    #[cold]
-    #[inline(never)]
-    pub(super) unsafe fn abort_after_message(size: usize) -> ! {
-        static PREV_ALLOC_FAILURE: AtomicBool = AtomicBool::new(false);
-        let mut out = [0u8; 160];
-        let mut k = 0;
-        let mut put = |b: &[u8]| {
-            for &c in b {
-                if k < out.len() {
-                    out[k] = c;
-                    k += 1;
-                }
-            }
-        };
-        let mut digits = [0u8; 20];
-        let mut i = digits.len();
-        let mut n = size;
-        loop {
-            i -= 1;
-            digits[i] = b'0' + (n % 10) as u8;
-            n /= 10;
-            if n == 0 {
-                break;
-            }
-        }
-        put(b"memory allocation of ");
-        put(&digits[i..]);
-        put(b" bytes failed\n");
-        if PREV_ALLOC_FAILURE.swap(true, Ordering::Relaxed) {
-            put(b"skipping backtrace printing to avoid potential recursion\n");
-        } else {
-            // (Relax prints no backtraces: std's line for RUST_BACKTRACE unset)
-            put(b"note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n");
-        }
-        let mut at = 0;
-        while at < k {
-            let w = write(2, out.as_ptr().add(at), (k - at) as _);
-            if w <= 0 {
-                break;
-            }
-            at += w as usize;
-        }
-        abort()
-    }
+extern "C" {
+    fn relax_alloc_error(size: usize) -> !;
 }
 
 /// Allocates or aborts; zero-sized layouts give the dangling pointer `align`.

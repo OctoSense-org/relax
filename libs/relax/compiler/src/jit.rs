@@ -26515,6 +26515,7 @@ pub(crate) fn loader_symbol(name: &[u8]) -> Option<usize> {
         b"relax_runtime_cpu_ns" => Some(crate::inspect::instrument::relax_runtime_cpu_ns as *const () as usize),
         b"relax_runtime_waited_ns" => Some(crate::inspect::instrument::relax_runtime_waited_ns as *const () as usize),
         b"relax_set_payload_end" => Some(relax_set_payload_end as *const () as usize),
+        b"relax_alloc_error" => Some(crate::os::fault::relax_alloc_error as *const () as usize),
         b"relax_before_first_frame" => Some(relax_before_first_frame as *const () as usize),
         b"relax_app_main" => Some(relax_app_main as *const () as usize),
         b"relax_first_present" => Some(relax_first_present as *const () as usize),
