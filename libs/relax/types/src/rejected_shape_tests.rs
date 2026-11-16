@@ -140,3 +140,27 @@ fn a_bound_only_an_alias_argument_carries_is_not_implied() {
     assert!(has(&e, "extend", ""), "{e:?}");
     assert!(!e.iter().any(|x| x.contains("fine") || x.contains("rigid")), "{e:?}");
 }
+
+/// An auto trait's goals are coinductive, but the where-clause of a written impl is no productive step:
+/// `unsafe impl<T> Sync for S<T> where S<T>: Sync` does not prove itself, nor do two impls that each ask for
+/// the other (E0275). A cycle through the fields of a type still holds.
+#[test]
+fn an_impl_whose_where_clause_needs_itself_proves_nothing() {
+    let e = errors(r#"
+        use std::marker::PhantomData;
+        pub struct S<T>(PhantomData<*const T>);
+        unsafe impl<T> Sync for S<T> where S<T>: Sync {}
+        pub struct A<T>(PhantomData<*const T>);
+        pub struct B<T>(PhantomData<*const T>);
+        unsafe impl<T> Send for A<T> where B<T>: Send {}
+        unsafe impl<T> Send for B<T> where A<T>: Send {}
+        pub struct Tree(pub Option<Box<Tree>>, pub u8);
+        fn sync<T: Sync>() {}
+        fn send<T: Send>() {}
+        pub fn itself() { sync::<S<u8>>(); }
+        pub fn pair() { send::<A<u8>>(); }
+        pub fn tree() { send::<Tree>(); sync::<Tree>(); }"#);
+    // (a type check error carries its location before the code)
+    for f in ["itself", "pair"] { assert!(e.iter().any(|x| x.starts_with(&format!("repro::{f}: ")) && x.contains(": E0275: ")), "{f}: {e:?}"); }
+    assert!(!has(&e, "tree", ""), "{e:?}");
+}
