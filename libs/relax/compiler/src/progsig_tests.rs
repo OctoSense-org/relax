@@ -52,7 +52,38 @@ extern "C" {
     fn raise(sig: i32) -> i32;
     fn write(fd: i32, b: *const u8, n: usize) -> isize;
     pub fn setrlimit(r: i32, l: *const [u64; 2]) -> i32;
+    fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
+    fn munmap(addr: *mut u8, len: usize) -> i32;
+    fn mprotect(addr: *mut u8, len: usize, prot: i32) -> i32;
+    fn sigaltstack(ss: *const StackT, old: *mut StackT) -> i32;
+    fn memset(p: *mut u8, c: i32, n: usize) -> *mut u8;
 }
+#[cfg(target_os = "linux")]
+#[repr(C)]
+struct StackT {
+    sp: *mut u8,
+    flags: i32,
+    pad: i32,
+    size: usize,
+}
+#[cfg(target_vendor = "apple")]
+#[repr(C)]
+struct StackT {
+    sp: *mut u8,
+    size: usize,
+    flags: i32,
+}
+const SIGSEGV: i32 = 11;
+#[cfg(target_os = "linux")]
+const SA_ONSTACK: i32 = 0x0800_0000;
+#[cfg(target_vendor = "apple")]
+const SA_ONSTACK: i32 = 0x1;
+#[cfg(target_os = "linux")]
+const MAP_PRIVATE_ANON: i32 = 0x22;
+#[cfg(target_vendor = "apple")]
+const MAP_PRIVATE_ANON: i32 = 0x1002;
+/// a small stack's size and its guard's, and the protected page's (any page size)
+const SMALL: usize = 1 << 16;
 #[cfg(target_os = "linux")]
 const SIGUSR2: i32 = 12;
 #[cfg(target_vendor = "apple")]
@@ -200,6 +231,50 @@ pub fn install_abrt(_out: &mut [u64; 8]) {
         "SIGABRT installation must succeed");
 }
 
+static PROTECTED: AtomicU64 = AtomicU64::new(0);
+static SEGV_RUNS: AtomicU64 = AtomicU64::new(0);
+
+#[inline(never)]
+fn first_in_segv(x: u64) -> u64 { x.wrapping_mul(5).wrapping_add(1) }
+
+extern "C" fn on_segv(_sig: i32, _info: *mut u8, _uc: *mut u8) {
+    SEGV_RUNS.fetch_add(first_in_segv(0), SeqCst);
+    unsafe { mprotect(PROTECTED.load(SeqCst) as *mut u8, SMALL, 3); }
+}
+
+pub fn install_segv(_out: &mut [u64; 8]) {
+    let a = action(on_segv as *const () as usize, SA_SIGINFO | SA_ONSTACK);
+    assert_eq!(unsafe { sigaction(SIGSEGV, &a, null_mut()) }, 0, "SIGSEGV installation must succeed");
+}
+
+/// A 64 KB signal stack (above a guard) placed above the calling thread's stack, a page it
+/// protected, and a write into that page by the C library: the handler runs on the small stack.
+pub fn segv_on_small_stack(out: &mut [u64; 8]) {
+    let mark = 0u8;
+    let here = &mark as *const u8 as usize;
+    let mut base = null_mut();
+    for shift in 28..40 {
+        let hint = (here + (1usize << shift)) & !(SMALL - 1);
+        let p = unsafe { mmap(hint as *mut u8, 2 * SMALL, 3, MAP_PRIVATE_ANON, -1, 0) };
+        if p as isize == -1 { continue; }
+        if p as usize > here { base = p; break; }
+        unsafe { munmap(p, 2 * SMALL); }
+    }
+    assert!(!base.is_null(), "a small stack above the thread's");
+    assert_eq!(unsafe { mprotect(base, SMALL, 0) }, 0, "the small stack's guard");
+    let mut ss: StackT = unsafe { std::mem::zeroed() };
+    ss.sp = unsafe { base.add(SMALL) };
+    ss.size = SMALL;
+    let mut old: StackT = unsafe { std::mem::zeroed() };
+    assert_eq!(unsafe { sigaltstack(&ss, &mut old) }, 0, "the small signal stack must be taken");
+    let page = unsafe { mmap(null_mut(), SMALL, 0, MAP_PRIVATE_ANON, -1, 0) };
+    PROTECTED.store(page as u64, SeqCst);
+    unsafe { memset(page, 7, std::hint::black_box(1)); }
+    assert_eq!(unsafe { sigaltstack(&old, null_mut()) }, 0, "the thread's signal stack must come back");
+    out[0] = SEGV_RUNS.load(SeqCst);
+    out[1] = unsafe { *page } as u64;
+}
+
 #[cfg(target_os = "linux")]
 extern "C" fn on_rt(_sig: i32, info: *mut u8, _uc: *mut u8) {
     let n = NVALUES.load(SeqCst) as usize;
@@ -222,11 +297,16 @@ pub fn values(out: &mut [u64; 8]) {
 "#;
 
 fn child(test: &str, hook: &str) -> std::process::Output {
+    child_with(test, hook, &[])
+}
+
+fn child_with(test: &str, hook: &str, env: &[(&str, &str)]) -> std::process::Output {
     let _slot = crate::test_child::slot();
     std::process::Command::new(std::env::current_exe().unwrap())
         .args(["--exact", &format!("progsig_tests::{test}"), "--nocapture", "--test-threads=1"])
         .env(CHILD, test)
         .env("RELAX_TEST_SIGNAL_IN_COMPILE", hook)
+        .envs(env.iter().copied())
         .output()
         .expect("the signal test child must run")
 }
@@ -442,4 +522,75 @@ fn queued_realtime_signals_in_a_compile_keep_their_count_and_values() {
     assert_eq!(out[3], 3, "all three queued realtime signals must be delivered");
     assert_eq!(&out[..3], &[1, 2, 3], "queued realtime signals must preserve their values and order");
     assert_eq!(crate::os::progsig::counts(50)[0], 3, "all three realtime handler runs must be counted");
+}
+
+/// A program's SIGSEGV handler runs on a 64 KB signal stack of the program's, and its first call
+/// compiles with 256 KB of stack (the compile hook): the compile moves to a stack segment and
+/// the handler fixes the page; the write lands. Before the stack check knew its stack, the
+/// compile ran on the signal stack and overflowed it with SIGSEGV blocked (the kernel's kill, no
+/// report). And right after the program's `sigaction`, the host's handler stays in the kernel
+/// with the program's behind it: the host's policy sees every fault without waiting for the run
+/// monitor to put it back.
+#[test]
+fn a_fault_handler_that_compiles_on_a_small_signal_stack_runs() {
+    const TEST: &str = "a_fault_handler_that_compiles_on_a_small_signal_stack_runs";
+    if std::env::var(CHILD).as_deref() != Ok(TEST) {
+        let output = child_with(TEST, "", &[("RELAX_TEST_COMPILE_STACK", "first_in_segv,256")]);
+        assert!(output.status.success(), "the small-stack child must succeed: {:?}\n{}", output.status, String::from_utf8_lossy(&output.stderr));
+        return;
+    }
+    let (mut u, krate) = setup();
+    let _program = crate::os::program_thread();
+    let mut out = [0u64; 8];
+    let arg = out.as_mut_ptr() as u64;
+    call(&mut u, krate, "install_segv", arg);
+    assert_eq!(crate::os::progsig::kernel_handler(SIGSEGV), crate::os::fault::host_handler(), "the host's handler stays in the kernel");
+    assert_eq!(crate::os::fault::chained_handler(SIGSEGV), crate::os::progsig::trampoline_addr(), "the program's handler is chained behind it");
+    call(&mut u, krate, "segv_on_small_stack", arg);
+    assert_eq!(out[0], 1, "the program's handler ran once");
+    assert_eq!(out[1], 7, "the write landed once the handler gave the page back");
+}
+
+/// A fault inside a compile is the compiler's: no program handler runs there, and the process
+/// ends by the signal with a report naming the signal, the address, the thread and the compile.
+/// Which fault runs the program's handler: on its thread outside a compile; on a thread with no
+/// program state, outside the host's own code.
+#[test]
+fn a_fault_inside_a_compile_ends_the_process_with_a_report() {
+    const TEST: &str = "a_fault_inside_a_compile_ends_the_process_with_a_report";
+    if std::env::var(CHILD).as_deref() != Ok(TEST) {
+        use crate::os::progsig::runs_handler;
+        assert!(runs_handler(true, 0, || true), "a program thread outside a compile runs it");
+        assert!(!runs_handler(true, 1, || false) && !runs_handler(true, 2, || false), "inside a compile it never does");
+        assert!(runs_handler(false, 0, || false), "a thread with no state runs it for a fault outside the host's code");
+        assert!(!runs_handler(false, 0, || true), "a fault in the host's code with no state is the host's crash");
+        crate::os::fault::note_host_text();
+        let host = crate::os::fault::host_code as *const () as u64;
+        let libc = libc_write as *const () as u64;
+        assert!(crate::os::fault::host_code(host), "the host's code is its own");
+        // (under the JIT the host's code is JIT code in no image: every pc counts as the host's)
+        assert_eq!(crate::os::fault::host_code(libc), cfg!(relax), "the C library's code is not the host's");
+        let output = child(TEST, "target_in_compile,11,fault");
+        let err = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.signal(), Some(SIGSEGV), "the fault ends the process by its signal: {:?}\n{err}", output.status);
+        let line = err.lines().find(|l| l.starts_with("relax: fatal signal 11 on thread ")).unwrap_or_else(|| panic!("no fatal signal report:\n{err}"));
+        let at = err.lines().find_map(|l| l.strip_prefix("relax test: a fault at ")).and_then(|l| l.split(' ').next()).unwrap_or_else(|| panic!("no fault address from the hook:\n{err}"));
+        assert!(line.contains(&format!(" addr {at}")) && line.contains("inside a compile"), "the report names the address and why: {line}");
+        assert!(err.contains("in the compile of slot ") && err.contains("target_in_compile"), "the report names the compile:\n{err}");
+        return;
+    }
+    let (mut u, krate) = setup();
+    let _program = crate::os::program_thread();
+    let mut out = [0u64; 8];
+    let arg = out.as_mut_ptr() as u64;
+    call(&mut u, krate, "install_segv", arg);
+    call(&mut u, krate, "target_in_compile", arg);
+    panic!("the fault inside the compile must end the process");
+}
+
+const SIGSEGV: i32 = 11;
+
+extern "C" {
+    #[link_name = "write"]
+    fn libc_write(fd: i32, buf: *const core::ffi::c_void, n: usize) -> isize;
 }

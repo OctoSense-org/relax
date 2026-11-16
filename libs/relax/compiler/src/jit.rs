@@ -1532,6 +1532,82 @@ fn raw_report_frames(f: &os::fault::Fault, raw: &[u64], scanned: bool) {
     }
 }
 
+/// os/fault.rs `fatal_signal`'s report (from a signal handler: no allocation, no lock): the
+/// signal, the thread and what it was doing, the stack the fault came on and its room (`alt`: the
+/// thread's signal stack), the frames.
+/// Why a fault the host passes on finds no program handler behind the host's: what the program
+/// set for the signal (none, or its handler and how many changes the entry saw) against what the
+/// kernel and the host's chain hold.
+#[cfg(unix)]
+fn raw_no_handler(sig: i32) {
+    let (h, domain, changes) = os::progsig::program_disposition(sig);
+    let mut l = RawLine::new();
+    l.put(b"relax:   signal ").dec(sig as u64).put(b": ");
+    if h == 0 {
+        l.put(b"the program set no handler");
+    } else {
+        l.put(b"the program's handler ").hex(h as u64).put(b" (domain ").hex(domain).put(b")");
+    }
+    l.put(b", its entry changed ").dec(changes as u64).put(b" time(s); the kernel runs ").hex(os::progsig::kernel_handler(sig) as u64);
+    l.put(b", the host's chain holds ").hex(os::fault::chained_handler(sig) as u64).put(b" (the trampoline is ").hex(os::progsig::trampoline_addr() as u64).put(b")");
+    l.flush();
+}
+
+#[cfg(unix)]
+pub(crate) fn raw_fatal_signal(f: &os::fault::Fault, why: &str, alt: (u64, u64)) {
+    let mut l = RawLine::new();
+    l.put(b"relax: fatal signal ").dec(f.sig as u64).put(b" on thread ").hex(os::thread::current());
+    let mut name = [0u8; 64];
+    let n = os::thread::own_name(&mut name);
+    if n > 0 {
+        l.put(b" `").put(&name[..n]).put(b"`");
+    }
+    l.put(b" pc ").hex(f.pc).put(b" addr ").hex(f.addr).put(b" sp ").hex(f.sp).put(b": ").put(why.as_bytes());
+    l.flush();
+    l.put(b"relax:   ");
+    match os::progsig::thread_class() {
+        Some((0, _)) => {
+            l.put(b"a program thread, outside any compile");
+        }
+        Some((depth, slot)) => {
+            l.put(b"a program thread at compile depth ").dec(depth as u64).put(b", in the compile of slot ").dec(slot as u64);
+            let u = cur_unit();
+            let fns = if u.is_null() { None } else { Some(unsafe { &(*u).fns }) };
+            if let Some(fns) = fns.filter(|fns| (slot as usize) < fns.len()) {
+                let fname = fns[slot as usize].name.as_bytes();
+                l.put(b" `").put(&fname[..fname.len().min(300)]).put(b"`");
+            }
+        }
+        None if owner::is_owner() => {
+            l.put(b"the compiler's owner (a host thread)");
+        }
+        None => {
+            l.put(b"a thread with no program state (the host's, or one a native library started)");
+        }
+    }
+    l.flush();
+    l.put(b"relax:   the fault came on ");
+    let sp = f.sp;
+    if alt.1 != 0 && sp >= alt.0 && sp < alt.1 {
+        l.put(b"the signal stack, ").dec(sp - alt.0).put(b" bytes left");
+    } else if alt.1 != 0 && sp < alt.0 && alt.0 - sp <= 1 << 16 {
+        l.put(b"the signal stack's guard, ").dec(alt.0 - sp).put(b" bytes below it (an overflow)");
+    } else {
+        match crate::stack::stack_of(sp as usize) {
+            Some((what, left)) => {
+                l.put(what.as_bytes()).put(b", ").dec(left as u64).put(b" bytes left");
+            }
+            None => {
+                l.put(b"a stack the JIT did not make or read");
+            }
+        }
+    }
+    l.flush();
+    let mut raw = [0u64; 16];
+    let k = walk_fp_bounded(f.fp, f.sp, &mut raw);
+    raw_report_frames(f, &raw[..k], false);
+}
+
 /// Our fault handlers back on top if a library of the program replaced them (it stays chained
 /// for signals that are not faults in JIT code). macOS; elsewhere nothing yet.
 pub fn reassert_signals() {
@@ -1554,6 +1630,8 @@ pub(crate) fn ensure_altstack() {
         return;
     }
     STACK_BOUNDS.with(|c| c.set(os::fault::stack_bounds_of_self()));
+    // (the stack check's bounds too: read here, not first inside a signal handler)
+    crate::stack::note_thread_stack();
     let sp = os::fault::this_thread();
     let _ = ALTSTACK.try_with(|a| a.0.set(sp.max(1)));
 }
@@ -4686,6 +4764,10 @@ fn rt_compile_in(up: usize, slot: u64) -> u64 {
     if CompileInnermost::get() {
         compile_reentered(slot as u32);
     }
+    // a thread a native library started becomes a program thread at its first lazy call
+    if !owner::is_owner() {
+        adopt_thread();
+    }
     // a signal for a program handler waits for this call's compile (os/progsig.rs); a thread
     // parked at a compile error takes them again (an outside SIGABRT ends a parked JIT)
     let signals = compiling(slot as u32);
@@ -4949,6 +5031,8 @@ unsafe fn on_fault_locked(f: &os::fault::Fault, hooks: &os::fault::Hooks) -> os:
             // not ours: the handler we replaced (a library's), else the default action
             if !hooks.chained {
                 raw_report(f, "fault outside JIT code, not contained: the process ends");
+                #[cfg(unix)]
+                raw_no_handler(f.sig);
                 // RELAX_FAULT_REGS (opt-in; allocates): after the raw lines
                 (hooks.debug)();
             }
@@ -9917,7 +10001,10 @@ pub unsafe fn compile_slot(up: *mut Unit, id: u32) -> u64 {
     // else is an interruption (rt_compile_in)
     let _innermost = CompileInnermost::set(true);
     test_signal_in_compile(up, id);
-    let code = ensure_sufficient_stack(|| compile_slot_on_stack(up, id));
+    let code = ensure_sufficient_stack(|| {
+        test_stack_in_compile(up, id);
+        compile_slot_on_stack(up, id)
+    });
     // a program thread compiles in bursts: its chunks go back between them (frees from other
     // threads into them are taken then; at most twice a second)
     crate::zone_alloc::compiler_hand_back_idle();
@@ -10389,13 +10476,15 @@ unsafe fn test_hot_compile_panic(up: *mut Unit, id: u32) {
 
 /// os/progsig.rs's compile guard: a signal for a program handler waits for the compile's end.
 #[cfg(unix)]
-use os::progsig::compiling;
+use os::progsig::{adopt as adopt_thread, compiling};
 #[cfg(not(unix))]
 struct Compiling;
 #[cfg(not(unix))]
 fn compiling(_slot: u32) -> Compiling {
     Compiling
 }
+#[cfg(not(unix))]
+fn adopt_thread() {}
 
 thread_local! {
     /// The innermost host activity of this thread is a compile (`compile_slot`); `call_jit_in`
@@ -10499,6 +10588,27 @@ unsafe fn test_signal_in_compile(up: *mut Unit, id: u32) {
     }
     #[cfg(not(unix))]
     let _ = (up, id);
+}
+
+/// RELAX_TEST_COMPILE_STACK=<name part>,<KB>: the compile of a fn whose name contains <name part>
+/// uses <KB> of stack where its own work would (past the stack check), so a test does not depend
+/// on how deep a type check goes. The stack tests' hook.
+unsafe fn test_stack_in_compile(up: *mut Unit, id: u32) {
+    static WANT: std::sync::OnceLock<Option<(String, usize)>> = std::sync::OnceLock::new();
+    let want = WANT.get_or_init(|| crate::zone_alloc::kept_with(|| {
+        let v = std::env::var("RELAX_TEST_COMPILE_STACK").ok()?;
+        let (part, kb) = v.split_once(',')?;
+        Some((part.to_string(), kb.parse().ok()?))
+    }));
+    let Some((part, kb)) = want else { return };
+    #[inline(never)]
+    fn down(n: usize) -> usize {
+        let page = std::hint::black_box([n as u8; 1024]);
+        if n == 0 { page[0] as usize } else { down(n - 1) + std::hint::black_box(page[n % 1024]) as usize }
+    }
+    if (&*up).fns[id as usize].name.contains(part.as_str()) {
+        std::hint::black_box(down(*kb));
+    }
 }
 
 unsafe fn test_compile_panic(up: *mut Unit, id: u32) {

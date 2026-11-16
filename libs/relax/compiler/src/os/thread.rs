@@ -27,7 +27,8 @@ mod unix {
         unsafe { pthread_self() as u64 }
     }
 
-    fn own_name(b: &mut [u8; 64]) -> usize {
+    /// The calling thread's name into `b`: its length (no allocation; a fault report's).
+    pub fn own_name(b: &mut [u8; 64]) -> usize {
         unsafe { pthread_getname_np(pthread_self(), b.as_mut_ptr(), b.len()) };
         b.iter().position(|&c| c == 0).unwrap_or(0)
     }
@@ -135,7 +136,7 @@ mod unix {
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
 mod imp {
-    pub use super::unix::{current, end_kick, waiting_cell, exit_now, fork, kick, name, note_current};
+    pub use super::unix::{current, end_kick, waiting_cell, exit_now, fork, kick, name, note_current, own_name};
 
     pub fn realtime() -> bool {
         extern "C" {
@@ -148,7 +149,7 @@ mod imp {
 
 #[cfg(target_vendor = "apple")]
 mod imp {
-    pub use super::unix::{current, end_kick, waiting_cell, exit_now, fork, kick, name, note_current};
+    pub use super::unix::{current, end_kick, waiting_cell, exit_now, fork, kick, name, note_current, own_name};
     use super::unix::pthread_self;
 
     /// A thread with a time-constraint policy (CoreAudio's IO threads, audio workgroups).

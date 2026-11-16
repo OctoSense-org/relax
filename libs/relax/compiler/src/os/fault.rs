@@ -560,11 +560,58 @@ mod imp {
         size: usize,
     }
 
-    fn default_action(sig: i32) {
+    pub(crate) fn default_action(sig: i32) {
         let act = SigAction { handler: 0, mask: [0; 16], flags: 0, pad: 0, restorer: 0 };
         unsafe {
             sigaction(sig, &act, std::ptr::null_mut());
         }
+    }
+
+    /// The interrupted context's (pc, sp, fp, lr) (`uc`: a handler's third argument).
+    pub(crate) unsafe fn regs(uc: *mut u8) -> (u64, u64, u64, u64) {
+        let gregs = uc.add(40) as *const u64;
+        (*gregs.add(16), *gregs.add(15), *gregs.add(10), 0)
+    }
+
+    /// The fault's data address (`info`: a handler's second argument; 0 without one).
+    pub(crate) unsafe fn fault_addr(info: *const u8) -> u64 {
+        if info.is_null() { 0 } else { *(info.add(16) as *const u64) }
+    }
+
+    /// The calling thread's alternate signal stack, [lo, hi) ((0, 0): none on).
+    pub(crate) fn altstack() -> (u64, u64) {
+        const SS_DISABLE: i32 = 2;
+        let mut old = StackT { sp: std::ptr::null_mut(), flags: 0, pad: 0, size: 0 };
+        if unsafe { sigaltstack(std::ptr::null(), &mut old) } != 0 || old.flags & SS_DISABLE != 0 {
+            return (0, 0);
+        }
+        (old.sp as u64, old.sp as u64 + old.size as u64)
+    }
+
+    /// The faults whose handler the host keeps on top (`chain_behind`).
+    const HOST_FAULTS: [i32; 4] = [SIGILL, SIGBUS, SIGFPE, SIGSEGV];
+
+    /// progsig.rs's `set` of `sig` to handler `h` with `flags`: where `sig` is a fault of the
+    /// host's and the kernel runs our handler for it, that stays and `h` goes behind it (true);
+    /// else nothing changes (false: the caller sets the kernel's action).
+    pub(crate) unsafe fn chain_behind(sig: i32, h: usize, flags: i32) -> bool {
+        if !HOST_FAULTS.contains(&sig) {
+            return false;
+        }
+        let mut cur = SigAction { handler: 0, mask: [0; 16], flags: 0, pad: 0, restorer: 0 };
+        if sigaction(sig, std::ptr::null(), &mut cur) != 0 || cur.handler != on_signal as *const () as usize {
+            return false;
+        }
+        if h != on_signal as *const () as usize {
+            CHAINED[sig as usize][0].store(h, Ordering::SeqCst);
+            CHAINED[sig as usize][1].store(flags as usize, Ordering::SeqCst);
+        }
+        true
+    }
+
+    /// The flags of the handler chained behind ours for `sig`.
+    pub(crate) fn chained_flags(sig: i32) -> i32 {
+        CHAINED.get(sig as usize).map_or(0, |c| c[1].load(Ordering::SeqCst) as i32)
     }
 
     extern "C" fn on_signal(sig: i32, info: *mut u8, uc: *mut u8) {
@@ -776,11 +823,58 @@ mod imp {
         size: usize,
     }
 
-    fn default_action(sig: i32) {
+    pub(crate) fn default_action(sig: i32) {
         let act = SigAction { handler: 0, mask: 0, flags: 0, pad: 0, restorer: 0 };
         unsafe {
             sigaction(sig, &act, std::ptr::null_mut());
         }
+    }
+
+    /// The interrupted context's (pc, sp, fp, lr) (`uc`: a handler's third argument).
+    pub(crate) unsafe fn regs(uc: *mut u8) -> (u64, u64, u64, u64) {
+        let reg = |i: usize| *(uc.add(OFFSETS[i]) as *const u64);
+        (reg(14), reg(13), reg(11), reg(12))
+    }
+
+    /// The fault's data address (`info`: a handler's second argument; 0 without one).
+    pub(crate) unsafe fn fault_addr(info: *const u8) -> u64 {
+        if info.is_null() { 0 } else { *(info.add(OFFSETS[7]) as *const u64) }
+    }
+
+    /// The calling thread's alternate signal stack, [lo, hi) ((0, 0): none on).
+    pub(crate) fn altstack() -> (u64, u64) {
+        const SS_DISABLE: i32 = 2;
+        let mut old = StackT { sp: std::ptr::null_mut(), flags: 0, pad: 0, size: 0 };
+        if unsafe { sigaltstack(std::ptr::null(), &mut old) } != 0 || old.flags & SS_DISABLE != 0 {
+            return (0, 0);
+        }
+        (old.sp as u64, old.sp as u64 + old.size as u64)
+    }
+
+    /// The faults whose handler the host keeps on top (`chain_behind`).
+    const HOST_FAULTS: [i32; 4] = [SIGILL, SIGBUS, SIGFPE, SIGSEGV];
+
+    /// progsig.rs's `set` of `sig` to handler `h` with `flags`: where `sig` is a fault of the
+    /// host's and the kernel runs our handler for it, that stays and `h` goes behind it (true);
+    /// else nothing changes (false: the caller sets the kernel's action).
+    pub(crate) unsafe fn chain_behind(sig: i32, h: usize, flags: i32) -> bool {
+        if !HOST_FAULTS.contains(&sig) {
+            return false;
+        }
+        let mut cur = SigAction { handler: 0, mask: 0, flags: 0, pad: 0, restorer: 0 };
+        if sigaction(sig, std::ptr::null(), &mut cur) != 0 || cur.handler != on_signal as *const () as usize {
+            return false;
+        }
+        if h != on_signal as *const () as usize {
+            CHAINED[sig as usize][0].store(h, Ordering::SeqCst);
+            CHAINED[sig as usize][1].store(flags as usize, Ordering::SeqCst);
+        }
+        true
+    }
+
+    /// The flags of the handler chained behind ours for `sig`.
+    pub(crate) fn chained_flags(sig: i32) -> i32 {
+        CHAINED.get(sig as usize).map_or(0, |c| c[1].load(Ordering::SeqCst) as i32)
     }
 
     extern "C" fn on_signal(sig: i32, info: *mut u8, uc: *mut u8) {
@@ -1004,11 +1098,59 @@ mod imp {
     const SS_PC: usize = SS + 256;
     const SS_SP: usize = SS + 248;
 
-    fn default_action(sig: i32) {
+    pub(crate) fn default_action(sig: i32) {
         let act = SigAction { handler: 0, mask: 0, flags: 0 };
         unsafe {
             sigaction(sig, &act, std::ptr::null_mut());
         }
+    }
+
+    /// The interrupted context's (pc, sp, fp, lr) (`uc`: a handler's third argument).
+    pub(crate) unsafe fn regs(uc: *mut u8) -> (u64, u64, u64, u64) {
+        let mc = *(uc.add(UC_MCONTEXT) as *const *const u8);
+        let reg = |off: usize| *(mc.add(off) as *const u64);
+        (reg(SS_PC), reg(SS_SP), reg(SS_FP), reg(SS + 240))
+    }
+
+    /// The fault's data address (`info`: a handler's second argument; 0 without one).
+    pub(crate) unsafe fn fault_addr(info: *const u8) -> u64 {
+        if info.is_null() { 0 } else { *(info.add(SI_ADDR) as *const u64) }
+    }
+
+    /// The calling thread's alternate signal stack, [lo, hi) ((0, 0): none on).
+    pub(crate) fn altstack() -> (u64, u64) {
+        const SS_DISABLE: i32 = 4;
+        let mut old = StackT { sp: std::ptr::null_mut(), size: 0, flags: 0 };
+        if unsafe { sigaltstack(std::ptr::null(), &mut old) } != 0 || old.flags & SS_DISABLE != 0 {
+            return (0, 0);
+        }
+        (old.sp as u64, old.sp as u64 + old.size as u64)
+    }
+
+    /// The faults whose handler the host keeps on top (`chain_behind`).
+    const HOST_FAULTS: [i32; 5] = [SIGILL, SIGTRAP, SIGBUS, SIGFPE, SIGSEGV];
+
+    /// progsig.rs's `set` of `sig` to handler `h` with `flags`: where `sig` is a fault of the
+    /// host's and the kernel runs our handler for it, that stays and `h` goes behind it (true);
+    /// else nothing changes (false: the caller sets the kernel's action).
+    pub(crate) unsafe fn chain_behind(sig: i32, h: usize, flags: i32) -> bool {
+        if !HOST_FAULTS.contains(&sig) {
+            return false;
+        }
+        let mut cur = SigAction { handler: 0, mask: 0, flags: 0 };
+        if sigaction(sig, std::ptr::null(), &mut cur) != 0 || cur.handler != on_signal as *const () as usize {
+            return false;
+        }
+        if h != on_signal as *const () as usize {
+            CHAINED[sig as usize][0].store(h, Ordering::SeqCst);
+            CHAINED[sig as usize][1].store(flags as usize, Ordering::SeqCst);
+        }
+        true
+    }
+
+    /// The flags of the handler chained behind ours for `sig`.
+    pub(crate) fn chained_flags(sig: i32) -> i32 {
+        CHAINED.get(sig as usize).map_or(0, |c| c[1].load(Ordering::SeqCst) as i32)
     }
 
     /// RELAX_COMPILE_WATCH: the watcher asks a thread stuck in one step where it is (no lock:
@@ -1595,6 +1737,48 @@ pub fn die_by(sig: i32) -> ! {
 /// What this module holds of a run, as a fresh process has it (`run_end`). Nothing of the run is left that could see it.
 pub(crate) unsafe fn reset_statics() {
     imp::reset_statics();
+}
+
+/// The host's own code: the executable range of the image this crate is in, [lo, hi) ((0, 0):
+/// not read, or JIT code itself). progsig.rs routes a fault on a thread with no program state by
+/// it; read once, at the signal thread's start.
+#[cfg(unix)]
+static HOST_TEXT: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+#[cfg(unix)]
+pub(crate) fn note_host_text() {
+    use std::sync::atomic::Ordering::Relaxed;
+    if let Some((lo, hi)) = crate::inspect::symbols::text_of(note_host_text as *const () as u64) {
+        HOST_TEXT[0].store(lo, Relaxed);
+        HOST_TEXT[1].store(hi, Relaxed);
+    }
+}
+
+/// Is `pc` in the host's own code? True also where that is not known: a fault there is the
+/// host's crash, reported. Async-signal-safe.
+#[cfg(unix)]
+pub(crate) fn host_code(pc: u64) -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    let (lo, hi) = (HOST_TEXT[0].load(Relaxed), HOST_TEXT[1].load(Relaxed));
+    hi == 0 || (lo <= pc && pc < hi)
+}
+
+/// The interrupted pc of a handler's context `uc`.
+#[cfg(unix)]
+pub(crate) unsafe fn pc_of(uc: *mut u8) -> u64 {
+    imp::regs(uc).0
+}
+
+/// The report of a signal the process ends by where nothing else reported it (progsig.rs's
+/// routing: a fault inside a compile, in the host's own code, or racing a disposition change),
+/// then the default action: the handler returns, the instruction faults again and the core holds
+/// the true context. No allocation, no lock.
+#[cfg(unix)]
+pub(crate) unsafe fn fatal_signal(sig: i32, info: *mut u8, uc: *mut u8, why: &str) {
+    let (pc, sp, fp, lr) = imp::regs(uc);
+    let f = Fault { kind: unix::kind(sig), sig, pc, sp, fp, addr: imp::fault_addr(info), lr };
+    crate::jit::raw_fatal_signal(&f, why, imp::altstack());
+    imp::default_action(sig);
 }
 
 #[cfg(all(test, any(target_os = "linux", target_vendor = "apple")))]
