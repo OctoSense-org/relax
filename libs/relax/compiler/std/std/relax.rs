@@ -151,6 +151,7 @@ extern "C" {
     fn __relax_module_load_stream(name: *const u8, nlen: usize, path: *const u8, plen: usize, src: *const u8, slen: usize, deps: *const u8, dlen: usize) -> u64;
     fn __relax_module_stream(h: u64, src: *const u8, slen: usize, kept: *mut usize) -> u32;
     fn __relax_module_stream_settled(h: u64) -> u32;
+    fn __relax_module_stream_hold(h: u64, on: u32) -> u32;
     fn __relax_module_get(h: u64, name: *const u8, nlen: usize, ty: *const u8, tlen: usize) -> u64;
     fn __relax_module_replace(h: u64, src: *const u8, slen: usize) -> u32;
     fn __relax_module_unload(h: u64);
@@ -632,6 +633,16 @@ pub enum Edit {
     NeedsReload,
 }
 
+/// A module stream's hold ([`Module::hold_stream`]); dropping it releases the stream.
+pub struct StreamHold(u64);
+
+impl Drop for StreamHold {
+    fn drop(&mut self) {
+        // (a module unloaded meanwhile has no stream left to release)
+        unsafe { __relax_module_stream_hold(self.0, 0) };
+    }
+}
+
 /// The result of feeding a module's whole source so far.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Stream {
@@ -778,6 +789,19 @@ impl Module {
     pub fn stream_settled(&self) -> Result<(), String> {
         match unsafe { __relax_module_stream_settled(self.0) } {
             0 => Ok(()),
+            _ => Err(last_error()),
+        }
+    }
+
+    /// Holds this module's stream until the returned guard drops: each `stream` call only keeps
+    /// its text as the newest pending one and returns `Stream::Pending`, and the live watcher
+    /// neither feeds nor reports it (a burst of text that should land as one edit, or not while
+    /// the app is in the middle of something). On release the watcher, or the next feed, applies
+    /// the newest text. `finish_stream` and `unload` end the stream and its hold;
+    /// `stream_settled` on a held stream with a pending text is `Err`.
+    pub fn hold_stream(&self) -> Result<StreamHold, String> {
+        match unsafe { __relax_module_stream_hold(self.0, 1) } {
+            0 => Ok(StreamHold(self.0)),
             _ => Err(last_error()),
         }
     }

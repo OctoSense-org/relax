@@ -9683,6 +9683,9 @@ struct StreamFile {
     text: Vec<u8>,
     changed: Option<Instant>,
     reported: bool,
+    /// held by the program (std::relax Module::hold_stream): its feeds only keep the newest text
+    /// pending, and the watcher neither feeds nor reports it until it is released
+    held: bool,
 }
 #[derive(Clone, PartialEq, Eq)]
 enum StreamTarget {
@@ -9760,6 +9763,11 @@ unsafe fn apply_stream_target(up: *mut Unit, target: StreamTarget, text: Vec<u8>
         state.text = text.clone();
     }
     state.pending = Some(text);
+    if state.held {
+        let mut o = idle_outcome(None, "incomplete: the stream is held");
+        o.pending = true;
+        return o;
+    }
     // the watcher drains a coalesced prefix and reports a stalled stream: it polls while one is open
     watch_events::kick();
     if state.last.is_some_and(|t| t.elapsed().as_millis() < 16) {
@@ -9803,6 +9811,26 @@ pub(crate) fn forget_module_stream(up: *mut Unit, h: u64) {
     STREAMS_SETTLED.notify_all();
 }
 
+/// Holds (`on`) or releases module `h`'s stream (std::relax Module::hold_stream). A release with a
+/// pending text wakes the watcher, which feeds it. False: the module is not loaded.
+pub(crate) fn hold_module_stream(up: *mut Unit, h: u64, on: bool) -> bool {
+    let mut streams = STREAMS.lock().unwrap_or_else(|e| e.into_inner());
+    if crate::modules::stream_target(h).is_none() {
+        return false;
+    }
+    let target = StreamTarget::Module(h);
+    match streams.iter_mut().find(|s| s.0 == up as usize && s.1 == target) {
+        Some(s) => s.2.held = on,
+        // (a release of a stream that ended -- finish_stream, unload -- has nothing to release)
+        None if on => streams.push((up as usize, target, StreamFile { held: true, ..StreamFile::default() })),
+        None => {}
+    }
+    if !on {
+        watch_events::kick();
+    }
+    true
+}
+
 /// Waits until the live watcher has nothing left of module `h`'s stream (std::relax
 /// Module::stream_settled): the newest coalesced prefix fed and, once its text stopped changing,
 /// the stall pass made (drain_streams). No stream open: at once. Err when nothing would settle
@@ -9810,8 +9838,12 @@ pub(crate) fn forget_module_stream(up: *mut Unit, h: u64) {
 pub(crate) fn module_stream_settled(up: *mut Unit, h: u64) -> Result<(), String> {
     let mut streams = STREAMS.lock().unwrap_or_else(|e| e.into_inner());
     loop {
-        if streams.iter().all(|s| !(s.0 == up as usize && s.1 == StreamTarget::Module(h)) || s.2.settled()) {
+        let mine = streams.iter().find(|s| s.0 == up as usize && s.1 == StreamTarget::Module(h));
+        if mine.is_none_or(|s| s.2.settled()) {
             return Ok(());
+        }
+        if mine.is_some_and(|s| s.2.held) {
+            return Err("the stream is held (Module::hold_stream): nothing applies it until the hold is released".to_string());
         }
         if crate::modules::stream_target(h).is_none() {
             return Err("the module was unloaded".to_string());
@@ -9826,14 +9858,14 @@ pub(crate) fn module_stream_settled(up: *mut Unit, h: u64) -> Result<(), String>
 /// A stream of `up` has a coalesced prefix to feed or a stall still to report (drain_streams
 /// has work in the next rounds).
 fn streams_busy(up: *mut Unit) -> bool {
-    STREAMS.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|s| s.0 == up as usize && !s.2.settled())
+    STREAMS.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|s| s.0 == up as usize && !s.2.held && !s.2.settled())
 }
 
 unsafe fn drain_streams(up: *mut Unit) {
     let mut streams = STREAMS.lock().unwrap_or_else(|e| e.into_inner());
     // a stream this drain fed or reported: module_stream_settled's waiters look again
     let mut worked = false;
-    for (_, target, s) in streams.iter_mut().filter(|s| s.0 == up as usize) {
+    for (_, target, s) in streams.iter_mut().filter(|s| s.0 == up as usize && !s.2.held) {
         let Some((file, path)) = target_file(up, target) else { continue };
         if s.pending.is_some() && s.last.is_none_or(|t| t.elapsed().as_millis() >= 16) {
             let text = s.pending.take().unwrap();
