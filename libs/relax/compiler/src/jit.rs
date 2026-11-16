@@ -4578,10 +4578,9 @@ thread_local! {
 }
 
 /// `__relax_catch_caught`, which std's catch_unwind calls just before its recovery point: the
-/// panic that point catches goes back to the program, and its report line says so
-/// (`report (caught):`). A panic that ends a thread or a test keeps `report:`, and a log's readers
-/// (land_gate.sh's test_failures, jit_misses) count only those: untagged, a test run's deliberate
-/// panics read as its failures (11-07).
+/// panic that point catches goes back to the program, which handles it, and no report follows
+/// std's message (rustc prints only that). A panic that ends a thread or a test keeps its
+/// `report:` line, which a log's readers (land_gate.sh's test_failures, jit_misses) count.
 pub extern "C" fn relax_catch_caught() {
     let _ = CATCH_CAUGHT.try_with(|c| c.set(true));
 }
@@ -4603,10 +4602,17 @@ pub(crate) fn rt_catch_panic(f: u64, data: u64) -> u64 {
         // the run ended: the code this returns to faults, on to the next recovery point
         Err(p) if p.kind == RUN_ENDED_KIND => 1,
         Err(p) => {
-            let r = owner::call(owner::Class::Job, || unsafe { (&*u).report(&p) });
-            fatal_compile_error(&p, &r);
-            // std's hook already printed the panic message (as rustc's does); add where
-            eprintln!("  report{}: {}", if caught { " (caught)" } else { "" }, r);
+            // A panic of the program's that the program catches (catch_unwind, the harness of a
+            // `#[should_panic]` test) is the program's to handle: std's hook printed its message, as
+            // rustc's does, and nothing more is said. A compile error, a fault or a hang the JIT
+            // contained is no panic of the program's: its report follows, caught or not.
+            let program_panic = p.kind == "panic" && !p.message.starts_with("compile error in ") && !is_ice_stub_message(&p.message);
+            if !(caught && program_panic) {
+                let r = owner::call(owner::Class::Job, || unsafe { (&*u).report(&p) });
+                fatal_compile_error(&p, &r);
+                // std's hook already printed the panic message (as rustc's does); add where
+                eprintln!("  report: {}", r);
+            }
             // A contained hang or fault has no std payload. A null file asks std to record
             // the message without running the user hook or replacing an existing payload.
             let hook = unsafe { (*u).panic_hook.load(Ordering::Acquire) };

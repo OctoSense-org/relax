@@ -118,6 +118,12 @@ pub fn install_core_hook() {
         relax_set_panic_hook(runtime_panic_hook);
         relax_set_payload_end(payload_end);
     }
+    // std's default hook prints the message of every panic, caught or not, as rustc's does (a
+    // hook the program sets replaces it: set_hook). Without it a panic the program caught said
+    // nothing at all, and one it did not left its message to the runtime's report.
+    if unsafe { STD_HOOK }.is_none() {
+        unsafe { STD_HOOK = Some(crate::panic::trampoline) };
+    }
     core::panicking::set_depth_fn(crate::panic::panic_depth_step);
     if core::panicking::hook_fn().is_none() {
         core::panicking::set_hook_fn(Some(core_hook));

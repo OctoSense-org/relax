@@ -1341,14 +1341,27 @@ fn cmd_test(sess: &std::sync::Arc<crate::Session>, args: &[String]) -> i32 {
             continue;
         }
         crate::owner::call(crate::owner::Class::Program, || {
-            match r {
-                Ok(_) => {
+            // libtest calc_result: a `#[should_panic]` test passes by panicking (a program panic,
+            // with the expected text when it names one); a fault or hang fails it
+            let (should_panic, expected) = crate::harness::should_panic_of(&u.prog, d);
+            let failure = match (&r, should_panic) {
+                (Ok(_), 0) => None,
+                (Ok(_), _) => Some("test did not panic as expected".to_string()),
+                (Err(p), 1 | 2) if p.kind == "panic" && (should_panic == 1 || p.message.contains(expected.as_str())) => None,
+                (Err(p), 2) if p.kind == "panic" => Some(format!(
+                    "panic did not contain expected string\n      panic message: {:?}\n expected substring: {:?}",
+                    p.message, expected
+                )),
+                (Err(p), _) => Some(format!("report: {}", u.report(p))),
+            };
+            match failure {
+                None => {
                     println!("test {} ... ok ({:.2} ms)", name, dt);
                     passed += 1;
                 }
-                Err(p) => {
+                Some(why) => {
                     println!("test {} ... FAILED ({:.2} ms)", name, dt);
-                    println!("  report: {}", u.report(&p));
+                    println!("  {}", why);
                     failed += 1;
                 }
             }
