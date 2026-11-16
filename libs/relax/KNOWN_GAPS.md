@@ -236,4 +236,5 @@ against it, on top of what the program itself allocates.
   use runs out sooner.
 
 This is by design: the JIT and the program are one process. A program that tests itself under a
-tight data limit needs headroom for the JIT above what it uses itself.
+tight data limit needs headroom for the JIT above what it uses itself. When the JIT itself runs
+out under such a limit, it says so, names the limit, and the run stops with exit code 101.

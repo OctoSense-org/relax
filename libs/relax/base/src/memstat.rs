@@ -468,8 +468,13 @@ impl Counting {
 #[inline(always)]
 fn outside_domains<R>(f: impl FnOnce() -> R) -> R {
     if relax_session::phase::in_run() {
-        let _kept = relax_session::phase::kept();
-        return f();
+        let r = {
+            let _kept = relax_session::phase::kept();
+            f()
+        };
+        // (the block is a provided crate's op's: a refusal is the program's, not the JIT's)
+        crate::zone_alloc::jit_oom::forget();
+        return r;
     }
     f()
 }

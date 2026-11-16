@@ -359,12 +359,69 @@ mod unix {
             crate::tui::fatal_drain(text.as_bytes());
         }
 
+        /// The abort of a JIT allocation the system refused (`handle_alloc_error` after
+        /// jit_oom::refused): says so, with the data limit, and ends the process with 101 as a
+        /// fatal compile error does. A crash report would need the memory that is not there (its
+        /// frames came out by address only). Async-signal-safe: a stack buffer, getrlimit, write.
+        unsafe fn out_of_memory(size: usize, thread: &[u8]) -> ! {
+            extern "C" {
+                fn getrlimit(resource: i32, rlim: *mut [u64; 2]) -> i32;
+                fn _exit(code: i32) -> !;
+            }
+            // (Linux and macOS alike; RLIM_INFINITY is all ones on Linux, i64::MAX on macOS)
+            const RLIMIT_DATA: i32 = 2;
+            let mut lim = [u64::MAX; 2];
+            let limited = getrlimit(RLIMIT_DATA, &mut lim) == 0 && lim[0] < i64::MAX as u64;
+            let mut out = [0u8; 640];
+            let mut k = 0;
+            let mut put = |b: &[u8]| {
+                for &c in b {
+                    if k < out.len() {
+                        out[k] = c;
+                        k += 1;
+                    }
+                }
+            };
+            let num = |mut n: u64, digits: &mut [u8; 20]| -> usize {
+                let mut i = digits.len();
+                loop {
+                    i -= 1;
+                    digits[i] = b'0' + (n % 10) as u8;
+                    n /= 10;
+                    if n == 0 {
+                        return i;
+                    }
+                }
+            };
+            let mut d = [0u8; 20];
+            put(b"relax: the JIT ran out of memory: the system refused it ");
+            let i = num(size as u64, &mut d);
+            put(&d[i..]);
+            put(b" bytes on thread '");
+            put(thread);
+            put(b"'. ");
+            if limited {
+                put(b"The JIT compiles in the program's process, so its memory counts against the data limit the program set (RLIMIT_DATA ");
+                let i = num(lim[0] >> 20, &mut d);
+                put(&d[i..]);
+                put(b" MB): give the JIT headroom above the program's own use (Relax's KNOWN_GAPS.md, 11).");
+            } else {
+                put(b"No data limit is set: the machine has no memory left for it.");
+            }
+            put(b" The run stops here.\n");
+            crate::os::fault::raw_stderr(&out[..k]);
+            _exit(101)
+        }
+
         /// Reports SIGABRT (on the aborting thread, before its handler restores the default
         /// action): a line on the real stderr, then the reporter's report. Async-signal-safe.
         pub unsafe fn report_abort(pc: u64, fp: u64) {
             let mut name = [0u8; 64];
             pthread_getname_np(pthread_self(), name.as_mut_ptr(), name.len());
             let len = name.iter().position(|&c| c == 0).unwrap_or(0);
+            if let Some(size) = crate::zone_alloc::jit_oom::refused_just_now() {
+                out_of_memory(size, &name[..len]);
+            }
             let mut line = [0u8; 128];
             let mut k = 0;
             for &c in b"relax: SIGABRT on thread '".iter().chain(&name[..len]).chain(b"'\n") {
@@ -1548,6 +1605,41 @@ mod abort_tests {
     extern "C" {
         fn kill(pid: i32, sig: i32) -> i32;
         fn setrlimit(resource: i32, limit: *const [u64; 2]) -> i32;
+        fn getrlimit(resource: i32, limit: *mut [u64; 2]) -> i32;
+    }
+
+    /// Relax issue 231: under a data limit the program set (RLIMIT_DATA counts the JIT's memory),
+    /// an allocation of the JIT's that the system refused ended in `handle_alloc_error`'s abort()
+    /// and a crash report whose frames came out by address only. The abort that follows a refused
+    /// allocation of the JIT's says so, names the limit, and ends the process with 101, as a fatal
+    /// compile error does: no crash report.
+    #[test]
+    fn a_refused_jit_allocation_ends_the_run_with_its_reason() {
+        const CHILD: &str = "RELAX_REFUSED_ALLOCATION_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            unsafe { setrlimit(4, &[0, 0]) };
+            // a data limit far above what the process uses: only the request below meets it
+            let mut lim = [0u64; 2];
+            unsafe { getrlimit(2, &mut lim) };
+            assert_eq!(unsafe { setrlimit(2, &[1 << 40, lim[1]]) }, 0);
+            super::install();
+            super::start_abort_reporter();
+            // what handle_alloc_error does after the allocator refuses an infallible request
+            let p = unsafe { std::alloc::alloc(std::alloc::Layout::from_size_align(1 << 60, 1).unwrap()) };
+            assert!(p.is_null());
+            std::process::abort();
+        }
+        let _slot = crate::test_child::slot();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "os::fault::abort_tests::a_refused_jit_allocation_ends_the_run_with_its_reason", "--nocapture", "--test-threads=1"])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        let err = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(101), "status {:?}:\n{err}", output.status);
+        assert!(err.contains("relax: the JIT ran out of memory: the system refused it 1152921504606846976 bytes on thread '"), "no reason:\n{err}");
+        assert!(err.contains("(RLIMIT_DATA 1048576 MB)") && err.contains("The run stops here."), "no data limit:\n{err}");
+        assert!(!err.contains("report:") && !err.contains("SIGABRT on thread"), "a crash report too:\n{err}");
     }
 
     /// A chain walked with no recorded stack bounds ends at the first word it cannot read, with
