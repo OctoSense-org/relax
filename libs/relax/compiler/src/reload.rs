@@ -854,6 +854,55 @@ fn first_tok_at(toks: &(impl crate::parser::lazy_bodies::TokSeq + ?Sized), lo: u
     a
 }
 
+/// Where item `it` starts with the outer attributes and doc comments before it (`#[..]`, `///`):
+/// they are the item's, not its container's. A container's key and text are its own tokens with
+/// its items' spans left out (`holes`), and a method added with a `#[cfg]` changed its impl's
+/// head: the impl paired with the file's other `impl` of the same type, whose methods were lost
+/// ("no method named `dispatch_a11y_action` found for `&mut Cx`", 11-16). An inner attribute
+/// (`#![..]`) stays its container's.
+fn lo_with_attrs(pf: &crate::parser::ParsedFile, it: &crate::ast::Item) -> u32 {
+    use crate::lexer::T;
+    if it.lo as usize >= pf.src.len() {
+        return it.lo;
+    }
+    let toks = &pf.toks;
+    let mut i = first_tok_at(toks, it.lo);
+    if i >= toks.len() || toks.at(i).lo != it.lo {
+        return it.lo;
+    }
+    while i > 0 {
+        if toks.at(i - 1).kind == T::DocComment {
+            i -= 1;
+            continue;
+        }
+        if toks.at(i - 1).kind != T::CloseBracket {
+            break;
+        }
+        // the `[` that `]` closes, then `#`
+        let mut depth = 0i32;
+        let mut j = i - 1;
+        let open = loop {
+            match toks.at(j).kind {
+                T::CloseParen | T::CloseBracket | T::CloseBrace => depth += 1,
+                T::OpenParen | T::OpenBracket | T::OpenBrace => depth -= 1,
+                _ => {}
+            }
+            if depth == 0 {
+                break Some(j);
+            }
+            if j == 0 {
+                break None;
+            }
+            j -= 1;
+        };
+        match open {
+            Some(j) if j >= 1 && toks.at(j).kind == T::OpenBracket && toks.at(j - 1).kind == T::Pound => i = j - 1,
+            _ => break,
+        }
+    }
+    toks.at(i).lo.min(it.lo)
+}
+
 fn toks<'a>(pf: &'a crate::parser::ParsedFile, lo: u32, hi: u32, holes: &[(u32, u32)]) -> Vec<&'a [u8]> {
     // past the file's text: the expansions of its lazily parsed bodies (a part's tokens and text,
     // ParsedFile::part). The file's own text does not reach them: a range read from it there
@@ -1326,7 +1375,7 @@ fn item_keys(pf: &crate::parser::ParsedFile) -> Vec<String> {
             if derives[iid.0 as usize].is_some() { continue; }
             let it = ast.item(iid);
             let kids = child_items(ast, &it.kind);
-            let holes: Vec<(u32, u32)> = kids.iter().map(|c| (ast.items[c.0 as usize].lo, ast.items[c.0 as usize].hi)).collect();
+            let holes: Vec<(u32, u32)> = kids.iter().map(|c| (lo_with_attrs(pf, &ast.items[c.0 as usize]), ast.items[c.0 as usize].hi)).collect();
             let head = match &it.kind {
                 ItemKind::Impl { .. } | ItemKind::Use { .. } | ItemKind::Mac(_) | ItemKind::ForeignMod(..) | ItemKind::ExternCrate(_) => {
                     let mut head = String::new();
@@ -1658,16 +1707,42 @@ fn item_keys_memo(pf: &crate::parser::ParsedFile) -> std::rc::Rc<Vec<String>> {
 }
 
 pub(crate) fn pair_items(old: &crate::parser::ParsedFile, new: &crate::parser::ParsedFile) -> (Vec<(u32, u32)>, Vec<u32>, Vec<u32>) {
+    use crate::ast::ItemKind;
     let ko = item_keys_memo(old);
     let kn = item_keys_memo(new);
+    // Repeats of a key are numbered in order (item_keys), so a block added before or between
+    // `impl`s of one header renumbered the blocks after it, and each paired with its neighbour:
+    // one block's methods became the other's (E0034, 11-16). Impls whose header repeats in either
+    // version pair by the items they share instead, the rest of them in order.
+    let base = |k: &str| -> String { k.rsplit_once('#').map_or(k, |x| x.0).to_string() };
+    let impl_at = |pf: &crate::parser::ParsedFile, i: usize| matches!(pf.ast.items[i].kind, ItemKind::Impl(_));
+    let mut groups: std::collections::BTreeMap<String, (Vec<usize>, Vec<usize>)> = Default::default();
+    for (i, k) in ko.iter().enumerate() {
+        if impl_at(old, i) {
+            groups.entry(base(k)).or_default().0.push(i);
+        }
+    }
+    for (j, k) in kn.iter().enumerate() {
+        if impl_at(new, j) {
+            groups.entry(base(k)).or_default().1.push(j);
+        }
+    }
+    groups.retain(|_, (o, n)| o.len() > 1 || n.len() > 1);
+    let grouped_old: crate::fxhash::HashSet<usize> = groups.values().flat_map(|g| g.0.iter().copied()).collect();
+    let grouped_new: crate::fxhash::HashSet<usize> = groups.values().flat_map(|g| g.1.iter().copied()).collect();
     let mut by_key: crate::fxhash::HashMap<&str, u32> = Default::default();
     for (i, k) in kn.iter().enumerate() {
-        by_key.insert(k.as_str(), i as u32);
+        if !grouped_new.contains(&i) {
+            by_key.insert(k.as_str(), i as u32);
+        }
     }
     let mut pairs = Vec::new();
     let mut removed = Vec::new();
     let mut used = vec![false; kn.len()];
     for (i, k) in ko.iter().enumerate() {
+        if grouped_old.contains(&i) {
+            continue;
+        }
         match by_key.get(k.as_str()) {
             Some(&j) => {
                 pairs.push((i as u32, j));
@@ -1676,6 +1751,49 @@ pub(crate) fn pair_items(old: &crate::parser::ParsedFile, new: &crate::parser::P
             None => removed.push(i as u32),
         }
     }
+    let kids = |pf: &crate::parser::ParsedFile, keys: &[String], i: usize| -> crate::fxhash::HashSet<String> {
+        child_items(&pf.ast, &pf.ast.items[i].kind).iter().map(|c| keys[c.0 as usize].clone()).collect()
+    };
+    for (olds, news) in groups.values() {
+        let ok: Vec<_> = olds.iter().map(|&i| kids(old, &ko, i)).collect();
+        let nk: Vec<_> = news.iter().map(|&j| kids(new, &kn, j)).collect();
+        let mut shared: Vec<(usize, usize, usize)> = Vec::new();
+        for (a, ka) in ok.iter().enumerate() {
+            for (b, kb) in nk.iter().enumerate() {
+                let n = ka.intersection(kb).count();
+                if n > 0 {
+                    shared.push((n, a, b));
+                }
+            }
+        }
+        shared.sort_by_key(|&(n, a, b)| (std::cmp::Reverse(n), a, b));
+        let (mut old_done, mut new_done) = (vec![false; olds.len()], vec![false; news.len()]);
+        for (_, a, b) in shared {
+            if !old_done[a] && !new_done[b] {
+                old_done[a] = true;
+                new_done[b] = true;
+                pairs.push((olds[a] as u32, news[b] as u32));
+            }
+        }
+        let rest_new: Vec<usize> = (0..news.len()).filter(|&b| !new_done[b]).collect();
+        let mut rest_new = rest_new.into_iter();
+        for a in (0..olds.len()).filter(|&a| !old_done[a]) {
+            match rest_new.next() {
+                Some(b) => {
+                    new_done[b] = true;
+                    pairs.push((olds[a] as u32, news[b] as u32));
+                }
+                None => removed.push(olds[a] as u32),
+            }
+        }
+        for (b, done) in new_done.iter().enumerate() {
+            if *done {
+                used[news[b]] = true;
+            }
+        }
+    }
+    pairs.sort_unstable();
+    removed.sort_unstable();
     let added = (0..kn.len() as u32).filter(|j| !used[*j as usize]).collect();
     (pairs, removed, added)
 }
@@ -2139,12 +2257,13 @@ fn classify_moving(prog: &crate::program::Program, old_file: u32, new: &crate::p
     for &(i, j) in &pairs {
         let (a, b) = (&oa.items[i as usize], &na.items[j as usize]);
         let name = String::from_utf8_lossy(&new.src[b.name.lo as usize..b.name.hi as usize]).into_owned();
-        // (a module's items with their attributes: an item's attributes are classified with it)
+        // (a container's items with their attributes: an item's attributes are classified with it)
         let holes = |pf: &crate::parser::ParsedFile, k: &ItemKind| -> Vec<(u32, u32)> {
             let module = matches!(k, ItemKind::Mod(_));
             child_items(&pf.ast, k).iter().map(|c| {
                 let it = &pf.ast.items[c.0 as usize];
-                let lo = if module { pf.ast.list(it.attrs).iter().filter_map(|t| pf.toks.get(t.toks.lo as usize).map(|x| x.lo)).fold(it.lo, u32::min) } else { it.lo };
+                let lo = lo_with_attrs(pf, it);
+                let lo = if module { pf.ast.list(it.attrs).iter().filter_map(|t| pf.toks.get(t.toks.lo as usize).map(|x| x.lo)).fold(lo, u32::min) } else { lo };
                 (lo, it.hi)
             }).collect()
         };

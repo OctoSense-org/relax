@@ -2813,6 +2813,62 @@ pub fn {name}(p: *mut u64) {{
     std::fs::remove_dir_all(dir).unwrap();
 }
 
+/// A type's inherent methods split over several `impl` blocks, in its own file and in another:
+/// an edit that adds methods to one block (plain, then with a doc comment and a `cfg`), or a new
+/// block before the others, patches, and every other block's methods stay the type's, for
+/// callers in unchanged files too (a
+/// landing that added `cfg`'d methods to the first of two `impl Cx` blocks lost the second
+/// block's methods: "no method named `dispatch_a11y_action` found for `&mut Cx`", 11-16).
+#[test]
+fn methods_added_to_one_impl_block_keep_the_other_blocks() {
+    isolated_test!(methods_added_to_one_impl_block_keep_the_other_blocks);
+    use crate::jit::{FnKey, Unit};
+    use crate::reload::{apply, Edit, Rung};
+    crate::jit::CHECK_FIRST.store(false, std::sync::atomic::Ordering::Relaxed);
+    std::env::set_var("RELAX_STD", concat!(env!("CARGO_MANIFEST_DIR"), "/std"));
+    let dir = std::env::temp_dir().join(format!("relax-impl-blocks-{}", std::process::id()));
+    std::fs::create_dir_all(dir.join("app/src")).unwrap();
+    std::fs::write(dir.join("Cargo.toml"), "[workspace]\nmembers = [\"app\"]\n").unwrap();
+    std::fs::write(dir.join("app/Cargo.toml"), "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n").unwrap();
+    let lib_with = |first: &str, added: &str, used: &str| format!("mod other;\nmod split;\npub struct C {{ pub k: u32 }}\n{first}impl C {{\n    pub fn a(&self) -> u32 {{ self.k }}\n{added}}}\nimpl C {{\n    pub fn b(&self) -> u32 {{ self.k * 2 }}\n}}\npub fn value(out: &mut u32) {{\n    let c = C {{ k: 1 }};\n    *out = other::call(&c) * 100 + c.a() * 10 + c.d(){used};\n}}\n");
+    let lib = |added: &str, used: &str| lib_with("", added, used);
+    let src = dir.join("app/src");
+    std::fs::write(src.join("lib.rs"), lib("", "")).unwrap();
+    std::fs::write(src.join("other.rs"), "pub fn call(c: &super::C) -> u32 { c.b() }\n").unwrap();
+    std::fs::write(src.join("split.rs"), "impl super::C {\n    pub fn d(&self) -> u32 { self.k + 2 }\n}\n").unwrap();
+    let app = src.join("lib.rs").to_string_lossy().into_owned();
+    let session = Arc::new(crate::Session::default());
+    let (prog, core, app_crate) = crate::load_with_std(&session, &app, "impl_blocks_app", false).unwrap();
+    let value = prog.defs.iter().enumerate().find_map(|(i, d)| {
+        let id = crate::program::DefId(i as u32);
+        (d.krate == app_crate && prog.name(id) == "value").then_some(id)
+    }).unwrap();
+    let mut tcx = crate::tcx::Tcx::new();
+    tcx.collect(&prog);
+    let mut u = Unit::new(prog, tcx, core);
+    let up = &mut *u as *mut Unit;
+    let entry = crate::owner::call(crate::owner::Class::Program, || { let f = u.fn_id(FnKey::Inst(value, vec![])); u.entry(f) });
+    let run = || {
+        let mut out = 0u32;
+        unsafe { crate::jit::call_jit(up, entry, &mut out as *mut u32 as u64) }.unwrap_or_else(|p| panic!("JIT call panicked: {}", p.message));
+        out
+    };
+    assert_eq!(run(), 213, "b (second block, called from other.rs) 2, a (first block) 1, d (split.rs) 3");
+    let edit = |what: &str, text: String, expect: u32| {
+        let file = unsafe { &*up }.prog.def(value).file;
+        let o = unsafe { apply(up, vec![Edit { file, path: app.clone(), src: text.into_bytes() }]) };
+        assert_eq!(o.rung, Rung::Patch, "{what}: {:?}", o.lines);
+        assert_eq!(run(), expect, "{what}: every block's methods after the edit");
+    };
+    edit("a plain method added to the first block", lib("    pub fn e(&self) -> u32 { 4 }\n", " + c.e() * 1000"), 4213);
+    edit("a documented, cfg'd method added to the first block",
+        lib("    pub fn e(&self) -> u32 { 4 }\n    /// The fifth.\n    #[cfg(not(target_arch = \"wasm32\"))]\n    pub fn f(&self) -> u32 { 5 }\n", " + c.e() * 1000 + c.f() * 10000"), 54213);
+    edit("a new block before the others",
+        lib_with("impl C {\n    pub fn g(&self) -> u32 { 6 }\n}\n", "    pub fn e(&self) -> u32 { 4 }\n    /// The fifth.\n    #[cfg(not(target_arch = \"wasm32\"))]\n    pub fn f(&self) -> u32 { 5 }\n", " + c.e() * 1000 + c.f() * 10000 + c.g() * 100000"), 654213);
+    std::mem::forget(u);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
 /// A type alias in a fn body is part of that body: its edit is the body's edit (the alias
 /// goes and a new one comes with the body). An alias a nested item names restarts as before:
 /// the nested item would keep the old type.
