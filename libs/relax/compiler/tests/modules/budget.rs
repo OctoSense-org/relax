@@ -84,9 +84,22 @@ fn budget() {
     m.call_with(&mut tick, || third(100)).unwrap();
     let count = tick.consumed_fuel();
     assert!(a > 0 && b > a && count > b && tick.remaining_fuel() == 500_000 - count);
-    // Warm each export and wait for tier installation, then compare the same paths.
+    // Warm each export and wait for tier installation, then compare the same paths. With tiering
+    // on, run.sh names the JIT's O3 progress file (RELAX_O3_PROGRESS: `pending installs`): the
+    // exports are called until no O3 build is pending and one was installed at least.
     for _ in 0..3000 { first(3); second(3); third(3); }
-    std::thread::sleep(std::time::Duration::from_millis(800));
+    if let Ok(progress) = std::env::var("RELAX_O3_PROGRESS") {
+        loop {
+            let line = std::fs::read_to_string(&progress).unwrap_or_default();
+            let n: Vec<u64> = line.split_whitespace().filter_map(|x| x.parse().ok()).collect();
+            if n.len() == 2 && n[0] == 0 && n[1] > 0 {
+                eprintln!("budget: tier-up installed ({} O3 installs, none pending)", n[1]);
+                break;
+            }
+            for _ in 0..100 { first(3); second(3); third(3); }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
     tick.reset(500_000, CAP);
     m.call_with(&mut tick, || { first(100); second(100); third(100); }).unwrap();
     assert_eq!(tick.consumed_fuel(), count);
