@@ -2718,6 +2718,101 @@ pub fn value(out: &mut u32) {{
     std::fs::remove_dir_all(dir).unwrap();
 }
 
+/// A thread runs a closure whose captures an edit changed: the closure keeps its old code there
+/// (a slot of a replaced text: the edit's new closure is another slot). Its frame holds a value of
+/// `S`, made by that old code, which it hands to `read` once its loop ends. A field added to `S`
+/// would rebuild `read` for the new layout under that frame, so the layout patch must refuse it,
+/// naming the closure: while its parent fn is the program's and uses `S` (its closures are rebuilt
+/// with it), and once an edit replaced the parent too (renamed: its slots stay for the code in
+/// flight, and nothing checks them against the new definitions: reload::retired_text) (JP-L T3).
+#[test]
+fn a_thread_in_a_closure_an_edit_replaced_blocks_a_layout_patch() {
+    isolated_test!(a_thread_in_a_closure_an_edit_replaced_blocks_a_layout_patch);
+    use crate::jit::{FnKey, Unit};
+    use crate::reload::{apply, Edit, Rung};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    crate::jit::CHECK_FIRST.store(false, Ordering::Relaxed);
+    std::env::set_var("RELAX_STD", concat!(env!("CARGO_MANIFEST_DIR"), "/std"));
+    let dir = std::env::temp_dir().join(format!("relax-retired-frame-{}", std::process::id()));
+    std::fs::create_dir_all(dir.join("app/src")).unwrap();
+    std::fs::write(dir.join("Cargo.toml"), "[workspace]\nmembers = [\"app\"]\n").unwrap();
+    std::fs::write(dir.join("app/Cargo.toml"), "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n").unwrap();
+    // flags: [0] go on, [1] in the loop, [2] what `read` gave the thread, [3] the thread is done
+    let src_of = |name: &str, fields: &str, made: &str, captured: &str, read: &str| format!(r#"use std::sync::atomic::{{AtomicU64, Ordering}};
+pub struct S {{ {fields} }}
+#[inline(never)]
+pub fn read(s: &S) -> u64 {{ s.n }}
+pub fn {name}(p: *mut u64) {{
+    let at = p as usize;
+    {captured}
+    std::thread::spawn(move || {{
+        let a = unsafe {{ &*(at as *const [AtomicU64; 4]) }};
+        let s = {made};
+        a[1].store(1, Ordering::SeqCst);
+        while a[0].load(Ordering::SeqCst) == 0 {{ std::hint::spin_loop(); }}
+        a[2].store({read}, Ordering::SeqCst);
+        a[3].store(1, Ordering::SeqCst);
+    }});
+}}
+"#);
+    let named_src = |name: &str, fields: &str, made: &str, captured: &str, used: &str| src_of(name, fields, &format!("S {{ {made} }}"), captured, &format!("read(&s){used}"));
+    let src = |fields: &str, made: &str, captured: &str, used: &str| named_src("start", fields, made, captured, used);
+    std::fs::write(dir.join("app/src/lib.rs"), src("pub n: u64", "n: 5", "", "")).unwrap();
+    let app = dir.join("app/src/lib.rs").to_string_lossy().into_owned();
+    let session = Arc::new(crate::Session::default());
+    let (prog, core, app_crate) = crate::load_with_std(&session, &app, "retired_frame_app", false).unwrap();
+    let start = prog.defs.iter().enumerate().find_map(|(i, d)| {
+        let id = crate::program::DefId(i as u32);
+        (d.krate == app_crate && prog.name(id) == "start").then_some(id)
+    }).unwrap();
+    let mut tcx = crate::tcx::Tcx::new();
+    tcx.collect(&prog);
+    let mut u = Unit::new(prog, tcx, core);
+    // (no tier-up: a frame in a replaced version of the same text is another case, JP-L T1)
+    u.tier1 = None;
+    let up = &mut *u as *mut Unit;
+    let (start_slot, entry) = crate::owner::call(crate::owner::Class::Program, || { let f = u.fn_id(FnKey::Inst(start, vec![])); (f, u.entry(f)) });
+    let flags: Box<[AtomicU64; 4]> = Box::default();
+    let wait = |k: usize| {
+        let t0 = std::time::Instant::now();
+        while flags[k].load(Ordering::SeqCst) == 0 {
+            assert!(t0.elapsed().as_secs() < 30, "flag {k} never came");
+            std::thread::yield_now();
+        }
+    };
+    unsafe { crate::jit::call_jit(up, entry, flags.as_ptr() as u64) }.unwrap_or_else(|p| panic!("JIT call panicked: {}", p.message));
+    wait(1);
+    let closures = |u: &Unit| -> Vec<u32> {
+        (0..u.fns.len() as u32).filter(|&s| matches!(u.fns[s as usize].key, FnKey::Closure(_, _, p) if p == start_slot) && u.fns[s as usize].compiled).collect()
+    };
+    let old = closures(&u);
+    assert_eq!(old.len(), 1, "the thread's closure has code");
+    let old_name = u.fns[old[0] as usize].name.to_string();
+    let file = u.prog.def(start).file;
+    let apply_text = |text: String| unsafe { apply(up, vec![Edit { file, path: app.clone(), src: text.into_bytes() }]) };
+    // edit 1: the closure captures another value -- the running one keeps its old code
+    let o = apply_text(src("pub n: u64", "n: 5", "let k = 0u64;", " + k"));
+    assert_eq!(o.rung, Rung::Patch, "the captures edit applies: {:?}", o.lines);
+    assert!(closures(&u).contains(&old[0]) && u.fns[old[0] as usize].code != 0, "the thread's closure keeps its code: {:?}", o.lines);
+    // a field added to S, whose value the old closure's frame holds
+    let refused = |o: &crate::reload::Outcome| o.rung == Rung::Restart && o.lines.iter().any(|l| l.contains("struct `S` changed its layout") && l.contains(&old_name));
+    let o = apply_text(src("pub m: u64, pub n: u64", "m: 0, n: 5", "let k = 0u64;", " + k"));
+    let parent_kept = (refused(&o), format!("{:?} {:?}", o.rung, o.lines));
+    // the parent renamed (edit 2): its slots and the old closure's are no longer the program's
+    let o = apply_text(named_src("begin", "pub n: u64", "n: 5", "let k = 0u64;", " + k"));
+    assert_eq!(o.rung, Rung::Patch, "the rename applies: {:?}", o.lines);
+    let o = apply_text(named_src("begin", "pub m: u64, pub n: u64", "m: 0, n: 5", "let k = 0u64;", " + k"));
+    let parent_gone = (refused(&o), format!("{:?} {:?}", o.rung, o.lines));
+    flags[0].store(1, Ordering::SeqCst);
+    wait(3);
+    let got = flags[2].load(Ordering::SeqCst);
+    assert!(parent_kept.0, "while its parent is the program's, a frame in the closure edit 1 replaced refuses the layout patch, naming it (`{old_name}`): {}", parent_kept.1);
+    assert!(parent_gone.0, "once its parent was renamed too, the frame refuses it still, naming it (`{old_name}`): {}; the thread then read {got}", parent_gone.1);
+    assert_eq!(got, 5, "the thread's value, read by the code it was made for");
+    std::mem::forget(u);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
 /// A type alias in a fn body is part of that body: its edit is the body's edit (the alias
 /// goes and a new one comes with the body). An alias a nested item names restarts as before:
 /// the nested item would keep the old type.

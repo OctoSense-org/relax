@@ -2287,6 +2287,15 @@ impl Program {
         self.edit_versions.contains(&f)
     }
 
+    /// File version `f`'s number among its file's versions (the one loaded first is 0, then each
+    /// version an edit committed, in commit order), and the number of the current one.
+    pub fn version_number(&self, f: u32) -> (usize, usize) {
+        let first = self.first_version(f);
+        let now = self.edit_current.get(&first).copied().unwrap_or(first);
+        let number = |v: u32| if v == first { 0 } else { 1 + self.edit_versions.iter().filter(|&&e| self.first_version(e) == first).position(|&e| e == v).unwrap_or(0) };
+        (number(f), number(now))
+    }
+
     /// Whether a live edit committed a file version, current or not (a refused or rolled-back
     /// version stays loaded): the program's tables are no longer the boot's.
     pub fn has_edit_versions(&self) -> bool {

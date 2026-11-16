@@ -636,8 +636,9 @@ pub(crate) fn hold_old_frames(u: &Unit, gen: u32, layout: &str, paused: bool) ->
 /// A patch that changes a struct's layout in place (reload.rs fresh_layout_struct), about to
 /// install with the program threads paused (inspect::instrument::pause_for_patch): the first frame
 /// of a program thread in code of one of `slots` (any version: what the patch rebuilds was built
-/// for the old layout), or in an earlier version of any slot (code of a text no longer the
-/// program's, whose types are not asked), named for the restart's reason. Every thread's frames
+/// for the old layout), in a slot of text the program no longer has (reload::retired_text: a fn
+/// an edit removed or replaced, a closure inside one), or in an earlier version of any slot (code
+/// of a text no longer the program's, whose types are not asked), named for the restart's reason. Every thread's frames
 /// are read, those of a walk that ends short too: a frame found is the answer. Err: none was
 /// found, and a stack could not be read to its end (what it hides is not known).
 pub(crate) fn frame_in(u: &Unit, slots: &crate::fxhash::HashSet<u32>) -> Result<Option<String>, String> {
@@ -670,6 +671,9 @@ pub(crate) fn frame_in(u: &Unit, slots: &crate::fxhash::HashSet<u32>) -> Result<
             let f = &u.fns[slot as usize];
             if slots.contains(&slot) {
                 return Ok(Some(format!("`{}` is running on thread {}", f.name, thread)));
+            }
+            if let Some(retired) = crate::reload::retired_text(u, slot) {
+                return Ok(Some(format!("`{}` runs on thread {} {}", f.name, thread, retired)));
             }
             if start != f.code {
                 return Ok(Some(format!("`{}` runs code from before an earlier edit on thread {}", f.name, thread)));

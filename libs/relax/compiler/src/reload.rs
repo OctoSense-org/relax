@@ -2640,6 +2640,38 @@ pub(crate) fn gandalf_keeps(prog: &Program, visible: &[bool], d: DefId) -> bool 
     (d.0 as usize) < prog.defs.len() && !visible.get(prog.def(d).krate as usize).copied().unwrap_or(true)
 }
 
+/// A frame's slot runs text the program no longer has (JP-L F2): a fn an edit removed or
+/// replaced (its def stays in a version of its file that is no longer current), or a closure or
+/// coroutine inside one, up the chain of its parents; a twin as its slot. Such a slot is never
+/// checked against the new definitions, so a layout patch cannot know what its frame holds. The
+/// answer names the fn and its version. Glue and shims are code of types, not text: None.
+pub(crate) fn retired_text(u: &Unit, id: u32) -> Option<String> {
+    let mut s = id;
+    for _ in 0..64 {
+        if s as usize >= u.fns.len() {
+            return None;
+        }
+        match &u.fns[s as usize].key {
+            FnKey::Inst(d, _) => {
+                if d.0 as usize >= u.prog.defs.len() {
+                    return None;
+                }
+                let file = u.prog.def(*d).file;
+                if u.prog.is_current_version(file) {
+                    return None;
+                }
+                let (k, now) = u.prog.version_number(file);
+                let path = u.prog.file_paths.get(file as usize).map_or("?", |p| p.rsplit('/').next().unwrap_or(p));
+                return Some(format!("in text an edit retired (`{}` of version {k} of {path}; the program's is version {now})", def_name(&u.prog, *d)));
+            }
+            FnKey::Closure(_, _, parent) => s = *parent,
+            FnKey::Sandbox(t) | FnKey::Plain(t) | FnKey::Ctfe(t) => s = *t,
+            _ => return None,
+        }
+    }
+    None
+}
+
 /// Whether `d` is still the program's (bound in its module, or in its impl's or bound trait's
 /// item list): an edit that replaced or removed a fn unbinds it, while code in flight keeps its
 /// slots. An item an edit dropped from a fn body it changed (an inner struct's impl) is left in
