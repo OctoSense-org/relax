@@ -230,6 +230,11 @@ fn loader_table(u: &mut Unit, d: DefId, p: usize) -> Option<bool> {
         return None;
     }
     let l = u.layout_of(t);
+    // Entry's every field, as the offsets below list them: this stops building when a field is
+    // added to Entry and not here (a missed field reads every program's table as laid out otherwise)
+    fn _listed(e: &Entry) {
+        let Entry { kind: _, module: _, key: _, sig: _, shim: _, slots: _, size: _, align: _, offsets: _, enum_layout: _, drop: _, addr: _ } = e;
+    }
     let rustc = [
         std::mem::offset_of!(Entry, kind),
         std::mem::offset_of!(Entry, module),
@@ -242,6 +247,7 @@ fn loader_table(u: &mut Unit, d: DefId, p: usize) -> Option<bool> {
         std::mem::offset_of!(Entry, offsets),
         std::mem::offset_of!(Entry, enum_layout),
         std::mem::offset_of!(Entry, drop),
+        std::mem::offset_of!(Entry, addr),
     ];
     if l.size as usize == std::mem::size_of::<Entry>() && l.align as usize == std::mem::align_of::<Entry>() && l.fields.iter().map(|&f| f as usize).eq(rustc) {
         return Some(true);
