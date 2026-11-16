@@ -579,6 +579,83 @@ fn a_tuple_field_read_through_pin_or_arc_is_read() {
     assert_eq!(warnings, ["field `0` is never read [dead_code]", "unused variable: `unused` [unused_variables]"]);
 }
 
+/// Relax issue 231: the unsafe builtin attributes are `unsafe_code` in either form, `#[no_mangle]`
+/// or `#[unsafe(no_mangle)]` (rustc_attr_parsing safety.rs: every use), at the attribute, so an
+/// `#[expect(unsafe_code)]` on one is fulfilled; and an exported fn is a dead-code root whatever
+/// its visibility, so what only it calls is used. Relax read `unsafe` as the attribute's path:
+/// each expectation went unfulfilled and the exported fns' callees were never used.
+#[test]
+fn unsafe_attributes_are_unsafe_code_in_either_form() {
+    let Some(warnings) = warnings_in_child("check_lint_tests::unsafe_attributes_are_unsafe_code_in_either_form") else {
+        check_package(r#"
+            #![warn(unsafe_code)]
+            #[expect(unsafe_code)]
+            #[unsafe(no_mangle)]
+            extern "C" fn exported() -> u32 { only_from_export() }
+            fn only_from_export() -> u32 { 7 }
+            #[expect(unsafe_code)]
+            #[unsafe(export_name = "rx231_named")]
+            extern "C" fn named() -> u32 { also_from_export() }
+            fn also_from_export() -> u32 { 8 }
+            #[expect(unsafe_code)]
+            #[cfg_attr(target_os = "macos", unsafe(link_section = "__DATA,__rx231"))]
+            #[cfg_attr(not(target_os = "macos"), unsafe(link_section = ".data.rx231"))]
+            #[unsafe(no_mangle)]
+            static SECTION: u32 = 1;
+            #[no_mangle]
+            extern "C" fn plain() -> u32 { from_plain() }
+            fn from_plain() -> u32 { 9 }
+            #[unsafe(no_mangle)]
+            static STATIC: u32 = 2;
+            fn never_called() {}
+        "#, &[]);
+        return;
+    };
+    // rustc 1.100's, for the same library
+    assert_eq!(warnings, [
+        "function `never_called` is never used [dead_code]",
+        "usage of the unsafe `no_mangle` attribute [unsafe_code]",
+        "usage of the unsafe `no_mangle` attribute [unsafe_code]",
+    ]);
+}
+
+/// Relax issue 231 (its destructuring-coercion case showed it): a destructuring assignment is
+/// rustc's `let` pattern and assignments (`Two(x, _, ..) = v` is `let Two(lhs0, _, ..) = v; x =
+/// lhs0;`), so a tuple-struct, struct or variant assignee reads the fields it names, nested ones
+/// too; `_` and `..` read none. Relax counted the assignee as a construction only and said all
+/// its fields were never read.
+#[test]
+fn a_destructuring_assignment_reads_the_fields_it_takes() {
+    let Some(warnings) = warnings_in_child("check_lint_tests::a_destructuring_assignment_reads_the_fields_it_takes") else {
+        check_package(r#"
+            struct Two(u8, u16, u32);
+            struct Named { a: u8, b: u16, c: u32 }
+            enum E { V(u8, u16) }
+            struct Inner(u8, u8);
+            pub fn run() -> u32 {
+                let (x, z): (u8, u32);
+                Two(x, _, ..) = Two(1, 2, 3);
+                let p: u8;
+                Named { a: p, b: _, .. } = Named { a: 4, b: 5, c: 6 };
+                let r: u8;
+                (E::V(r, _),) = (E::V(7, 8),);
+                let s: u8;
+                [Inner(_, s)] = [Inner(9, 10)];
+                z = 1;
+                x as u32 + p as u32 + r as u32 + s as u32 + z
+            }
+        "#, &[]);
+        return;
+    };
+    // rustc 1.100's, for the same library
+    assert_eq!(warnings, [
+        "field `0` is never read [dead_code]",
+        "field `1` is never read [dead_code]",
+        "fields `1` and `2` are never read [dead_code]",
+        "fields `b` and `c` are never read [dead_code]",
+    ]);
+}
+
 /// WARNZERO class 8 (hal linux_ipc.rs:69 and :74): `IoSlice` and `IoSliceMut` are FFI-safe, as
 /// real std's are (repr(transparent) over an `iovec` / `WSABUF`; Relax std had plain slices),
 /// so a `msghdr` of them in an `extern` block is no `improper_ctypes`; a slice still is.

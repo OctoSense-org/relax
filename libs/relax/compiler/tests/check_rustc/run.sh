@@ -1,7 +1,7 @@
 #!/bin/bash
 # Check-diagnostic fixtures that must equal rustc's: `relax check` of each *.rs here (a library when
 # the name ends in _lib, else a binary) gives exactly rustc's errors (by code) and warnings (by
-# message), at rustc's positions. The expected lines below are rustc 1.97's
+# message), at rustc's positions. The expected lines below are rustc 1.97's (rx231's 1.100's)
 # (`rustc --edition 2021 --error-format=short --emit=metadata`); with RUSTC_CMP=1 rustc is run too
 # and must still print them.
 #   run.sh <path to relax or makepad binary>
@@ -29,7 +29,7 @@ for line in sys.stdin:
 ' "$H"
 }
 : > "$T/actual"; : > "$T/rustc"
-for f in gh1327_borrow_key gh1327_borrow_key_reject gh1328_errors gh1328_live_bin gh1328_live_lib; do
+for f in gh1327_borrow_key gh1327_borrow_key_reject gh1328_errors gh1328_live_bin gh1328_live_lib rx231_unsafe_attrs; do
   kind=bin; case $f in *_lib) kind=lib;; esac
   python3 - "$H" "$f" "$kind" "$T/units.json" <<'PY'
 import json, sys
@@ -61,6 +61,10 @@ gh1328_live_lib.rs:104:4 warning: function `truly_dead` is never used
 gh1328_live_lib.rs:105:7 warning: constant `TRULY_DEAD` is never used
 gh1328_live_lib.rs:106:8 warning: struct `DeadStruct` is never constructed
 gh1328_live_lib.rs:108:24 warning: field `read_by_debug_only` is never read
+== rx231_unsafe_attrs
+rx231_unsafe_attrs.rs:33:3 warning: usage of the unsafe `no_mangle` attribute
+rx231_unsafe_attrs.rs:41:3 warning: usage of the unsafe `no_mangle` attribute
+rx231_unsafe_attrs.rs:44:4 warning: function `never_called` is never used
 EXPECTED
 fail=0
 if ! diff -u "$T/expected" "$T/actual"; then echo "check_rustc: relax differs from the expected rustc diagnostics"; fail=1; fi

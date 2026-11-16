@@ -673,6 +673,47 @@ impl<'a> BodyRefs<'a> {
         }
     }
 
+    /// The fields a destructuring assignee's tuple-struct and struct parts take (pat_fields for
+    /// the pattern rustc lowers the assignee to): the ones it names, not `_` or `..`.
+    fn assignee_fields(&mut self, a: ExprId) {
+        let ast = self.ast;
+        let skip = |x: ExprId| matches!(ast.expr(x).kind, ExprKind::Underscore | ExprKind::Range(OptExprId::NONE, OptExprId::NONE, false));
+        match ast.expr(a).kind {
+            ExprKind::Paren(x) => self.assignee_fields(x),
+            ExprKind::Tuple(xs) | ExprKind::Array(xs) => {
+                for &x in ast.list(xs) { self.assignee_fields(x); }
+            }
+            ExprKind::Call(_, args) => {
+                let Some(Res::Def(d)) = self.body.res.get(&a.0).copied() else { return };
+                let (adt, vi) = self.variant_of(d);
+                let Some(nf) = self.tcx.adts.get(&adt).and_then(|ad| ad.variants.get(vi as usize)).map(|v| v.fields.len()) else { return };
+                let list = ast.list(args);
+                let rest = list.iter().position(|x| matches!(ast.expr(*x).kind, ExprKind::Range(OptExprId::NONE, OptExprId::NONE, false)));
+                for (k, &x) in list.iter().enumerate() {
+                    if skip(x) { continue; }
+                    let idx = match rest { Some(r) if k > r => nf.wrapping_sub(list.len() - k), _ => k };
+                    self.out.push(Ref::Field((adt, vi, idx as u32)));
+                    self.assignee_fields(x);
+                }
+            }
+            ExprKind::Struct(row) => {
+                let st = *ast.row(row);
+                let Some(Res::Def(d)) = self.body.res.get(&a.0).copied() else { return };
+                let (adt, vi) = self.variant_of(d);
+                for f in ast.list(st.fields) {
+                    if skip(f.expr) { continue; }
+                    let name = self.prog.files[self.body.file as usize].text(f.name);
+                    let fields = self.tcx.adts.get(&adt).and_then(|ad| ad.variants.get(vi as usize)).map(|v| &v.fields);
+                    let i = fields.and_then(|fs| fs.iter().position(|ft| self.prog.syms.str(ft.name) == name))
+                        .or_else(|| crate::ast::tuple_index(name).map(|n| n as usize));
+                    if let Some(i) = i { self.out.push(Ref::Field((adt, vi, i as u32))); }
+                    self.assignee_fields(f.expr);
+                }
+            }
+            _ => {}
+        }
+    }
+
     /// The variants a pattern needs (`Pat::necessary_variants`: not through or-patterns).
     fn necessary_variants(&self, p: PatId, out: &mut Vec<DefId>) {
         let ast = self.ast;
@@ -844,6 +885,9 @@ impl<'a> Visitor<'a> for BodyRefs<'a> {
                 // with its field accesses: a field written to is live
                 self.expr(l);
                 self.expr(r);
+                // `S(a, b) = v` / `S { x, .. } = v` is rustc's `let S(lhs0, lhs1) = v; a = lhs0; ..`:
+                // the pattern reads the fields it takes
+                if crate::lit::is_assignee_pattern(ast, l) { self.assignee_fields(l); }
                 return;
             }
             _ => {}

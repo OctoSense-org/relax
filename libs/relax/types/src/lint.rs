@@ -643,13 +643,19 @@ pub fn external(prog: &Program, file: u32, pos: u32) -> bool {
     matches!(prog.files[file as usize].expansion_kind(pos), crate::parser::ExpnKind::ExternalRules | crate::parser::ExpnKind::Builtin)
 }
 
-/// The attribute list's leading path (`allow`, `repr`, `doc`, `rustfmt::skip`) as bytes.
+/// The attribute list's leading path (`allow`, `repr`, `doc`, `rustfmt::skip`) as bytes. An unsafe
+/// attribute's path is inside its `unsafe(..)`: `no_mangle` of `#[unsafe(no_mangle)]` as of
+/// `#[no_mangle]` (rustc_ast `AttrItem::unsafety` wraps the path, it is not one).
 pub fn attr_path(prog: &Program, file: u32, a: &Attr) -> Vec<u8> {
     let p = prog.src(file);
-    let (lo, hi) = (a.toks.lo as usize, a.toks.hi as usize);
+    let (mut lo, hi) = (a.toks.lo as usize, a.toks.hi as usize);
+    if hi > lo + 2 && crate::cfg::tok_str(p, lo) == b"unsafe" && crate::cfg::tok_str(p, lo + 1) == b"(" {
+        lo += 2;
+    }
     let mut name: Vec<u8> = Vec::new();
     let mut i = lo;
-    while i < hi && !matches!(crate::cfg::tok_str(p, i), b"(" | b"=" | b"[" | b"{") {
+    // (`)` closes `unsafe(..)`: `#[unsafe(no_mangle)]`'s path ends there)
+    while i < hi && !matches!(crate::cfg::tok_str(p, i), b"(" | b")" | b"=" | b"[" | b"{") {
         name.extend_from_slice(crate::cfg::tok_str(p, i));
         i += 1;
     }
