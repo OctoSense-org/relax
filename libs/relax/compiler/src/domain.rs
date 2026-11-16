@@ -1671,6 +1671,7 @@ fn launch_main(upn: usize, id: DomainId, base: u64, target: u64, arg: u64, root:
             x.thread_done = true;
         }
         CHANGED.notify_all();
+        _program.end_with_thread();
     });
     match spawned {
         Ok(h) => Ok(h),
