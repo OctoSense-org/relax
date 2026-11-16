@@ -425,6 +425,9 @@ fn gen_int(o: &mut String, t: &Int) {
         let _ = writeln!(o, "    pub const fn rem_euclid(self, rhs: {n}) -> {n} {{ let r = self % rhs; if r < 0 {{ r.wrapping_add(rhs.wrapping_abs()) }} else {{ r }} }}");
         let _ = writeln!(o, "    pub const fn div_euclid(self, rhs: {n}) -> {n} {{ let q = self / rhs; if self % rhs < 0 {{ if rhs > 0 {{ q - 1 }} else {{ q + 1 }} }} else {{ q }} }}");
         let _ = writeln!(o, "    pub const fn cast_unsigned(self) -> {u} {{ self as {u} }}");
+        // int_macros.rs checked_isqrt / isqrt: the unsigned root of a value that is not negative
+        let _ = writeln!(o, "    pub const fn checked_isqrt(self) -> Option<{n}> {{ if self < 0 {{ None }} else {{ Some((self as {u}).isqrt() as {n}) }} }}");
+        let _ = writeln!(o, "    #[track_caller]\n    pub const fn isqrt(self) -> {n} {{ match self.checked_isqrt() {{ Some(sqrt) => sqrt, None => crate::panicking::panic_str(\"argument of integer square root cannot be negative\") }} }}");
         let _ = writeln!(o, "    pub const fn overflowing_add_unsigned(self, rhs: {u}) -> ({n}, bool) {{ let rhs = rhs as {n}; let (res, o) = self.overflowing_add(rhs); (res, o ^ (rhs < 0)) }}");
         let _ = writeln!(o, "    pub const fn checked_add_unsigned(self, rhs: {u}) -> Option<{n}> {{ let (a, b) = self.overflowing_add_unsigned(rhs); if b {{ None }} else {{ Some(a) }} }}");
         let _ = writeln!(o, "    pub const fn saturating_add_unsigned(self, rhs: {u}) -> {n} {{ match self.checked_add_unsigned(rhs) {{ Some(v) => v, None => {n}::MAX }} }}");

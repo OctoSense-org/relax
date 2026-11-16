@@ -969,6 +969,9 @@ impl i8 {
     pub const fn rem_euclid(self, rhs: i8) -> i8 { let r = self % rhs; if r < 0 { r.wrapping_add(rhs.wrapping_abs()) } else { r } }
     pub const fn div_euclid(self, rhs: i8) -> i8 { let q = self / rhs; if self % rhs < 0 { if rhs > 0 { q - 1 } else { q + 1 } } else { q } }
     pub const fn cast_unsigned(self) -> u8 { self as u8 }
+    pub const fn checked_isqrt(self) -> Option<i8> { if self < 0 { None } else { Some((self as u8).isqrt() as i8) } }
+    #[track_caller]
+    pub const fn isqrt(self) -> i8 { match self.checked_isqrt() { Some(sqrt) => sqrt, None => crate::panicking::panic_str("argument of integer square root cannot be negative") } }
     pub const fn overflowing_add_unsigned(self, rhs: u8) -> (i8, bool) { let rhs = rhs as i8; let (res, o) = self.overflowing_add(rhs); (res, o ^ (rhs < 0)) }
     pub const fn checked_add_unsigned(self, rhs: u8) -> Option<i8> { let (a, b) = self.overflowing_add_unsigned(rhs); if b { None } else { Some(a) } }
     pub const fn saturating_add_unsigned(self, rhs: u8) -> i8 { match self.checked_add_unsigned(rhs) { Some(v) => v, None => i8::MAX } }
@@ -1093,6 +1096,9 @@ impl i16 {
     pub const fn rem_euclid(self, rhs: i16) -> i16 { let r = self % rhs; if r < 0 { r.wrapping_add(rhs.wrapping_abs()) } else { r } }
     pub const fn div_euclid(self, rhs: i16) -> i16 { let q = self / rhs; if self % rhs < 0 { if rhs > 0 { q - 1 } else { q + 1 } } else { q } }
     pub const fn cast_unsigned(self) -> u16 { self as u16 }
+    pub const fn checked_isqrt(self) -> Option<i16> { if self < 0 { None } else { Some((self as u16).isqrt() as i16) } }
+    #[track_caller]
+    pub const fn isqrt(self) -> i16 { match self.checked_isqrt() { Some(sqrt) => sqrt, None => crate::panicking::panic_str("argument of integer square root cannot be negative") } }
     pub const fn overflowing_add_unsigned(self, rhs: u16) -> (i16, bool) { let rhs = rhs as i16; let (res, o) = self.overflowing_add(rhs); (res, o ^ (rhs < 0)) }
     pub const fn checked_add_unsigned(self, rhs: u16) -> Option<i16> { let (a, b) = self.overflowing_add_unsigned(rhs); if b { None } else { Some(a) } }
     pub const fn saturating_add_unsigned(self, rhs: u16) -> i16 { match self.checked_add_unsigned(rhs) { Some(v) => v, None => i16::MAX } }
@@ -1217,6 +1223,9 @@ impl i32 {
     pub const fn rem_euclid(self, rhs: i32) -> i32 { let r = self % rhs; if r < 0 { r.wrapping_add(rhs.wrapping_abs()) } else { r } }
     pub const fn div_euclid(self, rhs: i32) -> i32 { let q = self / rhs; if self % rhs < 0 { if rhs > 0 { q - 1 } else { q + 1 } } else { q } }
     pub const fn cast_unsigned(self) -> u32 { self as u32 }
+    pub const fn checked_isqrt(self) -> Option<i32> { if self < 0 { None } else { Some((self as u32).isqrt() as i32) } }
+    #[track_caller]
+    pub const fn isqrt(self) -> i32 { match self.checked_isqrt() { Some(sqrt) => sqrt, None => crate::panicking::panic_str("argument of integer square root cannot be negative") } }
     pub const fn overflowing_add_unsigned(self, rhs: u32) -> (i32, bool) { let rhs = rhs as i32; let (res, o) = self.overflowing_add(rhs); (res, o ^ (rhs < 0)) }
     pub const fn checked_add_unsigned(self, rhs: u32) -> Option<i32> { let (a, b) = self.overflowing_add_unsigned(rhs); if b { None } else { Some(a) } }
     pub const fn saturating_add_unsigned(self, rhs: u32) -> i32 { match self.checked_add_unsigned(rhs) { Some(v) => v, None => i32::MAX } }
@@ -1344,6 +1353,9 @@ impl i64 {
     pub const fn rem_euclid(self, rhs: i64) -> i64 { let r = self % rhs; if r < 0 { r.wrapping_add(rhs.wrapping_abs()) } else { r } }
     pub const fn div_euclid(self, rhs: i64) -> i64 { let q = self / rhs; if self % rhs < 0 { if rhs > 0 { q - 1 } else { q + 1 } } else { q } }
     pub const fn cast_unsigned(self) -> u64 { self as u64 }
+    pub const fn checked_isqrt(self) -> Option<i64> { if self < 0 { None } else { Some((self as u64).isqrt() as i64) } }
+    #[track_caller]
+    pub const fn isqrt(self) -> i64 { match self.checked_isqrt() { Some(sqrt) => sqrt, None => crate::panicking::panic_str("argument of integer square root cannot be negative") } }
     pub const fn overflowing_add_unsigned(self, rhs: u64) -> (i64, bool) { let rhs = rhs as i64; let (res, o) = self.overflowing_add(rhs); (res, o ^ (rhs < 0)) }
     pub const fn checked_add_unsigned(self, rhs: u64) -> Option<i64> { let (a, b) = self.overflowing_add_unsigned(rhs); if b { None } else { Some(a) } }
     pub const fn saturating_add_unsigned(self, rhs: u64) -> i64 { match self.checked_add_unsigned(rhs) { Some(v) => v, None => i64::MAX } }
@@ -1477,6 +1489,9 @@ impl i128 {
     pub const fn rem_euclid(self, rhs: i128) -> i128 { let r = self % rhs; if r < 0 { r.wrapping_add(rhs.wrapping_abs()) } else { r } }
     pub const fn div_euclid(self, rhs: i128) -> i128 { let q = self / rhs; if self % rhs < 0 { if rhs > 0 { q - 1 } else { q + 1 } } else { q } }
     pub const fn cast_unsigned(self) -> u128 { self as u128 }
+    pub const fn checked_isqrt(self) -> Option<i128> { if self < 0 { None } else { Some((self as u128).isqrt() as i128) } }
+    #[track_caller]
+    pub const fn isqrt(self) -> i128 { match self.checked_isqrt() { Some(sqrt) => sqrt, None => crate::panicking::panic_str("argument of integer square root cannot be negative") } }
     pub const fn overflowing_add_unsigned(self, rhs: u128) -> (i128, bool) { let rhs = rhs as i128; let (res, o) = self.overflowing_add(rhs); (res, o ^ (rhs < 0)) }
     pub const fn checked_add_unsigned(self, rhs: u128) -> Option<i128> { let (a, b) = self.overflowing_add_unsigned(rhs); if b { None } else { Some(a) } }
     pub const fn saturating_add_unsigned(self, rhs: u128) -> i128 { match self.checked_add_unsigned(rhs) { Some(v) => v, None => i128::MAX } }
@@ -1605,6 +1620,9 @@ impl isize {
     pub const fn rem_euclid(self, rhs: isize) -> isize { let r = self % rhs; if r < 0 { r.wrapping_add(rhs.wrapping_abs()) } else { r } }
     pub const fn div_euclid(self, rhs: isize) -> isize { let q = self / rhs; if self % rhs < 0 { if rhs > 0 { q - 1 } else { q + 1 } } else { q } }
     pub const fn cast_unsigned(self) -> usize { self as usize }
+    pub const fn checked_isqrt(self) -> Option<isize> { if self < 0 { None } else { Some((self as usize).isqrt() as isize) } }
+    #[track_caller]
+    pub const fn isqrt(self) -> isize { match self.checked_isqrt() { Some(sqrt) => sqrt, None => crate::panicking::panic_str("argument of integer square root cannot be negative") } }
     pub const fn overflowing_add_unsigned(self, rhs: usize) -> (isize, bool) { let rhs = rhs as isize; let (res, o) = self.overflowing_add(rhs); (res, o ^ (rhs < 0)) }
     pub const fn checked_add_unsigned(self, rhs: usize) -> Option<isize> { let (a, b) = self.overflowing_add_unsigned(rhs); if b { None } else { Some(a) } }
     pub const fn saturating_add_unsigned(self, rhs: usize) -> isize { match self.checked_add_unsigned(rhs) { Some(v) => v, None => isize::MAX } }
@@ -1730,6 +1748,9 @@ impl isize {
     pub const fn rem_euclid(self, rhs: isize) -> isize { let r = self % rhs; if r < 0 { r.wrapping_add(rhs.wrapping_abs()) } else { r } }
     pub const fn div_euclid(self, rhs: isize) -> isize { let q = self / rhs; if self % rhs < 0 { if rhs > 0 { q - 1 } else { q + 1 } } else { q } }
     pub const fn cast_unsigned(self) -> usize { self as usize }
+    pub const fn checked_isqrt(self) -> Option<isize> { if self < 0 { None } else { Some((self as usize).isqrt() as isize) } }
+    #[track_caller]
+    pub const fn isqrt(self) -> isize { match self.checked_isqrt() { Some(sqrt) => sqrt, None => crate::panicking::panic_str("argument of integer square root cannot be negative") } }
     pub const fn overflowing_add_unsigned(self, rhs: usize) -> (isize, bool) { let rhs = rhs as isize; let (res, o) = self.overflowing_add(rhs); (res, o ^ (rhs < 0)) }
     pub const fn checked_add_unsigned(self, rhs: usize) -> Option<isize> { let (a, b) = self.overflowing_add_unsigned(rhs); if b { None } else { Some(a) } }
     pub const fn saturating_add_unsigned(self, rhs: usize) -> isize { match self.checked_add_unsigned(rhs) { Some(v) => v, None => isize::MAX } }

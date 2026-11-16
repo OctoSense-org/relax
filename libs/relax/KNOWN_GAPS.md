@@ -204,3 +204,36 @@ know.
 
 Start in compiler/src/sandbox/script.rs (`entry`, the domain's table) and sandbox/broker.rs (the
 folders and the walk); the decision is relax-front unitgraph.rs `script_confined`.
+
+## 10. Instruction counts and timings include the JIT's own work
+
+A test that counts the instructions its code runs (a hardware counter around a call, a scaling
+check that compares N items with 2N) or that times a loop measures the JIT along with the program.
+Under Relax, code compiles when it is first called and hot functions are compiled again at a higher
+tier while the program runs, in the same process. A counter read across such a call includes that
+compile, and a timing changes when a function moves to its next tier part way through.
+
+- rustc: the binary is compiled before it starts, so its counts and timings stay put from run to
+  run.
+- Relax: the first runs of a function and the runs around a tier-up count the JIT's work too.
+
+The same goes for a program that steers glibc's choice of `memcpy` and `memset` with
+`GLIBC_TUNABLES` (for instance to count a slower variant's instructions): the JIT's code copies
+and fills memory with its own code, so the tunables do not change what runs.
+
+This is by design and stays: a JIT that tiers up cannot give rustc's counts. Run tests that pin
+instruction counts or timing ratios under cargo.
+
+## 11. A data limit the program sets counts the JIT's memory too
+
+A test that lowers its own data limit (`setrlimit(RLIMIT_DATA, ..)`) to check how the program
+behaves when memory runs out shares that limit with the JIT. Under Relax the JIT compiles in the
+program's process, so the code, arenas and caches it allocates after the limit is set count
+against it, on top of what the program itself allocates.
+
+- rustc: the limit only counts the program's own memory.
+- Relax: the limit counts the JIT's memory as well, so a limit set just above the program's own
+  use runs out sooner.
+
+This is by design: the JIT and the program are one process. A program that tests itself under a
+tight data limit needs headroom for the JIT above what it uses itself.
