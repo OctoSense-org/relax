@@ -7009,6 +7009,9 @@ impl<'a> Lcx<'a> {
                         self.moved_field(li, &path);
                     }
                 }
+                // rustc's `a = lhs0`: the part coerces to the assignee's type (`&Box<T>` to `&T`)
+                let at = self.body_ty(a);
+                let v = self.apply_coercion_at(a.0 | crate::typeck::ASSIGN_VALUE_KEY, t, v, at);
                 self.assign_to(a, v);
             }
         }
@@ -7096,14 +7099,21 @@ impl<'a> Lcx<'a> {
     }
 
     fn apply_coercion(&mut self, e: ExprId, v: Val, target: TyId) -> Val {
-        match self.b.coerce(e.0) {
+        let src = self.body_ty(e);
+        self.apply_coercion_at(e.0, src, v, target)
+    }
+
+    /// The coercion typeck recorded under `key` (an expression's id, or a synthetic key such as
+    /// `ASSIGN_VALUE_KEY`'s) applied to `v` of type `from`.
+    fn apply_coercion_at(&mut self, key: u32, from: TyId, v: Val, target: TyId) -> Val {
+        match self.b.coerce(key) {
             None | Some(Coerce::MutToConst | Coerce::RefToRaw(_)) => v,
             Some(Coerce::Never) => {
                 // a `!` value used as another type (`fn f(x: !) -> T { x }`): control never gets
                 // here; the rest is emitted into a dead block with a placeholder of T's shape
                 // (the target may be unknown here -- a block tail passes its own type -- so the
                 // placeholder is memory, which reads as any shape)
-                if self.is_never(self.body_ty(e)) && self.dead_blk != Some(self.cur) {
+                if self.is_never(from) && self.dead_blk != Some(self.cur) {
                     self.term(Term::Unreachable);
                     self.dead();
                     let a = if self.is_never(target) {
@@ -7121,7 +7131,7 @@ impl<'a> Lcx<'a> {
             Some(Coerce::Unsize) => {
                 // [T; N] -> [T] behind a pointer (&, *const/*mut) or a smart pointer (Box, Rc, ..):
                 // the thin pointer gets the length N
-                let src = self.body_ty(e);
+                let src = from;
                 let len = match (self.kind(src), self.kind(target)) {
                     (TyKind::Ref(_, a, _) | TyKind::Ptr(_, a), TyKind::Ref(_, b, _) | TyKind::Ptr(_, b)) => self.unsize_len(a, b),
                     // Box<[T; N]> / Box<S<[T; N]>> -> Box<[T]> / Box<S<[T]>>
@@ -7153,7 +7163,7 @@ impl<'a> Lcx<'a> {
                 let dy = self.monomorphize(dy);
                 // thin pointer -> (data, vtable); a smart pointer's other fields stay (a Box's
                 // allocator)
-                let st = self.body_ty(e);
+                let st = from;
                 let vt = self.f.vreg(Cls::I);
                 match self.u.vtable_shared(src, dy) {
                     Ok(Some(addr)) => {
@@ -7191,7 +7201,7 @@ impl<'a> Lcx<'a> {
                 let Some(slot) = self.u.tcx.supertrait_vtable_slot(&self.u.prog, sd, dd) else { return v };
                 // (data, vtable of Sub) -> (data, Sub's stored vtable for Super); a smart
                 // pointer's other fields stay (a Box's allocator)
-                let st = self.body_ty(e);
+                let st = from;
                 let mut swap_vt = |me: &mut Self, p: &mut Vec<VReg>, i: usize| {
                     if i + 1 >= p.len() {
                         return false;
@@ -7211,7 +7221,7 @@ impl<'a> Lcx<'a> {
                 }
             }
             Some(Coerce::DerefRef(n)) => {
-                let st = self.body_ty(e);
+                let st = from;
                 let (inner, m) = match self.kind(st) {
                     TyKind::Ref(m, i, _) => (i, m),
                     _ => return v,
@@ -7222,7 +7232,7 @@ impl<'a> Lcx<'a> {
                 let saved = self.want_mut;
                 self.want_mut = m;
                 for k in 0..n {
-                    let (a, b) = self.deref_place(e.0 | crate::typeck::DEREF_COERCE_KEY, k, pl, pt);
+                    let (a, b) = self.deref_place(key | crate::typeck::DEREF_COERCE_KEY, k, pl, pt);
                     pl = a;
                     pt = b;
                 }
@@ -7239,7 +7249,7 @@ impl<'a> Lcx<'a> {
                 }
             }
             Some(Coerce::ReifyFn) => {
-                let t = self.body_ty(e);
+                let t = from;
                 if let TyKind::FnDef(d, args, _) = self.kind(t) {
                     // `<T as Trait>::method` as a value: the impl's method (or the default body)
                     let r = self.fn_item_addr(d, self.u.tcx.tys.list(args).to_vec());
@@ -7250,7 +7260,7 @@ impl<'a> Lcx<'a> {
             Some(Coerce::UnsafeFn) => v,
             Some(Coerce::ClosureFn) => {
                 // rustc_codegen_ssa/src/mir/rvalue.rs:536-550.
-                let instance = Instance::resolve_closure(&self.u.tcx, &self.u.prog, self.body_ty(e), relax_types::upvar::ClosureKind::FnOnce);
+                let instance = Instance::resolve_closure(&self.u.tcx, &self.u.prog, from, relax_types::upvar::ClosureKind::FnOnce);
                 let id = self.u.instance_fn_id(instance);
                 let r = self.f.vreg(Cls::I);
                 self.emit(Inst::FnAddr(r, id));

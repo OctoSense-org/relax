@@ -90,6 +90,11 @@ pub const PAT_KEY: u32 = 0x4000_0000;
 /// `pat_local` key of an async fn parameter whose pattern is matched inside the body coroutine: the parameter's
 /// pattern id with this bit gives the local holding the whole argument.
 pub const ASYNC_ARG_KEY: u32 = 0x2000_0000;
+/// Adjustments key of the value a destructuring assignment gives one of its plain assignees (the
+/// assignee's id with this bit). rustc lowers `(a, b) = rhs` to `{ let (lhs0, lhs1) = rhs; a = lhs0;
+/// b = lhs1; }`, and each `a = lhs0` coerces its part to the assignee's type (`&Box<T>` to `&T`):
+/// the coercion of `lhs0` is recorded under this key, since the part has no expression of its own.
+pub const ASSIGN_VALUE_KEY: u32 = 0x1000_0000;
 
 #[derive(Clone)]
 pub struct Local {
@@ -2885,7 +2890,8 @@ impl<'a> Fcx<'a> {
             _ => {
                 let ta = self.check_expr(a, None);
                 self.check_lhs_assignable(a, false);
-                self.coerce_or_unify(t, ta, None, lo);
+                // `a = lhs0` of rustc's desugaring: the part coerces to the assignee's type
+                self.coerce_or_unify(t, ta, Some(ExprId(a.0 | ASSIGN_VALUE_KEY)), lo);
                 return;
             }
         }

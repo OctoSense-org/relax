@@ -95,7 +95,13 @@ impl Cx<'_> {
     /// The value-site adjustments of `e`: typeck stores a reference coercion without its leading
     /// builtin `Deref(None)`; insert it as rustc has it.
     fn value_adjustments(&self, e: ast::ExprId, source_ty: TyId) -> Vec<Adjustment> {
-        let Some(adj) = self.tb().adjustments(e.0) else { return Vec::new() };
+        self.value_adjustments_at(e.0, source_ty)
+    }
+
+    /// `value_adjustments` of an adjustments key (a node, or a synthetic key such as
+    /// `ASSIGN_VALUE_KEY`'s).
+    pub(super) fn value_adjustments_at(&self, key: u32, source_ty: TyId) -> Vec<Adjustment> {
+        let Some(adj) = self.tb().adjustments(key) else { return Vec::new() };
         let mut list: Vec<Adjustment> = adj.value.iter().copied().collect();
         if list.iter().any(|a| matches!(a.kind, Adjust::Borrow(_))) {
             if let TyKind::Ref(_, pointee, _) = *self.tcx().tys.kind(source_ty) {
@@ -113,7 +119,7 @@ impl Cx<'_> {
         matches!(self.prog().syms.str(self.prog().def(def).name), "deref_mut" | "index_mut")
     }
 
-    fn apply_adjustment(&mut self, e: ast::ExprId, expr: Expr, adjustment: Adjustment, two_phase: bool) -> BuildResult<Expr> {
+    pub(super) fn apply_adjustment(&mut self, e: ast::ExprId, expr: Expr, adjustment: Adjustment, two_phase: bool) -> BuildResult<Expr> {
         let (temp_scope, bid, span) = (expr.temp_scope, expr.bid, expr.span);
         let target = adjustment.target;
         let tcx = self.tcx();
