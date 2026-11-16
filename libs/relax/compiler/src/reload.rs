@@ -2865,6 +2865,41 @@ fn retired_hit(u: &Unit, t: TyId, depth: u32) -> Option<(String, u64)> {
     }
 }
 
+/// The code to build again for the closures and async bodies `rebind` pairs (old, new), each old
+/// one marked patched first (never inlined again: a build calls it, and its forwarder runs the new
+/// version): every slot that inlined one (`inlined_into`: its RIR or code holds a copy), their
+/// twins built from their RIR, and theirs in turn -- a slot `rebuilt` already holds included (built
+/// before the pairing, it may have taken the copy in again). Not the old closures of the rebuilt
+/// parents (rebound: their code is a forwarder; kept: their own old code) nor those parents (their
+/// new code lowers the new closures).
+fn rebound_hosts(u: &Unit, rebind: &[(u32, u32)], rebuilt: &[u32]) -> Vec<u32> {
+    let parent = |c: u32| match u.fns[c as usize].key { FnKey::Closure(_, _, p) => Some(p), _ => None };
+    let olds: Vec<u32> = u.closures_of_slots(rebuilt.iter().copied()).into_iter().filter(|&c| !lowered_now(u, c)).chain(rebind.iter().map(|x| x.0)).collect();
+    let mut seen: crate::fxhash::HashSet<u32> = olds.iter().copied().collect();
+    seen.extend(olds.iter().filter_map(|&c| parent(c)));
+    for &(o, _) in rebind {
+        u.fns[o as usize].patched.store(true, Ordering::Relaxed);
+    }
+    let mut hosts = Vec::new();
+    let mut work: Vec<u32> = rebind.iter().map(|x| x.0).collect();
+    while let Some(s) = work.pop() {
+        let mut deps = u.fns[s as usize].history().inlined_into.clone();
+        // (a rebound version's own twins are other builds of its old body, not hosts)
+        if !rebind.iter().any(|x| x.0 == s) {
+            deps.extend(crate::sandbox::twin_of(u, s));
+            deps.extend(crate::ctfe_twin::twin_of(u, s));
+            deps.extend(u.plain_twin_of(s));
+        }
+        for d in deps {
+            if seen.insert(d) {
+                hosts.push(d);
+                work.push(d);
+            }
+        }
+    }
+    hosts
+}
+
 /// K2: frame slot `slot` (a twin as its slot) can still call code of retired text after the
 /// install: its key's types (an instance's generic arguments, a closure's owner's, a shim's, a
 /// glue's type) hold one (retired_in): a generic `pump::<F>` over a kept closure.
@@ -7321,8 +7356,10 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
                 // (what the parent's lowering makes now: of this edit's new files, or of the
                 // version an earlier edit moved its def to when this patch rebuilt it for a
                 // constant it reads or a body it inlined; an async fn's body is the poll block's)
+                // An old one has code of its own, or its body is inline in code this patch does not
+                // rebuild (an instance over its type: `pump::<C>`, an iterator adapter's)
                 if lowered_now(u, id) { news_c.push(id); }
-                else if f.compiled && !matches!(u.forward_of(id), Some((_, false))) && *ce & crate::tcx::ASYNC_FN_BODY == 0 { olds_c.push(id); }
+                else if (f.compiled || f.history().inlined_into.iter().any(|h| !rebuilt.contains(h))) && !matches!(u.forward_of(id), Some((_, false))) && *ce & crate::tcx::ASYNC_FN_BODY == 0 { olds_c.push(id); }
             }
         }
         {
@@ -7535,6 +7572,61 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
     }
     // a rebound poll fn's slot runs the new body too
     flagged.extend(rebind.iter().map(|&(o, _)| o));
+    // The code holding a copy of a version this patch rebinds (its body inline: an O3 host's fast
+    // half reads no patch flag, and code built above, before the pairing, may have taken it in
+    // again) is built again now, calling the version, which is never inlined again (patched: its
+    // forwarder runs the new one): rebound_hosts.
+    let mut rebuilt_hosts: Vec<u32> = Vec::new();
+    if errs.is_empty() && !rebind.is_empty() {
+        let rebuilt: Vec<u32> = slots.iter().chain(fresh.iter()).copied().collect();
+        let hosts = rebound_hosts(&*up, &rebind, &rebuilt);
+        trace_count("rebound_hosts", hosts.len());
+        if reload_trace() && !hosts.is_empty() {
+            let n = |id: u32| format!("{}#{id}", (&*up).fns[id as usize].name);
+            eprintln!("reload-trace: rebound hosts {:?} over {:?}", hosts.iter().map(|&h| n(h)).collect::<Vec<_>>(), rebind.iter().map(|&(o, w)| (n(o), n(w))).collect::<Vec<_>>());
+        }
+        let u = &mut *up;
+        let mut targets: Vec<u32> = Vec::new();
+        for &id in &hosts {
+            let unverified = !u.verdict_clean(id);
+            if unverified { crate::jit::note_unverified(u, id); }
+            let f = &mut u.fns[id as usize];
+            f.unverified.store(unverified, Ordering::Relaxed);
+            f.rir = None;
+            if let Some(h) = &mut f.history { h.inlined_into.clear(); }
+            f.build_err = None;
+            f.spec = None;
+            u.reload_errors.remove(&id);
+            u.reload_specs.remove(&id);
+            // (one with no code of its own, only ever inlined, is built from its text at its next
+            // use; the code that inlined it is among the hosts)
+            if (u.fns[id as usize].compiled || fresh.contains(&id)) && !crate::sandbox::is_sandboxed_slot(u, id)
+                && (!matches!(u.fns[id as usize].key, FnKey::Sandbox(_) | FnKey::Ctfe(_)) || u.fns[id as usize].compiled) {
+                targets.push(id);
+            }
+        }
+        staged.retain(|(id, _)| !targets.contains(id));
+        let (twins, host): (Vec<u32>, Vec<u32>) = targets.iter().copied().partition(|id| under_lock(&*up, *id));
+        let threads = std::thread::available_parallelism().map_or(2, |n| n.get()).clamp(1, 8);
+        for (id, r) in jit::compile_batch_off_lock(up, &host, threads) {
+            match r {
+                Ok(c) => staged.push((id, c)),
+                Err(e) => errs.push(format!("{}: {}", (&*up).fns[id as usize].name, e)),
+            }
+        }
+        for id in twins {
+            match compile_guarded(up, id) {
+                Ok(c) => staged.push((id, c)),
+                Err(e) => errs.push(format!("{}: {}", (&*up).fns[id as usize].name, e)),
+            }
+        }
+        for &id in &targets {
+            if !slots.contains(&id) && !fresh.contains(&id) {
+                slots.push(id);
+            }
+        }
+        rebuilt_hosts = hosts;
+    }
     trace_count("compiled_slots", staged.len() + pre.len());
     trace_stage("compile");
     let t3 = Instant::now();
@@ -7844,6 +7936,16 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
         }
         if let Err(e) = jit::install_forward(up, id, target, false, gen) {
             out.lines.push(format!("link error in {}: {}", (&*up).fns[id as usize].name, e));
+        }
+    }
+    // the hosts built again over the rebound versions call them now: no copy of theirs is left
+    // there (a later patch of a version does not build those hosts again)
+    if !rebuilt_hosts.is_empty() {
+        let u = &mut *up;
+        for &(o, _) in &rebind {
+            if let Some(h) = &mut u.fns[o as usize].history {
+                h.inlined_into.retain(|x| !rebuilt_hosts.contains(x));
+            }
         }
     }
     // the new bodies are installed: the guards of their copies inlined before call them now

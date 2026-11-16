@@ -2536,7 +2536,11 @@ fn a_live_edit_reaches_both_crates_of_a_lib_test_root() {
 /// forwarders per closure (the lineage's cell jumps to the newest version, the previous newest to
 /// the cell) and copies no code into the older versions; every older version reaches the newest in
 /// at most two jumps; a build of an older version's own body never lands in it (a tier-up would
-/// bring back old code); a rolled-back patch brings back the forwarders it replaced.
+/// bring back old code); a rolled-back patch brings back the forwarders it replaced. From the
+/// third edit on, an edit also builds again the once shim of the version it replaces (the edit
+/// that made that version built it with the body inline; its copy would run the old body): an
+/// edit installs exactly make, the code holding a copy of make and that shim, however many came
+/// before.
 #[test]
 fn stored_closure_follows_edits_with_flat_work() {
     const CHILD: &str = "RELAX_STORED_CLOSURE_TEST";
@@ -2604,14 +2608,38 @@ pub fn value(out: &mut u32) {{
     let first = versions(&u)[0];
     let mut files = vec![u.prog.def(value).file];
     let mut undo = None;
-    let mut names_first: Option<Vec<String>> = None;
     for i in 2..=6u32 {
         let before = u.forwards.len();
+        // the once shims (`FnOnce::call_once` through a box's vtable) holding a copy of the version
+        // this edit replaces, and their code before it
+        let replaced = *versions(&u).last().unwrap();
+        let shims: Vec<(u32, u64)> = u.fns[replaced as usize].history().inlined_into.iter()
+            .filter(|&&h| u.fns[h as usize].name.contains(" - once shim(")).map(|&h| (h, u.fns[h as usize].code)).collect();
+        let shim_names = |u: &Unit| shims.iter().map(|&(h, _)| format!("{}#{h}", u.fns[h as usize].name)).collect::<Vec<_>>();
+        // the code holding a copy of make (value's closure, while it inlines make)
+        let make_holders: Vec<u32> = u.fns[make_slot as usize].history().inlined_into.clone();
         let o = unsafe { apply(up, vec![Edit { file: *files.last().unwrap(), path: app.clone(), src: src(i).into_bytes() }]) };
         assert_eq!(o.rung, Rung::Patch, "edit {i}: {:?}", o.lines);
-        // (make, and value's closure while it inlines make)
-        let first_names = names_first.get_or_insert_with(|| o.names.clone());
-        assert!(o.names.iter().all(|n| first_names.contains(n)), "edit {i}: more fns installed than by the first edit: {:?}", o.names);
+        // exactly make and the code holding a copy of it (value's closure, while it inlines make),
+        // and from the third edit on the once shim holding a copy of the version this edit replaces
+        let mut want: Vec<String> = std::iter::once(make_slot).chain(make_holders.iter().copied()).map(|s| u.fns[s as usize].name.to_string()).collect();
+        if i == 2 {
+            assert!(!make_holders.is_empty(), "edit 2: value's closure inlines make");
+            // the first version's shims were never built: no code to build again
+            assert!(shims.is_empty(), "edit 2: once shims hold a copy of the first version: {:?}", shim_names(&u));
+        } else {
+            // the previous edit built the replaced version's once shim with its body inline; this
+            // edit builds it again, calling that version (its forwarder runs the new one)
+            assert_eq!(shims.len(), 1, "edit {i}: the once shims holding a copy of the replaced version: {:?}", shim_names(&u));
+            let (shim, code) = shims[0];
+            want.push(u.fns[shim as usize].name.to_string());
+            assert_ne!(u.fns[shim as usize].code, code, "edit {i}: the replaced version's once shim was not built again");
+            assert!(!u.fns[replaced as usize].history().inlined_into.contains(&shim), "edit {i}: the shim built again still holds a copy of the replaced version");
+        }
+        let mut got = o.names.clone();
+        want.sort();
+        got.sort();
+        assert_eq!(got, want, "edit {i}: installs exactly make, the code holding a copy of it and the once shim of the version it replaces");
         files.push(o.files[0]);
         assert_eq!(run(), 15 + i, "edit {i}: the box stored at the first run runs the edited closure");
         assert_eq!(u.forwards.len() - before, if i == 2 { 1 } else { 2 }, "edit {i}: forwarders installed (the cell, the previous version)");
@@ -3112,6 +3140,69 @@ pub fn later(p: *mut u64) {
     rig.call("later");
     assert!(refused.0, "a stored value of the closure edit 1 kept refuses the layout patch, naming it (`{name}`) and edit 1: {}", refused.1);
     assert_eq!(rig.flag(2), 5, "the stored closure's call after it");
+}
+
+/// T3c T10: two closures stored behind `pump::<C>`, whose O3 code holds each one's body inline:
+/// one never called on its own (its body exists only in its copies), one also called through a
+/// trait object (code of its own). Edit 1 changes both bodies, which rebinds both: the next calls
+/// through `pump` run the new bodies. Edit 2 adds a field to `S`, which the bodies make: it
+/// applies, and the calls give the new bodies' values from the new layout.
+#[test]
+fn a_rebound_closure_inline_in_a_host_runs_its_new_body() {
+    isolated_test!(a_rebound_closure_inline_in_a_host_runs_its_new_body);
+    let lib = format!("{KEPT_FLAGS}{}", r#"pub trait Run { fn run(&self) -> u64; }
+pub struct Pumped<F>(pub F);
+#[inline(never)]
+pub fn pump<F: Fn() -> u64>(f: &F) -> u64 { f() }
+impl<F: Fn() -> u64> Run for Pumped<F> { fn run(&self) -> u64 { pump(&self.0) } }
+static mut ONLY: Option<Box<dyn Run>> = None;
+static mut OWN: Option<Box<dyn Run>> = None;
+pub fn start(p: *mut u64) {
+    let a = unsafe { &*(p as *const [AtomicU64; 4]) };
+    let k = 0u64;
+    let only = move || { let s = S { n: 5 }; read(&s) + k };
+    let own = move || { let s = S { n: 7 }; read(&s) + k };
+    let d: &dyn Fn() -> u64 = std::hint::black_box(&own);
+    a[1].store(d(), Ordering::SeqCst);
+    unsafe { ONLY = Some(Box::new(Pumped(only))); OWN = Some(Box::new(Pumped(own))); }
+}
+pub fn later(p: *mut u64) {
+    let a = unsafe { &*(p as *const [AtomicU64; 4]) };
+    a[2].store(unsafe { (*std::ptr::addr_of!(ONLY)).as_ref().unwrap().run() }, Ordering::SeqCst);
+    a[3].store(unsafe { (*std::ptr::addr_of!(OWN)).as_ref().unwrap().run() }, Ordering::SeqCst);
+}
+"#);
+    // (O1 inlines small callees, closures among them, as a session does)
+    let mut rig = KeptRig::with("rebound", &[("lib.rs", &lib)], &["start", "later"], |_| {});
+    rig.call("start");
+    rig.call("later");
+    let pumps = rig.tier_up("pump");
+    rig.call("later");
+    let tiered = (rig.flag(2), rig.flag(3));
+    // (the closures of `start`: the stored ones' slots, with code or not, and what pump's O3 code holds)
+    let (copies, only_code) = {
+        use crate::jit::FnKey;
+        let u = &rig.unit;
+        let of_start: Vec<u32> = (0..u.fns.len() as u32).filter(|&s| matches!(u.fns[s as usize].key, FnKey::Closure(_, _, p)
+            if matches!(&u.fns[p as usize].key, FnKey::Inst(d, _) if u.prog.name(*d) == "start"))).collect();
+        let code = u.code.read().unwrap();
+        let copies: Vec<u32> = pumps.iter().flat_map(|&p| code.inlined_at(u.fns[p as usize].code).map(|v| v.to_vec()).unwrap_or_default()).filter(|c| of_start.contains(c)).collect();
+        let only_code = of_start.iter().filter(|&&c| !u.fns[c as usize].compiled).count();
+        (copies, only_code)
+    };
+    let edit1 = rig.edit("lib.rs", &[("S { n: 5 }; read(&s) + k }", "S { n: 5 }; read(&s) + k + 1 }"), ("S { n: 7 }; read(&s) + k }", "S { n: 7 }; read(&s) + k + 1 }")]);
+    rig.call("later");
+    let rebound = (rig.flag(2), rig.flag(3));
+    let edit2 = rig.edit("lib.rs", &[("pub struct S { pub n: u64 }", "pub struct S { pub m: u64, pub n: u64 }"), ("S { n: 5 }", "S { m: 0, n: 5 }"), ("S { n: 7 }", "S { m: 0, n: 7 }")]);
+    rig.flags[2].store(0, std::sync::atomic::Ordering::SeqCst);
+    rig.flags[3].store(0, std::sync::atomic::Ordering::SeqCst);
+    rig.call("later");
+    let layout = (rig.flag(2), rig.flag(3));
+    assert_eq!((pumps.len(), copies.len(), only_code, tiered), (2, 2, 1, (5, 7)), "both instances of pump have O3 code holding their closure's body, one closure has no code of its own");
+    assert_eq!(edit1.rung, crate::reload::Rung::Patch, "the bodies' edit applies: {:?}", edit1.lines);
+    assert_eq!(rebound, (6, 8), "the calls through pump's hosts run the new bodies (the one only inline, the one with code): {:?}", edit1.lines);
+    assert_eq!(edit2.rung, crate::reload::Rung::Patch, "the field applies: {:?}", edit2.lines);
+    assert_eq!(layout, (6, 8), "the calls after the field, by the new bodies in the new layout");
 }
 
 const KEPT_U: &str = r#"pub struct U { pub a: u64 }
