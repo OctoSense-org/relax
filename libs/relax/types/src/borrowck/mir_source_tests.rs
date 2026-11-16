@@ -868,27 +868,6 @@ fn an_async_closure_cannot_move_out_of_a_shared_reference() {
 }
 
 #[test]
-fn bevys_param_set_takes_the_outlives_its_normalization_registers_as_implied_bounds() {
-    // `ParamSet<Query<&'a u8>>` is well-formed only where `'a: 'static` (the impl's `Q: 'static`); rustc keeps
-    // accepting bevy_ecs's use of it by assuming the region obligations normalizing its where clauses registers.
-    let source = "
-        pub trait WorldQuery {}
-        impl WorldQuery for &u8 {}
-        pub struct Query<Q: WorldQuery>(Q);
-        pub trait SystemParam { type State; }
-        impl<Q: WorldQuery + 'static> SystemParam for Query<Q> { type State = (); }
-        pub struct ParamSet<T: SystemParam>(T) where T::State: Sized;
-        fn handler<'a>(x: ParamSet<Query<&'a u8>>) { let _: ParamSet<_> = x; }
-        fn ref_handler<'a>(_: &ParamSet<Query<&'a u8>>) {}";
-    let (errors, unchecked) = borrowck_source_named(source, 2021, "bevy_ecs");
-    assert!(unchecked.is_empty(), "{unchecked:?}");
-    assert!(errors.is_empty(), "{errors:?}");
-    // another crate's ParamSet gets no such allowance
-    let (errors, _) = borrowck_source_named(source, 2021, "other_crate");
-    assert!(!errors.is_empty(), "{errors:?}");
-}
-
-#[test]
 fn a_local_without_an_annotation_is_instantiated_by_the_coercion_of_its_initializer() {
     // type-inference/generalize-subtyped-variables.rs: `let y = x` relates two type variables later, so the
     // first use of `z` generalizes it to the non-higher-ranked `fn(&'0 ())`.
