@@ -726,6 +726,12 @@ pub fn cmd_code(req: &Req, out: &mut Out) {
     let up = crate::jit::current_unit();
     if !up.is_null() {
         out.line(&unsafe { &*up }.window_line());
+        // what the lean point said: the window then, and the slots with the most versions
+        if let Some(report) = unsafe { &*up }.lean_report() {
+            for line in report.lines() {
+                out.line(&format!("  lean point: {}", line));
+            }
+        }
     }
     out.line(&crate::invalid::stats_line());
     if up.is_null() {

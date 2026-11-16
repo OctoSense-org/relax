@@ -538,8 +538,19 @@ pub struct Unit {
     /// bump allocators of code / read-only data / static memory (lock-free: lowering threads
     /// allocate too)
     code_next: AtomicU64,
+    /// where code_next stops (`code_bump`): the window's end, less CODE_TAIL
+    code_end: u64,
     /// the code window's bytes by what they are for (`code_bump`, WIN_NAMES)
     window_use: [AtomicU64; WIN_KINDS],
+    /// code installed into slots that had none (`install_code_refs`): with the thunks, the glue and
+    /// the startup image, what the window's lean point measures (`code_lean`)
+    first_code: AtomicU64,
+    /// the code window is lean (`code_lean`): only slots that have no code get code
+    lean: AtomicBool,
+    /// installs refused since: a rebuild of a slot that has code (`install_unchecked`), an O3 build
+    lean_refused: AtomicU64,
+    /// the report the lean point printed (`code_lean`)
+    lean_report: std::sync::OnceLock<String>,
     /// branch veneers in the code area by target (`Unit::veneer`): the last one placed for each
     pub(crate) veneers: relax_session::sync::Mutex<HashMap<u64, u64>>,
     /// invalidatable code (invalid.rs): per group, its own page-aligned chunks of the code area
@@ -5326,6 +5337,11 @@ mod type_cycle_tests {
 /// A unit's data and statics parts of its reservation.
 const UNIT_DATA_SIZE: u64 = 768 << 20;
 pub(crate) const UNIT_RW_SIZE: u64 = 256 << 20;
+/// A unit's code window: all of code's pc-relative reach (x64 rel32: +-2 GB; arm64 adrp: +-4 GB)
+/// that the data, statics and symbol values after it leave, so its first byte still reaches the
+/// last symbol value. Code is never freed: this is what a session can ever install. Address space
+/// only: pages are committed as code lands.
+const UNIT_CODE_SIZE: u64 = (if cfg!(target_arch = "aarch64") { 4 << 30 } else { 2 << 30 }) - UNIT_DATA_SIZE - UNIT_RW_SIZE - (crate::syms::SYM_CAP * 8) as u64;
 
 // queries.rs:58-108: evaluate the resolved instance through the registered
 // compiler provider; the final result is independent of its executable storage.
@@ -5478,7 +5494,7 @@ impl Unit {
         }
         // the wasm32 web target's program: the unit lives in the linear memory's window (web32.rs)
         let w32 = prog.ptr_bytes == 4;
-        let exec_size: u64 = if w32 { crate::web32::UNIT_CODE } else { 768 << 20 };
+        let exec_size: u64 = if w32 { crate::web32::UNIT_CODE } else { UNIT_CODE_SIZE };
         let data_size: u64 = if w32 { crate::web32::UNIT_DATA } else { UNIT_DATA_SIZE };
         let rw_size: u64 = UNIT_RW_SIZE;
         let syms_size = (crate::syms::SYM_CAP * 8) as u64;
@@ -5591,7 +5607,12 @@ impl Unit {
             #[cfg(windows)]
             end_event: unsafe { os::win32::CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()) },
             code_next: AtomicU64::new(misc),
+            code_end: exec_base + exec_size - os::mem::CODE_TAIL,
             window_use: [const { AtomicU64::new(0) }; WIN_KINDS],
+            first_code: AtomicU64::new(0),
+            lean: AtomicBool::new(false),
+            lean_refused: AtomicU64::new(0),
+            lean_report: std::sync::OnceLock::new(),
             veneers: Default::default(),
             code_groups: Default::default(),
             hot_code: Default::default(),
@@ -6125,7 +6146,7 @@ impl Unit {
 
     /// `size` bytes of the code window at `align`, counted as what they are for (`kind`, WIN_NAMES).
     fn code_bump(&self, kind: usize, size: u64, align: u64) -> u64 {
-        let at = bump(&self.code_next, size, align, self.exec_base + self.exec_size - os::mem::CODE_TAIL, "out of code memory");
+        let at = bump(&self.code_next, size, align, self.code_end, "out of code memory");
         self.window_use[kind].fetch_add(size, Ordering::Relaxed);
         at
     }
@@ -6420,7 +6441,67 @@ impl Unit {
             counted += b;
             by.push(format!("{} {:.1} MB", WIN_NAMES[k], mb(b)));
         }
-        format!("code window {:.1} of {:.0} MB used: {}, alignment {:.1} MB", mb(used), mb(self.exec_size), by.join(", "), mb(used.saturating_sub(counted)))
+        let lean = if self.lean.load(Ordering::Relaxed) {
+            format!("; LEAN: only slots without code get code ({} installs refused)", self.lean_refused.load(Ordering::Relaxed))
+        } else {
+            String::new()
+        };
+        format!("code window {:.1} of {:.0} MB used: {}, alignment {:.1} MB{}", mb(used), mb(self.exec_size), by.join(", "), mb(used.saturating_sub(counted)), lean)
+    }
+
+    /// What the slots' first code has taken of the code window: their code (`first_code`), their
+    /// thunks, and the glue with the startup image. The lean point keeps as much again.
+    fn first_room(&self) -> u64 {
+        self.first_code.load(Ordering::Relaxed) + self.window_use[WIN_THUNKS].load(Ordering::Relaxed) + self.window_use[WIN_GLUE].load(Ordering::Relaxed)
+    }
+
+    /// The code window is lean: less of it is left than the slots' first code has taken so far
+    /// (`first_room`), so from now on only slots that have no code get code (a lazy compile, a
+    /// module's twins, a slot an edit or an invalidation left without code): no O2 or O3 build, no
+    /// rebuild of a slot that has code, and a live edit waits for a restart. Code is never freed:
+    /// a loop that builds slots again and again stops here instead of filling the window, and the
+    /// program runs on with the code it has. Said once, loudly: the window by kind, and on the
+    /// owner the slots with the most versions; the flight recorder writes its recording.
+    pub(crate) fn code_lean(&self) -> bool {
+        if self.lean.load(Ordering::Relaxed) {
+            return true;
+        }
+        let left = self.code_end.saturating_sub(self.code_next.load(Ordering::Relaxed));
+        let first = self.first_room();
+        if left >= first {
+            return false;
+        }
+        if self.lean.swap(true, Ordering::Relaxed) {
+            return true;
+        }
+        let mb = |b: u64| b as f64 / 1048576.0;
+        let head = format!("the JIT code window is lean: {:.1} MB of it is left, less than the {:.1} MB the slots' first code has taken (with their thunks, the glue and the startup image). From now on only slots without code get code: no O2 or O3 builds, no rebuilds of slots that have code, and live edits wait for a restart. Code is never freed: slots built again and again filled it.", mb(left), mb(first));
+        let mut report = format!("{}\n{}\n{}", head, self.window_line(), crate::invalid::stats_line());
+        if crate::owner::is_owner() {
+            report += &format!("\n{}", self.versions_line(8));
+        }
+        for line in report.lines() {
+            eprintln!("relax run: {}", line);
+        }
+        crate::inspect::flightrec::code_lean(&head);
+        let _ = self.lean_report.set(report);
+        true
+    }
+
+    /// (tests) The code window ends `left` bytes past what it has used so far.
+    #[cfg(test)]
+    pub(crate) fn shrink_code_window(&mut self, left: u64) {
+        self.code_end = self.code_next.load(Ordering::Relaxed) + left;
+    }
+
+    /// The lean flag alone (`code_lean`, no measuring): the build queues' check.
+    pub(crate) fn lean_now(&self) -> bool {
+        self.lean.load(Ordering::Relaxed)
+    }
+
+    /// What the lean point said (`code_lean`), once it was reached.
+    pub(crate) fn lean_report(&self) -> Option<&str> {
+        self.lean_report.get().map(|s| s.as_str())
     }
 
     /// The slots' versions (`FnEntry::version` counts every install and rollback) in all, and the
@@ -9015,6 +9096,12 @@ impl Unit {
         if self.forward_of(id).is_some() {
             return Ok(self.fns[id as usize].code);
         }
+        // the code window is lean (code_lean): a slot that has code keeps it, the new build is
+        // dropped as above (a live edit's installs are refused before they are built: reload.rs)
+        if gen == 0 && self.fns[id as usize].compiled && self.code_lean() {
+            self.lean_refused.fetch_add(1, Ordering::Relaxed);
+            return Ok(self.fns[id as usize].code);
+        }
         self.install_code(id, code, relocs, pc_map, gen)
     }
 
@@ -9057,6 +9144,9 @@ impl Unit {
             Some(t) => t,
             None => self.emit_grouped(group, code, relocs)?,
         };
+        if redirect.is_none() && !self.fns[id as usize].compiled {
+            self.first_code.fetch_add(code.len() as u64, Ordering::Relaxed);
+        }
         self.mark_interpreted(id, at);
         if redirect.is_none() {
             self.index_code(at, code.len() as u32, id, info);
@@ -12236,7 +12326,8 @@ fn o2_offer_hottest() {
 
 /// Queues slot `id` (marked O2 or higher) for its O2 build on the O2 worker, once.
 unsafe fn o2_enqueue(up: *mut Unit, id: u32) {
-    if matches!((&*up).fns[id as usize].key, FnKey::Ctfe(_)) { return; }
+    // (a lean code window takes no O2 code: Unit::code_lean)
+    if matches!((&*up).fns[id as usize].key, FnKey::Ctfe(_)) || (&*up).lean_now() { return; }
     {
         let mut seen = O2_SEEN.lock().unwrap_or_else(|e| e.into_inner());
         if !seen.get_or_insert_with(Default::default).insert((up as usize, id)) {
@@ -22404,7 +22495,8 @@ fn run_o3(entry: (u32, u8, u64, u64)) {
             eprintln!("O3p @{:.6} #{} worker={} phase=popped ready={} startup={} last_compile={:.6} demand={} last_demand={:.6}", wall_ns() as f64 / 1e9, id, 0, tier1_workers_ready(), STARTUP_COMPILES.load(Ordering::SeqCst), COMPILE_LAST.load(Ordering::SeqCst) as f64 / 1e9, DEMAND_COMPILES.load(Ordering::SeqCst), DEMAND_LAST.load(Ordering::SeqCst) as f64 / 1e9);
         }
         let up = TIER_UNIT.load(Ordering::Acquire);
-        if up.is_null() || TIER_STOP.load(Ordering::SeqCst) {
+        // (a lean code window takes no O3 code: Unit::code_lean)
+        if up.is_null() || TIER_STOP.load(Ordering::SeqCst) || unsafe { (*up).lean_now() } {
             return;
         }
         let _job = compile_job();
@@ -23441,6 +23533,8 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
         u.stats.tier1_free_ns += t2 - t1;
         let ok = match built {
             Ok(Ok((code, map, relocs, (inlined, left_calls, cold_left, absent, frame_size, self_call, nounwind_used)))) if !rt.cut && PATCH_EPOCH.load(Ordering::SeqCst) == epoch && !PATCH_OPEN.load(Ordering::SeqCst) && u.fns[id as usize].version == version && (!crate::inspect::instrument::active(id) || inspect_o3_on()) && !inlined_rejected(u, &unverified_in, &inlined)
+                // (a lean code window keeps a slot's code: an O3-always build is a slot's first)
+                && (o3_first() || !u.code_lean())
                 // (code of an invalidated group -- an unloaded module's -- is never built again)
                 && crate::invalid::group_of(u, id, 0, &inlined).map_or(true, |g| !crate::invalid::is_dead(u, g)) && {
                 let n = if relax_codegen::interp::blob::is_blob(&code) { code.len() } else { relax_backend::rir::split_unwind_info(&code).0 };
@@ -23813,8 +23907,12 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
                     Ok(Ok(_)) if PATCH_EPOCH.load(Ordering::SeqCst) != epoch || PATCH_OPEN.load(Ordering::SeqCst) => "patch changed meanwhile",
                     Ok(Ok(_)) if u.fns[id as usize].version != version => "slot changed meanwhile",
                     Ok(Ok((_, _, _, (inlined, ..)))) if inlined_rejected(u, &unverified_in, inlined) => "inlined a rejected callee",
+                    Ok(Ok(_)) if !o3_first() && u.lean_now() => "the code window is lean",
                     Ok(Ok(_)) => "link check failed",
                 };
+                if why == "the code window is lean" {
+                    u.lean_refused.fetch_add(1, Ordering::Relaxed);
+                }
                 drop_why(up, why);
                 // (the slot changed: which code went in, kind + 1, for the tier log)
                 let now_kind = if why == "slot changed meanwhile" {
@@ -23828,6 +23926,7 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
                     "codegen error" => crate::inspect::tierlog::DROP_CODEGEN,
                     "patch changed meanwhile" => crate::inspect::tierlog::DROP_PATCH,
                     "slot changed meanwhile" => crate::inspect::tierlog::DROP_SLOT_CHANGED,
+                    "the code window is lean" => crate::inspect::tierlog::DROP_LEAN,
                     _ => crate::inspect::tierlog::DROP_LINK,
                 }, now_kind, 0);
                 let u = &mut *up;
@@ -30134,6 +30233,9 @@ mod inspect_tiers_tests;
 #[cfg(test)]
 #[path = "tier_stuck_tests.rs"]
 mod tier_stuck_tests;
+#[cfg(test)]
+#[path = "code_window_tests.rs"]
+mod code_window_tests;
 
 #[cfg(test)]
 mod own_work_tests {

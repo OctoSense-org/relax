@@ -72,7 +72,8 @@ pub const DROP_CODEGEN: u8 = 1;
 pub const DROP_PATCH: u8 = 2;
 pub const DROP_SLOT_CHANGED: u8 = 3;
 pub const DROP_LINK: u8 = 4;
-pub const DROP_WHY: [&str; 5] = ["build panicked", "codegen error", "a patch changed meanwhile", "the slot changed meanwhile (other code installed, e.g. its O2 build)", "link check failed"];
+pub const DROP_LEAN: u8 = 5;
+pub const DROP_WHY: [&str; 6] = ["build panicked", "codegen error", "a patch changed meanwhile", "the slot changed meanwhile (other code installed, e.g. its O2 build)", "link check failed", "the code window is lean (only slots without code get code)"];
 
 pub const REFUSE_VERDICT: u8 = 0;
 pub const REFUSE_TAKE: u8 = 1;

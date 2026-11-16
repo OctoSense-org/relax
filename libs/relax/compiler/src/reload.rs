@@ -4685,6 +4685,11 @@ unsafe fn apply_mode(up: *mut Unit, edits: Vec<Edit>, sources: &[Edit], partial:
     if let Some(why) = unit_suspect() {
         return Outcome { failure: Some(makepad_remote::hot::Outcome::Panic), kept: 0, pending: false, rung: Rung::Restart, files, lines: vec![format!("not applied to a program an earlier edit left half-made ({why}): a process restart applies it")], names: Vec::new(), changed: 0, test_changes: None, bodies: Vec::new(), first_code: Vec::new(), group: 0, ms: [0.0; 4], undo: None, work: [0; 5], deferred: Vec::new() };
     }
+    // a lean code window (Unit::code_lean) takes code only for slots that have none: the edit
+    // waits for a restart, which starts with a new window
+    if (*up).code_lean() {
+        return Outcome { failure: None, kept: 0, pending: false, rung: Rung::Restart, files, lines: vec!["not applied: the JIT code window is lean, it takes code only for slots that have none (`inspect code` says what filled it): a process restart applies it".to_string()], names: Vec::new(), changed: 0, test_changes: None, bodies: Vec::new(), first_code: Vec::new(), group: 0, ms: [0.0; 4], undo: None, work: [0; 5], deferred: Vec::new() };
+    }
     // an internal compiler panic in the transaction refuses the edit with its message. Nothing
     // undoes what the transaction had changed of the program by then (its file versions, defs,
     // query inputs), so the unit is marked suspect: no edit applies to it again, and the
