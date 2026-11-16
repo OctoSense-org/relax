@@ -802,6 +802,13 @@ unsafe fn reset_hand(e: &Entry, seq: u32, sig: i32, bit: u64) -> bool {
     true
 }
 
+/// Blocks `sig` on the calling thread from now on (its end: `os::thread::kicks_done`).
+pub(crate) fn block_here(sig: i32) {
+    let mut set = [0u64; 16];
+    set[0] = 1u64 << (sig - 1);
+    unsafe { sys::pthread_sigmask(SIG_BLOCK, &set, std::ptr::null_mut()) };
+}
+
 /// The signal stays blocked on this thread: in the interrupted context once the handler returns
 /// (uc_sigmask), and in the handler's own from now (SA_NODEFER would take the copy sent on here).
 unsafe fn hold(bit: u64, uc: *mut u8) {

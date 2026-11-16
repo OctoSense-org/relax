@@ -85,6 +85,10 @@ const MAP_PRIVATE_ANON: i32 = 0x1002;
 /// a small stack's size and its guard's, and the protected page's (any page size)
 const SMALL: usize = 1 << 16;
 #[cfg(target_os = "linux")]
+const SIGUSR1: i32 = 10;
+#[cfg(target_vendor = "apple")]
+const SIGUSR1: i32 = 30;
+#[cfg(target_os = "linux")]
 const SIGUSR2: i32 = 12;
 #[cfg(target_vendor = "apple")]
 const SIGUSR2: i32 = 31;
@@ -293,6 +297,28 @@ pub fn install_rt(_out: &mut [u64; 8]) {
 pub fn values(out: &mut [u64; 8]) {
     for i in 0..3 { out[i] = VALUES[i].load(SeqCst); }
     out[3] = NVALUES.load(SeqCst);
+}
+
+static USR1_RUNS: AtomicU64 = AtomicU64::new(0);
+static WATCH_SIG_RUNS: AtomicU64 = AtomicU64::new(0);
+extern "C" fn on_usr1(_sig: i32, _info: *mut u8, _uc: *mut u8) { USR1_RUNS.fetch_add(1, SeqCst); }
+extern "C" fn on_watch_sig(_sig: i32, _info: *mut u8, _uc: *mut u8) { WATCH_SIG_RUNS.fetch_add(1, SeqCst); }
+
+/// Handlers on SIGUSR1 and on the host's watchdog signal (out[0]).
+pub fn install_usr1(out: &mut [u64; 8]) {
+    let a = action(on_usr1 as *const () as usize, SA_SIGINFO | SA_RESTART);
+    assert_eq!(unsafe { sigaction(SIGUSR1, &a, null_mut()) }, 0, "SIGUSR1 installation must succeed");
+    let a = action(on_watch_sig as *const () as usize, SA_SIGINFO | SA_RESTART);
+    assert_eq!(unsafe { sigaction(out[0] as i32, &a, null_mut()) }, 0, "the watchdog signal's installation must succeed");
+}
+
+/// Raises out[1] (0: none); out[2], out[3]: the SIGUSR1 and watchdog-signal handlers' runs.
+pub fn raise_and_count(out: &mut [u64; 8]) {
+    if out[1] != 0 {
+        assert_eq!(unsafe { raise(out[1] as i32) }, 0, "raise must succeed");
+    }
+    out[2] = USR1_RUNS.load(SeqCst);
+    out[3] = WATCH_SIG_RUNS.load(SeqCst);
 }
 "#;
 
@@ -594,3 +620,43 @@ extern "C" {
     #[link_name = "write"]
     fn libc_write(fd: i32, buf: *const core::ffi::c_void, n: usize) -> isize;
 }
+
+/// A program's SIGUSR1 is the program's: its handler runs, also after the run monitor put the
+/// host's handlers back on top. The host's watchdog has a signal of its own, and only its kicks
+/// are the host's: the program's own send of that signal runs the program's handler on it.
+#[test]
+fn a_program_sigusr1_and_its_send_of_the_watchdog_signal_run_its_handlers() {
+    const TEST: &str = "a_program_sigusr1_and_its_send_of_the_watchdog_signal_run_its_handlers";
+    if std::env::var(CHILD).as_deref() != Ok(TEST) {
+        let output = child(TEST, "");
+        assert!(output.status.success(), "the SIGUSR1 child must succeed: {:?}\n{}", output.status, String::from_utf8_lossy(&output.stderr));
+        return;
+    }
+    let (mut u, krate) = setup();
+    let _program = crate::os::program_thread();
+    let watch = crate::os::fault::watchdog_signal();
+    assert_ne!(watch, SIGUSR1, "the watchdog's signal is not SIGUSR1");
+    let mut out = [0u64; 8];
+    out[0] = watch as u64;
+    let arg = out.as_mut_ptr() as u64;
+    call(&mut u, krate, "install_usr1", arg);
+    assert_eq!(crate::os::progsig::kernel_handler(watch), crate::os::fault::host_handler(), "the host's handler stays on the watchdog's signal");
+    assert_eq!(crate::os::fault::chained_handler(watch), crate::os::progsig::trampoline_addr(), "the program's handler is chained behind it");
+    // the run monitor's tick
+    crate::os::fault::reassert();
+    out[1] = SIGUSR1 as u64;
+    call(&mut u, krate, "raise_and_count", arg);
+    assert_eq!((out[2], out[3]), (1, 0), "the program's SIGUSR1 runs its handler once");
+    crate::os::thread::kick(crate::os::thread::current());
+    out[1] = 0;
+    call(&mut u, krate, "raise_and_count", arg);
+    assert_eq!((out[2], out[3]), (1, 0), "a kick runs no program handler");
+    out[1] = watch as u64;
+    call(&mut u, krate, "raise_and_count", arg);
+    assert_eq!((out[2], out[3]), (1, 1), "the program's own send of the watchdog's signal runs its handler once");
+}
+
+#[cfg(target_os = "linux")]
+const SIGUSR1: i32 = 10;
+#[cfg(target_vendor = "apple")]
+const SIGUSR1: i32 = 30;

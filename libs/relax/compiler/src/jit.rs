@@ -1640,6 +1640,9 @@ struct AltStack(std::cell::Cell<u64>);
 
 impl Drop for AltStack {
     fn drop(&mut self) {
+        // (no kick reaches the thread from here)
+        #[cfg(unix)]
+        os::thread::kicks_done();
         let sp = self.0.get();
         if sp > 1 {
             os::fault::this_thread_done(sp);

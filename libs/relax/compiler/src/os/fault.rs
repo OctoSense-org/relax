@@ -533,8 +533,15 @@ mod imp {
     use super::{Action, Fault, Hooks};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    /// SIGUSR1: the hang watchdog's signal
-    pub const SIG_WATCHDOG: i32 = 10;
+    /// The hang watchdog's signal: SIGRTMIN+4, a real-time signal of the JIT's own (they queue:
+    /// one delivery per kick), so a program's SIGUSR1 stays the program's. inspect's capture
+    /// signal takes the first free one from SIGRTMIN+6.
+    pub fn watchdog_signal() -> i32 {
+        extern "C" {
+            fn __libc_current_sigrtmin() -> i32;
+        }
+        unsafe { __libc_current_sigrtmin() + 4 }
+    }
     /// the watchdog's signal handler runs on the looping thread itself
     pub const NEEDS_HANG_TRAMP: bool = false;
 
@@ -588,14 +595,14 @@ mod imp {
         (old.sp as u64, old.sp as u64 + old.size as u64)
     }
 
-    /// The faults whose handler the host keeps on top (`chain_behind`).
+    /// The faults whose handler the host keeps on top (`chain_behind`), and the watchdog's signal.
     const HOST_FAULTS: [i32; 4] = [SIGILL, SIGBUS, SIGFPE, SIGSEGV];
 
     /// progsig.rs's `set` of `sig` to handler `h` with `flags`: where `sig` is a fault of the
     /// host's and the kernel runs our handler for it, that stays and `h` goes behind it (true);
     /// else nothing changes (false: the caller sets the kernel's action).
     pub(crate) unsafe fn chain_behind(sig: i32, h: usize, flags: i32) -> bool {
-        if !HOST_FAULTS.contains(&sig) {
+        if !HOST_FAULTS.contains(&sig) && sig != watchdog_signal() {
             return false;
         }
         let mut cur = SigAction { handler: 0, mask: [0; 16], flags: 0, pad: 0, restorer: 0 };
@@ -625,8 +632,12 @@ mod imp {
                 raise_abort();
                 return;
             }
+            if sig == watchdog_signal() && !crate::os::thread::take_kick() {
+                super::not_a_kick(sig, info, uc);
+                return;
+            }
             // RELAX_COMPILE_WATCH: the watcher asks a thread stuck in one step where it is
-            if sig == SIG_WATCHDOG && crate::jit::WATCH_DUMP.load(std::sync::atomic::Ordering::Relaxed) {
+            if sig == watchdog_signal() && crate::jit::WATCH_DUMP.load(std::sync::atomic::Ordering::Relaxed) {
                 let (pc, fp) = (*gregs.add(16), *gregs.add(10));
                 eprintln!("relax watch: stuck thread {:#x} at pc {:#x} ({}) fp {:#x}", crate::os::thread::current(), pc, crate::jit::fn_name_at(pc), fp);
                 return;
@@ -679,7 +690,7 @@ mod imp {
         }
     }
 
-    const OUR_SIGNALS: [i32; 6] = [SIGILL, SIGBUS, SIGFPE, SIG_WATCHDOG, SIGSEGV, SIGABRT];
+    fn our_signals() -> [i32; 6] { [SIGILL, SIGBUS, SIGFPE, watchdog_signal(), SIGSEGV, SIGABRT] }
     const SA_SIGINFO: i32 = 4;
     /// SA_SIGINFO | SA_ONSTACK. No SA_NODEFER: the signal stays blocked while its handler runs,
     /// so a fault inside the handler is not handled again (the kernel kills the process).
@@ -687,7 +698,7 @@ mod imp {
 
     pub fn install() {
         unsafe {
-            for sig in OUR_SIGNALS {
+            for sig in our_signals() {
                 let act = SigAction { handler: on_signal as *const () as usize, mask: [0; 16], flags: OUR_FLAGS, pad: 0, restorer: 0 };
                 sigaction(sig, &act, std::ptr::null_mut());
             }
@@ -696,7 +707,7 @@ mod imp {
 
     /// Handlers a library of the program installed over ours (Chromium's in cef_initialize, as on
     /// macOS): (handler, flags) per signal, called for signals that are not faults in JIT code.
-    static CHAINED: [[AtomicUsize; 2]; 32] = [const { [const { AtomicUsize::new(0) }; 2] }; 32];
+    static CHAINED: [[AtomicUsize; 2]; 65] = [const { [const { AtomicUsize::new(0) }; 2] }; 65];
 
     /// A handler the ended run's program chained goes; a library's stays.
     pub(crate) unsafe fn reset_statics() {
@@ -718,7 +729,7 @@ mod imp {
     /// in JIT code after CEF started was Chromium's (a bare core dump, no report).
     pub fn reassert() {
         unsafe {
-            for sig in OUR_SIGNALS {
+            for sig in our_signals() {
                 let mut old = SigAction { handler: 0, mask: [0; 16], flags: 0, pad: 0, restorer: 0 };
                 sigaction(sig, std::ptr::null(), &mut old);
                 if old.handler != on_signal as *const () as usize {
@@ -742,7 +753,7 @@ mod imp {
     }
 
     /// Passes a signal that is not ours to the handler we replaced, if any. False: none.
-    unsafe fn chain(sig: i32, info: *mut u8, uc: *mut u8) -> bool {
+    pub(crate) unsafe fn chain(sig: i32, info: *mut u8, uc: *mut u8) -> bool {
         let h = CHAINED[sig as usize][0].load(Ordering::SeqCst);
         let flags = CHAINED[sig as usize][1].load(Ordering::SeqCst) as i32;
         if h <= 1 {
@@ -851,14 +862,14 @@ mod imp {
         (old.sp as u64, old.sp as u64 + old.size as u64)
     }
 
-    /// The faults whose handler the host keeps on top (`chain_behind`).
+    /// The faults whose handler the host keeps on top (`chain_behind`), and the watchdog's signal.
     const HOST_FAULTS: [i32; 4] = [SIGILL, SIGBUS, SIGFPE, SIGSEGV];
 
     /// progsig.rs's `set` of `sig` to handler `h` with `flags`: where `sig` is a fault of the
     /// host's and the kernel runs our handler for it, that stays and `h` goes behind it (true);
     /// else nothing changes (false: the caller sets the kernel's action).
     pub(crate) unsafe fn chain_behind(sig: i32, h: usize, flags: i32) -> bool {
-        if !HOST_FAULTS.contains(&sig) {
+        if !HOST_FAULTS.contains(&sig) && sig != watchdog_signal() {
             return false;
         }
         let mut cur = SigAction { handler: 0, mask: 0, flags: 0, pad: 0, restorer: 0 };
@@ -882,6 +893,10 @@ mod imp {
             // the handler allocates: in the system heap, never in the faulting thread's arena (the fault may be inside its allocator)
             let _kept = crate::zone_alloc::kept();
             let reg = |i: usize| uc.add(OFFSETS[i]) as *mut u64;
+            if sig == watchdog_signal() && !crate::os::thread::take_kick() {
+                super::not_a_kick(sig, info, uc);
+                return;
+            }
             // RELAX_COMPILE_WATCH: the watcher asks a thread stuck in one step where it is
             if sig == watchdog_signal() && crate::jit::WATCH_DUMP.load(std::sync::atomic::Ordering::Relaxed) {
                 let (pc, fp) = (*reg(14), *reg(11));
@@ -1022,7 +1037,7 @@ mod imp {
     }
 
     /// Passes a signal that is not ours to the handler we replaced, if any. False: none.
-    unsafe fn chain(sig: i32, info: *mut u8, uc: *mut u8) -> bool {
+    pub(crate) unsafe fn chain(sig: i32, info: *mut u8, uc: *mut u8) -> bool {
         let h = CHAINED[sig as usize][0].load(Ordering::SeqCst);
         let flags = CHAINED[sig as usize][1].load(Ordering::SeqCst) as i32;
         if h <= 1 {
@@ -1055,8 +1070,10 @@ mod imp {
     use crate::jit::cur_unit;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    /// SIGUSR1 (Darwin numbering): the hang watchdog's signal
-    pub const SIG_WATCHDOG: i32 = 30;
+    /// SIGEMT: the hang watchdog's signal. Darwin has no real-time signals; on Apple silicon
+    /// nothing raises SIGEMT and programs almost never handle it, so a program's SIGUSR1 stays the
+    /// program's. Two kicks pending at once are one delivery (`os::thread::take_kick`).
+    pub const SIG_WATCHDOG: i32 = 7;
     /// the watchdog's signal handler runs on the looping thread itself
     pub const NEEDS_HANG_TRAMP: bool = false;
 
@@ -1127,14 +1144,14 @@ mod imp {
         (old.sp as u64, old.sp as u64 + old.size as u64)
     }
 
-    /// The faults whose handler the host keeps on top (`chain_behind`).
+    /// The faults whose handler the host keeps on top (`chain_behind`), and the watchdog's signal.
     const HOST_FAULTS: [i32; 5] = [SIGILL, SIGTRAP, SIGBUS, SIGFPE, SIGSEGV];
 
     /// progsig.rs's `set` of `sig` to handler `h` with `flags`: where `sig` is a fault of the
     /// host's and the kernel runs our handler for it, that stays and `h` goes behind it (true);
     /// else nothing changes (false: the caller sets the kernel's action).
     pub(crate) unsafe fn chain_behind(sig: i32, h: usize, flags: i32) -> bool {
-        if !HOST_FAULTS.contains(&sig) {
+        if !HOST_FAULTS.contains(&sig) && sig != SIG_WATCHDOG {
             return false;
         }
         let mut cur = SigAction { handler: 0, mask: 0, flags: 0 };
@@ -1240,6 +1257,10 @@ mod imp {
                 report_abort(*reg(SS_PC), *reg(SS_FP));
                 default_action(SIGABRT);
                 raise_abort();
+                return;
+            }
+            if sig == SIG_WATCHDOG && !crate::os::thread::take_kick() {
+                super::not_a_kick(sig, info, uc);
                 return;
             }
             if sig == SIG_WATCHDOG && crate::jit::WATCH_DUMP.load(Ordering::Relaxed) {
@@ -1366,7 +1387,7 @@ mod imp {
     }
 
     /// Passes a signal that is not ours to the handler we replaced, if any. False: none.
-    unsafe fn chain(sig: i32, info: *mut u8, uc: *mut u8) -> bool {
+    pub(crate) unsafe fn chain(sig: i32, info: *mut u8, uc: *mut u8) -> bool {
         let h = CHAINED[sig as usize][0].load(Ordering::SeqCst);
         let flags = CHAINED[sig as usize][1].load(Ordering::SeqCst) as i32;
         if h <= 1 {
@@ -1584,8 +1605,24 @@ mod imp {
     pub(crate) unsafe fn reset_statics() {}
 }
 
-#[cfg(not(target_os = "android"))]
+#[cfg(not(any(target_os = "android", target_os = "linux")))]
 pub fn watchdog_signal() -> i32 { SIG_WATCHDOG }
+
+/// A delivery of the watchdog's signal that is no kick (`os::thread::take_kick`): the program's
+/// own, or another process's. The program's handler takes it, as natively; with none, its
+/// default action (it ends the process), and nothing when the program ignores it.
+#[cfg(unix)]
+unsafe fn not_a_kick(sig: i32, info: *mut u8, uc: *mut u8) {
+    if imp::chain(sig, info, uc) || imp::chained_handler(sig) == 1 {
+        return;
+    }
+    extern "C" {
+        fn raise(sig: i32) -> i32;
+    }
+    imp::default_action(sig);
+    // (blocked while this handler runs: it is delivered as the handler returns, by default)
+    raise(sig);
+}
 
 /// Starts the thread SIGABRT's report is made on (`unix::abort`), with the compiler's owner.
 #[cfg(any(target_os = "linux", target_vendor = "apple"))]
