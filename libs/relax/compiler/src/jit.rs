@@ -9532,7 +9532,8 @@ impl Unit {
                 match self.stored_owner_verdict(*d, epoch) {
                     Some(crate::borrowck::lazy::StoredVerdict::Clean) => Verdict::Clean,
                     Some(crate::borrowck::lazy::StoredVerdict::Unchecked(why)) => Verdict::Unverifiable(why),
-                    None => pending,
+                    // (a crate's verdict: no owner's)
+                    Some(crate::borrowck::lazy::StoredVerdict::Failed(_)) | None => pending,
                 }
             }
             FnKey::Closure(_, _, parent) | FnKey::Ctfe(parent) => self.verdict_state(*parent),
@@ -24264,8 +24265,8 @@ pub(crate) fn presented() -> bool {
     FIRST_PRESENT.load(Ordering::Acquire)
 }
 
-/// Whether the program was taken for a batch program (`batch_program`).
-#[cfg(test)]
+/// Whether the program was taken for a batch program (`batch_program`), or never presents a frame
+/// (startup_main of a test harness or a program without the platform): no first present will come.
 pub(crate) fn past_startup_headless() -> bool {
     HEADLESS.load(Ordering::Acquire)
 }
@@ -30131,7 +30132,7 @@ fn trace_stored_verdict(prog: &Program, def: DefId, what: &str, stored: Option<&
     let state = match stored {
         Some(crate::borrowck::lazy::StoredVerdict::Clean) => "clean",
         Some(crate::borrowck::lazy::StoredVerdict::Unchecked(_)) => "unchecked",
-        None => "check",
+        Some(crate::borrowck::lazy::StoredVerdict::Failed(_)) | None => "check",
     };
     eprintln!("gandalf-verdict: {} {} {}", what, state, prog.def_path(def));
 }

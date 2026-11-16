@@ -238,3 +238,19 @@ against it, on top of what the program itself allocates.
 This is by design: the JIT and the program are one process. A program that tests itself under a
 tight data limit needs headroom for the JIT above what it uses itself. When the JIT itself runs
 out under such a limit, it says so, names the limit, and the run stops with exit code 101.
+
+## 12. The early check of a dependency finds type errors only
+
+A test run, and a program that never presents a frame, type-check the bodies of the registry crates
+their code sees in the background, and say once, early, when one does not compile (a body that
+names a std item Relax lacks, for instance); the verdict is stored, so a warm run checks nothing
+again. That check is the type checker's: names, types, traits.
+
+- rustc: cargo compiles every body of every dependency before the program starts, so any body it
+  cannot compile stops the build.
+- Relax: a body that type-checks but that Relax then fails to lower or compile is found only when
+  the run first calls it. Its error is printed then, once, and each test that calls it fails with
+  its one-line message; the run's end names the body.
+
+Start in compiler/src/typeck_bg.rs (the background check and its stored verdicts) and jit.rs
+install_error (the report when a body's build fails).

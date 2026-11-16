@@ -216,14 +216,18 @@ pub trait FrontSource: Send + Sync {
 /// BORROWCK_VERSION), so an unchanged body is never checked again: Clean, or Unchecked -- the
 /// check completed but could not certify the body (its identity body has type errors, or a
 /// trait property stays unresolved). Both are deterministic for one build and source; errors
-/// and checker failures are never stored (they are reported again).
+/// and checker failures are never stored (they are reported again). Failed is a crate's (the
+/// background type check's, by crate check key): its bodies' type errors, a registry crate's
+/// Relax gaps, so a warm run does not check that crate again.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum StoredVerdict { Clean, Unchecked(String) }
+pub enum StoredVerdict { Clean, Unchecked(String), Failed(Vec<String>) }
 impl StoredVerdict {
     fn reuse(self, key: ItemKey) {
         match self {
             StoredVerdict::Clean => { record(key, FnVerdict::Clean); CACHED_CLEAN.fetch_add(1, Ordering::Relaxed); }
             StoredVerdict::Unchecked(why) => { record(key, FnVerdict::Unchecked(why)); CACHED_UNCHECKED.fetch_add(1, Ordering::Relaxed); }
+            // (a crate's verdict, under no body's key)
+            StoredVerdict::Failed(_) => {}
         }
     }
 }

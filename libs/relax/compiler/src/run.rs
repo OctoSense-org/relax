@@ -2716,8 +2716,18 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
         jit::start_cpu_budget();
     }
     jit::start_completion(up);
-    // the dependencies' bodies no build asked for are type-checked after the first frame
-    if !harness && !plain_test { crate::typeck_bg::start(up, root, main_def); }
+    // the dependencies' bodies no build asked for are type-checked after the first frame; in a test
+    // run, the registry crates its tests see, from its tests on (never in a test's child process)
+    if !((harness || plain_test) && (self_exec || check)) {
+        let mut registry = vec![None; u.prog.crates.len()];
+        for (ci, c) in g.crates.iter().enumerate() {
+            if c.registry && crate_of[ci] != u32::MAX {
+                registry[crate_of[ci] as usize] = Some(format!("`{}` {}", g.pkg[ci].1, g.pkg[ci].2));
+            }
+        }
+        let test_subjects = if harness || plain_test { test_subjects.clone() } else { Vec::new() };
+        crate::typeck_bg::start(up, crate::typeck_bg::Scope { root, main: main_def, test_subjects, registry });
+    }
     let platform = u.prog.crates.iter().any(|c| unitgraph::presents(&unitgraph::manifest_dir_of(c.root_path())));
     jit::live_needs_present(!live_tests && platform);
     // a test harness never presents, nor does a program without the platform: no startup to wait out

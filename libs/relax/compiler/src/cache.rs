@@ -133,12 +133,15 @@ fn enc_verdict(v: &StoredVerdict) -> Vec<u8> {
     match v {
         StoredVerdict::Clean => Vec::new(),
         StoredVerdict::Unchecked(why) => std::iter::once(1u8).chain(why.bytes()).collect(),
+        // the errors, each ended by a 0 byte
+        StoredVerdict::Failed(errors) => std::iter::once(2u8).chain(errors.iter().flat_map(|e| e.bytes().chain(std::iter::once(0u8)))).collect(),
     }
 }
 fn dec_verdict(p: &[u8]) -> Option<StoredVerdict> {
     match p.split_first() {
         None => Some(StoredVerdict::Clean),
         Some((1, why)) => Some(StoredVerdict::Unchecked(String::from_utf8(why.to_vec()).ok()?)),
+        Some((2, errors)) => Some(StoredVerdict::Failed(errors.split(|&b| b == 0).filter(|e| !e.is_empty()).map(|e| String::from_utf8(e.to_vec()).ok()).collect::<Option<Vec<String>>>()?)),
         Some(_) => None,
     }
 }
