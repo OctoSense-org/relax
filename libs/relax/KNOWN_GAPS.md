@@ -205,15 +205,16 @@ know.
 Start in compiler/src/sandbox/script.rs (`entry`, the domain's table) and sandbox/broker.rs (the
 folders and the walk); the decision is relax-front unitgraph.rs `script_confined`.
 
-## 10. A future of an async cycle bound to a local before it is boxed: E0733 where rustc accepts it
+## 10. A future of an async cycle borrowed in a block that ends before the await: E0733 where rustc accepts it
 
 `src/main.rs` of a package:
 
 ```rust
+fn by_ref<T>(_: &T) {}
 async fn outer(n: u32) -> u64 {
     if n > 0 {
-        let f = inner(n - 1);
-        Box::pin(f).await
+        let b = { let f = inner(n - 1); by_ref(&f); Box::pin(f) };
+        b.await
     } else { 0 }
 }
 async fn inner(n: u32) -> u64 { outer(n).await + 1 }
@@ -221,17 +222,16 @@ async fn inner(n: u32) -> u64 { outer(n).await + 1 }
 
 and a `main` that polls `outer(3)` to completion (any executor; a no-op waker is enough).
 
-- rustc: builds and runs. The same holds when the future is first destructured from a tuple
-  (`let (s, f) = pass(inner(n - 1));`) or borrowed inside a block that ends before the await
-  (`let b = { let f = inner(n - 1); by_ref(&f); Box::pin(f) }; b.await`).
-- Relax: E0733 at `outer`, from the coroutine transform. `Box::pin(inner(n - 1)).await`, with no
-  local, works.
+- rustc: builds and runs. `f`'s borrow ends with its block, before the await, so the future is not
+  held across it.
+- Relax: E0733 at `outer`, from the coroutine transform. The same without the borrow (`let f =
+  inner(n - 1); Box::pin(f).await`), or with `f` destructured from a tuple, works.
 
 The transform saves a slot at a suspension point when its address escaped and it was touched
 before (compiler/src/lower.rs `coroutine_transform`, the saved-slot rule), with no test of whether
-the slot's value is still there: RIR has no storage-dead point. So `outer` saves the slot that held
+the slot's storage has ended: RIR has no storage-dead point. So `outer` saves the slot that held
 `inner`'s future, and that future holds `outer`'s: the future would contain itself. rustc saves a
-local only while it is live or borrowed and its storage is live (`locals_live_across_suspend_points`),
-and StorageDead ends both. Start with a storage-dead marker in coroutine bodies at the end of a
-local's or a temporary's scope, and a mask over the saved set (alive since its last direct touch,
-or a vreg pointing into the slot directly live at the point).
+borrowed local only while its storage is live (`locals_live_across_suspend_points`), and
+StorageDead ends it. Start with a storage-dead marker in coroutine bodies at the end of a local's or
+a temporary's scope, and a mask over the saved set (alive since its last direct touch, or a vreg
+pointing into the slot directly live at the point).

@@ -370,6 +370,10 @@ pub struct Lcx<'a> {
     /// into the drops after it, never into itself
     pad_fixed: Option<Option<u32>>,
     building_pad: bool,
+    /// a drop at a scope's or a temporary's exit (emit_drop_act), not one in the middle of a
+    /// local's life: in a coroutine body its drop glue gets the address as the call's own
+    /// memory (Coro::call_private)
+    exit_drop: bool,
     /// the last cleanup pad and the drop-state hash it was made for (consecutive calls of a
     /// statement mostly share their drop state)
     last_pad: Option<(u64, u32)>,
@@ -600,6 +604,7 @@ impl<'a> Lcx<'a> {
             pad_cache: HashMap::default(),
             pad_fixed: None,
             building_pad: false,
+            exit_drop: false,
             last_pad: None,
             coro: None,
             tree_cx: None,
@@ -1943,9 +1948,9 @@ impl<'a> Lcx<'a> {
                             // unless those wait for this one, a future that holds itself
                             if crate::jit::coro_defer(self.u, c.ct, deps).is_err() {
                                 // (the clause goes with the storage-dead points: the transform saves
-                                // a slot whose future was moved into a box or whose scope ended
-                                // before the suspension point, rustc does not; KNOWN_GAPS.md)
-                                self.err(self.pos, "recursion in an async fn or block requires boxing: the future would contain itself (E0733) (Relax also reports this, where rustc does not, when a future of the cycle is bound to a local before it is boxed: see Relax's KNOWN_GAPS.md)".to_string());
+                                // a slot borrowed in a scope that ended before the suspension point,
+                                // rustc does not; KNOWN_GAPS.md)
+                                self.err(self.pos, "recursion in an async fn or block requires boxing: the future would contain itself (E0733) (Relax also reports this, where rustc does not, when a future of the cycle is borrowed in a block that ends before the await: see Relax's KNOWN_GAPS.md)".to_string());
                             }
                         } else {
                             match self.u.tcx.coro_frames.get(&c.ct) {
@@ -3723,6 +3728,23 @@ impl<'a> Lcx<'a> {
             // outside a drop sequence (emit_drop_seq) the drop state may still list this value;
             // a drop that cannot unwind (std types all the way down) needs no pad
             let plain = self.pad_fixed.is_none() || !self.u.drop_may_unwind(t);
+            // An exit drop in a coroutine body: the glue gets the address as the call's own
+            // memory (what the value holds flows, the address does not), on a vreg of its own so
+            // the place's other uses stay what they are. The place's storage ends right after it,
+            // which ends the borrow the drop makes (rustc: StorageDead after the Drop, so
+            // MaybeBorrowedLocals no longer holds it). A drop in the middle of a local's life
+            // (an assignment's, drop_local_before_rebind) stays an ordinary argument.
+            let addr = match self.coro.is_some() && self.exit_drop {
+                true => {
+                    let p = self.f.vreg(Cls::I);
+                    self.emit(Inst::Mov(p, addr));
+                    if let Some(c) = self.coro.as_mut() {
+                        c.call_private.insert(p);
+                    }
+                    p
+                }
+                false => addr,
+            };
             self.nounwind += plain as u32;
             self.emit(Inst::Call(Callee::Fn(id), vec![addr], Vec::new()));
             self.nounwind -= plain as u32;
@@ -4471,11 +4493,13 @@ impl<'a> Lcx<'a> {
     }
 
     fn emit_drop_act(&mut self, a: &DropAct) {
+        let was = std::mem::replace(&mut self.exit_drop, true);
         match *a {
             DropAct::Local(li) => self.drop_local_if_live(li),
             DropAct::Temp(p, t, None) => self.drop_at(p, t),
             DropAct::Temp(p, t, Some(f)) => self.drop_flagged_temp(p, t, f),
         }
+        self.exit_drop = was;
     }
 
     /// What a drop action's code depends on (cleanup pads are shared by it).
@@ -14493,10 +14517,15 @@ fn coroutine_transform(f: &mut Func, c: &Coro, ptr_bytes: u32, tys: &(std::colle
         }
         v
     };
+    // (only the blocks still reachable after the flag fold: unreachable code reads and stores
+    // nothing, as a drop of a value moved out before it)
     let mut changed = true;
     while changed {
         changed = false;
-        for b in &f.blocks {
+        for (bi, b) in f.blocks.iter().enumerate() {
+            if !seen_g[bi] {
+                continue;
+            }
             for i in &b.insts {
                 // what memory at the slots `base` points to may hold (unknown memory: U)
                 let read_through = |pts: &[u64], content: &[u64], uset: &[u64], base: VReg| -> Vec<u64> {
@@ -14634,6 +14663,9 @@ fn coroutine_transform(f: &mut Func, c: &Coro, ptr_bytes: u32, tys: &(std::colle
     let mut touched: Vec<Vec<u32>> = vec![Vec::new(); ns];
     let mut written: Vec<Vec<u32>> = vec![Vec::new(); ns];
     for (bi, b) in f.blocks.iter().enumerate() {
+        if !seen_g[bi] {
+            continue;
+        }
         let mut mark = vec![false; ns];
         let mut wmark = vec![false; ns];
         for i in &b.insts {
@@ -14842,6 +14874,9 @@ fn coroutine_transform(f: &mut Func, c: &Coro, ptr_bytes: u32, tys: &(std::colle
             r
         };
         for (bi, b) in f.blocks.iter().enumerate() {
+            if !seen_g[bi] {
+                continue;
+            }
             let mut g = vec![0u64; wd];
             let mut k = vec![0u64; wd];
             for i in b.insts.iter().rev() {
