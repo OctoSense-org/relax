@@ -127,8 +127,9 @@ fn a_local_of_a_type_whose_bounds_fail_is_refused() {
 
 /// A bound that only an alias's arguments carry, `'b: 'a` from `<&'a &'b () as Trait>::Type`, is gone once the
 /// alias normalizes to `()`, and a fn item used through the `Fn` traits is called without its unnormalized
-/// signature being proven. The body may not assume it: implied bounds come from the normalized type, and an
-/// alias contributes nothing from its arguments (lifetime may not live long enough).
+/// signature being proven. The body may not assume it: implied bounds come from the normalized type, so an
+/// alias that normalizes away contributes nothing from its arguments (lifetime may not live long enough). An
+/// alias that stays rigid keeps what its arguments and its item's where-clauses imply.
 #[test]
 fn a_bound_only_an_alias_argument_carries_is_not_implied() {
     let e = errors("
@@ -136,9 +137,11 @@ fn a_bound_only_an_alias_argument_carries_is_not_implied() {
         impl<T> Trait for T { type Type = (); }
         pub fn extend<'a, 'b, T>(_: <&'a &'b () as Trait>::Type, v: &'b T) -> &'a T { v }
         pub fn fine<'a, 'b, T>(_: &'a &'b (), v: &'b T) -> &'a T { v }
-        pub fn rigid<'a, X: Trait>(_: &'a X::Type, v: &'a X) -> &'a X { v }");
+        pub fn rigid<'a, X: Trait>(_: &'a X::Type, v: &'a X) -> &'a X { v }
+        pub trait Lock { type Guard<'g, T> where T: 'g; fn read<T>(_: &Self) -> Self::Guard<'_, T>; }
+        pub fn guarded<'a, L: Lock, T>(_: L::Guard<'a, T>) -> Option<&'a T> { None }");
     assert!(has(&e, "extend", ""), "{e:?}");
-    assert!(!e.iter().any(|x| x.contains("fine") || x.contains("rigid")), "{e:?}");
+    for f in ["fine", "rigid", "read", "guarded"] { assert!(!has(&e, f, ""), "{f}: {e:?}"); }
 }
 
 /// An auto trait's goals are coinductive, but the where-clause of a written impl is no productive step:

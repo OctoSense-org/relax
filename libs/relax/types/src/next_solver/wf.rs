@@ -7,27 +7,18 @@ use crate::types::fold::{TypeFolder, super_fold_ty, super_fold_const};
 use crate::consts::{ConstKind, AliasConstKind};
 
 pub fn unnormalized_obligations(infcx: &InferCtxt<'_>, prog: &Program, env: &ParamEnvId, term: Term) -> Result<Option<Vec<Goal>>, NoSolution> {
-    obligations(infcx, prog, env, term, false)
-}
-/// The obligations whose outlives parts a well-formed `term` implies. An alias contributes nothing from its
-/// arguments or its item's where-clauses: nobody proves those for a fn item used through the `Fn` traits
-/// (rustc issues 100051, 129005), so assuming them would let a body rely on bounds no caller showed.
-pub fn implied_bounds_obligations(infcx: &InferCtxt<'_>, prog: &Program, env: &ParamEnvId, term: Term) -> Result<Option<Vec<Goal>>, NoSolution> {
-    obligations(infcx, prog, env, term, true)
-}
-fn obligations(infcx: &InferCtxt<'_>, prog: &Program, env: &ParamEnvId, term: Term, implied: bool) -> Result<Option<Vec<Goal>>, NoSolution> {
     let term = match term { Term::Ty(t) => Term::Ty(infcx.deeply_resolve_ignoring_regions(t)), Term::Const(c) => Term::Const(crate::infer::resolve::DeepResolverIgnoringRegions::new(infcx).fold_const(&infcx.tcx.tys, c, 0)) };
     match term {
         Term::Ty(t) if matches!(infcx.tcx.tys.kind(t), TyKind::Infer(_)) => return Ok(None),
         Term::Const(c) if matches!(infcx.tcx.tys.const_kind(c), ConstKind::Infer(_)) => return Ok(None),
         _ => {}
     }
-    let mut wf = WfPredicates { infcx, prog, env, out: Vec::new(), visited_tys: crate::fxhash::HashSet::default(), failed: false, implied };
+    let mut wf = WfPredicates { infcx, prog, env, out: Vec::new(), visited_tys: crate::fxhash::HashSet::default(), failed: false };
     match term { Term::Ty(t) => { wf.fold_ty(&infcx.tcx.tys, t, 0); } Term::Const(c) => { wf.fold_const(&infcx.tcx.tys, c, 0); } }
     if wf.failed { Err(NoSolution) } else { Ok(Some(wf.out)) }
 }
 struct WfPredicates<'a, 'tcx> {
-    infcx: &'a InferCtxt<'tcx>, prog: &'a Program, env: &'a ParamEnvId, out: Vec<Goal>, visited_tys: crate::fxhash::HashSet<TyId>, failed: bool, implied: bool,
+    infcx: &'a InferCtxt<'tcx>, prog: &'a Program, env: &'a ParamEnvId, out: Vec<Goal>, visited_tys: crate::fxhash::HashSet<TyId>, failed: bool,
 }
 impl WfPredicates<'_, '_> {
     fn push(&mut self, kind: PredicateKind) { self.out.push(Goal { param_env: self.env.clone(), predicate: Predicate::dummy(kind) }); }
@@ -79,7 +70,6 @@ impl WfPredicates<'_, '_> {
 impl TypeFolder for WfPredicates<'_, '_> {
     fn fold_ty(&mut self, tys: &Types, t: TyId, depth: u32) -> TyId {
         if !self.visited_tys.insert(t) { return t; }
-        if self.implied && matches!(tys.kind(t), TyKind::Alias(..)) { return t; }
         let tcx = self.infcx.tcx;
         match tys.kind(t) {
             TyKind::Slice(e) => self.require_sized(*e),

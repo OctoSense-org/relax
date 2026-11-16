@@ -43,7 +43,7 @@ fn v6_function_items_exclude_shallow_lifetimes_but_keep_type_arguments() {
     assert_eq!(bounds(&tcx,&[],&[P::Type(f,a)]).outlives,[(b,a)]);
 }
 #[test]
-fn v7_concrete_wf_walk_covers_functions_closures_and_objects_but_not_aliases() {
+fn v7_concrete_wf_walk_covers_functions_aliases_closures_and_objects() {
     let mut tcx = Tcx::new(); let a = region(&tcx,0); let b = region(&tcx,1);
     let inner = reference(&tcx,b,tcx.tys.unit); let nested = reference(&tcx,a,inner);
     let f = tcx.tys.intern(TyKind::FnPtr(tcx.tys.mk_list(&[nested]),tcx.tys.unit,FnHeader::RUST,0));
@@ -62,7 +62,7 @@ fn v7_concrete_wf_walk_covers_functions_closures_and_objects_but_not_aliases() {
     let rs = tcx.tys.intern_region_args(&[a]);
     for alias in [TyKind::Alias(crate::consts::IsRigid::No, AliasTy { kind: AliasTyKind::Projection { def_id: d }, args: tcx.tys.mk_list(&[inner]), regions: rs }),TyKind::Alias(crate::consts::IsRigid::No, AliasTy { kind: AliasTyKind::Opaque { def_id: d }, args: tcx.tys.mk_list(&[inner]), regions: rs })] {
         let t = tcx.tys.intern(alias);
-        assert!(bounds(&tcx,&[t],&[]).outlives.is_empty(),"an alias contributes nothing from its arguments");
+        assert_eq!(bounds(&tcx,&[t],&[]).outlives,[(b,a)]);
     }
     // Trait: 'a means the explicit object bound 'b must outlive 'a.
     let object = tcx.tys.intern(TyKind::Dyn(d,tcx.tys.mk_list(&[nested]),Default::default(),rs,b,0,Default::default()));

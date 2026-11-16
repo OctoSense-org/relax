@@ -1,5 +1,6 @@
 // ported from N:rustc_borrowck/src/implied_bounds.rs @8d1a764
 use crate::program::Program;
+use crate::types::{AliasTy, AliasTyKind};
 use crate::tcx::{outlives::OutlivesPredicate, Tcx};
 use crate::types::{RegionId, RegionKind, TyId, TyKind};
 
@@ -171,9 +172,24 @@ impl ImpliedBounds {
                 }
                 wf_args.extend(tcx.tys.list(*args));
             }
-            // An alias implies nothing from its arguments or its item's where-clauses (see
-            // `wf::implied_bounds_obligations`); a surrounding type still gives `Alias: 'r`.
-            TyKind::Alias(..) => {}
+            // An alias here stayed rigid (the walk gets normalized types): its arguments and where-clauses count.
+            TyKind::Alias(_, AliasTy { kind: AliasTyKind::Projection { def_id: d }, args, regions: rs }) => {
+                if let Some(contract) = tcx.nominal_region_contracts.get(d) {
+                    let params: Vec<_> = contract.regions.iter().map(|p| p.1).collect();
+                    self.nominal(tcx,contract,tcx.tys.list(*args),&params,*rs);
+                }
+                wf_args.extend(tcx.tys.list(*args));
+            }
+            TyKind::Alias(_, AliasTy { kind: AliasTyKind::Opaque { def_id: d }, args, regions: rs }) => {
+                if let Some(decl) = tcx.opaques.get(d) {
+                    // The alias's region arguments are the opaque's lifetime parameters by index (the
+                    // parent's, then the captured ones); the contract also lists late-bound ones.
+                    let params: Vec<_> = if (d.0 as usize) < prog.defs.len() { tcx.generic_indices_of(prog, *d).lifetimes.iter().map(|&i| tcx.tys.intern_region(RegionKind::ReEarlyParam(i))).collect() }
+                        else { decl.region_contract.regions.iter().map(|p| p.1).collect() }; // (a fixture's opaque is no program item)
+                    self.nominal(tcx,&decl.region_contract,tcx.tys.list(*args),&params,*rs);
+                }
+                wf_args.extend(tcx.tys.list(*args));
+            }
             TyKind::Closure(_, _, crate::types::ClosureArgs { parent_args: owner, tupled_upvars_ty: upvars, .. }) => {
                 if let TyKind::FnDef(d,args,rs) = tcx.tys.kind(*owner) {
                     if let Some(sig) = tcx.fn_item_sig(prog, *d) {

@@ -62,11 +62,13 @@ pub fn implied_outlives_bounds(infcx: &crate::infer::InferCtxt<'_>, prog: &crate
 }
 pub fn compute_implied_outlives_bounds_inner(ocx: &mut ObligationCtxt<'_, '_>, env: &ParamEnvId, _ty: TyId, normalized: TyId) -> Result<Vec<OutlivesBound>, NoSolution> {
     let mut checked = crate::fxhash::HashSet::default();
-    // Only the normalized type implies bounds (the unnormalized one adds only what alias arguments hold).
+    // Only the normalized type implies bounds. An alias that normalizes away is gone with its arguments, whose
+    // bounds no caller of a fn item through the `Fn` traits proves (rustc issues 100051, 129005); one that stays
+    // rigid implies what its arguments and its item's where-clauses hold, as in rustc.
     let mut wf_args = vec![Term::Ty(normalized)]; let mut result = Vec::new();
     while let Some(arg) = wf_args.pop() {
         if !checked.insert(arg) { continue; }
-        let Some(goals) = wf::implied_bounds_obligations(ocx.infcx, ocx.prog, env, arg)? else { continue; };
+        let Some(goals) = wf::unnormalized_obligations(ocx.infcx, ocx.prog, env, arg)? else { continue; };
         for goal in goals {
             let p = ocx.deeply_normalize_predicate(env, &goal.predicate)?;
             if p.has_bound_vars(&ocx.infcx.tcx.tys) { continue; }
