@@ -2921,6 +2921,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
         let code = crate::harness::run(u, up, &[(label(subject_ci), root)]);
         let code = crate::check::finish_test_deps(code);
         flush_errors(true);
+        failed_bodies_line();
         return code;
     }
     let main_def = main_def.expect("a run without --exports has main");
@@ -3633,6 +3634,89 @@ fn start_ahead(up: *mut Unit, defs: Vec<DefId>) {
     }
 }
 
+/// The compile errors this process reported, by `reported_key`: a failed build's stub install and
+/// the run's flushes (each error once), the background check (typeck_bg.rs), and the launcher
+/// report of a compile error a test met (jit.rs rt_catch_panic; its own key space).
+static REPORTED: relax_session::sync::Mutex<Option<std::collections::HashSet<u64>>> = relax_session::sync::Mutex::new(None);
+
+/// An error's key: its diagnostic's first line, without the `compile error in <fn>: ` a failed
+/// build's note puts before it, so the stub's note and the background check's report of one body
+/// meet.
+fn reported_key(space: u8, text: &str) -> u64 {
+    let line = text.lines().next().unwrap_or("");
+    let line = line.strip_prefix("compile error in ").and_then(|r| r.split_once(": ").map(|(_, d)| d)).unwrap_or(line);
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    std::hash::Hash::hash(&(space, line), &mut h);
+    std::hash::Hasher::finish(&h)
+}
+
+/// Whether `text` is reported for the first time in this process (and from now on it is).
+/// `space` 0: the error itself; 1: its launcher `report:` line.
+pub(crate) fn first_report(space: u8, text: &str) -> bool {
+    let key = reported_key(space, text);
+    let _k = crate::zone_alloc::kept();
+    REPORTED.lock().unwrap_or_else(|p| p.into_inner()).get_or_insert_with(std::collections::HashSet::new).insert(key)
+}
+
+/// Bodies whose build failed and got the stub that panics when called (jit.rs install_error), in
+/// order: a test run's end names each once.
+static FAILED_BODIES: relax_session::sync::Mutex<Vec<String>> = relax_session::sync::Mutex::new(Vec::new());
+
+pub(crate) fn note_failed_body(name: &str) {
+    let mut v = FAILED_BODIES.lock().unwrap_or_else(|p| p.into_inner());
+    if !v.iter().any(|n| n == name) {
+        let _k = crate::zone_alloc::kept();
+        v.push(name.to_string());
+    }
+}
+
+/// A test run's last line about its compile errors (each printed in full when it happened): the
+/// bodies that did not compile, each once.
+fn failed_bodies_line() {
+    let v = FAILED_BODIES.lock().unwrap_or_else(|p| p.into_inner());
+    if !v.is_empty() {
+        eprintln!("relax: {} bod{} did not compile (the error{} above): {}", v.len(), if v.len() == 1 { "y" } else { "ies" }, if v.len() == 1 { " is" } else { "s are" }, v.join(", "));
+    }
+}
+
+/// Launcher reports of errors printed on the owner (`print_new_errors`), written by the next flush.
+static PENDING_REPORTS: relax_session::sync::Mutex<Vec<String>> = relax_session::sync::Mutex::new(Vec::new());
+
+/// Prints the run unit's compile errors noted since the last print, each once (`first_report`); on
+/// the owner. What the launcher is to get is returned (the report file may be a FIFO a slow
+/// reader drains: written off the owner).
+fn print_errors_since(u: &mut Unit) -> Vec<String> {
+    let seen = ERRORS_SEEN.load(Ordering::Relaxed) as usize;
+    if u.errors.iter().skip(seen).any(|e| e.contains("internal compiler error")) {
+        crate::tui::keep_log();
+    }
+    // printed with --quiet as well: an error no call ever panics on (a constant's, which the
+    // program reads as a stand-in value) reaches the user only here
+    let mut new = Vec::new();
+    for e in u.errors.iter().skip(seen) {
+        if first_report(0, e) {
+            eprintln!("relax: [t={:.0} ms] {}", crate::clock::ms_since_start(), e);
+            new.push(e.to_string());
+        }
+    }
+    ERRORS_SEEN.store(u.errors.len() as u64, Ordering::Relaxed);
+    if reporting() || crate::run_state::observed() { new } else { Vec::new() }
+}
+
+/// A failed build's stub was installed (jit.rs install_error, on the owner): its error is printed
+/// now, not at the run's end.
+pub(crate) fn print_new_errors(u: &mut Unit) {
+    // (a proc-macro host's or a build script's unit: not the run's)
+    if !std::ptr::eq(u as *const Unit, unsafe { RUN_UNIT } as *const Unit) {
+        return;
+    }
+    let reports = print_errors_since(u);
+    if !reports.is_empty() {
+        let _k = crate::zone_alloc::kept();
+        PENDING_REPORTS.lock().unwrap_or_else(|p| p.into_inner()).extend(reports);
+    }
+}
+
 /// Prints new compile errors as they happen (each failed fn panics only if it is called).
 fn flush_errors(block: bool) {
     let up = unsafe { RUN_UNIT };
@@ -3650,25 +3734,15 @@ fn flush_errors(block: bool) {
         FLUSHED.store(crate::owner::SERVED.load(Ordering::Relaxed), Ordering::Relaxed);
         let u = unsafe { &mut *up };
         u.flush_query_errors(false);
-        let seen = ERRORS_SEEN.load(Ordering::Relaxed) as usize;
-        if u.errors.iter().skip(seen).any(|e| e.contains("internal compiler error")) {
-            crate::tui::keep_log();
-        }
-        // printed with --quiet as well: an error no call ever panics on (a constant's, which the
-        // program reads as a stand-in value) reaches the user only here
-        for e in u.errors.iter().skip(seen) {
-            eprintln!("relax: [t={:.0} ms] {}", crate::clock::ms_since_start(), e);
-        }
-        // the report file may be a FIFO a slow reader drains: written after the owner thread releases it
-        let to_report: Vec<String> = if u.errors.len() > seen && (reporting() || crate::run_state::observed()) { u.errors.iter().skip(seen).map(|e| e.to_string()).collect() } else { Vec::new() };
-        ERRORS_SEEN.store(u.errors.len() as u64, Ordering::Relaxed);
-        to_report
+        print_errors_since(u)
     };
-    let to_report = if block {
+    let mut to_report = if block {
         crate::owner::call(crate::owner::Class::Program, body)
     } else {
         crate::owner::publish(body)
     };
+    // the report file may be a FIFO a slow reader drains: written after the owner thread releases it
+    to_report.splice(0..0, std::mem::take(&mut *PENDING_REPORTS.lock().unwrap_or_else(|p| p.into_inner())));
     for e in to_report {
         report("error", &e);
     }
@@ -5807,6 +5881,9 @@ pub(crate) unsafe fn reset_statics() {
     reset(&PHASES, relax_session::sync::Mutex::new(Vec::new()));
     reset(&MAIN_START_MS, AtomicU64::new(0));
     reset(&ERRORS_SEEN, AtomicU64::new(0));
+    reset(&REPORTED, relax_session::sync::Mutex::new(None));
+    reset(&FAILED_BODIES, relax_session::sync::Mutex::new(Vec::new()));
+    reset(&PENDING_REPORTS, relax_session::sync::Mutex::new(Vec::new()));
     reset(&LIVE_SESSION, AtomicBool::new(false));
     reset(&VERBOSE, AtomicBool::new(false));
     reset(&STARTUP_PATH, relax_session::sync::Mutex::new(String::new()));

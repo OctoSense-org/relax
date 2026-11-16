@@ -4617,11 +4617,17 @@ pub(crate) fn rt_catch_panic(f: u64, data: u64) -> u64 {
             // rustc's does, and nothing more is said. A compile error, a fault or a hang the JIT
             // contained is no panic of the program's: its report follows, caught or not.
             let program_panic = p.kind == "panic" && !p.message.starts_with("compile error in ") && !is_ice_stub_message(&p.message);
-            if !(caught && program_panic) {
+            // A compile error's report comes once a process: each test that calls the body fails
+            // with std's one-line message, and the error itself was printed when its stub went in.
+            let compile_error = p.kind == "panic" && p.message.starts_with("compile error in ");
+            if !(caught && program_panic) && (!compile_error || crate::run::first_report(1, &p.message)) {
                 let r = owner::call(owner::Class::Job, || unsafe { (&*u).report(&p) });
                 fatal_compile_error(&p, &r);
                 // std's hook already printed the panic message (as rustc's does); add where
                 eprintln!("  report: {}", r);
+            } else if compile_error && COMPILE_ERRORS_FATAL.load(Ordering::Relaxed) {
+                // (its report printed once already: the run still ends at it)
+                fatal_compile_error(&p, "(above)");
             }
             // A contained hang or fault has no std payload. A null file asks std to record
             // the message without running the user hook or replacing an existing payload.
@@ -11226,6 +11232,10 @@ unsafe fn install_error(up: *mut Unit, id: u32, e: &str) -> u64 {
             // identity to rebuild, only the stub that reports it if the slot is ever called
             if !follow_on && !matches!(u.fns[id as usize].key, FnKey::Glue(GLUE_UNNAMED, _)) {
                 u.note_error(format!("compile error in {}: {}", name, e));
+                // printed now, once (a test run printed it at its end, and its report in each
+                // test that called it); its end names the body (run.rs failed_bodies_line)
+                crate::run::note_failed_body(&name);
+                crate::run::print_new_errors(u);
             }
             // a body that failed to compile panics when called, with the error's first line
             let msg = format!("compile error in {}: {}", name, e.lines().next().unwrap_or(""));
