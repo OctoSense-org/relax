@@ -4,10 +4,17 @@
 # message), at rustc's positions. The expected lines below are rustc 1.97's (rx231's 1.100's)
 # (`rustc --edition 2021 --error-format=short --emit=metadata`); with RUSTC_CMP=1 rustc is run too
 # and must still print them.
-#   run.sh <path to relax or makepad binary>
+#   run.sh [<path to relax or makepad binary>]  (none: builds this checkout's host makepad)
 set -eu
 H=$(cd "$(dirname "$0")" && pwd)
-BIN=$(cd "$(dirname "$1")" && pwd)/$(basename "$1")
+if [ $# -ge 1 ]; then
+  BIN=$(cd "$(dirname "$1")" && pwd)/$(basename "$1")
+else
+  # none named (the CI bucket): this checkout's host makepad, built if it is not current
+  ROOT=$(cd "$H/../../../../.." && pwd)
+  cargo build --profile host -q --manifest-path "$ROOT/Cargo.toml" -p makepad-run --bin makepad
+  BIN=${CARGO_TARGET_DIR:-$ROOT/target}/host/makepad
+fi
 T=$(mktemp -d)
 export RELAX_CACHE=off
 export RELAX_STD="$H/../../std"
