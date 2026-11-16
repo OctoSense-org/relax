@@ -16498,6 +16498,11 @@ pub(crate) fn intern_lazy_rt(u: &mut Unit, name: &str) -> Option<relax_backend::
         "divrem128" => { let f: rt_fn_ty!(fn(u64, u64, u64, u64, u64) -> WideRet) = rt_divrem128; ("divrem128", f as usize as u64) }
         // the loop counters' helper (a trampoline in the code area)
         "loop_hot" => return Some(crate::jit::loop_hot_sym(u)),
+        // a constant-evaluation twin's steps (ctfe_twin.rs steps, promoted_steps, back_edge): a
+        // twin linked from the disk cache names them before any twin of the run was built
+        "const_fuel" => ("const_fuel", const_fuel_addr()),
+        "const_fuel_promoted" => ("const_fuel_promoted", const_fuel_promoted_addr()),
+        "const_fuel_promoted_end" => ("const_fuel_promoted_end", const_fuel_promoted_end_addr()),
         // the combined sin/cos routine the optimiser pairs sin and cos calls into (note_sincos)
         "__sincos_stret" | "__sincosf_stret" | "relax_sincos_pair" | "relax_sincosf_pair" => {
             let k = ["__sincos_stret", "__sincosf_stret", "relax_sincos_pair", "relax_sincosf_pair"].into_iter().find(|k| *k == name)?;

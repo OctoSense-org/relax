@@ -1138,6 +1138,8 @@ pub(crate) fn skip_fnkey(d: &mut D, depth: u32, v: &mut dyn FnMut(Atom)) -> Opti
             d.str()?;
             skip_fnkey(d, depth + 1, v)
         }
+        // a constant-evaluation twin: its base's key
+        KeyKind::Ctfe => skip_fnkey(d, depth + 1, v),
     }
 }
 
@@ -2163,7 +2165,8 @@ impl Linker {
 /// Whether slot `id`'s code stays out of the startup image: a sandboxed twin's identity and
 /// symbols resolve only once its unit's sandbox is set up (a run-time module's load, a macro
 /// world's confinement), after the image's prelink; it links lazily from its entry.
-/// Constant-evaluation twins are compiler-only code and have no disk entry at all.
+/// A constant-evaluation twin runs only while a constant is evaluated, never at the program's
+/// start: it links from its entry when an initializer runs (jit.rs run_init_code).
 fn not_in_image(u: &Unit, id: u32) -> bool {
     matches!(u.fns[id as usize].key, crate::jit::FnKey::Sandbox(_) | crate::jit::FnKey::Ctfe(_))
 }

@@ -11,8 +11,10 @@
 //!   twin's body: `lowering`). Loops the lowering makes for what MIR does in one statement (an
 //!   array repeat) count nothing.
 //! Its calls go to the callees' twins; fn values stay the run-time slots (an indirect call counts
-//! at its site, not inside its target). A twin is baseline code, never inlined, cached or tiered
-//! up, and keeps every frame (`Func::keep_frames`). Run-time slots are untouched: a `const fn`
+//! at its site, not inside its target). A twin is baseline code, never inlined or tiered up, and
+//! keeps every frame (`Func::keep_frames`). The disk cache keeps its code under its base's key
+//! (cache.rs KeyKind::Ctfe): a static whose value has no entry (std's STDOUT, interior
+//! mutability) runs its initializer in every run, and a warm run links the twins it runs. Run-time slots are untouched: a `const fn`
 //! that both a constant and the program call counts nothing when the program calls it.
 //! The limit and the verdict at it are jit.rs's (CONST_FUEL, ConstEvalScope).
 

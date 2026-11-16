@@ -8670,6 +8670,23 @@ impl Unit {
         let limited = verdict == InterpVerdict::None;
         let _census_context = self.exec_context(false);
         let options = &self.prog.session.clone().options;
+        // An initializer outside the CTFE subset has its code cached: its constant-evaluation
+        // twin's, recorded when an earlier run fell back to code. Trying CTFE first would
+        // type-check the bodies it calls on every warm launch (std's STDOUT under println!).
+        // Verification mode still evaluates both implementations.
+        if !crate::ctfe::check_mode(options)
+            && self.cache.as_ref().is_some_and(|c| c.mode != crate::cache::Mode::Verify)
+            && crate::reload::edited_crates().is_empty()
+        {
+            let base = self.fn_id(FnKey::Inst(d, args.clone()));
+            let id = crate::ctfe_twin::twin(self, base);
+            let mut cache = self.cache.take();
+            let cached = cache.as_mut().is_some_and(|c| c.has(self, id));
+            self.cache = cache;
+            if cached {
+                return self.run_init_code(d, args, buf, limited);
+            }
+        }
         // tables and other plain-data initializers: evaluated to bytes, no code (ctfe.rs)
         let t0 = cpu_ns();
         if crate::ctfe::check_mode(options) {
@@ -10910,7 +10927,7 @@ unsafe fn install_compiled(up: *mut Unit, id: u32, code: &[u8], map: Vec<(u32, u
     // built while an earlier request's slot was open (it was left out): no cache record
     if record && TAINTED.with(|t| t.get()) { crate::cache::trace_lookup(&*up, id, "norecord:tainted"); }
     let ctfe = matches!((&*up).fns[id as usize].key, FnKey::Ctfe(_));
-    let record = record && !ctfe && !TAINTED.with(|t| t.get());
+    let record = record && !TAINTED.with(|t| t.get());
     // a slot marked O2 (`#[relax(O2)]`, a closure of a hinted fn, a slot found hot) gets its O2
     // build from the O2 worker, whose code replaces its entry (record_o2). Its O1 code is still
     // recorded: that worker runs at the lowest priority and a run can end before it gets there,
@@ -10919,7 +10936,7 @@ unsafe fn install_compiled(up: *mut Unit, id: u32, code: &[u8], map: Vec<(u32, u
     let marked = marked_hot(&*up, id);
     // baseline code (built this run, or a TIER_BASE entry linked from the cache): it may keep
     // running (note_base)
-    let base = if record || ctfe {
+    let base = if record || ctfe && fresh {
         (&*up).fns[id as usize].rir.as_ref().is_some_and(|r| r.baseline)
     } else {
         (&mut *up).cache.as_mut().is_some_and(|c| c.base_linked.remove(&id))
@@ -20269,6 +20286,9 @@ pub fn sweep_verdicts() {
                     if let Some(t) = u.plain_twin_of(id) {
                         c.reject_verdict(u, t);
                     }
+                    if let Some(t) = crate::ctfe_twin::twin_of(u, id) {
+                        c.reject_verdict(u, t);
+                    }
                 }
             }
         }
@@ -29584,7 +29604,6 @@ pub fn count_cache_ahead() {
 
 /// The disk cache's code for slot `id`, linked (unit lock held); None: compile it.
 pub(crate) unsafe fn cache_lookup(up: *mut Unit, id: u32) -> Option<(Vec<u8>, Vec<(u32, u64)>, Vec<relax_backend::rir::RelocAt>)> {
-    if matches!((&*up).fns[id as usize].key, FnKey::Ctfe(_)) { return None; }
     let _mem = crate::memstat::tag(crate::memstat::Tag::CacheLoad);
     let u = &mut *up;
     if matches!(u.fns[id as usize].key, FnKey::Inst(d, _) if u.prog.def(d).kind == DefKind::ForeignFn) {

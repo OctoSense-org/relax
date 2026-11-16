@@ -2806,8 +2806,16 @@ impl Cache {
                 }
                 self.enc_tys(u, &shim.args, e, crates, 0)
             }
-            // Compiler-only code has no persistent key.
-            FnKey::Ctfe(_) => None,
+            // a constant-evaluation twin: its base's key (the twin's code is a function of the
+            // base's lowered body, ctfe_twin.rs steps; the kind keeps twin and base code apart)
+            FnKey::Ctfe(base) => {
+                if base as usize >= u.fns.len() {
+                    return None;
+                }
+                e.u8(KeyKind::Ctfe as u8);
+                let bk = u.fns[base as usize].key.clone();
+                self.enc_fnkey(u, &bk, e, crates, depth + 1)
+            }
             // a sandboxed twin: its domain and its base's key. Its code names what it holds of the
             // run's sandbox by symbols (sandbox.rs thunk_sym ..), linked again here; the domain
             // keeps code one policy made out of another domain's units, and the kind keeps
@@ -3918,7 +3926,6 @@ impl Cache {
     /// the tier and the dependency slots can change or be reclaimed before the encoding runs.
     /// None: `record` would store nothing.
     pub(crate) fn defer_record(&self, u: &Unit, id: u32, code: &[u8], relocs: &[RelocAt], pc_map: &[(u32, u64)]) -> Option<PendingRecord> {
-        if matches!(u.fns[id as usize].key, FnKey::Ctfe(_)) { return None; }
         if self.mode == Mode::ReadOnly || u.fns[id as usize].patch_gen != 0 || self.linked.contains(&id) {
             return None;
         }
@@ -4048,7 +4055,6 @@ impl Cache {
 
     #[allow(clippy::too_many_arguments)]
     fn record_entry(&mut self, u: &Unit, id: u32, code: &[u8], relocs: &[RelocAt], pc_map: &[(u32, u64)], o3: Option<(&[u32], &[(u32, bool)])>, kind: RecKind, pending: Option<&PendingRecord>) {
-        if matches!(u.fns[id as usize].key, FnKey::Ctfe(_)) { return; }
         let _mem = crate::memstat::tag(crate::memstat::Tag::CacheStore);
         let o2 = kind == RecKind::O2;
         // O3 and O2 code replace the slot's entry, verified O1 code a baseline one; O1 code is
@@ -4501,7 +4507,6 @@ impl Cache {
 
     /// Looks slot `id` up and links it.
     pub fn lookup(&mut self, u: &mut Unit, id: u32) -> Option<LinkedCode> {
-        if matches!(u.fns[id as usize].key, FnKey::Ctfe(_)) { return None; }
         unsafe { Linker::new(self).lookup(u, id) }
     }
 
@@ -5139,6 +5144,8 @@ key_kinds! {
     Closure = 5,
     /// a sandboxed twin: its confinement domain's name and its base's key
     Sandbox = 6,
+    /// a constant-evaluation twin (ctfe_twin.rs): its base's key
+    Ctfe = 7,
 }
 
 impl KeyKind {
@@ -5147,7 +5154,7 @@ impl KeyKind {
     pub(crate) fn counted(self) -> bool {
         match self {
             KeyKind::Inst | KeyKind::ClosureInFile | KeyKind::Closure | KeyKind::Twin | KeyKind::Sandbox => true,
-            KeyKind::Glue | KeyKind::Shim => false,
+            KeyKind::Glue | KeyKind::Shim | KeyKind::Ctfe => false,
         }
     }
 }
@@ -11295,6 +11302,17 @@ impl Linker {
                 unsafe { crate::sandbox::twin(u, base) };
                 FnKey::Sandbox(base)
             }
+            // a constant-evaluation twin, keyed by its base (a base the startup image names: its slot)
+            KeyKind::Ctfe => {
+                let base = match self.image_slot_at(u, d) {
+                    Some(b) => b,
+                    None => {
+                        let bk = self.dec_fnkey(u, d, depth + 1)?;
+                        u.fn_id(bk)
+                    }
+                };
+                FnKey::Ctfe(base)
+            }
         })
     }
 
@@ -11496,7 +11514,6 @@ impl Linker {
     }
 
     pub fn lookup(&mut self, u: &mut Unit, id: u32) -> Option<LinkedCode> {
-        if matches!(u.fns[id as usize].key, FnKey::Ctfe(_)) { return None; }
         if !self.cache().linking.insert(id) {
             relax_codegen::warm::reason(id, "cache lookup already in progress");
             return None;

@@ -464,3 +464,84 @@ fn a_constants_code_counts_its_steps_and_the_programs_does_not() {
     let of = |name: &str| twins.iter().find(|t| t.0.contains(name)).map_or(usize::MAX, |t| t.1);
     assert_eq!((of("AT_COMPILE"), of("count"), of("bump")), (1, 2, 0), "steps counted at the calls of fns and at the loop's back edge: {twins:?}");
 }
+
+/// A static whose value holds a union has no value entry in the disk cache (the data walk cannot
+/// tell its pointer words: syms.rs obj_ptrs), so every run runs its initializer, as println!'s
+/// STDOUT (a OnceLock) does; ctfe.rs cannot build the union and falls back to code. The
+/// constant-evaluation twins that run (the initializer's, the const fns' it calls) are cached like
+/// the program's code, and an initializer whose twin is cached runs it without trying ctfe.rs
+/// first: the next run links every twin and type-checks none of their bodies (before, every warm
+/// run did both again: the JIT legs' cache_warm_statics warm misses).
+const CTFE_WARM: &str = r#"
+const fn bump(x: &mut u32) { *x += 1; }
+pub const fn count(n: u32) -> u32 { let mut i = 0; while i < n { bump(&mut i); } i }
+const fn bits(n: u32) -> Bits { Bits { n: count(n) } }
+pub union Bits { n: u32, f: f32 }
+pub static HITS: Bits = bits(5);
+pub fn values(out: &mut [usize; 1]) {
+    out[0] = unsafe { HITS.n } as usize;
+}
+"#;
+
+#[test]
+fn a_constants_twins_link_from_the_disk_cache_in_the_next_run() {
+    const PHASE: &str = "RELAX_CTFE_WARM_TEST";
+    const DIR: &str = "RELAX_CTFE_WARM_TEST_DIR";
+    let Ok(phase) = std::env::var(PHASE) else {
+        let dir = std::env::temp_dir().join(format!("relax-ctfe-warm-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("lib.rs"), CTFE_WARM).unwrap();
+        let mut said = String::new();
+        for phase in ["cold", "warm"] {
+            let out = crate::test_child::output(std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "value_tests::a_constants_twins_link_from_the_disk_cache_in_the_next_run", "--nocapture", "--test-threads=1"])
+                .env(PHASE, phase).env(DIR, &dir).env("RELAX_WARM_STRICT", "1"));
+            let err = String::from_utf8_lossy(&out.stderr).into_owned();
+            said += &format!("{phase}: {}\n{err}\n", String::from_utf8_lossy(&out.stdout));
+            assert!(out.status.success(), "{said}");
+            // (RELAX_WARM_STRICT's report: the fixture's own bodies; std's load is not this test's)
+            let misses: Vec<&str> = err.lines().filter(|l| l.contains("warm miss:") && l.contains("ctfe_warm::")).collect();
+            assert!(phase == "cold" || misses.is_empty(), "the next run type-checks no body its twins came from: {misses:?}\n{said}");
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+        return;
+    };
+    crate::jit::CHECK_FIRST.store(false, std::sync::atomic::Ordering::Relaxed);
+    std::env::set_var("RELAX_STD", concat!(env!("CARGO_MANIFEST_DIR"), "/std"));
+    let dir = std::path::PathBuf::from(std::env::var_os(DIR).unwrap());
+    std::env::set_var("RELAX_CACHE_DIR", dir.join("cache"));
+    let (prog, core, krate) = crate::load_with_std_checks(&std::sync::Arc::new(crate::Session::default()), dir.join("lib.rs").to_str().unwrap(), "ctfe_warm", false, RELEASE).unwrap();
+    let mut tcx = crate::tcx::Tcx::new();
+    tcx.collect(&prog);
+    let mut u = crate::jit::Unit::new(prog, tcx, core);
+    crate::owner::call(crate::owner::Class::Program, || {
+        let mut cache = crate::cache::Cache::open(&u, crate::cache::Mode::ReadOnly).unwrap();
+        cache.mode = crate::cache::Mode::On;
+        u.cache = Some(Box::new(crate::cache::CacheCell::new(cache)));
+    });
+    // the warm start, validated (run.rs classify): what it type-checks from here is a warm miss
+    if phase == "warm" {
+        relax_codegen::warm::classify(true);
+    }
+    assert_eq!(run::<1>(&mut u, krate), [5], "HITS as its initializer left it");
+    // the twins that ran, with where their code came from
+    let twins: Vec<(String, &str)> = crate::owner::call(crate::owner::Class::Program, || {
+        u.fns.iter().filter(|f| f.compiled && matches!(f.key, crate::jit::FnKey::Ctfe(_)))
+            .map(|f| (f.name.to_string(), crate::inspect::codever::kind_at(&u, f.code).origin_name())).collect()
+    });
+    let ran = |name: &str| twins.iter().any(|t| t.0.contains(name));
+    assert!(ran("HITS") && ran("bits") && ran("count") && ran("bump"), "the initializer and the const fns it calls run as twins ({phase} run): {twins:?}");
+    if phase == "cold" {
+        assert!(twins.iter().all(|t| t.1 == "fresh"), "the first run builds them: {twins:?}");
+        crate::owner::call(crate::owner::Class::Program, || {
+            u.flush_cache_records();
+            u.cache.as_mut().unwrap().flush().unwrap();
+        });
+    } else {
+        let built: Vec<_> = twins.iter().filter(|t| t.1 != "warm-cache").collect();
+        assert!(built.is_empty(), "the next run links every twin from the disk cache; built again: {built:?} of {twins:?}");
+        relax_codegen::warm::finish();
+    }
+    // (process exit owns the runtime's teardown)
+    std::mem::forget(u);
+}
