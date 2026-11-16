@@ -5277,7 +5277,9 @@ fn first_code(u: &Unit, bodies: &[DefId]) -> Vec<(DefId, Option<(u64, bool)>)> {
                     if let Some(ids) = slots.get_mut(d) { ids.push(id as u32); }
                     break;
                 }
-                FnKey::Closure(_, _, p) | FnKey::Sandbox(p) | FnKey::Plain(p) | FnKey::Ctfe(p) => base = *p,
+                // (the sandbox's trap slot, FnKey::Sandbox(u32::MAX), every unused thunk's target,
+                // has no base: no body's code)
+                FnKey::Closure(_, _, p) | FnKey::Sandbox(p) | FnKey::Plain(p) | FnKey::Ctfe(p) if *p != u32::MAX => base = *p,
                 _ => break,
             }
         }
