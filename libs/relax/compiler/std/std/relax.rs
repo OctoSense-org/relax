@@ -150,6 +150,7 @@ extern "C" {
     fn __relax_module_load_src(name: *const u8, nlen: usize, path: *const u8, plen: usize, src: *const u8, slen: usize, deps: *const u8, dlen: usize) -> u64;
     fn __relax_module_load_stream(name: *const u8, nlen: usize, path: *const u8, plen: usize, src: *const u8, slen: usize, deps: *const u8, dlen: usize) -> u64;
     fn __relax_module_stream(h: u64, src: *const u8, slen: usize, kept: *mut usize) -> u32;
+    fn __relax_module_stream_settled(h: u64) -> u32;
     fn __relax_module_get(h: u64, name: *const u8, nlen: usize, ty: *const u8, tlen: usize) -> u64;
     fn __relax_module_replace(h: u64, src: *const u8, slen: usize) -> u32;
     fn __relax_module_unload(h: u64);
@@ -754,7 +755,8 @@ impl Module {
     /// applies independently; cut tokens, incomplete bodies and invalid items keep their
     /// last applied version. Missing items in a prefix are never deleted.
     /// Calls within 16 ms coalesce; feed again or run with the live watcher to drain them.
-    /// Source errors are quiet until a roughly one-second stall (reported by the watcher)
+    /// Source errors are quiet until a roughly one-second stall (no new text and no feed for a
+    /// second; reported by the watcher)
     /// or `finish_stream`; `Err` here indicates an invalid handle, not unfinished source.
     /// `&str` cannot split a UTF-8 character: buffer incomplete bytes before calling.
     pub fn stream(&self, text: &str) -> Result<Stream, String> {
@@ -764,6 +766,18 @@ impl Module {
             1 => Ok(Stream::Incomplete),
             2 => Ok(Stream::NeedsReload),
             3 => Ok(Stream::Pending),
+            _ => Err(last_error()),
+        }
+    }
+
+    /// Blocks until the live watcher has nothing left of this module's stream: the newest
+    /// coalesced prefix (a `Stream::Pending` feed) applied and, once the text stopped changing,
+    /// its stall reported (about a second after the last change and feed). Returns at once when no
+    /// stream is open (none fed, or `finish_stream` ended it). `Err` when nothing would settle
+    /// it: the run has no live watcher (feed the text again instead), or the module was unloaded.
+    pub fn stream_settled(&self) -> Result<(), String> {
+        match unsafe { __relax_module_stream_settled(self.0) } {
+            0 => Ok(()),
             _ => Err(last_error()),
         }
     }

@@ -8251,9 +8251,14 @@ fn loaded_of(files: &[WatchFile]) -> std::sync::Arc<Vec<String>> {
 }
 
 fn watch_gone() {
-    let _g = WATCH_INPUTS.lock().unwrap_or_else(|e| e.into_inner());
-    WATCH_GONE.store(true, std::sync::atomic::Ordering::Release);
-    WATCH_READY.notify_all();
+    {
+        let _g = WATCH_INPUTS.lock().unwrap_or_else(|e| e.into_inner());
+        WATCH_GONE.store(true, std::sync::atomic::Ordering::Release);
+        WATCH_READY.notify_all();
+    }
+    // a module_stream_settled waiter: no watcher will settle its stream now
+    let _s = STREAMS.lock().unwrap_or_else(|e| e.into_inner());
+    STREAMS_SETTLED.notify_all();
 }
 static DOMAIN_REVISION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -9685,6 +9690,16 @@ enum StreamTarget {
     Module(u64),
 }
 static STREAMS: relax_session::sync::Mutex<Vec<(usize, StreamTarget, StreamFile)>> = relax_session::sync::Mutex::new(Vec::new());
+/// Told (under STREAMS) when the watcher's work on a stream may have ended: a drain, a stream's
+/// end, the watcher's end ([`module_stream_settled`]).
+static STREAMS_SETTLED: relax_session::sync::Condvar = relax_session::sync::Condvar::new();
+
+impl StreamFile {
+    /// The watcher has nothing left of it: its newest prefix fed, its stall reported.
+    fn settled(&self) -> bool {
+        self.pending.is_none() && (self.reported || self.changed.is_none())
+    }
+}
 
 fn idle_outcome(file: Option<u32>, line: &str) -> Outcome {
     Outcome { failure: None, kept: 0, pending: false, rung: Rung::Patch, files: file.into_iter().collect(), lines: vec![line.to_string()], names: Vec::new(), changed: 0, test_changes: None, bodies: Vec::new(), first_code: Vec::new(), group: 0, ms: [0.0; 4], undo: None, work: [0; 5], deferred: Vec::new() }
@@ -9776,6 +9791,7 @@ pub(crate) unsafe fn apply_module_stream(up: *mut Unit, h: u64, text: Vec<u8>) -
 pub(crate) unsafe fn finish_module_stream(up: *mut Unit, h: u64, text: Vec<u8>) -> Option<Outcome> {
     let mut streams = STREAMS.lock().unwrap_or_else(|e| e.into_inner());
     streams.retain(|s| !(s.0 == up as usize && s.1 == StreamTarget::Module(h)));
+    STREAMS_SETTLED.notify_all();
     let (file, path) = crate::modules::stream_target(h)?;
     let o = apply_full(up, vec![Edit { file, path, src: text }]);
     record_stream(up, &StreamTarget::Module(h), &o);
@@ -9784,24 +9800,51 @@ pub(crate) unsafe fn finish_module_stream(up: *mut Unit, h: u64, text: Vec<u8>) 
 
 pub(crate) fn forget_module_stream(up: *mut Unit, h: u64) {
     STREAMS.lock().unwrap_or_else(|e| e.into_inner()).retain(|s| !(s.0 == up as usize && s.1 == StreamTarget::Module(h)));
+    STREAMS_SETTLED.notify_all();
+}
+
+/// Waits until the live watcher has nothing left of module `h`'s stream (std::relax
+/// Module::stream_settled): the newest coalesced prefix fed and, once its text stopped changing,
+/// the stall pass made (drain_streams). No stream open: at once. Err when nothing would settle
+/// it: no live watcher runs (or it ended), or the module was unloaded meanwhile.
+pub(crate) fn module_stream_settled(up: *mut Unit, h: u64) -> Result<(), String> {
+    let mut streams = STREAMS.lock().unwrap_or_else(|e| e.into_inner());
+    loop {
+        if streams.iter().all(|s| !(s.0 == up as usize && s.1 == StreamTarget::Module(h)) || s.2.settled()) {
+            return Ok(());
+        }
+        if crate::modules::stream_target(h).is_none() {
+            return Err("the module was unloaded".to_string());
+        }
+        if !crate::run::live_session() || WATCH_GONE.load(std::sync::atomic::Ordering::Acquire) {
+            return Err("no live watcher runs (a run without a live session): nothing feeds the stream's pending prefix; feed it again instead".to_string());
+        }
+        streams = STREAMS_SETTLED.wait(streams).unwrap_or_else(|e| e.into_inner());
+    }
 }
 
 /// A stream of `up` has a coalesced prefix to feed or a stall still to report (drain_streams
 /// has work in the next rounds).
 fn streams_busy(up: *mut Unit) -> bool {
-    STREAMS.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|s| s.0 == up as usize && (s.2.pending.is_some() || !s.2.reported && s.2.changed.is_some()))
+    STREAMS.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|s| s.0 == up as usize && !s.2.settled())
 }
 
 unsafe fn drain_streams(up: *mut Unit) {
     let mut streams = STREAMS.lock().unwrap_or_else(|e| e.into_inner());
+    // a stream this drain fed or reported: module_stream_settled's waiters look again
+    let mut worked = false;
     for (_, target, s) in streams.iter_mut().filter(|s| s.0 == up as usize) {
         let Some((file, path)) = target_file(up, target) else { continue };
         if s.pending.is_some() && s.last.is_none_or(|t| t.elapsed().as_millis() >= 16) {
             let text = s.pending.take().unwrap();
             feed_stream(up, target, file, &path, s, text);
+            worked = true;
         }
-        if !s.reported && s.changed.is_some_and(|t| t.elapsed().as_secs_f64() >= 1.0) {
+        // a stall: a second since the text last changed and since its last feed ended (a feed's
+        // compile, slow on a loaded machine, is the JIT's time, not the stream standing still)
+        if !s.reported && s.changed.is_some_and(|t| t.elapsed().as_secs_f64() >= 1.0) && s.last.is_none_or(|t| t.elapsed().as_secs_f64() >= 1.0) {
             s.reported = true;
+            worked = true;
             if let Some((file, path)) = target_file(up, target) {
                 let seen = Instant::now();
                 let (parsed, composed) = crate::owner::call(crate::owner::Class::Program, || {
@@ -9827,6 +9870,9 @@ unsafe fn drain_streams(up: *mut Unit) {
                 }
             }
         }
+    }
+    if worked {
+        STREAMS_SETTLED.notify_all();
     }
 }
 

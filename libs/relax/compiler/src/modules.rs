@@ -1191,6 +1191,24 @@ pub extern "C" fn __relax_module_stream(h: u64, src: *const u8, slen: usize, kep
     }
 }
 
+/// std::relax Module::stream_settled: 0 when the live watcher has nothing left of the module's
+/// stream, 1 when nothing would settle it (the reason: __relax_module_error).
+pub extern "C" fn __relax_module_stream_settled(h: u64) -> u32 {
+    let _kept = crate::zone_alloc::kept();
+    let up = jit::current_unit();
+    if up.is_null() {
+        set_error("no running unit".to_string());
+        return 1;
+    }
+    match crate::reload::module_stream_settled(up, h) {
+        Ok(()) => 0,
+        Err(e) => {
+            set_error(e);
+            1
+        }
+    }
+}
+
 // ------------------------------------------------------------ the program's entries (std::relax)
 
 /// Loads the module at `path` as crate `name`, depending on the running program's crates
@@ -1569,6 +1587,7 @@ pub fn symbol(name: &[u8]) -> Option<usize> {
         b"__relax_module_load_src" => __relax_module_load_src as *const () as usize,
         b"__relax_module_load_stream" => __relax_module_load_stream as *const () as usize,
         b"__relax_module_stream" => __relax_module_stream as *const () as usize,
+        b"__relax_module_stream_settled" => __relax_module_stream_settled as *const () as usize,
         b"__relax_module_get" => __relax_module_get as *const () as usize,
         b"__relax_module_replace" => __relax_module_replace as *const () as usize,
         b"__relax_module_unload" => __relax_module_unload as *const () as usize,
