@@ -29,6 +29,21 @@ fn call_at(at: u64) -> u32 {
     f()
 }
 
+/// `return *(arg0 as *const u8)` as machine code (x86-64 `movzx eax, byte [rdi or rcx]; ret`;
+/// arm64 `ldrb w0, [x0]; ret`).
+fn load_code() -> Vec<u8> {
+    #[cfg(all(target_arch = "x86_64", windows))]
+    return vec![0x0f, 0xb6, 0x01, 0xc3];
+    #[cfg(all(target_arch = "x86_64", not(windows)))]
+    return vec![0x0f, 0xb6, 0x07, 0xc3];
+    #[cfg(target_arch = "aarch64")]
+    {
+        let mut c = 0x3940_0000u32.to_le_bytes().to_vec();
+        c.extend(0xd65f_03c0u32.to_le_bytes());
+        c
+    }
+}
+
 fn source_unit(name: &str, source: &str) -> (Box<Unit>, std::path::PathBuf) {
     let path = std::env::temp_dir().join(format!("relax-{}-{}.rs", name, std::process::id()));
     std::fs::write(&path, source).unwrap();
@@ -50,7 +65,10 @@ fn slot(u: &mut Unit, name: &str) -> (u32, DefId) {
 /// Per case a process, which ends by its stale access as an unattended run does (the report,
 /// then the fault's signal): `call` calls the dead range, `odd` jumps into its middle, `closed`
 /// reads a chunk nothing lives in any more. Every case first fills 100 ranges in the page a
-/// looping thread runs its neighbour in.
+/// looping thread runs its neighbour in. Each access comes from code of the unit (the dead
+/// range's own, or a reader of another generation's arena), as in a run: under the JIT this
+/// test's own code is the JIT's, which contains a fault in its code before any handler the
+/// program installed (jit.rs `containment`), so a read made here ended as the JIT's fault.
 #[test]
 fn a_trap_filled_range_traps_at_any_offset_while_its_page_neighbour_runs_on() {
     const CHILD: &str = "RELAX_TRAP_FILL_CASE";
@@ -126,12 +144,17 @@ fn a_trap_filled_range_traps_at_any_offset_while_its_page_neighbour_runs_on() {
             call_at(to);
         }
         _ => {
+            // the reader: live code in another generation's arena (its own chunk)
+            let reader = u.emit_grouped(Some(Group::Patch { slot: 2_000_000, gen: 7 }), &load_code(), &[]).unwrap();
+            assert_ne!(reader & !(page - 1), live_at & !(page - 1), "the reader's page is not the chunk's");
+            let load: extern "C" fn(u64) -> u32 = unsafe { std::mem::transmute(reader as usize) };
+            assert_eq!(load(live_at) as u8, ret_code(7)[0], "the reader reads the neighbour's first byte while it lives");
             // the neighbour dies too: nothing lives in the chunk, it is inaccessible
             invalid::invalidate(&mut u, |x| x == live_g, 3, "invalidated code", None, "a test's rollback");
             assert!(invalid::PROT_BYTES.load(Ordering::Relaxed) >= page, "the chunk is inaccessible: {}", invalid::stats_line());
             eprintln!("trap fill expects: read/wrote {:#x} = invalidated code `{}` v1 + 0x0", live_at, u.fns[live as usize].name);
             std::fs::remove_file(&path).unwrap();
-            unsafe { std::ptr::read_volatile(live_at as *const u8) };
+            load(live_at);
         }
     }
     panic!("the stale access returned");
