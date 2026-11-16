@@ -595,14 +595,14 @@ mod imp {
         (old.sp as u64, old.sp as u64 + old.size as u64)
     }
 
-    /// The faults whose handler the host keeps on top (`chain_behind`), and the watchdog's signal.
+    /// The faults whose handler the host keeps on top (`chain_behind`), the watchdog's signal and SIGABRT.
     const HOST_FAULTS: [i32; 4] = [SIGILL, SIGBUS, SIGFPE, SIGSEGV];
 
     /// progsig.rs's `set` of `sig` to handler `h` with `flags`: where `sig` is a fault of the
     /// host's and the kernel runs our handler for it, that stays and `h` goes behind it (true);
     /// else nothing changes (false: the caller sets the kernel's action).
     pub(crate) unsafe fn chain_behind(sig: i32, h: usize, flags: i32) -> bool {
-        if !HOST_FAULTS.contains(&sig) && sig != watchdog_signal() {
+        if !HOST_FAULTS.contains(&sig) && sig != watchdog_signal() && sig != SIGABRT {
             return false;
         }
         let mut cur = SigAction { handler: 0, mask: [0; 16], flags: 0, pad: 0, restorer: 0 };
@@ -627,7 +627,14 @@ mod imp {
             let _kept = crate::zone_alloc::kept();
             let gregs = uc.add(40) as *mut u64;
             if sig == SIGABRT {
-                report_abort(*gregs.add(16), *gregs.add(10));
+                super::note_abort(*gregs.add(16), *gregs.add(10));
+                let handled = super::program_abort(sig, info, uc);
+                if !crate::os::progsig::take_sent_on_abort() {
+                    report_abort(*gregs.add(16), *gregs.add(10));
+                }
+                if handled {
+                    return;
+                }
                 default_action(SIGABRT);
                 raise_abort();
                 return;
@@ -1144,14 +1151,14 @@ mod imp {
         (old.sp as u64, old.sp as u64 + old.size as u64)
     }
 
-    /// The faults whose handler the host keeps on top (`chain_behind`), and the watchdog's signal.
+    /// The faults whose handler the host keeps on top (`chain_behind`), the watchdog's signal and SIGABRT.
     const HOST_FAULTS: [i32; 5] = [SIGILL, SIGTRAP, SIGBUS, SIGFPE, SIGSEGV];
 
     /// progsig.rs's `set` of `sig` to handler `h` with `flags`: where `sig` is a fault of the
     /// host's and the kernel runs our handler for it, that stays and `h` goes behind it (true);
     /// else nothing changes (false: the caller sets the kernel's action).
     pub(crate) unsafe fn chain_behind(sig: i32, h: usize, flags: i32) -> bool {
-        if !HOST_FAULTS.contains(&sig) && sig != SIG_WATCHDOG {
+        if !HOST_FAULTS.contains(&sig) && sig != SIG_WATCHDOG && sig != SIGABRT {
             return false;
         }
         let mut cur = SigAction { handler: 0, mask: 0, flags: 0 };
@@ -1254,7 +1261,14 @@ mod imp {
             if sig == SIGABRT {
                 let mc = *(uc.add(UC_MCONTEXT) as *const *mut u8);
                 let reg = |off: usize| -> *mut u64 { mc.add(off) as *mut u64 };
-                report_abort(*reg(SS_PC), *reg(SS_FP));
+                super::note_abort(*reg(SS_PC), *reg(SS_FP));
+                let handled = super::program_abort(sig, info, uc);
+                if !crate::os::progsig::take_sent_on_abort() {
+                    report_abort(*reg(SS_PC), *reg(SS_FP));
+                }
+                if handled {
+                    return;
+                }
                 default_action(SIGABRT);
                 raise_abort();
                 return;
@@ -1622,6 +1636,49 @@ unsafe fn not_a_kick(sig: i32, info: *mut u8, uc: *mut u8) {
     imp::default_action(sig);
     // (blocked while this handler runs: it is delivered as the handler returns, by default)
     raise(sig);
+}
+
+/// SIGABRT's site, quietly in the flight recorder (`signal.abort`: a = pc, b = fp, the frames' return
+/// addresses in its text) before the program's handler runs: one that ends the process, hangs or
+/// faults again still leaves where the abort came from. Signal context: a stack buffer and the
+/// recorder's lock-free ring.
+#[cfg(any(target_os = "linux", target_vendor = "apple"))]
+fn note_abort(pc: u64, fp: u64) {
+    if !crate::inspect::flightrec::on() {
+        return;
+    }
+    let mut raw = [0u64; 8];
+    let n = crate::jit::raw_frames_here(fp, &mut raw);
+    let mut text = [0u8; 168];
+    let mut k = 0;
+    let mut put = |b: u8| {
+        if k < text.len() {
+            text[k] = b;
+            k += 1;
+        }
+    };
+    b"SIGABRT, before the program's handler; frames".iter().for_each(|&b| put(b));
+    for &f in &raw[..n] {
+        put(b' ');
+        put(b'0');
+        put(b'x');
+        let digits = (16 - (f.leading_zeros() as usize / 4)).max(1);
+        for i in (0..digits).rev() {
+            let d = ((f >> (4 * i)) & 15) as u8;
+            put(if d < 10 { b'0' + d } else { b'a' + d - 10 });
+        }
+    }
+    crate::inspect::flightrec::event("signal.abort", std::str::from_utf8(&text[..k]).unwrap_or("SIGABRT"), pc, fp);
+}
+
+/// SIGABRT: the handler the program (or a library) set runs first, as natively, so one that ends
+/// the process is the only one to speak (a relax that is the program makes its own report); once
+/// it returns, relax's report, and the delivery is over (true): raise(SIGABRT) goes on, and
+/// abort() ends the process itself (it sets the default action and raises again). Also true when
+/// the program ignores it. False: nothing set, the report and the default action end it.
+#[cfg(any(target_os = "linux", target_vendor = "apple"))]
+unsafe fn program_abort(sig: i32, info: *mut u8, uc: *mut u8) -> bool {
+    imp::chain(sig, info, uc) || imp::chained_handler(sig) == 1
 }
 
 /// Starts the thread SIGABRT's report is made on (`unix::abort`), with the compiler's owner.

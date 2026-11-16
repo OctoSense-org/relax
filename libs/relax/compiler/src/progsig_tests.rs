@@ -338,13 +338,18 @@ fn child_with(test: &str, hook: &str, env: &[(&str, &str)]) -> std::process::Out
 }
 
 fn setup() -> (Box<Unit>, u32) {
+    setup_with(FIXTURE, "progsig_fixture")
+}
+
+/// A unit of fixture crate `name` (source `src`).
+fn setup_with(src: &str, name: &str) -> (Box<Unit>, u32) {
     crate::jit::CHECK_FIRST.store(false, std::sync::atomic::Ordering::Relaxed);
     std::env::set_var("RELAX_STD", concat!(env!("CARGO_MANIFEST_DIR"), "/std"));
     let dir = std::env::temp_dir().join(format!("relax-progsig-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("lib.rs");
-    std::fs::write(&path, FIXTURE).unwrap();
-    let (prog, core, krate) = crate::load_with_std(&std::sync::Arc::new(crate::Session::default()), path.to_str().unwrap(), "progsig_fixture", false).unwrap();
+    std::fs::write(&path, src).unwrap();
+    let (prog, core, krate) = crate::load_with_std(&std::sync::Arc::new(crate::Session::default()), path.to_str().unwrap(), name, false).unwrap();
     std::fs::remove_file(path).unwrap();
     std::fs::remove_dir(dir).unwrap();
     let mut tcx = crate::tcx::Tcx::new();
@@ -490,7 +495,8 @@ fn an_outside_sigabrt_in_a_compile_reports_and_ends_the_process() {
         let output = child(TEST, "target_in_compile,6,process");
         let err = String::from_utf8_lossy(&output.stderr);
         assert_eq!(output.status.signal(), Some(6), "outside SIGABRT must end the compile: {:?}\n{err}", output.status);
-        assert!(err.contains("fixture: SIGABRT report") || (cfg!(relax) && err.contains("SIGABRT on thread")), "outside SIGABRT must report before exit:\n{err}");
+        assert!(err.contains("SIGABRT on thread"), "outside SIGABRT must have relax's report:\n{err}");
+        assert!(err.contains("fixture: SIGABRT report"), "outside SIGABRT must run the program's handler after the report:\n{err}");
         return;
     }
     assert_eq!(unsafe { setrlimit(4, &[0, 0]) }, 0, "the SIGABRT child must disable core dumps");
@@ -508,6 +514,111 @@ fn an_outside_sigabrt_in_a_compile_reports_and_ends_the_process() {
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
     panic!("the outside SIGABRT must end the process once the compile is over");
+}
+
+/// One source for the SIGABRT fixture: run natively in this binary (`abrt_native`) and compiled by
+/// a unit (`ABRT_FIXTURE`), so both children run the same program.
+macro_rules! abrt_fixture {
+    ($($t:tt)*) => {
+        mod abrt_native { $($t)* }
+        const ABRT_FIXTURE: &str = stringify!($($t)*);
+    };
+}
+
+abrt_fixture! {
+    use std::sync::atomic::{AtomicU64, Ordering::SeqCst};
+    extern "C" {
+        fn signal(sig: i32, h: usize) -> usize;
+        fn raise(sig: i32) -> i32;
+        fn abort() -> !;
+        fn write(fd: i32, buf: *const core::ffi::c_void, n: usize) -> isize;
+        fn _exit(code: i32) -> !;
+    }
+    static RUNS: AtomicU64 = AtomicU64::new(0);
+    // a fn of the test's that the ending handler calls first (out[2]; 0: none)
+    static HOOK: AtomicU64 = AtomicU64::new(0);
+    fn say(m: &[u8]) {
+        unsafe { write(2, m.as_ptr().cast(), m.len()) };
+    }
+    extern "C" fn on_abrt(_sig: i32) {
+        RUNS.fetch_add(1, SeqCst);
+        say(b"abrt fixture: the handler ran\n");
+    }
+    extern "C" fn on_abrt_exit(_sig: i32) {
+        let hook = HOOK.load(SeqCst);
+        if hook != 0 {
+            let f: extern "C" fn() = unsafe { core::mem::transmute(hook as usize) };
+            f();
+        }
+        say(b"abrt fixture: the handler ends the process\n");
+        unsafe { _exit(3) }
+    }
+    // out[0]: 1 raise(SIGABRT), 2 abort(), each with a handler that returns; 3 raise(SIGABRT)
+    // with one that ends the process; out[1]: the returning handler's runs
+    pub fn abrt_case(out: &mut [u64; 8]) {
+        HOOK.store(out[2], SeqCst);
+        let h = if out[0] == 3 { on_abrt_exit as *const () as usize } else { on_abrt as *const () as usize };
+        unsafe { signal(6, h) };
+        if out[0] == 2 {
+            unsafe { abort() }
+        }
+        unsafe { raise(6) };
+        say(b"abrt fixture: raise returned\n");
+        out[1] = RUNS.load(SeqCst);
+    }
+}
+
+/// A program's SIGABRT handler under the JIT does what it does natively: it runs, and when it
+/// returns raise(SIGABRT) goes on and abort() ends the process, relax's report after it; one that
+/// ends the process is the only one to speak, and finds the abort's site in the flight recorder.
+/// Each case runs natively and as a unit's program; their ends and the fixture's lines must be the
+/// same.
+#[test]
+fn a_program_sigabrt_handler_runs_and_returns_as_it_does_natively() {
+    const TEST: &str = "a_program_sigabrt_handler_runs_and_returns_as_it_does_natively";
+    const MODE: &str = "RELAX_PROGSIG_ABRT_MODE";
+    if std::env::var(CHILD).as_deref() != Ok(TEST) {
+        let run = |mode: &str| {
+            let output = child_with(TEST, "", &[(MODE, mode)]);
+            let err = String::from_utf8_lossy(&output.stderr).into_owned();
+            let lines: Vec<String> = err.lines().filter(|l| l.starts_with("abrt fixture:")).map(str::to_string).collect();
+            (output.status.code(), output.status.signal(), lines, err)
+        };
+        for (case, reports) in [("raise", 1), ("abort", 1), ("exit", 0)] {
+            let (code, signal, lines, err) = run(&format!("native,{case}"));
+            // (the baseline ran the program's handler: else this binary's own run took the signal)
+            assert!(lines.iter().any(|l| l.starts_with("abrt fixture: the handler")), "{case}: natively the handler runs:\n{err}");
+            let (jit_code, jit_signal, jit_lines, jit_err) = run(&format!("jit,{case}"));
+            assert_eq!((jit_code, jit_signal), (code, signal), "{case}: under the JIT the process ends as natively:\n{jit_err}\nnatively:\n{err}");
+            assert_eq!(jit_lines, lines, "{case}: under the JIT the program says what it does natively:\n{jit_err}\nnatively:\n{err}");
+            let report = |e: &str| e.matches("relax: SIGABRT on thread").count();
+            assert_eq!(report(&jit_err), report(&err) + reports, "{case}: {reports} report(s) of the unit's:\n{jit_err}");
+            if case == "exit" {
+                assert!(jit_err.lines().any(|l| l == "abrt recorder: 1"), "{case}: the abort's site in the flight recorder before the handler:\n{jit_err}");
+            }
+        }
+        return;
+    }
+    assert_eq!(unsafe { setrlimit(4, &[0, 0]) }, 0, "the SIGABRT child must disable core dumps");
+    let mode = std::env::var(MODE).unwrap();
+    let (how, case) = mode.split_once(',').unwrap();
+    let mut out = [match case { "abort" => 2, "exit" => 3, _ => 1 }, 0, 0, 0, 0, 0, 0, 0];
+    if how == "native" {
+        abrt_native::abrt_case(&mut out);
+    } else {
+        // what the ending handler reads first: the unit's flight recorder
+        extern "C" fn recorder() {
+            eprintln!("abrt recorder: {}", crate::inspect::flightrec::count_events("signal.abort"));
+        }
+        crate::inspect::flightrec::init();
+        out[2] = recorder as *const () as usize as u64;
+        let (mut u, krate) = setup_with(ABRT_FIXTURE, "abrt_fixture");
+        let _program = crate::os::program_thread();
+        crate::os::fault::reassert();
+        call(&mut u, krate, "abrt_case", out.as_mut_ptr() as u64);
+    }
+    eprintln!("abrt fixture: runs {}", out[1]);
+    std::process::exit(0);
 }
 
 #[test]

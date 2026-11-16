@@ -303,6 +303,14 @@ fn push_ev(ring: &Slots<Ev>, cat: &str, text: &str, a: u64, b: u64) {
     ring.push(Ev { t: crate::clock::wall_ns(), os_id: super::threads::self_os_id(), a, b, cat_len, len, cat: cat_b, text: text_b });
 }
 
+/// The recorded events of category `cat` (a test's check of what a path recorded).
+#[cfg(test)]
+pub(crate) fn count_events(cat: &str) -> usize {
+    let mut n = 0;
+    events().read(0, &mut |_, e: Ev| n += (&e.cat[..e.cat_len as usize] == cat.as_bytes()) as usize);
+    n
+}
+
 /// An input event of the program as the remote command that injects it again
 /// (`mouse k=down x=.. y=..`, `key k=down c=..`, `text t=..`), at its UI frame.
 pub fn input(frame: u64, injected: bool, command: &str) {

@@ -430,6 +430,7 @@ pub(crate) fn give_back(bases: &[u64]) -> u32 {
 /// trampoline for it, the disposition goes back to what the program saw before its first change
 /// (SIG_DFL when that was code of an ended run too).
 pub(crate) unsafe fn reset_statics() {
+    ABRT_SENT_ON.store(0, Relaxed);
     let stale = |h: usize| h > 1 && crate::stale::lookup(h as u64).is_some();
     for sig in 1..NSIG as i32 {
         let e = &TABLE[sig as usize];
@@ -736,6 +737,9 @@ unsafe fn route(sig: i32, info: *mut u8, uc: *mut u8, chained: bool) -> bool {
             hold(bit, uc);
             if resend_process(sig, info) {
                 COUNTS[sig as usize][DEFLECTED].fetch_add(1, Relaxed);
+                if sig == SIGABRT && chained {
+                    ABRT_SENT_ON.fetch_add(1, Relaxed);
+                }
             } else {
                 lost(sig);
             }
@@ -750,6 +754,9 @@ unsafe fn route(sig: i32, info: *mut u8, uc: *mut u8, chained: bool) -> bool {
             st.last.store(sig, Relaxed);
             if resend_self(sig, info) {
                 COUNTS[sig as usize][DEFERRED].fetch_add(1, Relaxed);
+                if sig == SIGABRT && chained {
+                    ABRT_SENT_ON.fetch_add(1, Relaxed);
+                }
             } else {
                 lost(sig);
             }
@@ -825,6 +832,18 @@ unsafe fn hold(bit: u64, uc: *mut u8) {
     let mut set = [0u64; 16];
     set[0] = bit;
     sys::pthread_sigmask(SIG_BLOCK, &set, std::ptr::null_mut());
+}
+
+/// SIGABRT deliveries sent on (held for a compile, or deflected from a thread with no program
+/// state) instead of running the program's handler: their next delivery is the same SIGABRT,
+/// reported then (`take_sent_on_abort`).
+static ABRT_SENT_ON: AtomicU32 = AtomicU32::new(0);
+const SIGABRT: i32 = 6;
+
+/// A SIGABRT the host's handler chained here was sent on (true, counted off): not reported now,
+/// its next delivery is.
+pub(crate) fn take_sent_on_abort() -> bool {
+    ABRT_SENT_ON.try_update(Relaxed, Relaxed, |n| n.checked_sub(1)).is_ok()
 }
 
 /// The signal again, at this thread (Linux: with its siginfo).
