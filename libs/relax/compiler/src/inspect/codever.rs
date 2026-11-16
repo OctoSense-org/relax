@@ -723,23 +723,29 @@ pub fn cmd_code(req: &Req, out: &mut Out) {
         by.push(format!("{} {:.2} MB / {} installs", crate::jit::GROW_NAMES[k], crate::jit::CODE_GROWTH[k].load(Ordering::Relaxed) as f64 / 1048576.0, crate::jit::CODE_INSTALLS[k].load(Ordering::Relaxed)));
     }
     out.line(&format!("code installed {:.2} MB (append-only, never freed): {}", total as f64 / 1048576.0, by.join(", ")));
-    out.line(&crate::invalid::stats_line());
     let up = crate::jit::current_unit();
+    if !up.is_null() {
+        out.line(&unsafe { &*up }.window_line());
+    }
+    out.line(&crate::invalid::stats_line());
     if up.is_null() {
         return;
     }
     let r = crate::owner::call_within(crate::owner::Class::Job, 10_000, move || {
         let u = unsafe { &*up };
-        let mut v: Vec<(u32, u32, &str)> = u.fns.iter().filter(|f| f.version > 1).map(|f| (f.version, f.code_len, &*f.name)).collect();
-        v.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.cmp(&a.1)));
-        v.iter().take(n).map(|(ver, len, name)| format!("  {} versions  {} B now  {}", ver, len, name)).collect::<Vec<_>>()
+        let (installs, top) = u.version_stats(n);
+        (u.fns.len(), installs, top.iter().map(|(ver, len, name)| format!("  {} versions  {} B now  {}", ver, len, name)).collect::<Vec<_>>())
     });
     match r {
-        Some(lines) if lines.is_empty() => out.line("no fn has more than one version"),
-        Some(lines) => {
-            out.line(&format!("top fns by versions:"));
-            for l in lines {
-                out.line(&l);
+        Some((slots, installs, lines)) => {
+            out.line(&format!("{} slots, {} versions in all (every install and rollback counts one)", slots, installs));
+            if lines.is_empty() {
+                out.line("no fn has more than one version");
+            } else {
+                out.line("top fns by versions:");
+                for l in lines {
+                    out.line(&l);
+                }
             }
         }
         None => out.line("(top fns: the owner is busy; counts above are current)"),

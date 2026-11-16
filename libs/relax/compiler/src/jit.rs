@@ -538,6 +538,8 @@ pub struct Unit {
     /// bump allocators of code / read-only data / static memory (lock-free: lowering threads
     /// allocate too)
     code_next: AtomicU64,
+    /// the code window's bytes by what they are for (`code_bump`, WIN_NAMES)
+    window_use: [AtomicU64; WIN_KINDS],
     /// branch veneers in the code area by target (`Unit::veneer`): the last one placed for each
     pub(crate) veneers: relax_session::sync::Mutex<HashMap<u64, u64>>,
     /// invalidatable code (invalid.rs): per group, its own page-aligned chunks of the code area
@@ -5589,6 +5591,7 @@ impl Unit {
             #[cfg(windows)]
             end_event: unsafe { os::win32::CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()) },
             code_next: AtomicU64::new(misc),
+            window_use: [const { AtomicU64::new(0) }; WIN_KINDS],
             veneers: Default::default(),
             code_groups: Default::default(),
             hot_code: Default::default(),
@@ -5968,7 +5971,7 @@ impl Unit {
     }
 
     pub(crate) fn emit_linked(&self, code: &[u8], relocs: &[relax_backend::rir::RelocAt]) -> Result<u64, String> {
-        let at = bump(&self.code_next, code.len() as u64, 16, self.exec_base + self.exec_size - os::mem::CODE_TAIL, "out of code memory");
+        let at = self.code_bump(WIN_CODE, code.len() as u64, 16);
         let mut c = code.to_vec();
         self.link_code(&mut c, at, relocs)?;
         unsafe { os::mem::write_code(at, &c) };
@@ -5989,7 +5992,7 @@ impl Unit {
             let mut h = self.hot_code.lock().unwrap_or_else(|e| e.into_inner());
             if h.0 + need > h.1 {
                 let size = need.max(HOT_CHUNK);
-                let c = bump(&self.code_next, size, 64, self.exec_base + self.exec_size - os::mem::CODE_TAIL, "out of code memory");
+                let c = self.code_bump(WIN_HOT, size, 64);
                 *h = (c, c + size);
             }
             let at = h.0;
@@ -6006,9 +6009,8 @@ impl Unit {
     /// `emit_linked` into group `g`'s own pages (invalid.rs), or bump-shared code for None.
     pub(crate) fn emit_grouped(&self, g: Option<crate::invalid::Group>, code: &[u8], relocs: &[relax_backend::rir::RelocAt]) -> Result<u64, String> {
         let Some(g) = g else { return self.emit_linked(code, relocs) };
-        let end = self.exec_base + self.exec_size - os::mem::CODE_TAIL;
         // a chunk is page-aligned and page-sized: no other code shares its pages
-        let at = crate::invalid::alloc(self, g, code.len() as u64, |size, page| bump(&self.code_next, size, page, end, "out of code memory"))?;
+        let at = crate::invalid::alloc(self, g, code.len() as u64, |size, page| self.code_bump(WIN_GROUPS, size, page))?;
         let mut c = code.to_vec();
         self.link_code(&mut c, at, relocs)?;
         unsafe { os::mem::write_code(at, &c) };
@@ -6121,10 +6123,17 @@ impl Unit {
         }
     }
 
+    /// `size` bytes of the code window at `align`, counted as what they are for (`kind`, WIN_NAMES).
+    fn code_bump(&self, kind: usize, size: u64, align: u64) -> u64 {
+        let at = bump(&self.code_next, size, align, self.exec_base + self.exec_size - os::mem::CODE_TAIL, "out of code memory");
+        self.window_use[kind].fetch_add(size, Ordering::Relaxed);
+        at
+    }
+
     /// A block of `len` bytes of code memory, 16-byte aligned, not written (the startup image:
     /// cache.rs prelink links its code for this address and writes it whole).
     pub(crate) fn code_block(&self, len: u64) -> u64 {
-        let at = bump(&self.code_next, len, 16, self.exec_base + self.exec_size - os::mem::CODE_TAIL, "out of code memory");
+        let at = self.code_bump(WIN_GLUE, len, 16);
         // filled whole right away (the startup image's code)
         os::mem::prefault(at, len as usize);
         at
@@ -6133,7 +6142,7 @@ impl Unit {
     /// `len` bytes of code memory (global_asm.rs places a block whose fields need its address
     /// before it is written: write_reserved_code).
     pub(crate) fn reserve_asm_code(&self, len: u64, align: u64) -> u64 {
-        bump(&self.code_next, len.max(1), align.max(16), self.exec_base + self.exec_size - os::mem::CODE_TAIL, "out of code memory")
+        self.code_bump(WIN_GLUE, len.max(1), align.max(16))
     }
     pub(crate) fn write_reserved_code(&self, at: u64, b: &[u8]) {
         unsafe { os::mem::write_code(at, b) };
@@ -6141,7 +6150,7 @@ impl Unit {
 
     /// Glue code (`what` names it in the perf map: veneers, trampolines, entries, stubs).
     fn emit_code(&self, b: &[u8], what: &str) -> u64 {
-        let at = bump(&self.code_next, b.len() as u64, 16, self.exec_base + self.exec_size - os::mem::CODE_TAIL, "out of code memory");
+        let at = self.code_bump(WIN_GLUE, b.len() as u64, 16);
         unsafe { os::mem::write_code(at, b) };
         if perf_map_on() {
             perf_map(at, b.len(), what);
@@ -6398,6 +6407,37 @@ impl Unit {
 
     pub fn ro_range(&self) -> (u64, u64) {
         (self.ro_base, self.data_next.load(Ordering::Acquire))
+    }
+
+    /// The code window's use by kind (`window_use`): what is left over is alignment.
+    pub(crate) fn window_line(&self) -> String {
+        let mb = |b: u64| b as f64 / 1048576.0;
+        let used = self.code_next.load(Ordering::Relaxed).saturating_sub(self.exec_base);
+        let mut counted = 0;
+        let mut by = Vec::new();
+        for k in 0..WIN_NAMES.len() {
+            let b = self.window_use[k].load(Ordering::Relaxed);
+            counted += b;
+            by.push(format!("{} {:.1} MB", WIN_NAMES[k], mb(b)));
+        }
+        format!("code window {:.1} of {:.0} MB used: {}, alignment {:.1} MB", mb(used), mb(self.exec_size), by.join(", "), mb(used.saturating_sub(counted)))
+    }
+
+    /// The slots' versions (`FnEntry::version` counts every install and rollback) in all, and the
+    /// `n` slots with the most (versions, code bytes now, name). Owner thread (or on its behalf).
+    pub(crate) fn version_stats(&self, n: usize) -> (u64, Vec<(u32, u32, &str)>) {
+        let total: u64 = self.fns.iter().map(|f| f.version as u64).sum();
+        let mut v: Vec<(u32, u32, &str)> = self.fns.iter().filter(|f| f.version > 1).map(|f| (f.version, f.code_len, &*f.name)).collect();
+        v.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.cmp(&a.1)));
+        v.truncate(n);
+        (total, v)
+    }
+
+    /// `version_stats` in one line (the window-full report).
+    fn versions_line(&self, n: usize) -> String {
+        let (total, top) = self.version_stats(n);
+        let top = top.iter().map(|(ver, len, name)| format!("{} x{} ({} B now)", name, ver, len)).collect::<Vec<_>>().join(", ");
+        format!("{} slots, {} versions in all; the most: {}", self.fns.len(), total, if top.is_empty() { "none has more than one" } else { &top })
     }
 
     /// Bytes used of the unit's code, read-only data and static memory reservations (relax
@@ -7527,7 +7567,7 @@ impl Unit {
                 // the thunks are in the unit's code area, so calls reach them with a direct branch
                 // and their heads reach the code (calls.DESIGN.md); the lazy stubs, table words and
                 // tier records are a reservation of their own
-                let thunk = bump(&self.code_next, (count * THUNK_SIZE) as u64, 1 << 16, self.exec_base + self.exec_size - os::mem::CODE_TAIL, "out of code memory");
+                let thunk = self.code_bump(WIN_THUNKS, (count * THUNK_SIZE) as u64, 1 << 16);
                 if perf_map_on() {
                     perf_map(thunk, count * THUNK_SIZE, &format!("relax::thunks (segment {})", seg));
                 }
@@ -21473,7 +21513,7 @@ impl Unit {
         }
         // the block's place first: each stub jumps to its O1 code pc-relatively
         let cs = x64::COUNT_STUB_SIZE;
-        let at = bump(&self.code_next, (ids.len() * cs) as u64, 16, self.exec_base + self.exec_size - os::mem::CODE_TAIL, "out of code memory");
+        let at = self.code_bump(WIN_COUNTERS, (ids.len() * cs) as u64, 16);
         let mut buf = Vec::with_capacity(ids.len() * cs);
         let mut stubs = Vec::with_capacity(ids.len());
         unsafe {
@@ -21539,7 +21579,7 @@ impl Unit {
                     }
                 }
             } else {
-                let at = bump(&self.code_next, x64::COUNT_STUB_SIZE as u64, 16, self.exec_base + self.exec_size - os::mem::CODE_TAIL, "out of code memory");
+                let at = self.code_bump(WIN_COUNTERS, x64::COUNT_STUB_SIZE as u64, 16);
                 os::mem::write_code(at, &x64::count_stub(at, rec as u64, id, code, self.hot_entry, call_weight(bytes)));
                 at
             };
@@ -21587,7 +21627,7 @@ impl Unit {
                     }
                 }
             } else {
-                let at = bump(&self.code_next, x64::COUNT_STUB_SIZE as u64, 16, self.exec_base + self.exec_size - os::mem::CODE_TAIL, "out of code memory");
+                let at = self.code_bump(WIN_COUNTERS, x64::COUNT_STUB_SIZE as u64, 16);
                 os::mem::write_code(at, &x64::count_stub(at, rec as u64, id, code, self.hot_entry, call_weight(bytes)));
                 at
             };
@@ -21676,7 +21716,7 @@ impl Unit {
                 Err(_) => return false,
             }
         } else {
-            let at = bump(&self.code_next, x64::COUNT_STUB_SIZE as u64, 16, self.exec_base + self.exec_size - os::mem::CODE_TAIL, "out of code memory");
+            let at = self.code_bump(WIN_COUNTERS, x64::COUNT_STUB_SIZE as u64, 16);
             os::mem::write_code(at, &x64::count_stub(at, rec as u64, id, code, self.hot_entry, call_weight(bytes)));
             at
         };
@@ -29317,7 +29357,10 @@ pub(crate) fn body_callees(prog: &Program, tcx: &Tcx, b: &Body, inst: &[TyId], w
 /// Bump allocation in [*next, end): `size` bytes at `align` (lock-free: lowering threads and
 /// the lock holder allocate concurrently).
 /// The unit's code window is full: there is nowhere left to put code (it is append-only). A clear
-/// report, then a real crash (never an unwind a fault containment could swallow).
+/// report, then a real crash (never an unwind a fault containment could swallow). The report says
+/// where the window went: installed code by source, the window by kind, the invalidatable groups'
+/// pages, and on the owner (whose thread alone changes the slots) the slots with the most versions;
+/// the flight recorder's recording keeps the recent compiles and installs.
 #[cold]
 fn code_full(size: u64) -> ! {
     let mut msg = format!("relax run: the JIT code window is full ({} bytes asked); code is never freed. Installed code by source:", size);
@@ -29325,8 +29368,31 @@ fn code_full(size: u64) -> ! {
         msg += &format!(" {} {:.1} MB ({} installs);", GROW_NAMES[k], CODE_GROWTH[k].load(Ordering::Relaxed) as f64 / 1048576.0, CODE_INSTALLS[k].load(Ordering::Relaxed));
     }
     eprintln!("{}", msg);
+    let up = cur_unit();
+    if !up.is_null() {
+        eprintln!("relax run: {}", unsafe { &*up }.window_line());
+    }
+    eprintln!("relax run: {}", crate::invalid::stats_line());
+    if !up.is_null() && crate::owner::is_owner() {
+        eprintln!("relax run: {}", unsafe { &*up }.versions_line(8));
+    }
+    // the recent compiles and installs, for what filled it
+    crate::inspect::flightrec::fault_dump(&format!("code window full ({} bytes asked)", size));
     std::process::abort();
 }
+
+/// What the code window's bytes went to (`Unit::code_bump`, `Unit::window_use`), beside the installs by source: a
+/// slot's code, the O3 code chunks (HOT_CHUNK each), the invalidatable groups' own pages
+/// (invalid.rs), the slots' thunks (a segment at a time), the tier-up count stubs, and glue (veneers,
+/// trampolines, entries), global_asm blocks and the startup image.
+const WIN_CODE: usize = 0;
+const WIN_HOT: usize = 1;
+const WIN_GROUPS: usize = 2;
+const WIN_THUNKS: usize = 3;
+const WIN_COUNTERS: usize = 4;
+const WIN_GLUE: usize = 5;
+const WIN_KINDS: usize = 6;
+const WIN_NAMES: [&str; WIN_KINDS] = ["slot code", "O3 chunks", "group pages", "thunks", "count stubs", "glue and the startup image"];
 
 /// the size of one O3 code chunk (`Unit::emit_hot`)
 const HOT_CHUNK: u64 = 1 << 20;
