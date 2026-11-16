@@ -641,7 +641,10 @@ pub(crate) fn hold_old_frames(u: &Unit, gen: u32, layout: &str, paused: bool) ->
 /// install with the program threads paused (inspect::instrument::pause_for_patch): the first frame
 /// of a program thread in code of one of `slots` (any version: what the patch rebuilds was built
 /// for the old layout), in a slot of text the program no longer has (reload::retired_text: a fn
-/// an edit removed or replaced, a closure inside one), or in an earlier version of any slot (code
+/// an edit removed or replaced, a closure inside one, a closure a patch kept on its old code), in
+/// a version that holds a copy of such code (an inlining tier's), in a slot that can still call
+/// such code (reload::over_retired: an instance over a kept closure),
+/// or in an earlier version of any slot (code
 /// of a text no longer the program's, whose types are not asked), named for the restart's reason. Every thread's frames
 /// are read, those of a walk that ends short too: a frame found is the answer. Err: none was
 /// found, and a stack could not be read to its end (what it hides is not known).
@@ -650,6 +653,9 @@ pub(crate) fn frame_in(u: &Unit, slots: &crate::fxhash::HashSet<u32>) -> Result<
     let code = u.code.read().unwrap_or_else(|e| e.into_inner());
     // (a thread is named as reports name it: one nobody named is its program thread, or `unnamed`)
     let listed: Vec<crate::inspect::threads::Thread> = caps.iter().map(|c| c.t.clone()).collect();
+    // the hosts of copies of a closure a patch kept on its old code, for linked code below O3 (the
+    // image and disk-cache links note `inlined_into`, not a list per code body)
+    let hosts: crate::fxhash::HashMap<u32, u32> = u.kept_old.keys().flat_map(|&k| u.fns[k as usize].history().inlined_into.iter().map(move |&h| (h, k))).collect();
     let mut unread = None;
     for c in caps {
         if let Some(e) = c.err {
@@ -678,6 +684,20 @@ pub(crate) fn frame_in(u: &Unit, slots: &crate::fxhash::HashSet<u32>) -> Result<
             }
             if let Some(retired) = crate::reload::retired_text(u, slot) {
                 return Ok(Some(format!("`{}` runs on thread {} {}", f.name, thread, retired)));
+            }
+            // a copy of such code inlined into this version
+            // (code built in this run lists what it inlined when it inlined anything: none listed,
+            // none taken in, whatever a later version of the slot took)
+            let copy = match code.inlined_at(start) {
+                Some(list) => list.iter().find_map(|&c| crate::reload::retired_text(u, c).map(|r| (c, r))),
+                None if matches!(code.kind_of(start).origin, crate::jit::origin::CACHE | crate::jit::origin::IMAGE) => hosts.get(&slot).and_then(|&c| crate::reload::retired_text(u, c).map(|r| (c, r))),
+                None => None,
+            };
+            if let Some((c, retired)) = copy {
+                return Ok(Some(format!("`{}` runs on thread {} in code that holds a copy of `{}`, {}", f.name, thread, u.fns[c as usize].name, retired)));
+            }
+            if let Some(over) = crate::reload::over_retired(u, slot) {
+                return Ok(Some(format!("`{}` runs on thread {} and can still call {}", f.name, thread, over)));
             }
             if start != f.code {
                 return Ok(Some(format!("`{}` runs code from before an earlier edit on thread {}", f.name, thread)));

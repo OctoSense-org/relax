@@ -373,7 +373,7 @@ pub(crate) mod settle_rebuild;
 /// Drop). KEPT (system heap, built and grown under `zone_alloc::kept`): the Unit box, code tables,
 /// fns/fn_map, consts, const_readers, body_deps, statics/static_spans, sites/site_ix, rt/rs,
 /// syms, start_order, vtables, locations, lit_data, provided*, slots, missing_stubs, patch_log,
-/// forwards, tier-1 state, stats, errors and the scalars/addresses. COMPILER arena: prog, tcx, lay, bodies,
+/// forwards, kept_old/kept_at, tier-1 state, stats, errors and the scalars/addresses. COMPILER arena: prog, tcx, lay, bodies,
 /// old_bodies, coro_*, spec_cached, the unwind/unpin/cycle/core-path memos, const_failed, cache,
 /// front, ctfe_fn_bodies, query_errors, reload_*, closure_owners.
 pub struct Unit {
@@ -578,6 +578,16 @@ pub struct Unit {
     /// to, whether it is its lineage's cell). A slot forwards while its code is one of them, so a
     /// rollback that brings an earlier code back brings that code's role back with it.
     pub(crate) forwards: crate::fxhash::HashMap<u64, (u32, bool)>,
+    /// the closures an applied patch left on code of a text the program no longer has while their
+    /// parent stays the program's (reload: the closure and async rebind blocks, by complement):
+    /// slot -> (the patch gen that kept it, why; a later keep leaves the first gen). A layout patch
+    /// is refused while such code can still run: a frame in it, over it or a stored value of it
+    /// (reload::retired_text, invalid::frame_in, reload::kept_stored). Dropped when its parent's
+    /// patch is rolled back; otherwise kept to the end of the run (nothing knows when its last
+    /// value died). One entry per kept closure.
+    pub(crate) kept_old: crate::fxhash::HashMap<u32, (u32, &'static str)>,
+    /// the same closures as their types name them: (file, expression)
+    pub(crate) kept_at: crate::fxhash::HashSet<(u32, u32)>,
     /// the owners of the interned closure types (preserve_closure_bodies)
     pub(crate) closure_owners: ClosureOwners,
     /// the end of this unit's last variable in the per-thread block (`tls_alloc`)
@@ -5658,6 +5668,8 @@ impl Unit {
             patch_gen: 0,
             file_gen: Default::default(),
             forwards: Default::default(),
+            kept_old: Default::default(),
+            kept_at: Default::default(),
             closure_owners: Default::default(),
             // slot 0 of the block: the thread's domain static block (domain.rs)
             tls_next: TLS_FIRST_FREE,

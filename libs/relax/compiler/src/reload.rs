@@ -645,6 +645,14 @@ pub unsafe fn rollback(up: *mut Unit, undo: Undo, why: &str) -> Vec<String> {
         jit::bump_patch_epoch();
         let ids = u.rollback_gen(undo.group);
         let group = undo.group;
+        // a closure this group kept on old code is its parent's again once the parent's code went
+        // back (rollback_gen skips a slot a later group patched again: then the entry stays)
+        if u.kept_old.values().any(|e| e.0 == group) {
+            let back: crate::fxhash::HashSet<u32> = ids.iter().copied().collect();
+            let fns = &u.fns;
+            u.kept_old.retain(|&s, e| !(e.0 == group && matches!(fns[s as usize].key, FnKey::Closure(_, _, p) if back.contains(&p))));
+            crate::zone_alloc::kept_with(|| u.kept_at = u.kept_old.keys().filter_map(|&s| match fns[s as usize].key { FnKey::Closure(f, e, _) => Some((f, e)), _ => None }).collect());
+        }
         // code built after the patch that inlined its bodies is in its group (invalid::group_of);
         // RIR built meanwhile that took them in and has no code yet is dropped (built anew from
         // the restored source)
@@ -2761,14 +2769,19 @@ pub(crate) fn gandalf_keeps(prog: &Program, visible: &[bool], d: DefId) -> bool 
 
 /// A frame's slot runs text the program no longer has (JP-L F2): a fn an edit removed or
 /// replaced (its def stays in a version of its file that is no longer current), or a closure or
-/// coroutine inside one, up the chain of its parents; a twin as its slot. Such a slot is never
-/// checked against the new definitions, so a layout patch cannot know what its frame holds. The
-/// answer names the fn and its version. Glue and shims are code of types, not text: None.
+/// coroutine inside one, up the chain of its parents; a twin as its slot. Or a closure a patch
+/// kept on its old code while its parent stays (Unit::kept_old). Such a slot is never checked
+/// against the new definitions, so a layout patch cannot know what its frame holds. The answer
+/// names the fn and its version, or the patch that kept it. Glue and shims are code of types,
+/// not text: None.
 pub(crate) fn retired_text(u: &Unit, id: u32) -> Option<String> {
     let mut s = id;
     for _ in 0..64 {
         if s as usize >= u.fns.len() {
             return None;
+        }
+        if let Some(&(gen, why)) = u.kept_old.get(&s) {
+            return Some(format!("in the code patch gen {gen} kept it on ({why})"));
         }
         match &u.fns[s as usize].key {
             FnKey::Inst(d, _) => {
@@ -2790,6 +2803,189 @@ pub(crate) fn retired_text(u: &Unit, id: u32) -> Option<String> {
     }
     None
 }
+
+/// What of retired text a value of type `t` can still run (JP-L T3c, K2 and K3): a closure a
+/// patch kept on its old code (Unit::kept_at), or a fn item or closure of a fn the program no
+/// longer has (retired_text's binding rule), held by value or behind a pointer, through ADT
+/// and closure arguments, captures, tuples, arrays, slices, fn pointers, trait-object and alias
+/// arguments. Some: what it is, for the refusal; a type nested past the cap counts as one.
+fn retired_in(u: &Unit, t: TyId, depth: u32) -> Option<String> {
+    retired_hit(u, t, depth).map(|h| h.0)
+}
+
+/// How likely a value of closure slot `k` is to exist, as a rank (lower first): its first code
+/// came from a call (its parent's code ran and called it), it has code, then by slot.
+fn closure_rank(u: &Unit, k: u32) -> u64 {
+    let f = &u.fns[k as usize];
+    ((!f.first_by_call.load(Ordering::Acquire)) as u64) << 33 | ((!f.compiled) as u64) << 32 | k as u64
+}
+
+/// retired_in with the rank of what it found (closure_rank; a fn item or an unnamed closure after
+/// every named one): a check that finds several says the likeliest.
+fn retired_hit(u: &Unit, t: TyId, depth: u32) -> Option<(String, u64)> {
+    use crate::types::TyKind::*;
+    const UNNAMED: u64 = 3 << 32;
+    if depth > 16 {
+        return Some(("a value nested too deep to read".to_string(), UNNAMED));
+    }
+    let tys = &u.tcx.tys;
+    let any = |l: crate::types::TyList| tys.list(l).iter().find_map(|a| retired_hit(u, *a, depth + 1));
+    let gone = |d: DefId| (d.0 as usize) < u.prog.defs.len() && !u.prog.is_current_version(u.prog.def(d).file);
+    match tys.kind(t).clone() {
+        Adt(_, args, _) => any(args),
+        Ref(_, x, _) | Ptr(_, x) | Slice(x) | Array(x, _) => retired_hit(u, x, depth + 1),
+        Tuple(v) => any(v),
+        FnPtr(ps, r, _, _) => any(ps).or_else(|| retired_hit(u, r, depth + 1)),
+        FnDef(d, args, _) => if gone(d) { Some((format!("`{}`, of text an edit retired", u.prog.def_path(d)), UNNAMED)) } else { any(args) },
+        Closure(file, expr, c) => {
+            if u.kept_at.contains(&(file, expr)) {
+                let kept = u.kept_old.iter().filter(|e| matches!(u.fns[*e.0 as usize].key, FnKey::Closure(f, x, _) if (f, x) == (file, expr))).min_by_key(|e| *e.0);
+                return Some(match kept {
+                    Some((k, (gen, why))) => (format!("`{}`, which patch gen {gen} kept on its old code ({why})", u.fns[*k as usize].name), closure_rank(u, *k)),
+                    None => ("a closure a patch kept on its old code".to_string(), UNNAMED),
+                });
+            }
+            match tys.kind(c.parent_args).clone() {
+                FnDef(d, _, _) if gone(d) => {
+                    // (a closure has a slot per parent slot that lowered it: the one with code)
+                    let slot = u.closures_of_files(&[file]).into_iter().filter(|&k| matches!(u.fns[k as usize].key, FnKey::Closure(f, e, _) if (f, e) == (file, expr))).min_by_key(|&k| (!u.fns[k as usize].compiled, k));
+                    return Some(match slot {
+                        Some(k) => (format!("`{}`, of text an edit retired", u.fns[k as usize].name), closure_rank(u, k)),
+                        None => (format!("a closure of `{}`, of text an edit retired", u.prog.def_path(d)), UNNAMED),
+                    });
+                }
+                FnDef(_, args, _) => if let Some(x) = any(args) { return Some(x) },
+                _ => {}
+            }
+            retired_hit(u, c.tupled_upvars_ty, depth + 1)
+        }
+        Dyn(_, args, bounds, ..) => any(args).or_else(|| tys.list(bounds).iter().find_map(|b| retired_hit(u, b.1, depth + 1))),
+        Alias(_, a) => any(a.args),
+        _ => None,
+    }
+}
+
+/// K2: frame slot `slot` (a twin as its slot) can still call code of retired text after the
+/// install: its key's types (an instance's generic arguments, a closure's owner's, a shim's, a
+/// glue's type) hold one (retired_in): a generic `pump::<F>` over a kept closure.
+pub(crate) fn over_retired(u: &Unit, slot: u32) -> Option<String> {
+    key_types(u, slot).into_iter().find_map(|t| retired_in(u, t, 0))
+}
+
+/// The types slot `slot`'s code was built over: an instance's generic arguments (a closure's:
+/// its owner's), a shim's, a glue's type; a twin's are its slot's.
+fn key_types(u: &Unit, slot: u32) -> Vec<TyId> {
+    let mut s = slot;
+    for _ in 0..64 {
+        if s as usize >= u.fns.len() {
+            break;
+        }
+        match &u.fns[s as usize].key {
+            FnKey::Inst(_, args) => return args.clone(),
+            FnKey::Shim(sh) => return sh.args.clone(),
+            FnKey::Glue(_, t) => return vec![*t],
+            FnKey::Closure(_, _, parent) => s = *parent,
+            FnKey::Sandbox(t) | FnKey::Plain(t) | FnKey::Ctfe(t) => s = *t,
+        }
+    }
+    Vec::new()
+}
+
+/// A trait object the running code made of a type in which `ty_hit` finds something (the
+/// vtables this run lowered, by their source type), or whose code `slot_hit` finds it in (those
+/// linked from the disk cache or placed from the startup image, by the slots they hold: their
+/// source type is not kept): the object's type and what was found. `ty_hit` ranks what it finds
+/// (lower first, 0: take it): of several lowered vtables the lowest, then by the object's type.
+fn stored_in_objects(u: &Unit, ty_hit: &dyn Fn(TyId) -> Option<(String, u64)>, slot_hit: &dyn Fn(u32) -> Option<String>) -> Option<(String, String)> {
+    let lowered = u.vtables.snapshot();
+    let mut best: Option<(u64, String, String)> = None;
+    for (src, _) in lowered.keys() {
+        let Some((h, rank)) = ty_hit(*src) else { continue };
+        let of = object_type_name(u, *src);
+        if best.as_ref().is_none_or(|b| (rank, &of) < (b.0, &b.1)) {
+            best = Some((rank, of, h));
+        }
+        if rank == 0 {
+            break;
+        }
+    }
+    if let Some((_, of, h)) = best {
+        return Some((of, h));
+    }
+    let lowered: crate::fxhash::HashSet<u64> = lowered.values().copied().collect();
+    let mut thunks = Vec::new();
+    for (a, n) in u.syms.vtable_objs() {
+        if lowered.contains(&a) {
+            continue;
+        }
+        thunks.clear();
+        crate::syms::data_thunks(u, a, &mut thunks);
+        if let Some(h) = thunks.iter().find_map(|&sl| slot_hit(sl)) {
+            let of = stored_vtable_type_name(u, a).unwrap_or_else(|| format!("`{}`", vtable_name_types(&n).map_or_else(|| n.clone(), |t| t.0)));
+            return Some((of, h));
+        }
+    }
+    None
+}
+
+/// K3: a value that can run code of retired text may be stored where no frame shows it, so a
+/// layout patch cannot know what that code holds: a trait object made of a type holding one
+/// (retired_in; the vtables this run lowered, and those linked from the disk cache or placed from
+/// the startup image, by the code they hold), or a retired slot whose address is taken (a fn
+/// pointer to a removed fn, a closure coerced to one). Decided before the threads are paused.
+fn kept_stored(u: &Unit) -> Option<String> {
+    let ty_hit = |t: TyId| retired_hit(u, t, 0);
+    let slot_hit = |sl: u32| retired_text(u, sl).map(|r| format!("`{}` {r}", u.fns[sl as usize].name)).or_else(|| over_retired(u, sl));
+    if let Some((of, x)) = stored_in_objects(u, &ty_hit, &slot_hit) {
+        return Some(format!("the running code made trait objects of {of}, which hold {x}"));
+    }
+    let taken = u.code.read().unwrap_or_else(|e| e.into_inner()).taken_slots();
+    taken.into_iter().find_map(|sl| retired_text(u, sl).map(|r| format!("the address of `{}` is taken, and a stored pointer can still run it {r}", u.fns[sl as usize].name)))
+}
+
+/// The def of closure slot `c`'s owning fn: up its parents to the instance (a twin as its slot).
+fn closure_owner_def(u: &Unit, c: u32) -> Option<DefId> {
+    let mut s = c;
+    for _ in 0..64 {
+        match &u.fns[s as usize].key {
+            FnKey::Closure(_, _, p) => s = *p,
+            FnKey::Sandbox(t) | FnKey::Plain(t) | FnKey::Ctfe(t) => s = *t,
+            FnKey::Inst(d, _) => return ((d.0 as usize) < u.prog.defs.len()).then_some(*d),
+            _ => return None,
+        }
+    }
+    None
+}
+
+/// Closure slot `c` is what a lowering of its owning fn makes today (JP-L T3c, state A): its key
+/// is the file version its owner's def is in, and that version is current. Otherwise its key is
+/// an older version: its parent's running code still makes it while no patch has rebuilt the
+/// parent since its def moved on (state B: `retarget_file` moved the def, the text is the same),
+/// or a patch superseded it (state C: a forwarder to a state-A closure, or a Unit::kept_old
+/// entry). The rebind blocks pair state-A closures of a rebuilt parent with its others, and
+/// kept_retired is the complement.
+pub(crate) fn lowered_now(u: &Unit, c: u32) -> bool {
+    let FnKey::Closure(file, _, _) = u.fns[c as usize].key else { return false };
+    closure_owner_def(u, c).is_some_and(|d| {
+        let now = u.prog.def(d).file;
+        now == file && u.prog.is_current_version(now)
+    })
+}
+
+/// Whether old closure `o` of a rebuilt parent, which the patch did not rebind, is now code of a
+/// text the program no longer has while its owning fn stays the program's (Unit::kept_old): the
+/// owner's def is bound in a current version, and `o` is not what its lowering makes
+/// (lowered_now). An owner the patch removed or replaced: retired_text answers through the
+/// owner, no entry.
+fn kept_retired(u: &Unit, o: u32) -> bool {
+    let Some(d) = closure_owner_def(u, o) else { return false };
+    def_is_bound(&u.prog, d) && u.prog.is_current_version(u.prog.def(d).file) && !lowered_now(u, o)
+}
+
+/// Rebuilt parents a patch left with a compiled old closure and no closure of their current
+/// lowering (no closure at all in the new text, or the new lowering not made when the rebind
+/// block decided: JP-L T3c correction 4). Read by tests and the hot-failure ledger.
+pub(crate) static UNLOWERED_PARENTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Whether `d` is still the program's (bound in its module, or in its impl's or bound trait's
 /// item list): an edit that replaced or removed a fn unbinds it, while code in flight keeps its
@@ -4059,8 +4255,47 @@ fn coroutine_saved(u: &Unit, file: u32, expr: u32, owner: TyId) -> Option<Vec<Ty
         relax_types::borrowck::driver::ensure_coroutine_witnesses(&u.prog, &u.tcx, def);
         hidden = u.tcx.coroutine_hidden_types.get(&(file, expr));
     }
+    // (one of an older version of its owner's file, where an edit of another item moved the
+    // owner: its witness is the same coroutine's in the version the owner is in now)
+    if hidden.is_none() {
+        if let Some(now) = moved_coroutine(u, def, file, expr) {
+            hidden = u.tcx.coroutine_hidden_types.get(&now);
+        }
+    }
     let full = u.tcx.complete_args(&u.prog, def, u.tcx.tys.list(args), regions);
     Some(hidden?.iter().map(|&t| u.tcx.instantiate_ty(&u.prog, def, &full, t)).collect())
+}
+
+/// Coroutine `(file, expr)` of fn `def`, which an edit of other items of its file moved to the
+/// file's current version with its text the same (retarget_file; its running code still makes
+/// values of the old version's coroutine type): the same coroutine there -- the def's async body,
+/// or the async block at the same place in its text. None: the def's text changed.
+fn moved_coroutine(u: &Unit, def: DefId, file: u32, expr: u32) -> Option<(u32, u32)> {
+    let now = u.prog.def(def).file;
+    if now == file || (file as usize) >= u.prog.files.len() {
+        return None;
+    }
+    let (was, is) = (&u.prog.files[file as usize], &u.prog.files[now as usize]);
+    // (item_defs keeps the older version's entries: retarget_file adds the new ones)
+    let a = (0..was.ast.items.len() as u32).find(|&i| u.prog.item_defs.get(&(file, i)) == Some(&def))?;
+    let (ia, ib) = (&was.ast.items[a as usize], &is.ast.items[u.prog.def(def).item.0 as usize]);
+    if was.src.get(ia.lo as usize..ia.hi as usize)? != is.src.get(ib.lo as usize..ib.hi as usize)? {
+        return None;
+    }
+    let body = u.tcx.typeck(&u.prog, def);
+    if expr & crate::tcx::ASYNC_FN_BODY != 0 {
+        return body.body.map(|b| (now, crate::tcx::ASYNC_FN_BODY | b.0));
+    }
+    let e = crate::ast::ExprId(expr);
+    if !was.ast.has_expr(e) {
+        return None;
+    }
+    // (the same bytes: the expression at the same offset from the item's start)
+    let x = was.ast.expr(e);
+    let (lo, hi) = (x.lo - ia.lo + ib.lo, x.hi - ia.lo + ib.lo);
+    (0..body.expr_ty.len()).map(|i| body.expr_at(i)).find(|&n| {
+        is.ast.has_expr(n) && { let y = is.ast.expr(n); y.lo == lo && y.hi == hi && std::mem::discriminant(&y.kind) == std::mem::discriminant(&x.kind) }
+    }).map(|n| (now, n.0))
 }
 
 /// The hidden type of opaque type `o`, as the check of the fn defining it found it.
@@ -4570,8 +4805,11 @@ fn kept_closure_line(u: &Unit, slot: u32, why: &str) -> String {
     let FnKey::Closure(file, ce, parent) = u.fns[slot as usize].key else {
         return format!("kept: closure {} keeps its old code ({why})", u.fns[slot as usize].name);
     };
-    let stored = u.vtables.snapshot().into_iter().any(|((src, _), _)| holds_closure(&u.tcx.tys, src, (file, ce)));
-    if stored {
+    // (by the source types of the vtables this run lowered, and by the code those linked from the
+    // cache or the startup image hold: a warm session's)
+    let ty_hit = |t: TyId| holds_closure(&u.tcx.tys, t, (file, ce)).then(|| (String::new(), 0));
+    let slot_hit = |sl: u32| (sl == slot || key_types(u, sl).into_iter().any(|t| holds_closure(&u.tcx.tys, t, (file, ce)))).then(String::new);
+    if stored_in_objects(u, &ty_hit, &slot_hit).is_some() {
         format!("{HELD}stored values of a closure of `{}` ({}) keep its old code ({why})", u.fns[parent as usize].name, u.fns[slot as usize].name)
     } else {
         format!("kept: closure {} keeps its old code where it runs on ({why})", u.fns[slot as usize].name)
@@ -7066,18 +7304,35 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
     // follows the cell and is not looked at again: an edit's work stays the same however many
     // edits came before.
     let mut rebind: Vec<(u32, u32)> = Vec::new();
+    // The old closures of a rebuilt parent this patch does not rebind, by complement (every old
+    // closure the blocks below look at that is not rebound, whatever the reason): entered in
+    // Unit::kept_old before the layout checks (they read it: I2), when the parent's def is the
+    // program's and the closure is not what its new lowering makes (kept_retired).
+    let mut kept_closures: Vec<(u32, &'static str)> = Vec::new();
     if errs.is_empty() {
         let u = &*up;
         let rebuilt: Vec<u32> = slots.iter().chain(fresh.iter()).copied().collect();
-        let new_files: Vec<u32> = news.iter().map(|x| x.1).collect();
         let mut olds_c: Vec<u32> = Vec::new();
         let mut news_c: Vec<u32> = Vec::new();
         for id in u.closures_of_slots(rebuilt.iter().copied()) {
             trace_count("slot_visits", 1);
             let f = &u.fns[id as usize];
-            if let FnKey::Closure(file, _, _) = &f.key {
-                if new_files.contains(file) { news_c.push(id); }
-                else if f.compiled && !matches!(u.forward_of(id), Some((_, false))) { olds_c.push(id); }
+            if let FnKey::Closure(_, ce, _) = &f.key {
+                // (what the parent's lowering makes now: of this edit's new files, or of the
+                // version an earlier edit moved its def to when this patch rebuilt it for a
+                // constant it reads or a body it inlined; an async fn's body is the poll block's)
+                if lowered_now(u, id) { news_c.push(id); }
+                else if f.compiled && !matches!(u.forward_of(id), Some((_, false))) && *ce & crate::tcx::ASYNC_FN_BODY == 0 { olds_c.push(id); }
+            }
+        }
+        {
+            let parent = |c: u32| match u.fns[c as usize].key { FnKey::Closure(_, _, p) => p, _ => u32::MAX };
+            let mut unlowered: Vec<u32> = olds_c.iter().map(|&o| parent(o)).filter(|&p| !news_c.iter().any(|&n| parent(n) == p)).collect();
+            unlowered.sort_unstable();
+            unlowered.dedup();
+            if !unlowered.is_empty() {
+                trace_count("unlowered_parents", unlowered.len());
+                UNLOWERED_PARENTS.fetch_add(unlowered.len() as u64, std::sync::atomic::Ordering::Relaxed);
             }
         }
         // a new closure's identity is read from its parent's checked body, which the parent's
@@ -7092,36 +7347,51 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
         let u = &*up;
         let new_ids: Vec<(u32, Option<(u32, TyId, Vec<TyId>, TyId)>)> = news_c.iter().map(|&n| (n, closure_ident(u, n))).collect();
         let mut pairs = Vec::new();
-        for o in olds_c {
+        let mut why: Vec<(u32, &'static str)> = Vec::new();
+        for &o in &olds_c {
             let oi = closure_ident(u, o);
-            let parent = match &u.fns[o as usize].key {
-                FnKey::Closure(_, _, p) => *p,
-                _ => continue,
-            };
+            let FnKey::Closure(_, _, parent) = u.fns[o as usize].key else { unreachable!("olds_c holds closures") };
             let hit = new_ids.iter().find(|(n, ni)| {
                 matches!(&u.fns[*n as usize].key, FnKey::Closure(_, _, p) if *p == parent) && ni.is_some() && *ni == oi
             });
             match hit {
                 Some((n, _)) => pairs.push((o, *n)),
+                None if oi.is_none() => why.push((o, "no closure of the new text was matched to it")),
                 None => {
-                    if oi.is_some() && new_ids.iter().any(|(n, ni)| matches!(&u.fns[*n as usize].key, FnKey::Closure(_, _, p) if *p == parent) && ni.as_ref().map(|x| x.0) == oi.as_ref().map(|x| x.0)) {
+                    if new_ids.iter().any(|(n, ni)| matches!(&u.fns[*n as usize].key, FnKey::Closure(_, _, p) if *p == parent) && ni.as_ref().map(|x| x.0) == oi.as_ref().map(|x| x.0)) {
                         out.lines.push(kept_closure_line(u, o, "its captures or signature changed"));
+                        why.push((o, "its captures or signature changed"));
+                    } else {
+                        why.push((o, "the new text has no closure at its place"));
                     }
                 }
             }
         }
+        // (an old version that already forwards to its pair: the parent was rebuilt again with
+        // its file unchanged, and the forwarder runs that slot's new code as it is)
+        let mut settled: Vec<u32> = Vec::new();
         for (o, n) in pairs {
+            if matches!((&*up).forward_of(o), Some((t, _)) if t == n) {
+                settled.push(o);
+                continue;
+            }
             let built = pre.iter().any(|(id, r)| *id == n && r.is_ok()) || staged.iter().any(|(id, _)| *id == n);
             if !built {
                 match compile_guarded(up, n) {
                     Ok(c) => pre.push((n, Ok(c))),
                     Err(_) => {
                         out.lines.push(kept_closure_line(&*up, o, "its new code did not build"));
+                        why.push((o, "its new code did not build"));
                         continue;
                     }
                 }
             }
             rebind.push((o, n));
+        }
+        for o in olds_c {
+            if !rebind.iter().any(|x| x.0 == o) && !settled.contains(&o) {
+                kept_closures.push((o, why.iter().find(|x| x.0 == o).map_or("no closure of the new text was matched to it", |x| x.1)));
+            }
         }
     }
     // suspended async fn bodies (M5): an old poll whose parent was rebuilt resumes in the new
@@ -7164,12 +7434,20 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
                 if let Ok(code) = compile_guarded(up, id) { pre.push((id, Ok(code))); }
             }
         }
+        // (the polls of a rebuilt parent's old bodies: kept unless rebound, below)
+        let mut polls: Vec<u32> = Vec::new();
         let pairs: Vec<(u32, u32)> = {
             let u = &*up;
             let is_body = |k: &FnKey| matches!(k, FnKey::Closure(_, ce, _) if *ce & crate::tcx::ASYNC_FN_BODY != 0);
             let mut v = Vec::new();
             let parents = rebuilt.iter().copied().chain(u.slots_of_defs(removed_defs.iter().copied()));
-            let new_closures = u.closures_of_files(&new_files);
+            // the new bodies: what the lowering of a rebuilt parent, or of the async fn that
+            // replaced one, makes now (lowered_now), in this edit's files or not
+            let mut new_closures = u.closures_of_files(&new_files);
+            new_closures.extend(u.closures_of_slots(rebuilt.iter().copied()));
+            new_closures.retain(|&c| lowered_now(u, c));
+            new_closures.sort_unstable();
+            new_closures.dedup();
             // Values can retain any earlier constructor, including one rebound
             // by a previous edit. Compare those original states to this version
             // too, rather than leaving them on the first replacement's code.
@@ -7186,26 +7464,38 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
                 trace_count("slot_visits", 1);
                 let (FnKey::Closure(of, oce, op), true) = (&fo.key, is_body(&fo.key) && fo.compiled && !matches!(u.forward_of(o), Some((_, false)))) else { continue };
                 let replaced = matches!(&u.fns[*op as usize].key, FnKey::Inst(d, _) if removed_defs.contains(d) || replaced_paths.contains(&u.prog.def_path(*d)));
-                if !(rebuilt.contains(op) || replaced) || new_files.contains(of) {
+                if !(rebuilt.contains(op) || replaced) || lowered_now(u, o) {
                     continue;
+                }
+                if !replaced {
+                    polls.push(o);
                 }
                 // the new body: the same parent slot (a body edit), or the async fn that replaced
                 // the parent (an async fn's body edit is a new fn: same path)
                 let pname = |p: u32| -> Option<String> { match &u.fns[p as usize].key { FnKey::Inst(d, a) => Some(format!("{}{:?}", u.prog.def_path(*d), a)), _ => None } };
                 let want = pname(*op);
-                if let Some(n) = new_closures.iter().copied().find(|&id| matches!(&u.fns[id as usize].key, FnKey::Closure(nf, nce, np) if new_files.contains(nf) && *nce & crate::tcx::ASYNC_FN_BODY != 0 && (np == op || (want.is_some() && pname(*np) == want)))) {
+                if let Some(n) = new_closures.iter().copied().find(|&id| matches!(&u.fns[id as usize].key, FnKey::Closure(_, nce, np) if *nce & crate::tcx::ASYNC_FN_BODY != 0 && (np == op || (want.is_some() && pname(*np) == want)))) {
                     v.push((o as u32, n as u32, *of, *oce));
                 }
             }
             v.into_iter().map(|(o, n, _, _)| (o, n)).collect()
         };
+        let mut why: Vec<(u32, &'static str)> = Vec::new();
+        let mut settled: Vec<u32> = Vec::new();
         for (o, n) in pairs {
+            if matches!((&*up).forward_of(o), Some((t, _)) if t == n) {
+                settled.push(o);
+                continue;
+            }
             // the new poll code: built now if the edit's precompile did not reach it
             let built = pre.iter().any(|(id, r)| *id == n && r.is_ok()) || staged.iter().any(|(id, _)| *id == n);
             if !built {
                 match compile_guarded(up, n) {
                     Ok(c) => pre.push((n, Ok(c))),
-                    Err(_) => continue,
+                    Err(_) => {
+                        why.push((o, "its new poll code did not build"));
+                        continue;
+                    }
                 }
             }
             let u = &*up;
@@ -7231,7 +7521,15 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
                     rebind.push((o, n));
                     out.lines.push(format!("suspended `{}` values resume in the new code (same state up to the last await)", u.fns[o as usize].name));
                 }
-                _ => out.lines.push(format!("kept: suspended `{}` values finish on their old code (its code before an await, saved state, captures or output changed)", u.fns[o as usize].name)),
+                _ => {
+                    out.lines.push(format!("kept: suspended `{}` values finish on their old code (its code before an await, saved state, captures or output changed)", u.fns[o as usize].name));
+                    why.push((o, "its code before an await, saved state, captures or output changed"));
+                }
+            }
+        }
+        for o in polls {
+            if !rebind.iter().any(|x| x.0 == o) && !kept_closures.iter().any(|x| x.0 == o) && !settled.contains(&o) {
+                kept_closures.push((o, why.iter().find(|x| x.0 == o).map_or("the new text has no async body for it", |x| x.1)));
             }
         }
     }
@@ -7252,22 +7550,52 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
     // restart: nothing installs, the running code goes on as it was, and the restart is offered.
     // (An enum patch installed first and held such a thread for good: its report paused the whole
     // app with nobody told, and a quit waited for the paused main forever, 11-08.)
+    // This patch's own keeps are in the record its checks read (K1-K3, JP-L T3c I2), entered
+    // with the generation it installs as; a refusal takes exactly these out again.
+    let staged_gen = u.patch_gen + 1;
+    let staged_keeps: Vec<u32> = {
+        let entered: Vec<(u32, &'static str, (u32, u32))> = kept_closures.iter().filter(|x| !rebind.iter().any(|r| r.0 == x.0) && kept_retired(u, x.0)).filter_map(|&(o, why)| match u.fns[o as usize].key {
+            FnKey::Closure(file, ce, _) => Some((o, why, (file, ce))),
+            _ => None,
+        }).collect();
+        let mut fresh_keeps = Vec::new();
+        crate::zone_alloc::kept_with(|| for (o, why, at) in entered {
+            if !u.kept_old.contains_key(&o) {
+                u.kept_old.insert(o, (staged_gen, why));
+                fresh_keeps.push(o);
+            }
+            u.kept_at.insert(at);
+        });
+        fresh_keeps
+    };
     let breaking: Vec<DefId> = saved_adts.iter().filter(|(d, old)| old.is_enum || fresh_structs.iter().any(|x| x.0 == *d)).map(|(d, _)| *d).collect();
     let mut pre_paused = false;
     // Keep the frame's reason for the report after hold_back has made its existing decision.
     let mut frame_restart = None;
     if !breaking.is_empty() && errs.is_empty() {
-        pre_paused = crate::inspect::instrument::pause_for_patch();
-        let rebuilt: crate::fxhash::HashSet<u32> = slots.iter().copied().collect();
         let pos = layout_pos.iter().find(|x| x.0 == breaking[0]).map_or("", |x| x.1.as_str());
         let enums = saved_adts.iter().any(|(d, old)| old.is_enum && breaking.contains(d));
         let (what, holds) = if enums { ("enum", "was built for its old variants") } else { ("struct", "may hold values of it in the old layout") };
         let names: Vec<String> = breaking.iter().map(|&d| def_name(&u.prog, d)).collect();
-        let why = match crate::invalid::frame_in(u, &rebuilt) {
+        // (a stored value of retired code: no frame shows it, so no pause is needed to see it)
+        trace_sub("layout_check_setup");
+        let stored = kept_stored(u);
+        trace_sub("kept_stored");
+        trace_count("kept_entries", u.kept_old.len());
+        if stored.is_none() {
+            pre_paused = crate::inspect::instrument::pause_for_patch();
+        }
+        // (the closures this patch rebinds or keeps are code it stops vouching for, as the slots
+        // it rebuilds are: I2)
+        let rebuilt: crate::fxhash::HashSet<u32> = slots.iter().copied().chain(rebind.iter().map(|x| x.0)).chain(kept_closures.iter().map(|x| x.0)).collect();
+        let why = if let Some(stored) = stored {
+            Some(format!("{pos}{what} `{}` changed its layout, and {stored}: what that text holds is not known -- restart the app", names.join("`, `")))
+        } else { match crate::invalid::frame_in(u, &rebuilt) {
             Ok(None) => None,
             Ok(Some(running)) => Some(format!("{pos}{what} `{}` changed its layout, and {running}: its frame {holds} -- restart the app", names.join("`, `"))),
             Err(e) => Some(format!("{pos}{what} `{}` changed its layout, and the program's stacks could not be read to see that no frame runs code built for the old one ({e}) -- restart the app", names.join("`, `"))),
-        };
+        } };
+        trace_sub("frame_check");
         if let Some(why) = why {
             frame_restart = Some(why.clone());
             errs.push(why);
@@ -7277,6 +7605,11 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
     if !errs.is_empty() {
         if pre_paused {
             crate::inspect::instrument::resume_program();
+        }
+        if !staged_keeps.is_empty() {
+            u.kept_old.retain(|s, _| !staged_keeps.contains(s));
+            let fns = &u.fns;
+            crate::zone_alloc::kept_with(|| u.kept_at = u.kept_old.keys().filter_map(|&s| match fns[s as usize].key { FnKey::Closure(f, e, _) => Some((f, e)), _ => None }).collect());
         }
         // nothing installs: the running versions come back, and everything built from the
         // refused text is dropped (built again from the running text when needed)
@@ -7490,6 +7823,17 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
     for (id, target, cell) in forwards {
         if let Err(e) = jit::install_forward(up, id, target, cell, gen) {
             out.lines.push(format!("link error in {}: {}", (&*up).fns[id as usize].name, e));
+        }
+    }
+    // the closures this patch leaves on code of a text the program no longer has: entered in
+    // kept_old before the checks, with this generation (a later keep of one leaves its first)
+    {
+        let u = &mut *up;
+        for &o in &staged_keeps {
+            if let Some(e) = u.kept_old.get_mut(&o) {
+                e.0 = gen;
+                eprintln!("relax live: kept `{}` on the code of a text the program no longer has (patch gen {gen}: {})", u.fns[o as usize].name, e.1);
+            }
         }
     }
     // (the instances that resolve to another fn now: no lineage, each jumps to its fn)
@@ -12042,6 +12386,7 @@ pub(crate) unsafe fn reset_statics() {
     reset(&SAVES_SEEN, std::sync::atomic::AtomicU32::new(0));
     reset(&RESTART_SUPPORTED, std::sync::atomic::AtomicBool::new(false));
     reset(&LAYOUT_GROUP, std::sync::atomic::AtomicU32::new(0));
+    reset(&UNLOWERED_PARENTS, std::sync::atomic::AtomicU64::new(0));
     reset(&UNIT_SUSPECT, relax_session::sync::Mutex::new(None));
     reset(&PROGRAM_READS, relax_session::sync::Mutex::new(None));
     reset(&RESTART_REQUESTED, std::sync::atomic::AtomicBool::new(false));
