@@ -656,6 +656,39 @@ fn a_destructuring_assignment_reads_the_fields_it_takes() {
     ]);
 }
 
+/// A field only a derived Debug or Clone reads is never read (rustc ignores those impls), also
+/// when the same body reads a tuple's field of that index: `format!`'s expansion reads `args.0`,
+/// which Relax counted as a read of field 0 of every struct the body names (check_rustc's
+/// gh1328_live_lib.rs:108 too).
+#[test]
+fn a_tuple_field_is_no_struct_field_of_the_same_index() {
+    let Some(warnings) = warnings_in_child("check_lint_tests::a_tuple_field_is_no_struct_field_of_the_same_index") else {
+        check_package(r#"
+            #[derive(Debug)]
+            pub struct DebugOnly { read_by_debug_only: u32 }
+            pub fn debug_only() -> String { format!("{:?}", DebugOnly { read_by_debug_only: 1 }) }
+            #[derive(Debug, Clone)]
+            pub struct Two { a: u32, b: u8 }
+            pub fn two() -> (String, u32) {
+                let pair = (Two { a: 1, b: 2 }, 3u32);
+                (format!("{:?}", pair.0.clone()), pair.1)
+            }
+            pub struct Read { c: u32, d: u8 }
+            pub fn read() -> u32 {
+                let t = (Read { c: 4, d: 5 }, 6u32);
+                t.0.c + t.1
+            }
+        "#, &[]);
+        return;
+    };
+    // rustc 1.100's, for the same library
+    assert_eq!(warnings, [
+        "field `d` is never read [dead_code]",
+        "field `read_by_debug_only` is never read [dead_code]",
+        "fields `a` and `b` are never read [dead_code]",
+    ]);
+}
+
 /// WARNZERO class 8 (hal linux_ipc.rs:69 and :74): `IoSlice` and `IoSliceMut` are FFI-safe, as
 /// real std's are (repr(transparent) over an `iovec` / `WSABUF`; Relax std had plain slices),
 /// so a `msghdr` of them in an `extern` block is no `improper_ctypes`; a slice still is.

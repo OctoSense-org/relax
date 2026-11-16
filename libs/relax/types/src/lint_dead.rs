@@ -595,19 +595,23 @@ impl<'a> BodyRefs<'a> {
         self.prog.lookup_in_container(t, def.name, matches!(def.kind, DefKind::AssocTy)).or_else(|| self.prog.lookup_in_container(t, def.name, false))
     }
 
-    fn adt_of_ty(&self, t: crate::types::TyId, derefs: u32) -> Option<DefId> {
+    /// The struct whose field a field expression reads, from its base's type and the builtin
+    /// dereferences before it: Ok(None) when the base is a tuple (its field is no definition's),
+    /// Err when an overloaded dereference stands between or the type is not known.
+    fn adt_of_ty(&self, t: crate::types::TyId, derefs: u32) -> Result<Option<DefId>, ()> {
         let mut t = t;
         for _ in 0..derefs {
             match *self.tcx.tys.kind(t) {
                 TyKind::Ref(_, x, _) => t = x,
-                TyKind::Adt(d, args, _) if lint::is_diagnostic_item(self.prog, d, "Box") => t = *self.tcx.tys.list(args).first()?,
-                _ => return None,
+                TyKind::Adt(d, args, _) if lint::is_diagnostic_item(self.prog, d, "Box") => t = *self.tcx.tys.list(args).first().ok_or(())?,
+                _ => return Err(()),
             }
         }
         while let TyKind::Ref(_, x, _) = *self.tcx.tys.kind(t) { t = x; }
         match *self.tcx.tys.kind(t) {
-            TyKind::Adt(d, ..) => Some(d),
-            _ => None,
+            TyKind::Adt(d, ..) => Ok(Some(d)),
+            TyKind::Tuple(..) => Ok(None),
+            _ => Err(()),
         }
     }
 
@@ -615,9 +619,15 @@ impl<'a> BodyRefs<'a> {
         let Some(&(derefs, idx)) = self.body.field_idx.get(&e.0) else { return };
         let bi = self.body.expr_ix(base);
         if bi < self.body.expr_ty.len() {
-            if let Some(adt) = self.adt_of_ty(self.body.expr_ty[bi], derefs) {
-                self.out.push(Ref::Field((adt, 0, idx)));
-                return;
+            match self.adt_of_ty(self.body.expr_ty[bi], derefs) {
+                Ok(Some(adt)) => {
+                    self.out.push(Ref::Field((adt, 0, idx)));
+                    return;
+                }
+                // a tuple's field (`format_args!`'s `args.0`): not a field of the structs this
+                // body names that has the same index
+                Ok(None) => return,
+                Err(()) => {}
             }
         }
         // through an overloaded dereference (`Pin<&mut S>`, a guard): the struct the body names
