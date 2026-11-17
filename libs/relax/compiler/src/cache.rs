@@ -197,59 +197,42 @@ const TIER_QUEUED_SALT: u128 = 0x7469_6572_2d71_7565_7565_642d_7261_7465;
 /// stores a front image was mapped from: kept for the rest of the process (the arrays point
 /// into their mappings)
 static FRONT_STORES: relax_session::sync::Mutex<Vec<std::sync::Arc<Store>>> = relax_session::sync::Mutex::new(Vec::new());
-/// front images this run mapped (store, index entry): checksummed in the background
-static FRONT_USED: relax_session::sync::Mutex<Vec<(std::sync::Arc<Store>, usize)>> = relax_session::sync::Mutex::new(Vec::new());
 
-/// Pins a store a front image or collected image was mapped from (FRONT_STORES), and with `used`
-/// queues that entry's background checksum (FRONT_USED).
-fn pin_front(st: &std::sync::Arc<Store>, used: Option<usize>) {
+/// Pins a store a front image or collected image was mapped from (FRONT_STORES). What is mapped
+/// from it was proven by Store::get_at: a payload of the current epoch needs no check, and one of
+/// an earlier boot was checked at that first read (a mismatch was a miss).
+fn pin_front(st: &std::sync::Arc<Store>) {
     let mut keep = FRONT_STORES.lock().unwrap_or_else(|x| x.into_inner());
     if !keep.iter().any(|k| std::sync::Arc::ptr_eq(k, st)) {
         keep.push(st.clone());
     }
-    drop(keep);
-    if let Some(i) = used {
-        FRONT_USED.lock().unwrap_or_else(|x| x.into_inner()).push((st.clone(), i));
-    }
 }
 
-/// Checksums the front images this run mapped, on a low-priority background thread (after the
-/// start). A mismatch -- a store damaged on disk -- removes that store file, so the next run
-/// parses and compiles that crate afresh; this run already validated the images' structure
-/// (offsets, lengths, alignment) and, against its own parse, their source bytes. The same pass
-/// then seals what the stores this run opened hold of an earlier boot's (store.rs seal_suspects),
-/// stopping at the quit.
-pub fn verify_front_images() {
-    let used = std::mem::take(&mut *FRONT_USED.lock().unwrap_or_else(|x| x.into_inner()));
-    if used.is_empty() && !crate::store::suspects_pending() {
+/// The background pass after the start, on a low-priority thread: seals what the stores this run
+/// opened hold of an earlier boot's (store.rs seal_suspects), stopping at the quit. The front
+/// images and collected images this run mapped need no pass of their own: Store::get_at proved
+/// each at its first read, so a warm start of the boot that wrote its cache reads none of their
+/// payloads, and a store whose earlier-boot payload fails here is removed (the next run makes it
+/// again).
+pub fn background_seal() {
+    if !crate::store::suspects_pending() {
         return;
     }
     { let _k = crate::zone_alloc::kept();
     let _ = crate::run_threads::spawn("run-cache-verify", move || { let _z = crate::zone_alloc::compiler_thread();
         makepad_cpu_budget::set_thread_class(makepad_cpu_budget::BACKGROUND);
-        let verbose = crate::run::VERBOSE.load(std::sync::atomic::Ordering::Relaxed);
-        let t = std::time::Instant::now();
-        let mut bad: Vec<std::path::PathBuf> = Vec::new();
-        let mut bytes = 0u64;
-        for (st, i) in &used {
-            bytes += st.index.get(*i).map_or(0, |e| e.len as u64);
-            if !st.verify_at(*i) && !bad.contains(&st.path) {
-                bad.push(st.path.clone());
-            }
-        }
-        for p in bad {
-            if verbose {
-                eprintln!("relax cache: a front image in {} does not match its checksum: the store is removed (the next run rebuilds it)", p.display());
-            }
-            let _ = std::fs::remove_file(crate::store::current(&p));
-        }
-        let images = t.elapsed();
-        let sealed = crate::store::seal_suspects(&|| crate::jit::QUIT_SEEN.load(std::sync::atomic::Ordering::Relaxed));
-        if verbose {
-            eprintln!("relax cache: background checks: {} front images ({} bytes) in {:.1} ms; an earlier boot's payloads: {} stores sealed ({} bytes), {} removed, in {:.1} ms; epoch reads {}",
-                used.len(), bytes, images.as_secs_f64() * 1e3, sealed.stores, sealed.bytes, sealed.removed, (t.elapsed() - images).as_secs_f64() * 1e3, sealed.epoch_reads);
-        }
+        background_checks();
     });
+    }
+}
+
+/// `background_seal`'s work, on the calling thread.
+fn background_checks() {
+    let t = std::time::Instant::now();
+    let sealed = crate::store::seal_suspects(&|| crate::jit::QUIT_SEEN.load(std::sync::atomic::Ordering::Relaxed));
+    if crate::run::VERBOSE.load(std::sync::atomic::Ordering::Relaxed) {
+        eprintln!("relax cache: background checks: an earlier boot's payloads: {} stores sealed ({} bytes), {} removed, in {:.1} ms; epoch reads {}",
+            sealed.stores, sealed.bytes, sealed.removed, t.elapsed().as_secs_f64() * 1e3, sealed.epoch_reads);
     }
 }
 const LEDGER_KEY: u128 = 0;
@@ -7611,10 +7594,10 @@ impl FrontImages {
         if !ledger_current(&st, &present, &mut HashMap::new()) {
             return None;
         }
-        // Offsets, lengths and kinds are checked here; the payload checksums run in the
-        // background after the start (verify_front_images: a mismatch removes the store, the
-        // next run parses), as for file images -- checksumming every image here touched all of
-        // their pages on the boot path. Pin only after validation.
+        // Offsets, lengths and kinds are checked here; an image of the current epoch needs no
+        // payload checksum, and one of an earlier boot is checked at its first read
+        // (Store::get_at) -- checksumming every image here touched all of their pages on the
+        // boot path. Pin only after validation.
         // the file images: all in this store, else the record still certifies the fingerprint
         // (dependents restore; this crate is parsed)
         let restored = (|| -> Option<Vec<(String, crate::preload::Preparsed)>> {
@@ -8263,8 +8246,8 @@ fn front_record_from(prog: &FrontRecordView) -> Option<crate::crate_image::Recor
 /// A front image entry of store `st` (index entry `e`, key `key`), mapped for the rest of the
 /// process: inline (a demand part's) or a file's image a reference names (front_run.rs). The
 /// location is Some for a file's image. `check`: verify the payload checksums now; else
-/// structure only here (bounds; the image reader checks every section) and the checksum in the
-/// background (verify_front_images).
+/// structure only here (bounds; the image reader checks every section), the payload proven by
+/// Store::get_at (its epoch, or a check at its first read).
 fn front_entry(st: &std::sync::Arc<Store>, e: usize, key: u128, check: bool) -> Option<(Option<crate::parser::ImageLoc>, &'static [u8])> {
     let (kind, b) = st.get_at(e, key)?;
     if check && !st.verify_at(e) {
@@ -8276,7 +8259,7 @@ fn front_entry(st: &std::sync::Arc<Store>, e: usize, key: u128, check: bool) -> 
             Some((Some(loc), img))
         }
         KIND_FRONT => {
-            pin_front(st, (!check).then_some(e));
+            pin_front(st);
             // SAFETY: the store (and its mapping) is kept alive above for the rest of the
             // process, and a committed payload never changes (store.rs)
             Some((None, unsafe { std::slice::from_raw_parts(b.as_ptr(), b.len()) }))
@@ -12922,7 +12905,6 @@ pub static RECORDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64:
 pub(crate) unsafe fn reset_statics() {
     use relax_session::reset_static as reset;
     warm_count::reset_statics();
-    reset(&FRONT_USED, relax_session::sync::Mutex::new(Vec::new()));
     reset(&WRITTEN, relax_session::sync::Mutex::new(Vec::new()));
     reset(&OPENED, relax_session::sync::Mutex::new(Vec::new()));
     reset(&TRACE, relax_session::sync::Mutex::new(None));

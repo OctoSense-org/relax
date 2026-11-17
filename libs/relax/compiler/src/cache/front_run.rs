@@ -166,8 +166,8 @@ pub(super) fn decode_ref(b: &[u8]) -> Option<(&str, u128)> {
 }
 
 /// The image a crate store's reference entry names (`b`: its payload; `dir`: the folder of both
-/// stores), mapped for the rest of the process. `check`: its checksum is verified now (else in
-/// the background, verify_front_images, as any mapped front image's).
+/// stores), mapped for the rest of the process. `check`: its checksum is verified now (else it is
+/// proven by Store::get_at, as any mapped front image's: its epoch, or a check at its first read).
 pub(super) fn resolve(dir: &Path, b: &[u8], check: bool) -> Option<(ImageLoc, &'static [u8])> {
     let (name, key) = decode_ref(b)?;
     if !crate::store::name_ours(name) { return None; }
@@ -191,7 +191,7 @@ pub(super) fn resolve(dir: &Path, b: &[u8], check: bool) -> Option<(ImageLoc, &'
                 let found = if changed {
                     Store::open(&path).map(Arc::new).and_then(|st| {
                         // FRONT_STORES keeps every opened mapping for the rest of the process
-                        pin_front(&st, None);
+                        pin_front(&st);
                         open.insert(path.clone(), st.clone());
                         Some((st.clone(), find(&st)?))
                     })
@@ -207,7 +207,6 @@ pub(super) fn resolve(dir: &Path, b: &[u8], check: bool) -> Option<(ImageLoc, &'
     })?;
     let (kind, img) = st.get_at(i, key)?;
     if kind != KIND_FRONT || (check && !st.verify_at(i)) { return None; }
-    if !check { pin_front(&st, Some(i)); }
     // SAFETY: FRONT_STORES keeps the store (and its mapping) for the rest of the process, and a
     // committed payload never changes (store.rs)
     let img: &'static [u8] = unsafe { std::slice::from_raw_parts(img.as_ptr(), img.len()) };
@@ -352,5 +351,46 @@ mod tests {
             assert_eq!(entry(1, true), Some(image(1)), "{shape}: the first commit's image stays warm");
         }
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A warm start in the epoch that wrote its cache reads no front-image payload: the images a
+    /// crate store's references name are served unchecked (the kernel that took their writes still
+    /// runs), and the background pass after the start has nothing to check. The next boot's first
+    /// start checks each image and reference once, at its first use, and the background pass then
+    /// seals them (it reads them again, from the disk), so the start after reads none either.
+    #[test]
+    fn a_warm_start_in_the_caches_epoch_reads_no_front_image_payload() {
+        isolated_test!(a_warm_start_in_the_caches_epoch_reads_no_front_image_payload);
+        let dir = std::env::temp_dir().join(format!("relax-warm-reads-{}-{}", std::process::id(), crate::clock::wall_ns()));
+        std::fs::create_dir_all(&dir).unwrap();
+        crate::store::set_epoch(0xa1);
+        let run = RunStore::create(&dir, RUN_PREFIX, RUN_CAP).unwrap();
+        let keys: Vec<u128> = [1u8, 2].into_iter().map(|b| match run.append(b as u128, KIND_FRONT, IMAGE, &|out| out.write_all(&image(b))) {
+            Appended::Done(key, _) => key,
+            _ => panic!("the image append"),
+        }).collect();
+        run.commit().unwrap();
+        let refs = keys.iter().zip(1u128..).map(|(&key, k)| NewEntry { key: k, kind: KIND_FRONT_REF, payload: encode_ref(&ImageLoc { store: run.name.to_string().into(), key }) }).collect();
+        crate::store::append(&dir.join(CRATE_STORE), refs, false).unwrap();
+        drop(run);
+        // a start, as a later process makes it: nothing of this process's writes is held
+        let start = |when: &str| {
+            unsafe { super::reset_statics() };
+            crate::store::payload_reads();
+            let files: Vec<String> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+            let st = Arc::new(Store::open(&dir.join(CRATE_STORE)).unwrap_or_else(|| panic!("{when}: the crate store does not open; the folder holds {files:?}")));
+            for k in 1..=2u128 {
+                let e = st.index.binary_search_by(|x| { let kx = x.key; kx.cmp(&k) }).unwrap();
+                assert_eq!(front_entry(&st, e, k, false).map(|(_, img)| img.to_vec()), Some(image(k as u8)), "{when}: image {k}");
+            }
+            let at_start = crate::store::payload_reads();
+            super::super::background_checks();
+            (at_start, crate::store::payload_reads())
+        };
+        assert_eq!(start("the cache's epoch"), (0, 0), "a warm start in the cache's epoch read front-image payloads (at its start, after it)");
+        crate::store::set_epoch(0xb1);
+        assert_eq!(start("the next boot"), (4, 4), "the next boot: each image and reference checked once at its first use, then sealed");
+        assert_eq!(start("after the seal"), (0, 0), "the start after the seal read front-image payloads");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

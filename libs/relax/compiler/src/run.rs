@@ -5227,8 +5227,9 @@ impl Drop for CapturingNow {
 fn mid_flush(wait: bool) -> Option<(usize, usize)> {
     // the compiled kernels offered so far
     crate::kernel_store::flush();
-    // the first write comes after the start: the mapped front images are checksummed now
-    crate::cache::verify_front_images();
+    // the first write comes after the start: what the opened stores hold of an earlier boot's is
+    // sealed now (the background pass)
+    crate::cache::background_seal();
     let up = unsafe { RUN_UNIT };
     // one unit call: waits for the unit when `wait`, else only if it is free now
     fn unit_call<R>(wait: bool, f: impl FnOnce() -> R) -> Option<R> {

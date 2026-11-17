@@ -572,7 +572,7 @@ pub(crate) struct Sealed {
     pub epoch_reads: u64,
 }
 
-/// The background pass's seal (cache.rs verify_front_images, after the start): each opened store
+/// The background pass's seal (cache.rs background_seal, after the start): each opened store
 /// with payloads of an earlier epoch past its `tail` has those payloads checked against their
 /// checksums. A check that passed read them from the disk (a page of an earlier boot's write is
 /// not in this boot's page cache), which proves them there: the header then moves `tail` past
@@ -1943,6 +1943,13 @@ pub fn delete_checked(p: &Path) -> bool {
             Some(&m == MAGIC)
         }) == Some(true);
     name_ok && magic_ok && std::fs::remove_file(p).is_ok()
+}
+
+/// Tests: the payload reads this thread made since the last call (payload_matches,
+/// Store::verify_at).
+#[cfg(test)]
+pub(crate) fn payload_reads() -> u32 {
+    tests::PAYLOAD_READS.with(|r| r.replace(0))
 }
 
 /// Tests: every store this process opens or writes is taken to be of the epoch `e` (0: the

@@ -383,15 +383,15 @@ impl FrontImages {
         why = "collected store missing or unreadable";
         let st = Arc::new(Store::open(&path(&self.dir, graph.identity))?);
         // Like a front image: structure only here (bounds; the image reader checks every
-        // section), the checksum in the background (verify_front_images), so the boot reads
-        // only the pages of the tables it uses, not the whole image.
+        // section), the payload proven by Store::get_at (its epoch, or a check at its first
+        // read), so a warm boot reads only the pages of the tables it uses, not the whole image.
         why = "no collected entry in its store";
         let at = st.index.binary_search_by(|e| { let k = e.key; k.cmp(&key(graph.identity)) }).ok()?;
         why = "collected entry unreadable";
         let (kind, bytes) = st.get_at(at, key(graph.identity))?;
         why = "collected entry of another kind";
         if kind != KIND_COLLECTED { return None; }
-        pin_front(&st, Some(at));
+        pin_front(&st);
         // The checked, immutable mapping is pinned for the Program's mapped definition arena.
         let bytes: &'static [u8] = unsafe { std::slice::from_raw_parts(bytes.as_ptr(), bytes.len()) };
         why = "collected image header";
@@ -997,7 +997,7 @@ impl Cache {
         if { ix.len } != written.len || { ix.sum } != written.sum || { ix.kind } != KIND_COLLECTED { return None; }
         let (_, bytes) = st.get_at(at, written.key)?;
         // the mapping is pinned for the rest of the process: the tables point into it
-        pin_front(&st, Some(at));
+        pin_front(&st);
         let bytes: &'static [u8] = unsafe { std::slice::from_raw_parts(bytes.as_ptr(), bytes.len()) };
         let image = crate::image::Reader::new(bytes)?;
         if image.len() != 7 { return None; }
