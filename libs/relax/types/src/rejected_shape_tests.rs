@@ -308,3 +308,22 @@ fn a_fn_pointer_keeps_the_bounds_its_signature_implies() {
     for f in ["reify", "subtype"] { assert!(has(&e, f, ""), "{f}: {e:?}"); }
     for f in ["foo", "get", "output", "nested", "placeholders", "me", "free", "found", "put", "through"] { assert!(!has(&e, f, ""), "{f}: {e:?}"); }
 }
+
+/// A callable outlives a region only if the free lifetimes of its signature do: `early::<'x>` names `'x` in
+/// its signature, so it is not `'static` (lifetime may not live long enough). No lifetime, late-bound ones
+/// only, or `'static` still pass.
+#[test]
+fn a_callable_outlives_a_region_only_if_its_signature_does() {
+    let e = errors(r#"
+        fn need<F: 'static>(_: F) {}
+        fn early<'a: 'a>(x: &'a u8) -> &'a u8 { x }
+        pub fn early_fn<'x>() { need(early::<'x>); }
+        fn plain() {}
+        fn id<'a>(x: &'a u8) -> &'a u8 { x }
+        pub fn plain_fn() { need(plain); }
+        pub fn bound_closure() { need(|x: &u8| *x); }
+        pub fn static_closure() { need(|| -> &'static str { "" }); }
+        pub fn bound_fn() { need(id); }"#);
+    assert!(has(&e, "early_fn", ""), "{e:?}");
+    for f in ["need", "early", "plain", "id", "plain_fn", "bound_closure", "static_closure", "bound_fn"] { assert!(!has(&e, f, ""), "{f}: {e:?}"); }
+}

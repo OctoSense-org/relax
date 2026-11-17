@@ -15,8 +15,22 @@ impl TypeFolder for OutlivesCollector<'_> {
     fn fold_ty(&mut self, tys: &Types, ty: TyId, depth: u32) -> TyId {
         if !self.visited.insert(ty) { return ty; }
         match tys.kind(ty) {
-            TyKind::FnDef(_, args, _) => { for &t in tys.list(*args) { self.fold_ty(tys, t, depth); } }
-            TyKind::Closure(_, _, crate::types::ClosureArgs { tupled_upvars_ty: upvars, .. }) => { self.fold_ty(tys, *upvars, depth); }
+            TyKind::FnDef(def, args, regions) => {
+                for &t in tys.list(*args) { self.fold_ty(tys, t, depth); }
+                // rustc issue 84366: free signature regions also constrain a fn item's lifetime.
+                let tcx = self.tcx;
+                if let Some(sig) = tcx.fn_item_sig(self.prog, *def) {
+                    let args = tcx.complete_args(self.prog, *def, tys.list(*args), *regions);
+                    for &t in sig.params.iter().chain(std::iter::once(&sig.ret)) {
+                        let t = tcx.instantiate_ty(self.prog, *def, &args, t);
+                        self.fold_ty(tys, t, depth);
+                    }
+                }
+            }
+            TyKind::Closure(_, _, crate::types::ClosureArgs { tupled_upvars_ty: upvars, closure_sig_as_fn_ptr_ty: sig, .. }) => {
+                self.fold_ty(tys, *upvars, depth);
+                self.fold_ty(tys, *sig, depth);
+            }
             TyKind::Param(_) => self.out.push(Component::Param(ty)),
             TyKind::Placeholder(_) => self.out.push(Component::Placeholder(ty)),
             TyKind::Alias(_, alias) => {
