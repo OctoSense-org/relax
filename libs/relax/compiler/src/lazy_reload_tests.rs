@@ -3038,7 +3038,10 @@ impl Drop for KeptRig {
 /// running code goes on. Without the rename the hold applies, and that method, first called after
 /// it, builds from its running text against the edit. (An app, 11-17: such a closure was built at
 /// its first call after the edit, named a line in neither version of the file, E0425 parked its
-/// main thread at the call, and every later edit of the file was refused.)
+/// main thread at the call, and every later edit of the file was refused.) A held method's line!()
+/// and the location it passes a #[track_caller] fn (as panics take theirs) name its line in the
+/// running text, as its code runs as it was: not the held copy's line past the end of the text
+/// parsed, nor the line its new form has in the saved file.
 #[test]
 fn a_held_item_s_never_run_closure_is_checked_with_the_edit() {
     isolated_test!(a_held_item_s_never_run_closure_is_checked_with_the_edit);
@@ -3052,6 +3055,8 @@ impl Scope {
         let fall = |x: u64| x + PEAK_FALL;
         fall(self.a)
     }
+    #[inline(never)]
+    pub fn at(&self) -> u64 { line!() as u64 * 1000 + std::panic::Location::caller().line() as u64 }
 }
 impl Show for Scope { fn show(&self) -> u64 { self.a } }
 pub fn warm(p: *mut u64) {
@@ -3065,17 +3070,23 @@ pub fn fall(p: *mut u64) {
     let mut s = Scope::new(4);
     flags()[2].store(s.tick(), Ordering::SeqCst);
 }
+pub fn place(p: *mut u64) {
+    AT.store(p as usize, Ordering::SeqCst);
+    flags()[2].store(Scope::new(4).at(), Ordering::SeqCst);
+}
 "#);
     // where the closure names the const in the running text
     let (line, col) = lib.lines().enumerate().find_map(|(i, l)| l.find("x + PEAK_FALL").map(|c| (i + 1, c + 5))).unwrap();
-    let mut rig = KeptRig::new("heldclosure", &[("lib.rs", &lib)], &["warm", "fall"]);
+    let running_at = lib.lines().position(|l| l.contains("line!()")).unwrap() as u64 + 1;
+    let mut rig = KeptRig::new("heldclosure", &[("lib.rs", &lib)], &["warm", "fall", "place"]);
     rig.call("warm");
     assert_eq!(rig.flag(2), 5, "before the edit: a trait object of Scope, and tick has not run");
-    // Scope takes a field (trait objects of it were made: held for a restart), new needs it (its
-    // impl, with tick, held with it), and the const tick's closure reads is renamed
+    // Scope takes a field (trait objects of it were made: held for a restart; its new form has
+    // more lines), new needs it (its impl, with tick and at, held with it), and the const tick's
+    // closure reads is renamed
     let o = rig.save("lib.rs", &[
         ("pub const PEAK_FALL: u64 = 3;", "pub const PEAK_FALL_DB: u64 = 3;"),
-        ("pub struct Scope { pub a: u64 }", "pub struct Scope { pub a: u64, pub meter_at: u64 }"),
+        ("pub struct Scope { pub a: u64 }", "pub struct Scope {\n    pub a: u64,\n    pub meter_at: u64,\n}"),
         ("Scope { a } }", "Scope { a, meter_at: 0 } }"),
         ("let fall = |x: u64| x + PEAK_FALL;", "let fall = |x: u64| x + PEAK_FALL_DB;"),
     ]);
@@ -3092,6 +3103,8 @@ pub fn fall(p: *mut u64) {
     assert!(o.rung == crate::reload::Rung::Patch && o.lines.iter().any(|l| l.starts_with("incomplete:")), "the field's edit applies with Scope and its impl held: {:?} {:?}", o.rung, o.lines);
     rig.call("fall");
     assert_eq!(rig.flag(2), 7, "tick, first built after the hold, runs its running text");
+    rig.call("place");
+    assert_eq!(rig.flag(2), running_at * 1000 + running_at, "at, first built after the hold: its line!() and its call's location name its running line {running_at}");
 }
 
 fn refused_with(o: &crate::reload::Outcome, all: &[&str]) -> (bool, String) {

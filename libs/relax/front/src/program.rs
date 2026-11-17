@@ -2050,7 +2050,7 @@ impl Program {
         ParseSnapshot { old, path: path.to_string(), edition, kname, mod_path, dir, root: root.to_string(), together: Vec::new(),
             cfg: self.crates[krate as usize].cfg.clone(), macros,
             reuse: self.parse_reuse.get(&old).cloned().unwrap_or_default(),
-            previous: Some(self.files[old as usize].clone()), context: self.crates[krate as usize].context.clone() }
+            previous: Some(self.files[old as usize].clone()), context: self.crates[krate as usize].context.clone(), line_origins: Default::default() }
     }
 
     /// A parse of a NEW file that becomes child module `child` of module `parent` (makepad
@@ -2064,7 +2064,7 @@ impl Program {
         ParseSnapshot { old: self.mods[normal as usize].file, path: path.to_string(), edition: self.crates[krate as usize].edition, kname, mod_path,
             dir: dir_of(path).to_string(), root: self.crates[krate as usize].root_path().to_string(), together: Vec::new(),
             cfg: self.crates[krate as usize].cfg.clone(), macros: self.macros.clone(), reuse: Default::default(), previous: None,
-            context: self.crates[krate as usize].context.clone() }
+            context: self.crates[krate as usize].context.clone(), line_origins: Default::default() }
     }
 
     /// Adds `v` (a child_parse_snapshot parse) as a new private module `name` of module `parent`
@@ -6576,6 +6576,8 @@ pub struct ParseSnapshot {
     pub reuse: std::sync::Arc<crate::parse_work::Reuse>,
     pub previous: Option<std::sync::Arc<ParsedFile>>,
     pub context: std::sync::Arc<crate::source_context::Context>,
+    /// the regions of the text to parse that count their lines from another text (LineOrigins)
+    pub line_origins: crate::parser::LineOrigins,
 }
 /// Files edited together: each parse sees the imports the others write.
 pub fn share_import_edits<'a>(snapshots: &mut [Option<ParseSnapshot>], sources: impl Iterator<Item = &'a [u8]>) {
@@ -6625,7 +6627,9 @@ impl ParseSnapshot {
     /// diagnostics name it).
     pub fn parse_tokens(&self, src: Vec<u8>, stream: crate::pm_tokens::TokenStream) -> Result<FileVersion, String> {
         let Self { old, path, edition, kname, mod_path, cfg, macros, .. } = self;
-        let bctx = std::rc::Rc::new(crate::builtins::FileCtx::new(kname, path, mod_path, cfg));
+        let mut bctx = crate::builtins::FileCtx::new(kname, path, mod_path, cfg);
+        bctx.line_origins = self.line_origins.clone();
+        let bctx = std::rc::Rc::new(bctx);
         let context = self.context.edited(path, src.into());
         let (mut pf, used) = crate::parser::parse_token_stream(stream, path, *edition, Some(crate::macros::MacroScope::new(macros.clone())), bctx, context.sources().clone(), false)
             .map_err(|(span, m)| format!("{}:{}: {}", path, span.lo, m))?;
@@ -6636,7 +6640,9 @@ impl ParseSnapshot {
 
     pub fn parse_full(&self, src: Vec<u8>) -> Result<FileVersion, String> {
         let Self { old, path, edition, kname, mod_path, cfg, macros, .. } = self;
-        let bctx = std::rc::Rc::new(crate::builtins::FileCtx::new(kname, path, mod_path, cfg));
+        let mut bctx = crate::builtins::FileCtx::new(kname, path, mod_path, cfg);
+        bctx.line_origins = self.line_origins.clone();
+        let bctx = std::rc::Rc::new(bctx);
         let imports = crate::preload::import_edit(self, &src);
         let mut macros = macros.clone();
         if imports.is_some() || !self.together.is_empty() {

@@ -6847,7 +6847,7 @@ impl Unit {
         let key = key.clone();
         let (path, line, col) = match (self.prog.file_paths.get(file as usize), self.prog.files.get(file as usize)) {
             (Some(path), Some(src)) => {
-                let (line, col) = src.line_col(pos);
+                let (line, col) = src.location(pos);
                 (path.as_str(), line as u32, col as u32)
             }
             _ => ("<unknown>", 0, 0),

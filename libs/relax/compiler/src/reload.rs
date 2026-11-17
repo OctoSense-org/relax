@@ -1562,9 +1562,9 @@ const HELD_REACHES: &str = "held, as it needs a held item: ";
 /// An outcome line of an edit that could not hold its restart-only items back: a held item's
 /// running text does not type-check against the rest of the edit (at the running text's line).
 pub(crate) const NOT_HELD: &str = "not held back, as a held item's running text does not compile against the edit: ";
-/// The hold_back round apply_locked runs next: per file, where its held running texts start (the
-/// edit's own text ends there).
-static HELD_FROM: std::sync::Mutex<Vec<(u32, usize)>> = std::sync::Mutex::new(Vec::new());
+/// The hold_back round apply_locked runs next: per file, where its held running texts are (the
+/// edit's own text ends before the first) and the line each runs at.
+static HELD_FROM: std::sync::Mutex<Vec<(u32, crate::parser::LineOrigins)>> = std::sync::Mutex::new(Vec::new());
 
 /// The byte offset in `src` (file `path`'s text) of a diagnostic line's `path:line:col:` position.
 fn line_at(line: &str, path: &str, src: &[u8]) -> Option<usize> {
@@ -1678,7 +1678,7 @@ unsafe fn hold_back(up: *mut Unit, edits: &[Edit], lines: &[String], t0: Instant
                 // a held item's running text: said at its line there
                 let e = &srcs[k];
                 let Some(&(to, from)) = went[k].iter().filter(|w| w.0 <= p).max_by_key(|w| w.0) else { return Err(None) };
-                let (line, col) = (&(*up).prog).files[e.file as usize].line_col((from + p - to) as u32);
+                let (line, col) = (&(*up).prog).files[e.file as usize].location((from + p - to) as u32);
                 let what = l.strip_prefix(e.path.as_str()).and_then(|r| r.strip_prefix(':')).and_then(|r| r.splitn(3, ':').nth(2)).unwrap_or(l.as_str());
                 return Err(Some(format!("{NOT_HELD}{}:{line}:{col}:{what}", e.path)));
             }
@@ -1691,7 +1691,12 @@ unsafe fn hold_back(up: *mut Unit, edits: &[Edit], lines: &[String], t0: Instant
             held += n;
         }
         let again: Vec<Edit> = srcs.iter().map(|e| Edit { file: e.file, path: e.path.clone(), src: e.src.clone() }).collect();
-        *HELD_FROM.lock().unwrap_or_else(|e| e.into_inner()) = srcs.iter().zip(&ends).filter(|(e, &end)| e.src.len() > end).map(|(e, &end)| (e.file, end)).collect();
+        // each held text runs at its line in the running file (its location: a text an earlier
+        // save held counts from where that one came from)
+        *HELD_FROM.lock().unwrap_or_else(|e| e.into_inner()) = srcs.iter().zip(&went).filter(|(_, w)| !w.is_empty()).map(|(e, w)| {
+            let running = &(&(*up).prog).files[e.file as usize];
+            (e.file, crate::parser::LineOrigins(w.iter().map(|&(to, from)| { let (l, c) = running.location(from as u32); (to as u32, l as u32, c as u32) }).collect()))
+        }).collect();
         let mut r = apply_locked(up, again, Vec::new(), t0, HOLD_ROUND, retries - 1 - round, false, base);
         match r.rung {
             Rung::Patch => {
@@ -5477,12 +5482,17 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
     // live test session takes its restart at once, the whole edit with it: nothing waits there
     let hold = partial == 0 && !module && retries > 0 && !crate::harness::live::enabled();
     // a hold_back round: where each file's held running texts start
-    let held_from: Vec<(u32, usize)> = if partial == HOLD_ROUND { std::mem::take(&mut *HELD_FROM.lock().unwrap_or_else(|e| e.into_inner())) } else { Vec::new() };
+    let held_from: Vec<(u32, crate::parser::LineOrigins)> = if partial == HOLD_ROUND { std::mem::take(&mut *HELD_FROM.lock().unwrap_or_else(|e| e.into_inner())) } else { Vec::new() };
     for (i, e) in edits.iter().enumerate() {
         let initial = if partial == 2 {
             Err("incomplete".to_string())
         } else if let Some(p) = pre.get_mut(i).and_then(Option::take) {
             p
+        } else if let Some((_, origins)) = held_from.iter().find(|h| h.0 == e.file) {
+            // line!() and the locations in a held text name its running line
+            let mut snapshot = u.prog.parse_snapshot(e.file, &e.path);
+            snapshot.line_origins = origins.clone();
+            snapshot.parse(e.src.clone())
         } else { u.prog.parse_version(e.file, &e.path, e.src.clone()) };
         let parsed = initial.or_else(|err| {
             if partial != 0 && partial != HOLD_ROUND && (e.path.ends_with(".rs") || module) {
@@ -6476,9 +6486,9 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
         let u = &*up;
         let mut v = Vec::new();
         for (version, plan) in &versions {
-            let Some(&(_, from)) = held_from.iter().find(|h| h.0 == version.old) else { continue };
+            let Some(from) = held_from.iter().find(|h| h.0 == version.old).and_then(|h| h.1.start()) else { continue };
             for &(i, j) in &plan.pairs {
-                if (version.pf.call_site(version.pf.ast.items[j as usize].lo) as usize) < from { continue; }
+                if version.pf.call_site(version.pf.ast.items[j as usize].lo) < from { continue; }
                 if let Some(&d) = u.prog.item_defs.get(&(version.old, i)) {
                     if matches!(u.prog.def(d).kind, DefKind::Fn | DefKind::AssocFn) && !body_defs.contains(&d) && !v.contains(&d) { v.push(d); }
                 }
