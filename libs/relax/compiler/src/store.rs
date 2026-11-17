@@ -392,22 +392,22 @@ fn queue_seal(file: &Path, hb: &[u8]) {
     let started = crate::run_threads::spawn("store-seal", || {
         let _z = crate::zone_alloc::compiler_thread();
         loop {
-            let next = {
+            let batch = {
                 let mut q = TO_SEAL.lock().unwrap_or_else(|e| e.into_inner());
                 // a run that ends, or an exit, leaves the rest to the next open
                 if crate::run_threads::ending() || !ordered() {
                     q.clear();
                 }
-                let next = q.pop();
-                match &next {
-                    // the newest commit of a file seals the ones queued before it (one barrier)
-                    Some((file, _)) => q.retain(|(p, _)| p != file),
-                    None => SEALING.store(false, Ordering::Release),
+                // all of it: the newest commit of a file seals the ones queued before it
+                let mut batch: Vec<(PathBuf, [u8; HEADER])> = Vec::with_capacity(q.len());
+                for (file, hb) in q.drain(..).rev() {
+                    if !batch.iter().any(|(p, _)| *p == file) { batch.push((file, hb)); }
                 }
-                next
+                if batch.is_empty() { SEALING.store(false, Ordering::Release); }
+                batch
             };
-            let Some((file, hb)) = next else { break };
-            let _ = seal(&file, &hb);
+            if batch.is_empty() { break }
+            seal_batch(&batch);
         }
     });
     if started.is_err() {
@@ -420,17 +420,77 @@ fn queue_seal(file: &Path, hb: &[u8]) {
 /// only while the header still is `hb`, the same header with the active slot's `tail` at its end
 /// (its generation unchanged). The barrier runs outside the lock: no reader or appender waits on
 /// the disk for it. A file gone (a newer generation replaced it) has nothing to seal; Err: the
-/// barrier or the lock failed, and the commit stays to be verified by the next open.
+/// barrier or the lock failed, and the commit stays to be verified by the next open. (The seal
+/// thread seals a batch at once: `seal_batch`.)
+#[cfg(test)]
 fn seal(file: &Path, hb: &[u8; HEADER]) -> std::io::Result<()> {
     let Ok(mut f) = std::fs::OpenOptions::new().read(true).write(true).open(file) else { return Ok(()) };
+    seal_barrier(1, || order_writes(&f), &file.file_name().unwrap_or_default().to_string_lossy())?;
+    mark_sealed(&mut f, hb)
+}
+
+/// A seal's barrier (`n` stores' commits), with its trace line and the time it began for the exit's
+/// (SEAL_SINCE).
+fn seal_barrier(n: usize, barrier: impl FnOnce() -> std::io::Result<()>, what: &str) -> std::io::Result<()> {
     let (at, t) = (crate::clock::ms_since_start(), std::time::Instant::now());
     SEAL_SINCE.store(at as u64 + 1, Ordering::Relaxed);
-    let barrier = order_writes(&f);
+    let r = barrier();
     SEAL_SINCE.store(0, Ordering::Relaxed);
     if crate::run::VERBOSE.load(Ordering::Relaxed) {
-        eprintln!("relax store: seal at t={at:.0} ms: the barrier in {:.1} ms {}", t.elapsed().as_secs_f64() * 1e3, file.file_name().unwrap_or_default().to_string_lossy());
+        eprintln!("relax store: seal at t={at:.0} ms: the barrier in {:.1} ms (stores {n}) {what}", t.elapsed().as_secs_f64() * 1e3);
     }
-    barrier?;
+    r
+}
+
+/// Seals the commits of a drained batch (each file's newest): their barrier, then each header
+/// `seal` writes. Linux: one barrier for the batch's stores on each filesystem (`syncfs`): a busy
+/// disk's barrier is a journal commit of everything written so far, 1-10 s each on a cold run's
+/// node, and a barrier per store ran back to back for half a minute (each one also stalled the
+/// cache writer's appends). Elsewhere, and where syncfs fails, each store's own barrier.
+fn seal_batch(batch: &[(PathBuf, [u8; HEADER])]) {
+    let mut open: Vec<(std::fs::File, &[u8; HEADER])> = batch.iter()
+        .filter_map(|(file, hb)| std::fs::OpenOptions::new().read(true).write(true).open(file).ok().map(|f| (f, hb)))
+        .collect();
+    #[cfg(target_os = "linux")]
+    let synced: Vec<bool> = {
+        use std::os::unix::fs::MetadataExt;
+        let devs: Vec<Option<u64>> = open.iter().map(|(f, _)| f.metadata().ok().map(|m| m.dev())).collect();
+        let mut synced = vec![false; open.len()];
+        for i in 0..open.len() {
+            let Some(dev) = devs[i] else { continue };
+            if synced[i] || devs[..i].contains(&Some(dev)) { continue }
+            let on: Vec<usize> = (i..open.len()).filter(|&j| devs[j] == Some(dev)).collect();
+            if seal_barrier(on.len(), || sync_fs(&open[i].0), "(syncfs)").is_ok() {
+                for j in on { synced[j] = true; }
+            }
+        }
+        synced
+    };
+    #[cfg(not(target_os = "linux"))]
+    let synced = vec![false; open.len()];
+    for ((f, hb), synced) in open.iter_mut().zip(synced) {
+        if !synced && seal_barrier(1, || order_writes(f), "").is_err() { continue }
+        let _ = mark_sealed(f, *hb);
+    }
+}
+
+/// Makes everything written to the filesystem that `f` is on reach the disk (Linux `syncfs`): one
+/// barrier for the stores of a seal batch.
+#[cfg(target_os = "linux")]
+fn sync_fs(f: &std::fs::File) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    extern "C" {
+        fn syncfs(fd: i32) -> i32;
+    }
+    #[cfg(test)]
+    tests::BARRIERS.with(|b| b.set(b.get() + 1));
+    if unsafe { syncfs(f.as_raw_fd()) } == 0 { Ok(()) } else { Err(std::io::Error::last_os_error()) }
+}
+
+/// A seal's header, after its barrier: under the lock, and only while the header still is `hb`,
+/// the same header with the active slot's `tail` at its end (its generation unchanged).
+fn mark_sealed(f: &mut std::fs::File, hb: &[u8; HEADER]) -> std::io::Result<()> {
+    f.seek(SeekFrom::Start(0))?;
     f.lock()?;
     let mut now = [0u8; HEADER];
     if f.read_exact(&mut now).is_ok() && now == *hb {
@@ -1773,6 +1833,9 @@ mod tests {
         let d = tmpdir("checked");
         let p = d.join("core-00112233445566aa.rcs");
         append(&p, vec![NewEntry { key: 7, kind: 1, payload: b"code bytes that run".to_vec() }], false).unwrap();
+        // sealed here, or already by the seal thread: a corrupt payload past the seal is found
+        // at its checked read, not at the open (an unsealed one the open verifies)
+        seal_now(&p);
         let off = {
             let s = Store::open(&p).unwrap();
             assert_eq!(s.get_checked(7).unwrap().1, b"code bytes that run");
@@ -2058,6 +2121,36 @@ mod tests {
         let (s, ix) = active(&p);
         assert_eq!((s.tail, ix.len()), (s.end, 2), "a sealed commit has nothing left to verify");
         drop(st);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// The seal thread seals what it drained as one batch: on Linux one barrier for all of its
+    /// stores on a filesystem (syncfs; a busy disk took 1-10 s for each store's own, back to back),
+    /// elsewhere each store's own; and every commit of the batch is sealed.
+    #[test]
+    fn a_drained_batch_of_commits_is_sealed_under_one_barrier() {
+        let d = tmpdir("seal-batch");
+        let stores: Vec<PathBuf> = (0..3).map(|i| d.join(format!("core-0011223344556{i}aa.rcs"))).collect();
+        SEAL_HELD.with(|h| h.set(true));
+        for (i, p) in stores.iter().enumerate() {
+            append_as(p, vec![NewEntry { key: 1, kind: 1, payload: vec![i as u8; 5000] }], false, true).unwrap();
+        }
+        SEAL_HELD.with(|h| h.set(false));
+        let batch: Vec<(PathBuf, [u8; HEADER])> = stores.iter().map(|p| {
+            let file = current(&base_path(p));
+            let mut hb = [0u8; HEADER];
+            std::fs::File::open(&file).unwrap().read_exact(&mut hb).unwrap();
+            (file, hb)
+        }).collect();
+        assert!(stores.iter().all(|p| { let (s, _) = active(p); s.tail < s.end }), "the commits wait for their seal");
+        BARRIERS.with(|b| b.set(0));
+        seal_batch(&batch);
+        let want = if cfg!(target_os = "linux") { 1 } else { stores.len() as u32 };
+        assert_eq!(BARRIERS.with(|b| b.get()), want, "the batch's barriers (Linux: one for the filesystem)");
+        for p in &stores {
+            let (s, ix) = active(p);
+            assert_eq!((s.tail, ix.len()), (s.end, 1), "every commit of the batch is sealed: {}", p.display());
+        }
         let _ = std::fs::remove_dir_all(&d);
     }
 
