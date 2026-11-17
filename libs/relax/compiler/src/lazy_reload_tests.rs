@@ -180,7 +180,7 @@ fn gandalf_live_edit_guard_and_reporting() {
     let cfg = crate::cfg::CfgSet::host(&session, &[]);
     let framework_crate = prog.load_crate(dependency, &framework, 2021, cfg, vec![]).unwrap();
     let graph = format!(r#"{{"units":[{{"pkg_id":"path+file://{}/app#app@0.1.0","target":{{"name":"app","src_path":{}}}}},{{"pkg_id":"path+file://{}/{dependency}#{dependency}@0.1.0","target":{{"name":"{dependency}","src_path":{}}}}}]}}"#,
-        dir.display(), crate::diag::quote(&app), dir.display(), crate::diag::quote(&framework));
+        dir.display().to_string().replace('\\', "\\\\"), crate::diag::quote(&app), dir.display().to_string().replace('\\', "\\\\"), crate::diag::quote(&framework));
     let roots = crate::reload::gandalf_app_roots(&crate::unitgraph::Units::from_json(graph.as_bytes()).unwrap(), dir.join("app").to_str().unwrap());
     assert_eq!(roots, vec![crate::vfs::normalize_path(&app)]);
     let target = if case == "app" || case == "lazy" { app_crate } else { framework_crate };
@@ -365,7 +365,7 @@ fn specv_patch_before_verdict() {
     let app = dir.join("app/src/lib.rs").to_string_lossy().into_owned();
     let session = Arc::new(crate::Session::default());
     let (prog, core, app_crate) = crate::load_with_std(&session, &app, "specv_app", false).unwrap();
-    let graph = format!(r#"{{"units":[{{"pkg_id":"path+file://{}/app#app@0.1.0","target":{{"name":"app","src_path":{}}}}}]}}"#, dir.display(), crate::diag::quote(&app));
+    let graph = format!(r#"{{"units":[{{"pkg_id":"path+file://{}/app#app@0.1.0","target":{{"name":"app","src_path":{}}}}}]}}"#, dir.display().to_string().replace('\\', "\\\\"), crate::diag::quote(&app));
     let roots = crate::reload::gandalf_app_roots(&crate::unitgraph::Units::from_json(graph.as_bytes()).unwrap(), dir.join("app").to_str().unwrap());
     let def = prog.defs.iter().enumerate().find_map(|(i, d)| {
         let id = crate::program::DefId(i as u32);
@@ -504,7 +504,7 @@ fn specv_aliased_call_from_unverified_body() {
     let app = dir.join("app/src/lib.rs").to_string_lossy().into_owned();
     let session = Arc::new(crate::Session::default());
     let (prog, core, app_crate) = crate::load_with_std(&session, &app, "specv_alias", false).unwrap();
-    let graph = format!(r#"{{"units":[{{"pkg_id":"path+file://{}/app#app@0.1.0","target":{{"name":"app","src_path":{}}}}}]}}"#, dir.display(), crate::diag::quote(&app));
+    let graph = format!(r#"{{"units":[{{"pkg_id":"path+file://{}/app#app@0.1.0","target":{{"name":"app","src_path":{}}}}}]}}"#, dir.display().to_string().replace('\\', "\\\\"), crate::diag::quote(&app));
     let roots = crate::reload::gandalf_app_roots(&crate::unitgraph::Units::from_json(graph.as_bytes()).unwrap(), dir.join("app").to_str().unwrap());
     let find = |name: &str| prog.defs.iter().enumerate().find_map(|(i, d)| {
         let id = crate::program::DefId(i as u32);
@@ -637,7 +637,7 @@ fn specv_verified_rebuild_runs_twin_code_not_lazy_compiles() {
     let app = dir.join("app/src/lib.rs").to_string_lossy().into_owned();
     let session = Arc::new(crate::Session::default());
     let (prog, core, app_crate) = crate::load_with_std(&session, &app, "specv_borrow", false).unwrap();
-    let graph = format!(r#"{{"units":[{{"pkg_id":"path+file://{}/app#app@0.1.0","target":{{"name":"app","src_path":{}}}}}]}}"#, dir.display(), crate::diag::quote(&app));
+    let graph = format!(r#"{{"units":[{{"pkg_id":"path+file://{}/app#app@0.1.0","target":{{"name":"app","src_path":{}}}}}]}}"#, dir.display().to_string().replace('\\', "\\\\"), crate::diag::quote(&app));
     let roots = crate::reload::gandalf_app_roots(&crate::unitgraph::Units::from_json(graph.as_bytes()).unwrap(), dir.join("app").to_str().unwrap());
     let find = |name: &str| prog.defs.iter().enumerate().find_map(|(i, d)| {
         let id = crate::program::DefId(i as u32);
@@ -731,7 +731,7 @@ fn specv_twin_calls_reach_bases_only_from_code_that_needs_no_check() {
     session.options.relaxed = Some("disjoint-index".to_string());
     let session = Arc::new(session);
     let (prog, core, app_crate) = crate::load_with_std(&session, &app, "specv_d3_link", false).unwrap();
-    let graph = format!(r#"{{"units":[{{"pkg_id":"path+file://{}/app#app@0.1.0","target":{{"name":"app","src_path":{}}}}}]}}"#, dir.display(), crate::diag::quote(&app));
+    let graph = format!(r#"{{"units":[{{"pkg_id":"path+file://{}/app#app@0.1.0","target":{{"name":"app","src_path":{}}}}}]}}"#, dir.display().to_string().replace('\\', "\\\\"), crate::diag::quote(&app));
     let roots = crate::reload::gandalf_app_roots(&crate::unitgraph::Units::from_json(graph.as_bytes()).unwrap(), dir.join("app").to_str().unwrap());
     let find = |name: &str| prog.defs.iter().enumerate().find_map(|(i, d)| {
         let id = crate::program::DefId(i as u32);
@@ -839,7 +839,7 @@ fn specv_base_o3_takes_its_twins_counts() {
     let app = dir.join("app/src/lib.rs").to_string_lossy().into_owned();
     let session = Arc::new(crate::Session::default());
     let (prog, core, app_crate) = crate::load_with_std(&session, &app, "specv_twinpgo", false).unwrap();
-    let graph = format!(r#"{{"units":[{{"pkg_id":"path+file://{}/app#app@0.1.0","target":{{"name":"app","src_path":{}}}}}]}}"#, dir.display(), crate::diag::quote(&app));
+    let graph = format!(r#"{{"units":[{{"pkg_id":"path+file://{}/app#app@0.1.0","target":{{"name":"app","src_path":{}}}}}]}}"#, dir.display().to_string().replace('\\', "\\\\"), crate::diag::quote(&app));
     let roots = crate::reload::gandalf_app_roots(&crate::unitgraph::Units::from_json(graph.as_bytes()).unwrap(), dir.join("app").to_str().unwrap());
     let find = |name: &str| prog.defs.iter().enumerate().find_map(|(i, d)| {
         let id = crate::program::DefId(i as u32);
@@ -930,7 +930,7 @@ fn d3_disjoint_check_lowered_from_the_verdict() {
     session.options.relaxed = Some(if case == "strict" { "none" } else { "disjoint-index" }.to_string());
     let session = Arc::new(session);
     let (prog, core, app_crate) = crate::load_with_std(&session, &app, "d3_app", false).unwrap();
-    let graph = format!(r#"{{"units":[{{"pkg_id":"path+file://{}/app#app@0.1.0","target":{{"name":"app","src_path":{}}}}}]}}"#, dir.display(), crate::diag::quote(&app));
+    let graph = format!(r#"{{"units":[{{"pkg_id":"path+file://{}/app#app@0.1.0","target":{{"name":"app","src_path":{}}}}}]}}"#, dir.display().to_string().replace('\\', "\\\\"), crate::diag::quote(&app));
     let roots = crate::reload::gandalf_app_roots(&crate::unitgraph::Units::from_json(graph.as_bytes()).unwrap(), dir.join("app").to_str().unwrap());
     let find = |name: &str| prog.defs.iter().enumerate().find_map(|(i, d)| {
         let id = crate::program::DefId(i as u32);

@@ -1989,7 +1989,7 @@ fn hot_twin_asks_for_its_base_verdict() {
     let app = dir.join("app/src/lib.rs").to_string_lossy().into_owned();
     let session = std::sync::Arc::new(crate::Session::default());
     let (prog, core, app_crate) = crate::load_with_std(&session, &app, "hot_twin_verdict", false).unwrap();
-    let graph = format!(r#"{{"units":[{{"pkg_id":"path+file://{}/app#app@0.1.0","target":{{"name":"app","src_path":{}}}}}]}}"#, dir.display(), crate::diag::quote(&app));
+    let graph = format!(r#"{{"units":[{{"pkg_id":"path+file://{}/app#app@0.1.0","target":{{"name":"app","src_path":{}}}}}]}}"#, dir.display().to_string().replace('\\', "\\\\"), crate::diag::quote(&app));
     let roots = crate::reload::gandalf_app_roots(&crate::unitgraph::Units::from_json(graph.as_bytes()).unwrap(), dir.join("app").to_str().unwrap());
     let find = |name: &str| prog.defs.iter().enumerate().find_map(|(i, d)| {
         let id = DefId(i as u32);
