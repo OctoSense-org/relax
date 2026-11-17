@@ -26,6 +26,8 @@ pub struct BorrowckInferCtxt<'tcx> {
     /// A type op of the body failed (custom.rs scrape_region_constraints): the root's potentially
     /// region-dependent goals are re-proven (`check_potentially_region_dependent_goals`).
     pub type_op_failed: std::cell::Cell<bool>,
+    /// What the first failing type op was asked, for the report when no error explains the failure.
+    pub type_op_failure: RefCell<Option<String>>,
     encountered_re_error: std::cell::Cell<bool>,
     pub universal_regions: Option<super::universal_regions::UniversalRegions>,
     pub region_bound_pairs: Vec<(TyId, RegionId)>,
@@ -59,7 +61,7 @@ impl<'tcx> BorrowckInferCtxt<'tcx> {
         for p in &*result.clauses { clauses.push(tcx.instantiate_predicate(prog, def_id, &full, p)); }
         let param_env = ParamEnv { clauses: clauses.into() };
         let param_env_id = std::cell::OnceCell::new();
-        BorrowckInferCtxt { infcx, prog, root_def_id, param_env, param_env_id, tainted_by_errors: std::cell::Cell::new(false), type_op_failed: std::cell::Cell::new(false), encountered_re_error: std::cell::Cell::new(false), universal_regions: None, region_bound_pairs: Vec::new(), mir_view: None, mir_views_outer: Vec::new(), reg_var_to_origin: RefCell::new(HashMap::default()), root_typeck: None }
+        BorrowckInferCtxt { infcx, prog, root_def_id, param_env, param_env_id, tainted_by_errors: std::cell::Cell::new(false), type_op_failed: std::cell::Cell::new(false), type_op_failure: RefCell::new(None), encountered_re_error: std::cell::Cell::new(false), universal_regions: None, region_bound_pairs: Vec::new(), mir_view: None, mir_views_outer: Vec::new(), reg_var_to_origin: RefCell::new(HashMap::default()), root_typeck: None }
     }
 
     pub(crate) fn param_env_id(&self) -> crate::tcx::ParamEnvId {
@@ -157,6 +159,17 @@ impl<'tcx> BorrowckInferCtxt<'tcx> {
         if result.is_err() {
             self.tainted_by_errors.set(true);
             self.type_op_failed.set(true);
+            if self.type_op_failure.borrow().is_none() {
+                let show = |t| crate::typeck::ty_to_string(false, self.prog, &self.tcx, t);
+                let what = match &input {
+                    crate::next_solver::type_op::TypeOpInput::Normalize(_, t) => format!("normalize `{}`", show(*t)),
+                    crate::next_solver::type_op::TypeOpInput::ProvePredicate(_, p) => format!("prove {:?}", p.kind),
+                    crate::next_solver::type_op::TypeOpInput::AscribeUserType(_, t, _) => format!("ascribe a user type to `{}`", show(*t)),
+                    crate::next_solver::type_op::TypeOpInput::DropckOutlives(_, t) => format!("the drop outlives of `{}`", show(*t)),
+                    crate::next_solver::type_op::TypeOpInput::Custom => "a relation of the body's types".to_string(),
+                };
+                *self.type_op_failure.borrow_mut() = Some(what);
+            }
             if let Some(input_dbg) = &input_dbg {
                 let show = |t| crate::typeck::ty_to_string(false, self.prog, &self.tcx, t);
                 let what = match input_dbg {

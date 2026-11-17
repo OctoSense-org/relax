@@ -68,7 +68,7 @@ fn runtime_disjoint(v: &super::Verdict) -> Vec<(crate::mir::Span, crate::mir::Sp
 /// disjoint-index checks is checked again in every run (the checks are not part of the stored verdict).
 fn storable(result: &Result<Option<super::Verdict>, String>) -> Option<StoredVerdict> {
     match result {
-        Ok(Some(v)) if v.errors.is_empty() && runtime_disjoint(v).is_empty() => Some(v.unchecked.first().map_or(StoredVerdict::Clean, |why| StoredVerdict::Unchecked(why.clone()))),
+        Ok(Some(v)) if v.errors.is_empty() && runtime_disjoint(v).is_empty() => Some(v.unchecked.first().or(v.unsupported.first()).map_or(StoredVerdict::Clean, |why| StoredVerdict::Unchecked(why.clone()))),
         Ok(Some(_)) => None,
         Ok(None) => Some(StoredVerdict::Unchecked("typeck".into())),
         _ => None,
@@ -641,7 +641,7 @@ fn finish_verdict(prog: &Program, src: usize, epoch: u64, def: DefId, args: &[Ty
     let key = (src, def, epoch);
     match result {
         Ok(Some(v)) => {
-            let incomplete = v.errors.is_empty().then(|| v.unchecked.first().cloned()).flatten();
+            let incomplete = v.errors.is_empty().then(|| v.unchecked.first().or(v.unsupported.first()).cloned()).flatten();
             let checks = runtime_disjoint(&v);
             {
                 let mut d = DISJOINT.lock().unwrap_or_else(|e| e.into_inner());
