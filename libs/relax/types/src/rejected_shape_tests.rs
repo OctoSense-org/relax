@@ -208,3 +208,15 @@ fn a_higher_ranked_bound_keeps_the_bounds_its_arguments_imply() {
     for f in ["via_super", "via_keep_super", "via_keep", "via_fn_mut", "via_fn"] { assert!(!has(&e, f, ""), "{f}: {e:?}"); }
     assert!(e.iter().all(|x| x.starts_with("repro::via_sub: ") || x.starts_with("repro::dyn_extend: ")), "{e:?}");
 }
+
+/// A callee's clauses are proved together: `ndu(a2, &local)` needs `<a2 as FnOnce(u8)>::Output == R`, where the
+/// output is the caller's own opaque type and `R` the type the call gave it, and `T: 'static`. The first holds, so
+/// the second still requires `local` to be borrowed for `'static` (E0597); with a `'static` argument it passes.
+#[test]
+fn a_callee_bound_on_the_callers_own_opaque_output_keeps_its_other_bounds() {
+    let e = errors("
+        fn ndu<F: FnOnce(u8) -> R, R, T: 'static>(_: F, _: T) {}
+        pub fn a2(x: u8) -> impl Sized { let local = 1u8; ndu(a2, &local); x }
+        pub fn ok(x: u8) -> impl Sized { ndu(ok, 5u8); x }");
+    assert!(has(&e, "a2", "E0597") && e.len() == 1, "{e:?}");
+}

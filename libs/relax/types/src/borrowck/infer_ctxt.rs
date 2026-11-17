@@ -104,7 +104,7 @@ use crate::lang_items::LangItem;
 use crate::types::{UniverseIndex, AliasTyKind};
 use crate::types::variance::V;
 use crate::next_solver::{Goal, Predicate, PredicateKind, ClauseKind, Term};
-use crate::next_solver::type_op::{Normalize, ProvePredicate, CustomTypeOp, AscribeUserType};
+use crate::next_solver::type_op::{Normalize, NormalizeClauses, ProvePredicate, CustomTypeOp, AscribeUserType};
 
 impl<'tcx> BorrowckInferCtxt<'tcx> {
     /// type_check/mod.rs: the driver supplies the renumbered body's universal
@@ -267,21 +267,17 @@ impl BorrowckTypeOps for BorrowckInferCtxt<'_> {
         let _ = self.fully_perform_op(out, locations, category, ParamEnvAnd { param_env: self.param_env_id(), value: op });
     }
     fn normalize_and_prove_instantiated_clauses(&mut self, out: &mut MirTypeckRegionConstraints, owner: ClauseOwner, args: &[GenericArg], locations: Locations) {
+        // canonical.rs:143: each clause is normalized, which defines no opaque type (`NormalizeClauses`), then
+        // proved; proving one relates the body's opaque types like any other relation of the body, so a callee's
+        // `impl Trait` output met by the hidden type typeck gave the call is a use of it, not a failure.
         let def = self.clause_owner(owner); let env = self.param_env_id();
-        // (proving clauses never defines an opaque type: see `NormalizeSignature`)
-        let mode = self.infcx.typing_mode.get();
-        if matches!(mode, crate::tcx::TypingMode::PostTypeckUntilBorrowck { .. }) {
-            self.infcx.typing_mode.set(crate::tcx::TypingMode::PostTypeckUntilBorrowck { defining_opaque_types: Default::default() });
-        }
-        let _ = self.fully_perform_op(out, locations, ConstraintCategory::Predicate(self.locations_span(locations), def), CustomTypeOp::new(|ocx: &mut crate::next_solver::fulfill::ObligationCtxt<'_, '_>| {
-            for p in ocx.infcx.tcx.clauses_of(ocx.prog, def) {
-                let p = ocx.infcx.tcx.instantiate_predicate(ocx.prog, def, args, &p);
-                let predicate = ocx.normalize_predicate(&env, &p);
-                ocx.register_obligation(Goal { param_env: env.clone(), predicate });
-            }
+        let category = ConstraintCategory::Predicate(self.locations_span(locations), def);
+        let clauses = self.tcx.clauses_of(self.prog, def).iter().map(|p| self.tcx.instantiate_predicate(self.prog, def, args, p)).collect();
+        let Ok(clauses) = self.fully_perform_op(out, locations, category, ParamEnvAnd { param_env: env.clone(), value: NormalizeClauses { clauses } }) else { return };
+        let _ = self.fully_perform_op(out, locations, category, CustomTypeOp::new(|ocx: &mut crate::next_solver::fulfill::ObligationCtxt<'_, '_>| {
+            for predicate in clauses { ocx.register_obligation(Goal { param_env: env.clone(), predicate }); }
             Ok(())
         }));
-        self.infcx.typing_mode.set(mode);
     }
     fn normalize(&mut self, out: &mut MirTypeckRegionConstraints, ty: TyId, locations: Locations) -> TyId {
         self.fully_perform_op(out, locations, ConstraintCategory::Boring, ParamEnvAnd { param_env: self.param_env_id(), value: Normalize { value: ty } }).unwrap_or(ty)
