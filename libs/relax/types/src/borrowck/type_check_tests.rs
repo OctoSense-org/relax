@@ -23,7 +23,6 @@ pub(crate) enum Op {
     Ascribe(TyId, UserType, Span),
     AscribeSkipWf(TyId, TyId, Span),
     Opaque(TyId, V, TyId),
-    Outlives(TyId, RegionId, Locations, Cat),
 }
 pub(crate) struct Fake<'t> {
     pub(crate) tcx: &'t Tcx,
@@ -82,6 +81,7 @@ impl super::region_infer::opaque_types::OpaqueOps for Fake<'_> {
     fn equate_hidden_types(&mut self, _: &mut MirTypeckRegionConstraints, actual: TyId, expected: TyId, _: (u32, u32)) -> Result<(), ()> { self.equated.push((actual, expected)); Ok(()) }
 }
 impl super::mir_nll::RegionDriverOps for Fake<'_> {
+    fn num_region_vars(&self) -> usize { self.regions.len() }
     fn region_var_info(&self, vid: usize) -> (Origin, UniverseIndex) { self.regions[vid] }
     fn renumber(&mut self, body: &mut Body) {
         struct R<'a, 'b>(&'a mut Fake<'b>);
@@ -108,7 +108,6 @@ impl super::mir_nll::RegionDriverOps for Fake<'_> {
 }
 impl BorrowckTypeOps for Fake<'_> {
     fn universe(&self) -> UniverseIndex { self.universe }
-    fn num_region_vars(&self) -> usize { self.regions.len() }
     fn create_next_universe(&mut self) -> UniverseIndex { self.universe = UniverseIndex(self.universe.0 + 1); self.universe }
     fn next_nll_region_var(&mut self, origin: Origin, universe: UniverseIndex) -> RegionId {
         self.regions.push((origin, universe));
@@ -127,9 +126,6 @@ impl BorrowckTypeOps for Fake<'_> {
     }
     fn prove_trait_ref(&mut self, _: &mut MirTypeckRegionConstraints, t: LangItem, args: &[GenericArg], l: Locations, c: Cat) { self.ops.push(Op::Prove(t, args.to_vec(), l, c)); }
     fn prove_wf(&mut self, _: &mut MirTypeckRegionConstraints, ty: TyId, l: Locations, c: Cat) { self.ops.push(Op::Wf(ty, l, c)); }
-    fn type_must_outlive(&mut self, _: &mut MirTypeckRegionConstraints, ty: TyId, r: RegionId, l: Locations, _: Span, _: Cat, c: Cat) {
-        self.ops.push(Op::Outlives(ty, r, l, c));
-    }
     fn normalize_and_prove_instantiated_clauses(&mut self, _: &mut MirTypeckRegionConstraints, o: ClauseOwner, args: &[GenericArg], l: Locations) {
         self.ops.push(Op::Clauses(o, args.to_vec(), l));
     }
@@ -349,8 +345,9 @@ fn reify_and_closure_fn_pointer_casts() {
     let cat = Cat::Cast { is_raw_ptr_dyn_type_cast: false, is_implicit_coercion: true, unsize_to: None };
     let fresh = fn_ptr(&tcx, vec![rf(&tcx, re(&tcx, 3), t, false)], tcx.tys.unit, 0);
     assert!(fake.ops.contains(&Op::Wf(fresh, Locations::Single(at(0, 0)), cat)));
-    // Fresh '3 relates to '2 by the subtyping of the WF'd instantiated signature, the one relation.
-    assert_eq!(edges(&r), [(2, 3, Some(0), cat)]);
+    // Fresh '3 relates to '2 by the WF'd subtyping; the binder relation adds an existential '4.
+    let e = edges(&r);
+    assert!(e.contains(&(2, 3, Some(0), cat)) && e.contains(&(2, 4, Some(0), cat)), "{e:?}");
     // A closure's signature becomes a fn pointer of the target's safety.
     let sig = fn_ptr(&tcx, vec![rf(&tcx, re(&tcx, 1), t, false)], tcx.tys.unit, 0);
     let closure = tcx.tys.intern(TyKind::Closure(7, 1, crate::types::ClosureArgs { parent_args: item, closure_kind_ty: tcx.tys.prim(crate::program::Prim::I8), closure_sig_as_fn_ptr_ty: sig, tupled_upvars_ty: tcx.tys.unit }));
@@ -449,11 +446,10 @@ fn higher_ranked_fn_pointers_use_placeholders_and_existentials() {
     let origins: Vec<_> = fake.regions[3..].iter().map(|(o, u)| (matches!(o, Origin::Placeholder(_)), u.0)).collect();
     assert_eq!(origins, [(true, 1), (false, 1), (true, 2), (false, 2)]);
     assert_eq!(r.constraints.universe_causes.len(), 2);
-    // The outer `'1: '2` and the free arguments equated; per pass the bound arguments relate
-    // placeholder and existential both ways, which the binder's eliminator drops (the existential
-    // is the placeholder).
+    // The outer `'1: '2`; per pass the bound arguments relate placeholder and existential
+    // both ways and the free ones are equated.
     let mut e: Vec<_> = edges(&r).into_iter().map(|e| (e.0, e.1)).collect(); e.sort();
-    assert_eq!(e, [(1, 2), (1, 2), (1, 2), (2, 1), (2, 1)]);
+    assert_eq!(e, [(1, 2), (1, 2), (1, 2), (2, 1), (2, 1), (3, 4), (4, 3), (5, 6), (6, 5)]);
 }
 
 #[test]
@@ -946,38 +942,3 @@ mod driver {
 fn test_prog() -> crate::program::Program { crate::program::Program::new(&std::sync::Arc::new(crate::Session::default())) }
 
 fn annotation_value(ty: TyId) -> UserType { UserType::new(UserTypeKind::Ty(ty)) }
-
-/// A binder scope holds an alias obligation an assumption of an open scope could bound, and at its close
-/// discharges an own placeholder target only by an assumption on the same alias whose region arguments are proven
-/// equal (related both ways) and which covers that placeholder; every other target goes back to the ordinary rule.
-#[test]
-fn a_held_alias_obligation_is_discharged_only_by_the_same_alias() {
-    use crate::types::{AliasTy, AliasTyKind};
-    use super::constraints::RegionVid;
-    let tcx = Tcx::new(); let tys = &tcx.tys;
-    let opaque = |v| tys.intern(TyKind::Alias(crate::consts::IsRigid::No,
-        AliasTy { kind: AliasTyKind::Opaque { def_id: DefId(7) }, args: tys.mk_list(&[]), regions: tys.intern_region_args(&[re(&tcx, v)]) }));
-    // Regions: 1 'x and 2 'y outside, 3 '!r and 4 '!s the scope's placeholders, 5 '?e its existential, '?e: '!r.
-    let c = |sup, sub| OutlivesConstraint { sup, sub, location: None, span: Span::default(), category: Cat::Boring, from_closure: false };
-    let held = |v, at| HeldAlias { ty: opaque(v), region: re(&tcx, at), outer: Cat::Boring, category: Cat::Boring,
-        locations: Locations::All(Span::default()), span: Span::default() };
-    let vid = |r: RegionId| match tys.region_kind(r) { RegionKind::ReVar(v) => Some(v as RegionVid), _ => None };
-    let own: [RegionVid; 2] = [3, 4];
-    let is_e = |v: RegionVid| v == 5;
-    let owed = |h: HeldAlias, raw: &[OutlivesConstraint], types: &[(TyId, RegionVid)]| held_targets(tys, &[h], &vid, &own, &is_e, raw, raw, &[], types, 99);
-    let base = [c(5, 3)];
-    assert!(owed(held(2, 5), &[c(5, 3), c(1, 2), c(2, 1)], &[(opaque(1), 3)]).is_empty(), "arguments related both ways: discharged");
-    assert_eq!(owed(held(2, 5), &base, &[(opaque(1), 3)]), [(0, Some(3))], "unrelated arguments: 'y: '!r stays");
-    assert_eq!(owed(held(2, 5), &[c(5, 3), c(2, 1)], &[(opaque(1), 3)]), [(0, Some(3))], "one direction is not equality");
-    assert_eq!(owed(held(1, 5), &base, &[(opaque(1), 4)]), [(0, Some(3))], "an assumption on another placeholder");
-    assert_eq!(owed(held(1, 2), &base, &[(opaque(1), 3)]), [(0, Some(2))], "an outside target is never discharged");
-    // The hook: nothing is held with no open scope, or by a scope whose assumptions name other aliases; the
-    // innermost open scope holds what an enclosing one's assumption matches.
-    assert!(!hold_alias(&mut [], tys, held(1, 5)), "no open scope: the ordinary rule");
-    let other = tys.intern(TyKind::Alias(crate::consts::IsRigid::No,
-        AliasTy { kind: AliasTyKind::Opaque { def_id: DefId(8) }, args: tys.mk_list(&[]), regions: tys.intern_region_args(&[re(&tcx, 1)]) }));
-    assert!(!hold_alias(&mut [BinderFrame::new(tys, &[(other, 3)])], tys, held(1, 5)), "another alias: the ordinary rule");
-    let mut frames = [BinderFrame::new(tys, &[(opaque(2), 3)]), BinderFrame::new(tys, &[])];
-    assert!(hold_alias(&mut frames, tys, held(1, 5)), "an enclosing scope's assumption matches");
-    assert!(format!("{:?}", frames[1]).contains("HeldAlias"), "held by the innermost scope: {frames:?}");
-}

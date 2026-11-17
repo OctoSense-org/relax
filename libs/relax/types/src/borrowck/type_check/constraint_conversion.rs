@@ -41,11 +41,6 @@ impl<'a, 'tcx> ConstraintConversion<'a, 'tcx> {
         Self { infcx, universal_regions, region_bound_pairs, known_type_outlives_obligations, locations, span, category, constraints }
     }
 
-    /// One `ty: region` obligation (a binder scope's held alias obligation, submitted again at its close).
-    pub fn convert_type_outlives(&mut self, ty: TyId, region: RegionId, category: ConstraintCategory) {
-        self.convert(OutlivesPredicate::Type(ty, region), category);
-    }
-
     pub fn convert_all(&mut self, query_constraints: &QueryRegionConstraints) {
         for c in &query_constraints.constraints {
             for predicate in c.constraint.iter_outlives() { self.convert(predicate, c.category); }
@@ -209,10 +204,5 @@ impl TypeOutlivesDelegate for ConstraintConversion<'_, '_> {
         let bound = self.verify_bound_to_nll(bound);
         let type_test = self.verify_to_type_test(kind, a, bound);
         self.add_type_test(type_test);
-    }
-
-    fn hold_alias(&mut self, ty: TyId, a: RegionId, category: ConstraintCategory) -> bool {
-        let held = super::binder_scope::HeldAlias { ty, region: a, outer: self.category, category, locations: self.locations, span: self.span };
-        super::binder_scope::hold_alias(&mut self.constraints.binder_frames, &self.infcx.tcx.tys, held)
     }
 }
