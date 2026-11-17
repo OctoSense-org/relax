@@ -1559,6 +1559,12 @@ pub(crate) const HELD: &str = "held for a restart: ";
 /// An outcome line of an item held back because the rest of the edit reaches a held one: its
 /// error against the held item's running form.
 const HELD_REACHES: &str = "held, as it needs a held item: ";
+/// An outcome line of an edit that could not hold its restart-only items back: a held item's
+/// running text does not type-check against the rest of the edit (at the running text's line).
+pub(crate) const NOT_HELD: &str = "not held back, as a held item's running text does not compile against the edit: ";
+/// The hold_back round apply_locked runs next: per file, where its held running texts start (the
+/// edit's own text ends there).
+static HELD_FROM: std::sync::Mutex<Vec<(u32, usize)>> = std::sync::Mutex::new(Vec::new());
 
 /// The byte offset in `src` (file `path`'s text) of a diagnostic line's `path:line:col:` position.
 fn line_at(line: &str, path: &str, src: &[u8]) -> Option<usize> {
@@ -1588,8 +1594,9 @@ fn new_pos(u: &Unit, versions: &[(crate::program::FileVersion, Plan)], d: DefId)
 /// position of the text stays where the file has it: diagnostics and line tables name the file
 /// as saved), and the running version's spans of the same items (by identity: item_keys) go at
 /// the end of the text. An item the running version lacks goes. With the number of spans kept;
-/// None if the text made does not parse.
-fn keep_running(prog: &Program, file: u32, path: &str, src: &[u8], at: &[usize]) -> Option<(Vec<u8>, usize)> {
+/// None if the text made does not parse. `went` gets each kept span's (position in the text made,
+/// position in the running text).
+fn keep_running(prog: &Program, file: u32, path: &str, src: &[u8], at: &[usize], went: &mut Vec<(usize, usize)>) -> Option<(Vec<u8>, usize)> {
     let old = &prog.files[file as usize];
     let new = prog.parse_version(file, path, src.to_vec()).ok()?;
     let (new_keys, old_keys) = (item_keys(&new.pf), item_keys(old));
@@ -1610,6 +1617,7 @@ fn keep_running(prog: &Program, file: u32, path: &str, src: &[u8], at: &[usize])
             if !used[k] && old_roots.iter().any(|r| olo <= r.0 && r.0 < ohi && keys.contains(old_keys[r.1].as_str())) {
                 used[k] = true;
                 tail.push(b'\n');
+                went.push((src.len() + 1 + tail.len(), olo));
                 tail.extend_from_slice(&old.src[olo..ohi]);
             }
         }
@@ -1645,10 +1653,14 @@ fn root_positions(pf: &crate::parser::ParsedFile) -> Vec<(usize, usize)> {
 /// edit's text) keep their running text, and the edit applies again without them; an item the
 /// rest of it cannot type-check without a held one's new form is held too (its error names it),
 /// and so are the restart-only items a round finds, round by round. The held items' reasons wait
-/// for the restart as before ([`HELD`] lines: the watcher offers it). None: a line names no item
-/// of the edit's text (its reason is the whole program's), or the rounds ran out: the edit
-/// restarts whole.
-unsafe fn hold_back(up: *mut Unit, edits: &[Edit], lines: &[String], t0: Instant, retries: usize, base: &IncludeBase) -> Option<Outcome> {
+/// for the restart as before ([`HELD`] lines: the watcher offers it). A held item's running text
+/// is type-checked against the edit in each round, every fn of it, compiled or not, with the
+/// closures in it: one that does not check there (it names an item the edit renames or removes)
+/// would build on its first call against the edit, and its error would park the thread that calls
+/// it; the edit takes the restart whole instead ([`NOT_HELD`]: the error, at the running text's
+/// line). None: a line names no item of the edit's text (its reason is the whole program's), or
+/// the rounds ran out: the edit restarts whole.
+unsafe fn hold_back(up: *mut Unit, edits: &[Edit], lines: &[String], t0: Instant, retries: usize, base: &IncludeBase) -> Result<Outcome, Option<String>> {
     const SUMMARY: &str = "type checking failed due to previous errors";
     let mut srcs: Vec<Edit> = edits.iter().map(|e| Edit { file: e.file, path: e.path.clone(), src: e.src.clone() }).collect();
     // the held items' running texts go past each file's own end
@@ -1656,20 +1668,30 @@ unsafe fn hold_back(up: *mut Unit, edits: &[Edit], lines: &[String], t0: Instant
     let (mut reasons, mut reached) = (lines.to_vec(), Vec::new());
     let mut named: Vec<String> = lines.to_vec();
     let mut held = 0;
+    // per file: (position in its text, position in the running text) of each kept span
+    let mut went: Vec<Vec<(usize, usize)>> = vec![Vec::new(); srcs.len()];
     for round in 0..HOLD_ROUNDS.min(retries) {
         let mut at: Vec<Vec<usize>> = vec![Vec::new(); srcs.len()];
         for l in named.iter().filter(|l| !l.ends_with(SUMMARY)) {
-            let (k, p) = srcs.iter().enumerate().find_map(|(k, e)| line_at(l, &e.path, &e.src).map(|p| (k, p)))?;
-            if p >= ends[k] { return None; }
+            let Some((k, p)) = srcs.iter().enumerate().find_map(|(k, e)| line_at(l, &e.path, &e.src).map(|p| (k, p))) else { return Err(None) };
+            if p >= ends[k] {
+                // a held item's running text: said at its line there
+                let e = &srcs[k];
+                let Some(&(to, from)) = went[k].iter().filter(|w| w.0 <= p).max_by_key(|w| w.0) else { return Err(None) };
+                let (line, col) = (&(*up).prog).files[e.file as usize].line_col((from + p - to) as u32);
+                let what = l.strip_prefix(e.path.as_str()).and_then(|r| r.strip_prefix(':')).and_then(|r| r.splitn(3, ':').nth(2)).unwrap_or(l.as_str());
+                return Err(Some(format!("{NOT_HELD}{}:{line}:{col}:{what}", e.path)));
+            }
             at[k].push(p);
         }
         for (k, e) in srcs.iter_mut().enumerate() {
             if at[k].is_empty() { continue; }
-            let (next, n) = keep_running(&(*up).prog, e.file, &e.path, &e.src, &at[k])?;
+            let (next, n) = keep_running(&(*up).prog, e.file, &e.path, &e.src, &at[k], &mut went[k]).ok_or(None)?;
             e.src = next;
             held += n;
         }
         let again: Vec<Edit> = srcs.iter().map(|e| Edit { file: e.file, path: e.path.clone(), src: e.src.clone() }).collect();
+        *HELD_FROM.lock().unwrap_or_else(|e| e.into_inner()) = srcs.iter().zip(&ends).filter(|(e, &end)| e.src.len() > end).map(|(e, &end)| (e.file, end)).collect();
         let mut r = apply_locked(up, again, Vec::new(), t0, HOLD_ROUND, retries - 1 - round, false, base);
         match r.rung {
             Rung::Patch => {
@@ -1678,15 +1700,15 @@ unsafe fn hold_back(up: *mut Unit, edits: &[Edit], lines: &[String], t0: Instant
                 r.lines.push(format!("incomplete: {held} item(s) kept at their running version"));
                 r.lines.extend(reasons.iter().map(|l| format!("{HELD}{l}")));
                 r.lines.extend(reached.iter().map(|l| format!("{HELD_REACHES}{l}")));
-                return Some(r);
+                return Ok(r);
             }
             Rung::Restart => reasons.extend(r.lines.iter().cloned()),
-            Rung::Refuse if internal_failure(&r.lines) => return None,
+            Rung::Refuse if internal_failure(&r.lines) => return Err(None),
             Rung::Refuse => reached.extend(r.lines.iter().filter(|l| !l.ends_with(SUMMARY)).cloned()),
         }
         named = r.lines;
     }
-    None
+    Err(None)
 }
 
 /// Each item's container item (impl, trait, inline mod) in the tree walked from the root items;
@@ -5448,6 +5470,8 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
     // a whole save holds back its restart-only items alone (hold_back): its texts stay at hand. A
     // live test session takes its restart at once, the whole edit with it: nothing waits there
     let hold = partial == 0 && !module && retries > 0 && !crate::harness::live::enabled();
+    // a hold_back round: where each file's held running texts start
+    let held_from: Vec<(u32, usize)> = if partial == HOLD_ROUND { std::mem::take(&mut *HELD_FROM.lock().unwrap_or_else(|e| e.into_inner())) } else { Vec::new() };
     for (i, e) in edits.iter().enumerate() {
         let initial = if partial == 2 {
             Err("incomplete".to_string())
@@ -5555,11 +5579,16 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
         }
     }
     if !restart.is_empty() {
+        let mut why = None;
         if hold {
-            if let Some(r) = hold_back(up, &edits, &restart, t0, retries, base) { return r; }
+            match hold_back(up, &edits, &restart, t0, retries, base) {
+                Ok(r) => return r,
+                Err(w) => why = w,
+            }
         }
         out.rung = Rung::Restart;
         out.lines = restart;
+        out.lines.extend(why);
         out.ms[0] = ms(t0);
         return out;
     }
@@ -6434,6 +6463,23 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
     // the edited traits' items in their order, for a refused or rolled-back edit (the vtables
     // the running code makes are laid out from it)
     let saved_traits: Vec<(usize, Vec<DefId>)> = edited_traits.iter().map(|&td| { let ti = u.prog.def(td).sub as usize; (ti, u.prog.traits[ti].clone()) }).collect();
+    // the fns of the held items' running texts (hold_back), compiled or not: type-checked against
+    // the edit with its bodies, none rebuilt. A body (or a closure in one) that never ran builds on
+    // its first call after the edit, against it
+    let held_defs: Vec<DefId> = {
+        let u = &*up;
+        let mut v = Vec::new();
+        for (version, plan) in &versions {
+            let Some(&(_, from)) = held_from.iter().find(|h| h.0 == version.old) else { continue };
+            for &(i, j) in &plan.pairs {
+                if (version.pf.call_site(version.pf.ast.items[j as usize].lo) as usize) < from { continue; }
+                if let Some(&d) = u.prog.item_defs.get(&(version.old, i)) {
+                    if matches!(u.prog.def(d).kind, DefKind::Fn | DefKind::AssocFn) && !body_defs.contains(&d) && !v.contains(&d) { v.push(d); }
+                }
+            }
+        }
+        v
+    };
     // 4: commit the versions; check
     let t1 = Instant::now();
     out.ms[0] = (t1 - t0).as_secs_f64() * 1e3;
@@ -7238,7 +7284,7 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
     {
         let mut todo: Vec<(DefId, Vec<TyId>)> = Vec::new();
         let added_code: Vec<DefId> = added_defs.iter().copied().filter(|d| matches!(u.prog.def(*d).kind, DefKind::Fn | DefKind::AssocFn | DefKind::Const | DefKind::AssocConst | DefKind::Static)).collect();
-        for d in body_defs.iter().chain(const_defs.iter()).chain(added_code.iter()) {
+        for d in body_defs.iter().chain(const_defs.iter()).chain(added_code.iter()).chain(held_defs.iter()) {
             // a sandboxed module's consts, statics and associated consts too: the refusal below
             // reads their bodies (they have no fn signature for identity_args)
             let a = if crate::sandbox::is_sandboxed_crate_key(&u.sandbox, &u.prog, &FnKey::Inst(*d, Vec::new())) {
@@ -7966,7 +8012,11 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
             }
         }
         if as_restart && hold {
-            if let Some(r) = hold_back(up, &edits, &out.lines, t0, retries, base) { return r; }
+            match hold_back(up, &edits, &out.lines, t0, retries, base) {
+                Ok(r) => return r,
+                Err(Some(why)) => out.lines.push(why),
+                Err(None) => {}
+            }
         }
         if let Some(why) = frame_restart {
             // These types cannot take their new layout while a frame holds one: layout_edit's

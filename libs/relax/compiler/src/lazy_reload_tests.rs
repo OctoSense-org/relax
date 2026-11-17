@@ -2966,6 +2966,22 @@ impl KeptRig {
         self.set(file, &text)
     }
 
+    /// Substitutions in `file`'s text, applied as the watcher applies a saved file
+    /// (`apply_update`: items a restart needs are held back, and the rest applies).
+    fn save(&mut self, file: &str, subs: &[(&str, &str)]) -> crate::reload::Outcome {
+        let mut text = self.texts.iter().find(|(p, _)| p.replace('\\', "/").ends_with(&format!("/{file}"))).unwrap().1.clone();
+        for (from, to) in subs {
+            assert!(text.contains(from), "{file}: {from}");
+            text = text.replacen(from, to, 1);
+        }
+        let (path, kept) = self.texts.iter_mut().find(|(p, _)| p.replace('\\', "/").ends_with(&format!("/{file}"))).unwrap();
+        *kept = text.clone();
+        let norm = |s: &str| s.replace('\\', "/").to_lowercase();
+        let want = norm(path);
+        let (path, index) = self.unit.prog.current_source_files(|q| norm(q) == want).into_iter().next().map(|(p, i)| (p.clone(), i)).unwrap();
+        unsafe { crate::reload::apply_update(self.up, vec![crate::reload::Edit { file: index, path, src: text.into_bytes() }]) }
+    }
+
     /// `file`'s whole text, applied live.
     fn set(&mut self, file: &str, text: &str) -> crate::reload::Outcome {
         let (path, kept) = self.texts.iter_mut().find(|(p, _)| p.replace('\\', "/").ends_with(&format!("/{file}"))).unwrap();
@@ -3013,6 +3029,69 @@ impl Drop for KeptRig {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.dir);
     }
+}
+
+/// An edit that holds items back for a restart keeps their fns on their running texts, which it
+/// type-checks against the rest of it, every fn of them, compiled or not, with the closures in
+/// them. A held method that never ran and whose closure names a const the same edit renames
+/// cannot be held: the edit takes the restart whole, and says so at the running text's line; the
+/// running code goes on. Without the rename the hold applies, and that method, first called after
+/// it, builds from its running text against the edit. (An app, 11-17: such a closure was built at
+/// its first call after the edit, named a line in neither version of the file, E0425 parked its
+/// main thread at the call, and every later edit of the file was refused.)
+#[test]
+fn a_held_item_s_never_run_closure_is_checked_with_the_edit() {
+    isolated_test!(a_held_item_s_never_run_closure_is_checked_with_the_edit);
+    let lib = format!("{KEPT_FLAGS}{}", r#"pub const PEAK_FALL: u64 = 3;
+pub trait Show { fn show(&self) -> u64; }
+pub struct Scope { pub a: u64 }
+impl Scope {
+    pub fn new(a: u64) -> Scope { Scope { a } }
+    #[inline(never)]
+    pub fn tick(&mut self) -> u64 {
+        let fall = |x: u64| x + PEAK_FALL;
+        fall(self.a)
+    }
+}
+impl Show for Scope { fn show(&self) -> u64 { self.a } }
+pub fn warm(p: *mut u64) {
+    AT.store(p as usize, Ordering::SeqCst);
+    let shown: Box<dyn Show> = Box::new(Scope::new(1));
+    let s = Scope::new(4);
+    flags()[2].store(s.a + shown.show(), Ordering::SeqCst);
+}
+pub fn fall(p: *mut u64) {
+    AT.store(p as usize, Ordering::SeqCst);
+    let mut s = Scope::new(4);
+    flags()[2].store(s.tick(), Ordering::SeqCst);
+}
+"#);
+    // where the closure names the const in the running text
+    let (line, col) = lib.lines().enumerate().find_map(|(i, l)| l.find("x + PEAK_FALL").map(|c| (i + 1, c + 5))).unwrap();
+    let mut rig = KeptRig::new("heldclosure", &[("lib.rs", &lib)], &["warm", "fall"]);
+    rig.call("warm");
+    assert_eq!(rig.flag(2), 5, "before the edit: a trait object of Scope, and tick has not run");
+    // Scope takes a field (trait objects of it were made: held for a restart), new needs it (its
+    // impl, with tick, held with it), and the const tick's closure reads is renamed
+    let o = rig.save("lib.rs", &[
+        ("pub const PEAK_FALL: u64 = 3;", "pub const PEAK_FALL_DB: u64 = 3;"),
+        ("pub struct Scope { pub a: u64 }", "pub struct Scope { pub a: u64, pub meter_at: u64 }"),
+        ("Scope { a } }", "Scope { a, meter_at: 0 } }"),
+        ("let fall = |x: u64| x + PEAK_FALL;", "let fall = |x: u64| x + PEAK_FALL_DB;"),
+    ]);
+    let at = format!("lib.rs:{line}:{col}: E0425");
+    assert!(o.rung == crate::reload::Rung::Restart && o.lines.iter().any(|l| l.starts_with(crate::reload::NOT_HELD) && l.contains(&at)),
+        "the held impl's tick cannot build against the rename: the edit restarts whole, naming {at} of the running text: {:?} {:?}", o.rung, o.lines);
+    rig.call("fall");
+    assert_eq!(rig.flag(2), 7, "the running code goes on: tick's closure reads the running const");
+    // the field alone: Scope and its impl held, tick built from its running text at its first call
+    let o = rig.save("lib.rs", &[
+        ("pub const PEAK_FALL_DB: u64 = 3;", "pub const PEAK_FALL: u64 = 3;"),
+        ("let fall = |x: u64| x + PEAK_FALL_DB;", "let fall = |x: u64| x + PEAK_FALL;"),
+    ]);
+    assert!(o.rung == crate::reload::Rung::Patch && o.lines.iter().any(|l| l.starts_with("incomplete:")), "the field's edit applies with Scope and its impl held: {:?} {:?}", o.rung, o.lines);
+    rig.call("fall");
+    assert_eq!(rig.flag(2), 7, "tick, first built after the hold, runs its running text");
 }
 
 fn refused_with(o: &crate::reload::Outcome, all: &[&str]) -> (bool, String) {
