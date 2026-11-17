@@ -267,7 +267,9 @@ impl BorrowckTypeOps for BorrowckInferCtxt<'_> {
         }))
     }
     fn prove_trait_ref(&mut self, out: &mut MirTypeckRegionConstraints, trait_: LangItem, args: &[GenericArg], locations: Locations, category: ConstraintCategory) {
-        let def = self.tcx.lang_items.get(trait_).unwrap_or_else(|| panic!("required trait lang item: {trait_:?}"));
+        // A program without core has no `Sized` or `Copy` lang item and nothing of them to prove: sizedness is the
+        // solver's (trait_goals.rs), and building chose each copy without the trait.
+        let Some(def) = self.tcx.lang_items.get(trait_) else { return };
         // `try_fast_path`'s sizedness rule (prove_predicate.rs:13), asked before the predicate is built
         if let (LangItem::Sized | LangItem::MetaSized, Some(&GenericArg::Type(ty))) = (trait_, args.first()) {
             if crate::next_solver::eval_ctxt::fast_path::sizedness_holds(&self.infcx, self.prog, self.param_env_id(), def, trait_ == LangItem::MetaSized, ty) { return; }
@@ -496,7 +498,7 @@ impl BorrowckTypeOps for BorrowckInferCtxt<'_> {
         BorrowckTypeOps::normalize(self, out, ty, locations)
     }
     fn type_is_sized_modulo_regions(&mut self, ty: TyId) -> bool {
-        let def = self.tcx.lang_items.get(LangItem::Sized).expect("Sized lang item");
+        let Some(def) = self.tcx.lang_items.get(LangItem::Sized) else { return true };
         self.infcx.evaluate_obligation(self.prog, Goal { param_env: self.param_env_id(), predicate: crate::next_solver::collect::trait_predicate(def, vec![GenericArg::Type(ty)]) }).must_apply_modulo_regions()
     }
     fn simd_const_arg(&self, def: DefId) -> Option<(usize, &'static str)> {
