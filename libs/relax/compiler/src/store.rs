@@ -2017,7 +2017,10 @@ mod tests {
         // (the store, this process's live lock folder (hold_build) and its pass record (note_in_pass))
         assert_eq!(std::fs::read_dir(&d).unwrap().flatten().filter(|e| e.file_name() != "live" && e.file_name() != "passes").count(), 1);
         assert!(Store::open(&p).unwrap().get(2).is_some());
-        // Corrupt a retained payload and force capacity growth; only that entry is dropped.
+        // Corrupt a retained payload and force capacity growth; only that entry is dropped. (Its
+        // commit sealed first, here or already by the seal thread: in a commit not sealed yet the
+        // open verifies it and gives the whole commit up, as an exit's.)
+        seal_now(&p);
         let mut file = std::fs::OpenOptions::new().write(true).open(&p).unwrap();
         file.seek(SeekFrom::Start(after.index[0].off)).unwrap();
         file.write_all(&[99]).unwrap();
