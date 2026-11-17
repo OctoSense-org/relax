@@ -439,6 +439,10 @@ pub struct Unit {
     /// over rebuilds, never shrinks: code made from an earlier RIR names them too. The disk
     /// cache's dependency certificates are its transitive closure (cache.rs).
     pub body_deps: crate::fxhash::HashMap<u32, Vec<u32>>,
+    /// The bodies a build read for a callee's nocapture answer (tail_nocapture_facts,
+    /// o3_nocapture_facts; also in `body_deps`): a live edit of one builds the reader again
+    /// (reload::hosts_of), whose sibling call stood on the answer. Grows as `body_deps` does.
+    pub fact_deps: crate::fxhash::HashMap<u32, Vec<u32>>,
     pub statics: crate::fxhash::HashMap<DefId, u64>,
     /// the certificates of the constants' and statics' values of this run (ConstCert; by
     /// constant and arguments, a static with none): an evaluation that reads one takes it in.
@@ -5746,6 +5750,7 @@ impl Unit {
             consts: Default::default(),
             const_readers: Default::default(),
             body_deps: Default::default(),
+            fact_deps: Default::default(),
             statics: Default::default(),
             const_certs: Default::default(),
             tls_places: Default::default(),
@@ -11308,6 +11313,21 @@ pub(crate) fn note_body_deps(u: &mut Unit, id: u32, deps: impl Iterator<Item = u
     e.extend(v);
 }
 
+/// Records that slot `id`'s build read the bodies `reads` for a callee's nocapture answer: in
+/// `body_deps` (the disk cache's keys) and `fact_deps` (a live edit of one rebuilds `id`).
+fn note_fact_reads(u: &mut Unit, id: u32, reads: Vec<u32>) {
+    if !reads.is_empty() {
+        let _k = crate::zone_alloc::kept();
+        let e = u.fact_deps.entry(id).or_default();
+        for &r in &reads {
+            if r != id && !e.contains(&r) {
+                e.push(r);
+            }
+        }
+    }
+    note_body_deps(u, id, reads.into_iter());
+}
+
 fn note_const_reader(u: &Unit, d: DefId, slot: u32) {
     let mut g = u.const_readers.lock().unwrap_or_else(|e| e.into_inner());
     let _k = crate::zone_alloc::kept();
@@ -14979,7 +14999,7 @@ unsafe fn tail_nocapture_facts(up: *mut Unit, id: u32, func: &mut relax_backend:
         if !new {
             reads.sort_unstable();
             reads.dedup();
-            note_body_deps(&mut *up, id, reads.into_iter());
+            note_fact_reads(&mut *up, id, reads);
             func.nocapture = std::mem::take(&mut f.nocapture);
             return;
         }
@@ -15098,7 +15118,7 @@ unsafe fn o3_nocapture_facts(up: *mut Unit, id: u32, asks: &[(u32, u32)]) -> (Ve
     }
     reads.sort_unstable();
     reads.dedup();
-    note_body_deps(&mut *up, id, reads.into_iter());
+    note_fact_reads(&mut *up, id, reads);
     (facts, missing.into_inner())
 }
 

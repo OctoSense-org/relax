@@ -2900,6 +2900,32 @@ fn retired_hit(u: &Unit, t: TyId, depth: u32) -> Option<(String, u64)> {
     }
 }
 
+/// Slot `s`'s hosts: the slots whose code took its body in, as a copy (`inlined_into`) or as an
+/// answer read from it without a copy (`facts`: a callee's nocapture answer, Unit::fact_deps). A
+/// change of its body builds them again, as their next call needs: a caller's sibling call made
+/// on a callee keeping no copy of a frame address would hand a dangling one to a new body that
+/// keeps it.
+fn hosts_of(u: &Unit, s: u32, facts: &crate::fxhash::HashMap<u32, Vec<u32>>) -> Vec<u32> {
+    let mut v = u.fns[s as usize].history().inlined_into.clone();
+    if let Some(r) = facts.get(&s) {
+        let have: crate::fxhash::HashSet<u32> = v.iter().copied().collect();
+        v.extend(r.iter().copied().filter(|c| !have.contains(c)));
+    }
+    v
+}
+
+/// Per slot, the slots whose build read its body for an answer (`Unit::fact_deps` the other way
+/// round): one pass per patch.
+fn fact_readers(u: &Unit) -> crate::fxhash::HashMap<u32, Vec<u32>> {
+    let mut m: crate::fxhash::HashMap<u32, Vec<u32>> = Default::default();
+    for (&caller, deps) in &u.fact_deps {
+        for &d in deps {
+            m.entry(d).or_default().push(caller);
+        }
+    }
+    m
+}
+
 /// The code to build again for the closures and async bodies `rebind` pairs (old, new), each old
 /// one marked patched first (never inlined again: a build calls it, and its forwarder runs the new
 /// version): every slot that inlined one (`inlined_into`: its RIR or code holds a copy), their
@@ -6238,9 +6264,10 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
     let mut inlining_callers: Vec<u32> = Vec::new();
     let mut work: Vec<u32> = flagged.clone();
     let mut twins_walked: Vec<u32> = Vec::new();
+    let facts = fact_readers(u);
     while let Some(s) = work.pop() {
-        let inl = u.fns[s as usize].history().inlined_into.len();
-        let mut deps = u.fns[s as usize].history().inlined_into.clone();
+        let mut deps = hosts_of(u, s, &facts);
+        let inl = deps.len();
         deps.extend(crate::sandbox::twin_of(u, s));
         deps.extend(crate::ctfe_twin::twin_of(u, s));
         // SPEC-V: the slot's unverified-mode twin is its old text too, and unverified code inlines
@@ -7158,8 +7185,8 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
             }
         }
         while let Some(s) = work.pop() {
-            let inl = u.fns[s as usize].history().inlined_into.len();
-            let mut deps = u.fns[s as usize].history().inlined_into.clone();
+            let mut deps = hosts_of(u, s, &facts);
+            let inl = deps.len();
             deps.extend(crate::sandbox::twin_of(u, s));
             deps.extend(crate::ctfe_twin::twin_of(u, s));
             // (its unverified-mode twin: flagged and walked, built again with `plain`)

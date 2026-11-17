@@ -3242,6 +3242,54 @@ pub fn later(p: *mut u64) {
     assert_eq!(layout, (6, 8), "the calls after the field, by the new bodies in the new layout");
 }
 
+/// A C ABI body's call in tail position became a sibling call (a jump that frees its frame first)
+/// because the callee its frame address goes to keeps no copy of it (`Func::nocapture`, answered
+/// from that callee's body). An edit makes that callee keep the address: the body that took the
+/// fact is built again with the patch, without it, and its frame is there when the callee after it
+/// reads the kept address (a callee-body fact reaches its caller as an inlined copy does).
+#[test]
+fn a_caller_that_took_a_callees_nocapture_is_rebuilt_when_its_body_changes() {
+    isolated_test!(a_caller_that_took_a_callees_nocapture_is_rebuilt_when_its_body_changes);
+    let lib = format!("{KEPT_FLAGS}{}", r#"static KEPT: AtomicUsize = AtomicUsize::new(0);
+#[inline(never)]
+pub fn note(p: &u64) -> u64 {
+    *p
+}
+#[inline(never)]
+pub extern "C" fn last(n: u64) -> u64 {
+    let p = KEPT.load(Ordering::SeqCst);
+    if p == 0 { n } else { n + unsafe { *(p as *const u64) } }
+}
+#[inline(never)]
+pub extern "C" fn outer(n: u64) -> u64 {
+    let x = std::hint::black_box(n);
+    let k = note(&x);
+    last(k)
+}
+pub fn start(p: *mut u64) {
+    let a = unsafe { &*(p as *const [AtomicU64; 4]) };
+    a[2].store(outer(5), Ordering::SeqCst);
+}
+"#);
+    let mut rig = KeptRig::new("nocapture", &[("lib.rs", &lib)], &["start"]);
+    rig.call("start");
+    let before = rig.flag(2);
+    let slot_of = |rig: &KeptRig, name: &str| (0..rig.unit.fns.len() as u32).find(|&s| matches!(&rig.unit.fns[s as usize].key, crate::jit::FnKey::Inst(d, _) if rig.unit.prog.name(*d) == name)).unwrap_or_else(|| panic!("no slot for `{name}`"));
+    let (outer, note) = (slot_of(&rig, "outer"), slot_of(&rig, "note"));
+    // (the rig keeps no RIR: the bodies a build read for its facts are noted only when every
+    // frame address it passes is vouched for, jit::tail_nocapture_facts)
+    let took = rig.unit.body_deps.get(&outer).is_some_and(|v| v.contains(&note));
+    let o = rig.edit("lib.rs", &[("pub fn note(p: &u64) -> u64 {\n    *p", "pub fn note(p: &u64) -> u64 {\n    KEPT.store(p as *const u64 as usize, Ordering::SeqCst);\n    *p")]);
+    let gen = rig.unit.patch_log.iter().filter(|(s, _)| *s == note).map(|(_, g)| *g).max();
+    let rebuilt = gen.is_some_and(|g| rig.unit.patch_log.iter().any(|&(s, x)| s == outer && x == g));
+    rig.call("start");
+    let after = rig.flag(2);
+    assert_eq!((before, took), (5, true), "`outer` was built on `note` keeping no copy of `&x` (its tail call a sibling call)");
+    assert_eq!(o.rung, crate::reload::Rung::Patch, "the edit applies: {:?}", o.lines);
+    assert!(rebuilt, "the patch that changes `note` builds `outer` again, which took a fact from its body: {:?}", o.lines);
+    assert_eq!(after, 10, "`last` reads `x` through the kept address while `outer`'s frame holds it");
+}
+
 /// A thread loops in `hot`'s first code; O3 code replaces that code under its frame (a tier-up
 /// moves no frame), then an edit of `hot`'s body is patched. The landing check of the patch finds
 /// the thread in code from before it, naming `hot`: that loop never runs the edit. The tier-up's
