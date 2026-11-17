@@ -788,6 +788,126 @@ fn a_take_that_gives_way_waits_for_a_change() {
     std::fs::remove_dir_all(dir).unwrap();
 }
 
+const EDIT_SOURCE: &str = r#"
+pub fn hot(out: &mut u32) { *out = 6; }
+fn main() {
+    let mut x = 0;
+    hot(&mut x);
+}
+"#;
+
+/// A hot fn edited mid-run counts its calls again, in front of its patch's code, and returns to O3
+/// within its normal count: whether the edit found it counting, at O3, in its counted (PGO)
+/// window, or with its O3 take running. A patch left a slot marked queued (O3 code, a counted
+/// window, a take) with its count stub gone, and a take it dropped left its slot the same: their
+/// calls were never counted again, and a live app's edited draw ran O1 code for the rest of the
+/// run (11-17).
+#[test]
+fn a_hot_fn_edited_mid_run_returns_to_o3() {
+    isolated_test!(a_hot_fn_edited_mid_run_returns_to_o3);
+    crate::borrowck::lazy::disable_gandalf();
+    if std::env::var_os("RELAX_STD").is_none() {
+        std::env::set_var("RELAX_STD", concat!(env!("CARGO_MANIFEST_DIR"), "/std"));
+    }
+    let dir = std::env::temp_dir().join(format!("relax-edited-hot-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("input.rs");
+    std::fs::write(&path, EDIT_SOURCE).unwrap();
+    let (prog, core, krate) = crate::load_with_std(&std::sync::Arc::new(crate::Session::default()), path.to_str().unwrap(), "edited_hot", false).unwrap();
+    let hot = prog.defs.iter().enumerate().find_map(|(i, d)| {
+        let id = DefId(i as u32);
+        (d.krate == krate && d.kind == DefKind::Fn && prog.name(id) == "hot").then_some(id)
+    }).unwrap();
+    let mut tcx = Tcx::new();
+    tcx.collect(&prog);
+    assert!(tcx.errors.is_empty(), "{:?}", tcx.errors);
+    let mut u = Unit::new(prog, tcx, core);
+    let up = &mut *u as *mut Unit;
+    unsafe { UNIT = up };
+    assert!(u.tier1.is_some(), "the fixture needs O3");
+    enable_pipelining(&u.prog.session.options);
+    let threshold = u.tier1.as_ref().unwrap().threshold;
+    // hot runs its first code under its count stub
+    let (id, file) = crate::owner::call(crate::owner::Class::Program, || {
+        let id = u.fn_id(FnKey::Inst(hot, Vec::new()));
+        let c = unsafe { compile_fn(up, id) }.unwrap();
+        u.install(id, &c.0, &c.2, c.1, 0).unwrap();
+        let code = u.fns[id as usize].code;
+        u.arm_counter_as(id, code, true);
+        (id, u.prog.def(hot).file)
+    });
+    let rec = crate::owner::call(crate::owner::Class::Program, || tier_rec(&u.slots, id) as usize) as *const AtomicU64;
+    // its count stub is in the slot, in front of the code it runs, and its count starts below the threshold
+    let counting = |what: &str| crate::owner::call(crate::owner::Class::Program, || unsafe {
+        let u = &*up;
+        let (code, stub) = ((*rec.add(1)).load(Ordering::Relaxed), (*rec.add(2)).load(Ordering::Relaxed));
+        assert_eq!((*rec.add(3)).load(Ordering::Acquire), T_COUNTING, "{what}: hot counts its calls");
+        assert!(stub != 0 && SlotWord::of(&u.slots, id).load(Ordering::SeqCst) == stub, "{what}: hot's count stub is in its slot");
+        assert_eq!(code, u.fns[id as usize].code, "{what}: the count stub runs hot's newest code");
+        assert!(!u.fns[id as usize].o3.load(Ordering::Relaxed), "{what}: hot's code is not O3");
+        let (now, _) = tier_clocks();
+        tier_cost_now(rec, threshold, now).0
+    });
+    let run = || {
+        let entry = unsafe { (&*up).fns[id as usize].code };
+        let mut r = 0u32;
+        unsafe { call_jit(up, entry, &mut r as *mut u32 as u64) }.unwrap_or_else(|p| panic!("JIT call panicked: {}", p.message));
+        r
+    };
+    // a call turned it hot and queued it (queue_counting, without the inbox: no worker runs here)
+    let queue_again = || unsafe {
+        let (code, stub) = ((*rec.add(1)).load(Ordering::Relaxed), (*rec.add(2)).load(Ordering::Relaxed));
+        let _ = crate::owner::call(crate::owner::Class::Program, || SlotWord::of(&(&*up).slots, id).compare_exchange(stub, code, Ordering::SeqCst, Ordering::SeqCst));
+        assert!((*rec.add(3)).compare_exchange(T_COUNTING, T_QUEUED, Ordering::SeqCst, Ordering::SeqCst).is_ok(), "hot was counting");
+    };
+    let mut src = EDIT_SOURCE.to_string();
+    let mut edit = |from: &str, to: &str| {
+        src = src.replace(from, to);
+        let outcome = unsafe { crate::reload::apply(up, vec![crate::reload::Edit { file, path: path.to_string_lossy().into_owned(), src: src.clone().into_bytes() }]) };
+        assert_eq!(outcome.rung, crate::reload::Rung::Patch, "{:?}", outcome.lines);
+    };
+    assert_eq!(run(), 6);
+    // edited while counting: it counts on, in front of the patch's code
+    edit("= 6;", "= 7;");
+    counting("counting, then edited");
+    assert_eq!(run(), 7);
+    // edited at O3: it counts again from nothing, and its next take builds the edit at O3
+    queue_again();
+    assert!(unsafe { compile_tier1(up, id) }, "hot gets O3 code");
+    assert!(u.fns[id as usize].o3.load(Ordering::Relaxed));
+    edit("= 7;", "= 8;");
+    let cost = counting("at O3, then edited");
+    assert!(cost < threshold, "an edited O3 fn counts from nothing: cost {cost} of {threshold}");
+    assert_eq!(run(), 8);
+    queue_again();
+    assert!(unsafe { compile_tier1(up, id) }, "the edited hot gets O3 code again");
+    assert!(u.fns[id as usize].o3.load(Ordering::Relaxed));
+    assert_eq!(run(), 8);
+    // edited in its counted (PGO) window: the window of the old body closes, it counts again
+    edit("= 8;", "= 9;");
+    counting("at O3 again, then edited");
+    queue_again();
+    assert!(u.fns[id as usize].rir.is_some(), "hot's patch left its RIR for the counted build");
+    assert!(unsafe { counted_build(up, id, false) }, "hot gets its counted build");
+    assert!(COUNTING.lock().unwrap().iter().any(|e| e.id == id), "hot's counted window is open");
+    edit("= 9;", "= 10;");
+    assert!(!COUNTING.lock().unwrap().iter().any(|e| e.id == id), "the counted window of hot's old body is closed");
+    counting("in its counted window, then edited");
+    assert_eq!(run(), 10);
+    // a patch lands while its O3 take runs: the take is dropped, the slot counts again
+    queue_again();
+    TAKE_MEETS_PATCH.store(id, Ordering::Relaxed);
+    assert!(!unsafe { compile_tier1(up, id) }, "a take a patch landed under is dropped");
+    TAKE_MEETS_PATCH.store(u32::MAX, Ordering::Relaxed);
+    counting("its take dropped by a patch");
+    queue_again();
+    assert!(unsafe { compile_tier1(up, id) }, "hot gets O3 code after its dropped take");
+    assert_eq!(run(), 10);
+    // (process exit owns the runtime's teardown)
+    std::mem::forget(u);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
 const LEFT_SOURCE: &str = r#"
 const K1: u32 = 40 + 2;
 const K2: u32 = 6 * 7;

@@ -11383,7 +11383,7 @@ pub(crate) unsafe fn install_patched(up: *mut Unit, id: u32, code: &[u8], map: V
     if matches!(u.fns[id as usize].key, FnKey::Sandbox(_)) {
         u.rearm_sandbox_counter(id, a);
     } else {
-        u.arm_counter(id, a);
+        u.arm_after_patch(id, a);
     }
     Ok(a)
 }
@@ -11396,7 +11396,7 @@ pub(crate) unsafe fn install_unforwarded(up: *mut Unit, id: u32, code: &[u8], ma
     let t = if u.fns[id as usize].rir.as_ref().is_some_and(|r| r.baseline) { tier::BASELINE } else { tier::O1 };
     let _as = code_as(CodeKind::new(t, origin::PATCH));
     let a = u.install_code(id, code, relocs, map, gen)?;
-    u.arm_counter(id, a);
+    u.arm_after_patch(id, a);
     Ok(a)
 }
 
@@ -21293,6 +21293,9 @@ unsafe fn count_again_now(up: *mut Unit, id: u32) {
 /// (tests) the slot whose O3 takes give way at their start, as a take whose cause lasts does
 #[cfg(test)]
 pub(crate) static TAKE_GIVES_WAY: AtomicU32 = AtomicU32::new(u32::MAX);
+/// (tests) the slot whose O3 take meets a patch: the patch epoch moves once its code is built
+#[cfg(test)]
+pub(crate) static TAKE_MEETS_PATCH: AtomicU32 = AtomicU32::new(u32::MAX);
 
 /// A queued slot whose entry left at its pick counts again in its count stub, from the cost it has
 /// now: code that still runs queues itself again soon. `recount`: it left to be counted again (a
@@ -22060,6 +22063,59 @@ impl Unit {
         if self.tier1.is_some() {
             unsafe { (*tier_rec(&self.slots, id).add(3)).store(0, Ordering::Release); }
             self.arm_counter(id, code);
+        }
+    }
+
+    /// A live patch installed `code` in slot `id`, which took the count stub out of the slot: its
+    /// calls count again, whatever the code before it was (install_patched's fresh counter). A slot
+    /// still counting keeps its count, in front of the new code. One marked queued counts from
+    /// nothing: its O3 code, counted window, parked or queued take were of the body the patch
+    /// replaced. arm_counter left both as they were (it arms a slot never armed), so a hot fn edited
+    /// once ran its patch's O1 code for the rest of the run, its calls not counted (a traced pane's
+    /// draw, 11-17). A take of the old body still waiting builds the new one; one running is dropped
+    /// at its install (patch changed meanwhile). A final slot is the settle sweep's
+    /// (settle_rearm_all). Unit lock held.
+    fn arm_after_patch(&mut self, id: u32, code: u64) {
+        if self.tier1.is_some() {
+            let rec = tier_rec(&self.slots, id);
+            match unsafe { (*rec.add(3)).load(Ordering::Acquire) } {
+                T_COUNTING => {
+                    self.rearm_counter(id, code);
+                    return;
+                }
+                T_QUEUED => {
+                    COUNTING.lock().unwrap_or_else(|e| e.into_inner()).retain(|e| e.id != id);
+                    self.fns[id as usize].o3.store(false, Ordering::Relaxed);
+                    bail_done(self as *mut Unit, id);
+                    unsafe { (*rec.add(3)).store(0, Ordering::Release) };
+                }
+                _ => {}
+            }
+        }
+        self.arm_counter(id, code);
+    }
+
+    /// An O3 take of slot `id` was dropped because a patch landed while it ran: the slot counts again
+    /// from the cost it has, in front of the code it runs, and the next call that finds it hot
+    /// queues a take of the sources as they are now. The drop left it marked queued in no queue,
+    /// so an edit left every take in flight below O3 for the rest of the run. A slot the patch
+    /// changed counts already (arm_after_patch). Unit lock held.
+    fn count_again_after_patch(&mut self, id: u32) {
+        let Some(threshold) = self.tier1.as_ref().map(|t| t.threshold) else { return };
+        let f = &self.fns[id as usize];
+        let rec = tier_rec(&self.slots, id);
+        if !f.compiled || f.o3.load(Ordering::Relaxed) || unsafe { (*rec.add(3)).load(Ordering::Acquire) } != T_QUEUED {
+            return;
+        }
+        let code = f.code;
+        unsafe {
+            let (now, wall) = tier_clocks();
+            let (cost, _) = tier_cost_now(rec, threshold, now);
+            count_again(rec, threshold, cost, now, wall, true);
+        }
+        self.rearm_counter(id, code);
+        if tier1_trace() {
+            eprintln!("O3q @{:.3} #{} counts again: a patch landed while its take ran", wall_ns() as f64 / 1e9, id);
         }
     }
 
@@ -24004,6 +24060,11 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
     let t2 = cpu_ns();
     if let Some(m) = measure.as_mut() { m.phase(2, t2); }
     trace_tier1_phase(id, "built");
+    // (a test's slot whose take a patch lands under: TAKE_MEETS_PATCH)
+    #[cfg(test)]
+    if TAKE_MEETS_PATCH.load(Ordering::Relaxed) == id {
+        PATCH_EPOCH.fetch_add(1, Ordering::SeqCst);
+    }
     // SPEC-V: callees this replacement calls that have no code yet but ran inside twin code get
     // theirs before the swap (prebuild_callees)
     // (not for an O3-always first build: that is a program thread's lazy compile)
@@ -24437,6 +24498,9 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
                 // per slot, so a slot a patch keeps changing is not chased).
                 if why == "slot changed meanwhile" && !u.fns[id as usize].o3.load(Ordering::Relaxed) {
                     u.retier(id);
+                }
+                if why == "patch changed meanwhile" {
+                    u.count_again_after_patch(id);
                 }
                 // SPEC-V: a callee it took in unverified was rejected meanwhile: built again
                 // without it (the snapshot leaves a rejected callee out)
