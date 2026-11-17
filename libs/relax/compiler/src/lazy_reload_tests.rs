@@ -2958,7 +2958,7 @@ impl KeptRig {
 
     /// Substitutions in `file`'s text as the rig last set it, applied live.
     fn edit(&mut self, file: &str, subs: &[(&str, &str)]) -> crate::reload::Outcome {
-        let mut text = self.texts.iter().find(|(p, _)| p.ends_with(&format!("/{file}"))).unwrap().1.clone();
+        let mut text = self.texts.iter().find(|(p, _)| p.replace('\\', "/").ends_with(&format!("/{file}"))).unwrap().1.clone();
         for (from, to) in subs {
             assert!(text.contains(from), "{file}: {from}");
             text = text.replacen(from, to, 1);
@@ -2968,10 +2968,12 @@ impl KeptRig {
 
     /// `file`'s whole text, applied live.
     fn set(&mut self, file: &str, text: &str) -> crate::reload::Outcome {
-        let (path, kept) = self.texts.iter_mut().find(|(p, _)| p.ends_with(&format!("/{file}"))).unwrap();
+        let (path, kept) = self.texts.iter_mut().find(|(p, _)| p.replace('\\', "/").ends_with(&format!("/{file}"))).unwrap();
         *kept = text.to_string();
-        let path = path.clone();
-        let index = self.unit.prog.current_source_files(|q| q == path)[&path];
+        // (the program names a file by its normalized path: `c:/..` where a Windows path is `C:\..`)
+        let norm = |s: &str| s.replace('\\', "/").to_lowercase();
+        let want = norm(path);
+        let (path, index) = self.unit.prog.current_source_files(|q| norm(q) == want).into_iter().next().map(|(p, i)| (p.clone(), i)).unwrap();
         unsafe { crate::reload::apply(self.up, vec![crate::reload::Edit { file: index, path, src: text.as_bytes().to_vec() }]) }
     }
 
