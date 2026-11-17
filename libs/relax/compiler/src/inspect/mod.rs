@@ -1191,6 +1191,11 @@ fn cmd_threads(out: &mut Out) {
         if let Some(r) = jit_rows.iter().find(|r| r.os_id == t.os_id) {
             wait.push_str(&lifeline_fields(r));
         }
+        if t.state == "uninterruptible" {
+            if let Some(k) = threads::kernel_wait(t.os_id) {
+                wait.push_str(&format!(",\"kernel_wait\":{}", json_str(&k)));
+            }
+        }
         // held by a pause (or for good: a frame in code a layout patch replaced)
         if instrument::held_now(t.os_id) {
             wait.push_str(",\"held\":true");
@@ -1323,6 +1328,11 @@ pub(crate) fn cmd_stacks(req: &Req, out: &mut Out) {
         }
         if c.t.handle != 0 && instrument::stopped(&c.t) {
             err.push_str(&script_stack_field("script", c.t.handle));
+        }
+        if c.t.state == "uninterruptible" {
+            if let Some(k) = threads::kernel_wait(c.t.os_id) {
+                err.push_str(&format!(",\"kernel_wait\":{}", json_str(&k)));
+            }
         }
         out.line(&format!("{{\"threads\":[{}],\"state\":\"{}\",\"frames\":[{}]{}}}", names.join(","), c.t.state, key.join(","), err));
     }
