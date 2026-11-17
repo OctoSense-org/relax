@@ -114,6 +114,28 @@ mod test_child {
         command.output().unwrap()
     }
 
+    /// `output`, the child ended once it has run `secs`: Err with what it wrote until then.
+    #[cfg(unix)]
+    fn output_within(command: &mut Command, secs: u64) -> Result<Output, Output> {
+        extern "C" {
+            fn kill(pid: i32, sig: i32) -> i32;
+        }
+        let _slot = slot();
+        let child = command.stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).spawn().unwrap();
+        let pid = child.id() as i32;
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(child.wait_with_output().unwrap());
+        });
+        match rx.recv_timeout(std::time::Duration::from_secs(secs)) {
+            Ok(out) => Ok(out),
+            Err(_) => {
+                unsafe { kill(pid, 9) };
+                Err(rx.recv().unwrap())
+            }
+        }
+    }
+
     /// `command` (a child of this test binary) run to its end in a slot.
     pub fn status(command: &mut Command) -> ExitStatus {
         let _slot = slot();
@@ -128,6 +150,17 @@ mod test_child {
 
     /// `run_alone`, with an optional CPU budget for the child instead of its parent's share.
     pub fn run_alone_with_cores(module: &str, name: &str, cores: Option<usize>) -> bool {
+        run_alone_as(module, name, cores, None)
+    }
+
+    /// `run_alone` for a test whose regression is a hang: a child that has not ended `secs` after
+    /// it started is ended, and the test fails saying so.
+    #[cfg(any(target_vendor = "apple", all(target_os = "linux", target_arch = "x86_64")))]
+    pub fn run_alone_within(module: &str, name: &str, secs: u64) -> bool {
+        run_alone_as(module, name, None, Some(secs))
+    }
+
+    fn run_alone_as(module: &str, name: &str, cores: Option<usize>, within: Option<u64>) -> bool {
         let module = module.split_once("::").map_or("", |(_, rest)| rest);
         let test = if module.is_empty() { name.to_string() } else { format!("{module}::{name}") };
         if std::env::var(CHILD).is_ok_and(|t| t == test) {
@@ -139,7 +172,15 @@ mod test_child {
         if let Some(cores) = cores {
             command.env("MAKEPAD_CPU_CORES", cores.to_string());
         }
-        let output = output(&mut command);
+        let output = match within {
+            None => output(&mut command),
+            #[cfg(unix)]
+            Some(secs) => output_within(&mut command, secs).unwrap_or_else(|out| {
+                panic!("{test} in its own process: it had not ended {secs} s after it started (ended)\n{}\n{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr))
+            }),
+            #[cfg(not(unix))]
+            Some(_) => output(&mut command),
+        };
         let all = format!("{}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
         if !(output.status.success() && all.contains("test result: ok. 1 passed")) {
             panic!("{test} in its own process: {}\n{all}", child_cause(&all, &test, output.status));
