@@ -137,7 +137,6 @@ use crate::types::{RegionId, RegionKind, TyId, TyKind, UniverseIndex};
 
 /// What the driver needs of N01's inference context beyond the type operations.
 pub trait RegionDriverOps: BorrowckTypeOps {
-    fn num_region_vars(&self) -> usize;
     /// The origin and universe `next_nll_region_var*` recorded for `vid`.
     fn region_var_info(&self, vid: RegionVid) -> (NllRegionVariableOrigin, UniverseIndex);
     /// `renumber_mir`: every free region of the body and of its promoted bodies becomes a fresh variable.
@@ -334,7 +333,6 @@ pub fn free_regions_in_order(tcx: &Tcx, ty: TyId) -> Vec<RegionId> {
 }
 
 impl RegionDriverOps for super::infer_ctxt::BorrowckInferCtxt<'_> {
-    fn num_region_vars(&self) -> usize { self.infcx.num_region_vars() }
     fn region_var_info(&self, vid: RegionVid) -> (NllRegionVariableOrigin, UniverseIndex) {
         use crate::infer::region_constraints::RegionVariableOrigin;
         let origin = match self.infcx.region_var_origin(vid as u32) {

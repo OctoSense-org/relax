@@ -1718,6 +1718,11 @@ fn check_crate_impl(u: &mut Unit, root: u32, crates: &[u32], front: Vec<String>,
     st.mark("borrowck finish");
     if !quiet {
     eprintln!("relax check: {} body owners of the checked crates, {} compiled in all, {} errors", n_own, unsafe { (*up).stats.compiled }, errors.len() + borrow_count);
+    // the borrow check's fn-signature binder scopes by how they closed (binder_scope.rs)
+    let [eliminated, later, test, aside] = relax_types::borrowck::type_check::scope_closes();
+    if eliminated + later + test + aside > 0 {
+        eprintln!("relax check: binder scopes: {eliminated} eliminated, {later} kept for a later placeholder, {test} kept for a type test; {aside} nested components set aside");
+    }
     }
     if !quiet {
         let st = unsafe { &(*up).stats };
