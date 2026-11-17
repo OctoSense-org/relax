@@ -614,6 +614,20 @@ pub fn instantiate_body(cx: &crate::tcx::EvalCx<'_>, prog: &Program, tcx: &Tcx, 
     try_instantiate_body(cx, prog, tcx, def, args).unwrap_or_else(|_| no_codegen_body(prog, tcx, def, args))
 }
 
+/// The body the borrow check reads for the instance `def<args>`, typed as the check types it:
+/// rustc_borrowck reads the identity body's typeck results (TypingMode::borrowck), where another
+/// fn's opaque return stays the opaque its signature names. The identity instance is the stored
+/// typeck body (as check_crate and the background checker pass it); a concrete one is normalized
+/// in the borrowck mode. `instantiate_body`'s instance is revealed (PostAnalysis, codegen's view):
+/// a call's destination there is the callee's hidden type while the check reads the callee's output
+/// as the opaque, a MIR bug (call dest mismatch) at every call of a fn returning `impl Trait`.
+pub fn borrowck_body(prog: &Program, tcx: &Tcx, def: DefId, args: &[TyId]) -> Result<std::sync::Arc<Body>, crate::next_solver::NoSolution> {
+    let body = tcx.typeck(prog, def);
+    if *body.args == *args { return Ok(body); }
+    let env = crate::tcx::TypingEnv { limit: crate::tcx::RecursionLimit::for_item(prog, def), param_env: crate::tcx::ParamEnvId::EMPTY, mode: crate::tcx::TypingMode::borrowck(tcx, prog, def) };
+    instantiate::try_normalize_body(prog, tcx, env, &body, args).map(std::sync::Arc::new)
+}
+
 static CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// rustc_middle/src/ty/normalize_erasing_regions.rs:172-186: normalization failure

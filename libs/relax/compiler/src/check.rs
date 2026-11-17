@@ -753,6 +753,13 @@ fn def_ice(prog: &crate::program::Program, d: crate::program::DefId, what: &str,
 /// What a borrowck verdict says beyond its errors: an internal error for every body a failure left
 /// unchecked (never taken as checked: rustc's delayed bug), and a note on stderr for every body
 /// holding a construct the MIR builder does not express (a known gap, not refused).
+/// The verdict of an instance whose body has no normal form in the borrow check's typing mode
+/// (typeck::borrowck_body) while it has one revealed: the check could not run, an internal error.
+pub(crate) fn unnormalized_verdict(prog: &crate::program::Program, d: crate::program::DefId) -> crate::borrowck::Verdict {
+    crate::borrowck::Verdict { errors: Vec::new(), unchecked: vec![format!("{}: its instance has no normal form in the borrow check's typing mode", prog.def_path(d))],
+        unsupported: Vec::new(), fv_only: Vec::new(), fv_records: Vec::new(), relaxed_records: Vec::new(), bodies: 0 }
+}
+
 pub(crate) fn verdict_gaps(prog: &crate::program::Program, d: crate::program::DefId, v: &crate::borrowck::Verdict) -> Vec<String> {
     let errors = v.unchecked.iter().map(|x| def_ice(prog, d, "the borrows", x)).collect();
     for x in &v.unsupported { stderr_line!("relax check: note: not borrow-checked: {}", x); }
@@ -1616,7 +1623,11 @@ fn check_crate_impl(u: &mut Unit, root: u32, crates: &[u32], front: Vec<String>,
                 if !body.errors.is_empty() {
                     return;
                 }
-                let v = crate::borrowck::check_body(&crate::tcx::EvalCx::new(&uu.prog, &uu.tcx, crate::tcx::TypingEnv::fully_monomorphized(&uu.prog), &crate::tcx::EvalState::new()), &uu.prog, &uu.tcx, &body);
+                // the check reads the body as it types it (opaques kept), not the revealed instance
+                let v = match crate::typeck::borrowck_body(&uu.prog, &uu.tcx, d, &args) {
+                    Ok(checked) => crate::borrowck::check_body(&crate::tcx::EvalCx::new(&uu.prog, &uu.tcx, crate::tcx::TypingEnv::fully_monomorphized(&uu.prog), &crate::tcx::EvalState::new()), &uu.prog, &uu.tcx, &checked),
+                    Err(_) => unnormalized_verdict(&uu.prog, d),
+                };
                 crate::borrowck::note_verdict(&v);
                 borrow_errors.extend(verdict_gaps(&uu.prog, d, &v));
                 borrow_diagnostics.extend(crate::borrowck::lazy::report_checked(&uu.prog, 0, uu.tcx.collect_epoch.load(std::sync::atomic::Ordering::SeqCst), d, &body.args, v.errors, crate::borrowck::event::Origin::Check).iter().map(|e| e.error.to_diagnostic()));
