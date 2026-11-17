@@ -326,9 +326,14 @@ fn usable_slot(f: &mut std::fs::File, h: &Header, len: u64) -> Option<(u32, Vec<
 static TO_SEAL: relax_session::sync::Mutex<Vec<(PathBuf, [u8; HEADER])>> = relax_session::sync::Mutex::new(Vec::new());
 static SEALING: AtomicBool = AtomicBool::new(false);
 
-/// An open verified what an exit committed without a barrier (`hb`, the header it read): one
-/// background thread makes it durable (`seal`), so later opens do not read it all again.
+/// A commit made without a barrier (`hb`, its header): an append's or a rewrite's, or an exit's
+/// that an open verified. One background thread makes it durable (`seal`), so later opens do not
+/// read it all again; the writer does not wait on the disk for it (a cold run's spills sealed
+/// each store on the cache writer: 20-1900 ms a store on a busy disk, 12-14 s a spill).
 fn queue_seal(file: &Path, hb: &[u8]) {
+    // (a test's crash before the seal)
+    #[cfg(test)]
+    if tests::SEAL_HELD.with(|h| h.get()) { return; }
     let Ok(hb) = <[u8; HEADER]>::try_from(hb) else { return };
     if !ordered() {
         return;
@@ -353,8 +358,10 @@ fn queue_seal(file: &Path, hb: &[u8]) {
                     q.clear();
                 }
                 let next = q.pop();
-                if next.is_none() {
-                    SEALING.store(false, Ordering::Release);
+                match &next {
+                    // the newest commit of a file seals the ones queued before it (one barrier)
+                    Some((file, _)) => q.retain(|(p, _)| p != file),
+                    None => SEALING.store(false, Ordering::Release),
                 }
                 next
             };
@@ -955,10 +962,10 @@ fn append_inner<T: Entry>(base: &Path, mut entries: Vec<T>, drop_all: bool, orde
     let ib = encode_index(&ix);
     let next = 1 - k;
     // The commit goes in under the lock without a barrier, as an exit commits: its slot keeps
-    // `tail`, so an open meanwhile verifies these payloads. The barrier comes after the lock is
-    // released (`seal`, which then moves `tail` to the end): a barrier can wait on a busy disk for
+    // `tail`, so an open meanwhile verifies these payloads. The barrier comes on the seal thread
+    // (`queue_seal`, which then moves `tail` to the end): a barrier can wait on a busy disk for
     // tens of seconds, and under the lock every open of this store (another process's start
-    // included) would wait with it. Nothing is written after the header (a commit lost to a
+    // included) would wait with it, and on the writer every later store of its spill. Nothing is written after the header (a commit lost to a
     // power cut is a cache miss, and other processes read the page cache). An exit's commit is
     // not sealed: the next open verifies its payloads, from `tail` on.
     f.seek(SeekFrom::Start(h.slot_off(next)))?;
@@ -971,9 +978,7 @@ fn append_inner<T: Entry>(base: &Path, mut entries: Vec<T>, drop_all: bool, orde
     let _ = f.unlock();
     drop(f);
     if ordered {
-        if let Err(e) = seal(&gen_file, &hb) {
-            write_failed(base, &e);
-        }
+        queue_seal(&gen_file, &hb);
     }
     Ok(None)
 }
@@ -989,6 +994,8 @@ pub fn profiling() -> bool {
 /// `F_FULLFSYNC` there, a full flush of the drive's cache per call (a large app's cold launch made ~3.7k
 /// of them); elsewhere (and where the barrier is refused) `sync_data`.
 fn order_writes(f: &std::fs::File) -> std::io::Result<()> {
+    #[cfg(test)]
+    tests::BARRIERS.with(|b| b.set(b.get() + 1));
     #[cfg(target_vendor = "apple")]
     {
         use std::os::fd::AsRawFd;
@@ -1046,14 +1053,12 @@ fn rewrite<T: Entry>(base: &Path, dir: &Path, old: Vec<Ix>, from: Option<&std::f
         ix.sort_by_key(|e| e.key);
         crate::memstat::print_tag("cache rewrite", crate::memstat::Tag::CacheStore);
         let ib = encode_index(&ix);
-        h.slots[0] = Slot { n: ix.len() as u64, end: off, sum: sum64(&ib), tail: if ordered { off } else { h.data_start() } };
+        // committed as an exit commits (an open verifies its payloads, from the data start): the
+        // barrier that makes them durable runs on the seal thread (`queue_seal`), not here
+        h.slots[0] = Slot { n: ix.len() as u64, end: off, sum: sum64(&ib), tail: h.data_start() };
         out.seek(SeekFrom::Start(h.slot_off(0)))?;
         out.write_all(&ib)?;
-        // the payloads before the header that commits them (a temp file nobody reads yet)
         out.flush()?;
-        if ordered {
-            order_writes(out.get_ref())?;
-        }
         out.seek(SeekFrom::Start(0))?;
         out.write_all(&h.bytes())?;
         out.flush()?;
@@ -1061,6 +1066,9 @@ fn rewrite<T: Entry>(base: &Path, dir: &Path, old: Vec<Ix>, from: Option<&std::f
         Ok(())
     })?;
     written_gen(base, g);
+    if ordered {
+        queue_seal(&path, &h.bytes());
+    }
     Ok(())
 }
 
@@ -1633,6 +1641,21 @@ pub fn delete_checked(p: &Path) -> bool {
 mod tests {
     use super::*;
 
+    thread_local! {
+        /// The write barriers this thread made (order_writes)
+        pub(super) static BARRIERS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+        /// This thread's commits are not queued for the seal thread: the process ends first
+        pub(super) static SEAL_HELD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    /// Seals the store's commit as the seal thread does (or did already).
+    fn seal_now(p: &Path) {
+        let file = current(&base_path(p));
+        let mut hb = [0u8; HEADER];
+        std::fs::File::open(&file).unwrap().read_exact(&mut hb).unwrap();
+        seal(&file, &hb).unwrap();
+    }
+
     fn tmpdir(tag: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!("rcs-test-{}-{}", tag, std::process::id()));
         let _ = std::fs::create_dir_all(&d);
@@ -1955,6 +1978,55 @@ mod tests {
         (ix.iter().find(|e| e.key == 2).unwrap().off, s, ix)
     }
 
+    /// An append and a rewrite commit without waiting on the disk: the writer makes no barrier (a
+    /// cold run's spill sealed each of its 250 stores on the cache writer, 0.5-1.9 s a store on a
+    /// busy disk); the commit is served at once, and its seal (the seal thread's) is the barrier.
+    #[test]
+    fn a_writer_leaves_its_barrier_to_the_seal_thread() {
+        let d = tmpdir("seal-thread");
+        let p = d.join("core-00112233445566dd.rcs");
+        BARRIERS.with(|b| b.set(0));
+        // the first write makes the store (a rewrite), the second appends to it
+        append_as(&p, vec![NewEntry { key: 1, kind: 1, payload: vec![1; 5000] }], false, true).unwrap();
+        append_as(&p, vec![NewEntry { key: 2, kind: 1, payload: vec![2; 5000] }], false, true).unwrap();
+        assert_eq!(BARRIERS.with(|b| b.get()), 0, "the writer waited on the disk for its commit's barrier");
+        let st = Store::open(&p).unwrap();
+        assert_eq!((st.get(1).unwrap().1, st.get(2).unwrap().1), (&[1u8; 5000][..], &[2u8; 5000][..]));
+        // sealed here, or already by the seal thread
+        seal_now(&p);
+        let (s, ix) = active(&p);
+        assert_eq!((s.tail, ix.len()), (s.end, 2), "a sealed commit has nothing left to verify");
+        drop(st);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A crash between an append and its seal (the seal thread never ran): the commit says from
+    /// where its payloads are unverified, and an open that finds one of them not on the disk drops
+    /// the commit for the one before it. Nothing of the dropped commit is served.
+    #[test]
+    fn a_crash_before_the_seal_drops_a_commit_whose_payload_did_not_land() {
+        let d = tmpdir("crash-before-seal");
+        let p = d.join("core-00112233445566ee.rcs");
+        append_as(&p, vec![NewEntry { key: 1, kind: 1, payload: vec![1; 5000] }], false, true).unwrap();
+        seal_now(&p);
+        SEAL_HELD.with(|h| h.set(true));
+        append_as(&p, vec![NewEntry { key: 2, kind: 1, payload: vec![2; 5000] }], false, true).unwrap();
+        SEAL_HELD.with(|h| h.set(false));
+        let (s, ix) = active(&p);
+        let two = ix.iter().find(|e| e.key == 2).unwrap().off;
+        assert!(s.tail <= two && s.tail < s.end, "the unsealed commit says where its unverified payloads begin");
+        // key 2's payload did not reach the disk
+        let f = std::fs::OpenOptions::new().write(true).open(current(&base_path(&p))).unwrap();
+        write_at(&f, &[0x5a; 16], two + 2500).unwrap();
+        drop(f);
+        let st = Store::open(&p).expect("the commit before");
+        assert_eq!(st.get(1).unwrap().1, &[1u8; 5000][..], "the commit before stays warm");
+        assert!(st.get(2).is_none(), "a payload that did not reach the disk is never served");
+        assert_eq!(peek(&p, 1).unwrap(), vec![vec![1u8; 5000]], "a peek reads the commit before");
+        drop(st);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
     /// An exit commits without the write barrier (so it does not wait on the disk) and says from
     /// where: an open verifies those payloads and serves them, then seals the commit (its barrier,
     /// after the fact) without changing its generation; a later commit with its barrier covers them.
@@ -1977,10 +2049,11 @@ mod tests {
         assert_eq!(header_generation(&p), Some(st.generation), "a seal keeps the commit's generation");
         let certified = Store::open_certified(&p, Box::leak(st.index.to_vec().into_boxed_slice()), st.generation).unwrap();
         assert_eq!(certified.get(2).unwrap().1, &[2u8; 5000][..]);
-        // another exit's commit, then one with its barrier: that one covers both
+        // another exit's commit, then one sealed: its barrier covers both
         append_as(&p, vec![NewEntry { key: 3, kind: 1, payload: vec![3; 100] }], false, false).unwrap();
         assert!(active(&p).0.tail < active(&p).0.end);
         append_as(&p, vec![NewEntry { key: 4, kind: 1, payload: vec![4; 100] }], false, true).unwrap();
+        seal_now(&p);
         let (s, ix) = active(&p);
         assert_eq!((s.tail, ix.len()), (s.end, 4));
         drop((st, certified));
@@ -2003,6 +2076,7 @@ mod tests {
         assert_eq!(peek(&p, 1).unwrap(), vec![vec![1u8; 5000]]);
         // the next run's commit (with its barrier) builds on the commit before
         append_as(&p, vec![NewEntry { key: 3, kind: 1, payload: vec![3; 100] }], false, true).unwrap();
+        seal_now(&p);
         let next = Store::open(&p).unwrap();
         assert_eq!(next.get(1).unwrap().1, &[1u8; 5000][..]);
         assert_eq!(next.get(3).unwrap().1, &[3u8; 100][..]);
