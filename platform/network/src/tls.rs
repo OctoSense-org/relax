@@ -790,9 +790,16 @@ impl TlsStream {
     }
 
     /// A handle on the underlying socket, to shut it down from another
-    /// thread.
+    /// thread or to wait for input on it.
     pub fn try_clone_tcp(&self) -> io::Result<TcpStream> {
         crate::clone_tcp(self.inner.tcp())
+    }
+
+    /// Plaintext the TLS layer holds already: a read returns it without
+    /// waiting on the socket. A reader that waits for input on the socket
+    /// (`try_clone_tcp`, `peek`) reads first while this is above zero.
+    pub fn buffered(&self) -> usize {
+        self.inner.buffered()
     }
 
     pub fn shutdown(&mut self) {
