@@ -755,6 +755,41 @@ mod image_table_tests {
         crate::image::Reader::new(mapped(w.finish())).unwrap()
     }
 
+    /// A cell that another thread fills while its image is written (the collected program
+    /// captured under a front read while lazy compiles fill signatures) is written whole:
+    /// empty, or its full value. Never the empty flag followed by the value's bytes, which
+    /// misaligns every later field of the image.
+    #[test]
+    fn a_cell_filled_while_its_image_is_written_is_written_whole() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        const CELLS: usize = 2048;
+        // (a value whose first byte is no bool: a torn cell fails the decode)
+        const VALUE: u64 = 0xA5A5_A5A5_A5A5_A5A5;
+        let mut images = 0u32;
+        for round in 0..200 {
+            let cells: Vec<OnceLock<u64>> = (0..CELLS).map(|_| OnceLock::new()).collect();
+            let (go, filled) = (AtomicBool::new(false), AtomicBool::new(false));
+            std::thread::scope(|s| {
+                s.spawn(|| {
+                    while !go.load(Ordering::Acquire) { std::hint::spin_loop(); }
+                    // from the end: each image, written from the start, meets the filler once
+                    for c in cells.iter().rev() { let _ = c.set(VALUE); }
+                    filled.store(true, Ordering::Release);
+                });
+                go.store(true, Ordering::Release);
+                loop {
+                    let last = filled.load(Ordering::Acquire);
+                    let bytes = crate::crate_image::encode(&cells);
+                    let back = crate::crate_image::decode::<Vec<OnceLock<u64>>>(&bytes);
+                    assert!(back.is_some_and(|b| b.len() == CELLS && b.iter().all(|c| c.get().is_none_or(|v| *v == VALUE))),
+                        "round {round}, image {images}: a cell filled while it was written broke the image");
+                    images += 1;
+                    if last { break; }
+                }
+            });
+        }
+    }
+
     #[test]
     fn image_map_reads_in_place_and_owns_on_first_mutation() {
         let mut owned: ImageMap<(u32, DefId), Vec<String>> = Default::default();
