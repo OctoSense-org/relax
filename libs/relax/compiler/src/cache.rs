@@ -8778,6 +8778,89 @@ mod cold_tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    /// The collected program captured under a front read, off the owner thread (run.rs
+    /// record_collected). A front writer that comes during the capture stops it at its next
+    /// check and takes the lock once the read is released, and nothing is written; a table
+    /// changed without the front write (the shape guard) drops the image too; the next capture
+    /// records the owner's image byte for byte, and a start restores the program from it.
+    #[test]
+    fn a_collected_capture_under_a_front_read_gives_way_and_guards_its_shape() {
+        isolated_test!(a_collected_capture_under_a_front_read_gives_way_and_guards_its_shape);
+        let mut session = crate::Session::default();
+        session.options.rs_lazy = true;
+        let sess = &std::sync::Arc::new(session);
+        let dir = std::env::temp_dir().join(format!("relax-collected-capture-{}-{}", std::process::id(), crate::clock::wall_ns()));
+        let package = dir.join("host");
+        std::fs::create_dir_all(&package).unwrap();
+        std::fs::write(package.join("Cargo.toml"), "[package]\nname = \"capture\"\nversion = \"0.1.0\"\n[lib]\npath = \"lib.rs\"\n").unwrap();
+        let root = package.join("lib.rs").to_string_lossy().into_owned();
+        std::fs::write(&root, "pub struct Pair { pub a: u32, pub b: u64 } pub fn sum(p: &Pair) -> u64 { p.a as u64 + p.b } pub fn main() {}").unwrap();
+        let cfg = crate::cfg::CfgSet::host(sess, &[]);
+        let pre = vec![crate::preload::PreCrate { name: "capture".into(), root, edition: 2021, cfg: cfg.clone(),
+            deps: vec![], proc_macro: false, image_deps: vec![], image_dep_names: vec![] }];
+        let store = dir.join("cache");
+        pack::ensure_private_dir(&store).unwrap();
+        let mut prog = crate::program::Program::new(sess);
+        prog.record_front = true;
+        prog.front_sink = Some(FrontSink::for_dir(&store));
+        prog.preload(pre.clone());
+        prog.load_crate(&pre[0].name, &pre[0].root, 2021, cfg, vec![]).unwrap();
+        prog.resolve_imports();
+        assert!(prog.errors.is_empty(), "{:?}", prog.errors);
+        ColdFront::default().finish_in(&mut prog, store.clone());
+        let identity = prog.front_graph.as_ref().unwrap().identity;
+        let mut tcx = crate::tcx::Tcx::new();
+        tcx.collect(&prog);
+        let unit = Unit::new(prog, tcx, 0);
+        let mut cache = Cache::open_in(&unit, Mode::On, dir.join("collected")).unwrap();
+        cache.dir = store.clone();
+        cache.crate_path = vec![store.join(front_store_name(&sess.options, "capture", cache.fps[0]))];
+        let bytes = |payload: &crate::image::Writer<'_>| { let mut b = Vec::new(); payload.write_to(&mut b).unwrap(); b };
+        let owners = match cache.encode_collected(&unit.prog, &unit.tcx, &|| false) {
+            CollectedRecord::Ready(_, payload) => bytes(&payload),
+            _ => panic!("the owner's encode records the program"),
+        };
+        let inputs = cache.collected_record_inputs();
+        let stored = || Store::open(&collected::path(&store, identity)).is_some();
+
+        // a front writer comes during the capture: the capture's next check stops it
+        let epoch = crate::jit::front_epoch();
+        std::thread::scope(|s| {
+            let read = crate::jit::front_read("test capture");
+            let writer = s.spawn(|| drop(crate::jit::front_write()));
+            let r = inputs.capture(&unit.prog, &unit.tcx, &|| {
+                while !crate::preempt::writer_waiting() { std::thread::yield_now(); }
+                crate::run::capture_stop()
+            });
+            assert!(matches!(r, Ok(CollectedRecord::Yielded)), "a waiting front writer stops the capture");
+            drop(read);
+            writer.join().unwrap();
+        });
+        assert!(crate::jit::front_epoch() > epoch, "the writer took the front lock");
+        assert!(!stored(), "a stopped capture writes nothing");
+
+        // a table changed without the front write while the capture ran
+        collected::SHAPE_CHANGED.with(|c| c.set(true));
+        let guarded = inputs.capture(&unit.prog, &unit.tcx, &|| false);
+        assert!(guarded.as_ref().is_err_and(|why| why.contains("without the front write")), "the shape guard drops the image");
+        assert!(!stored());
+
+        // the next capture records the owner's image, and a start restores from it
+        let read = crate::jit::front_read("test capture");
+        let (dest, payload) = match inputs.capture(&unit.prog, &unit.tcx, &crate::run::capture_stop) {
+            Ok(CollectedRecord::Ready(dest, payload)) => (dest, payload),
+            _ => panic!("an undisturbed capture records the program"),
+        };
+        drop(read);
+        assert!(bytes(&payload) == owners, "the capture off the owner is the owner's image");
+        Cache::commit_collected(None, dest, payload, &|| false).expect("the capture is written");
+        let images = FrontImages { dir: store.clone(), ..Default::default() };
+        let (saved, saved_tcx, _) = images.restore_collected(sess, &pre).expect("a start restores the captured program");
+        assert_eq!((saved.defs.len(), saved.files.len(), saved_tcx.tys.len()), (unit.prog.defs.len(), unit.prog.files.len(), unit.tcx.tys.len()));
+        std::mem::forget(unit);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     /// An app check loads its checked crates again every time (reload_crates). Its first load puts
     /// them, the crates depending on them and the ones of their names last, so the collected image
     /// it records is the one the next check restores: that restore keeps every other crate, and a

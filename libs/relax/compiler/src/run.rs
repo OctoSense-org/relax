@@ -5019,6 +5019,8 @@ fn drop_later_now() {
 /// timeline (`pf`, `timeline`) shows each section as a span inside the owner's service, so a
 /// frame that waited for the owner names the section that held it.
 pub(crate) fn yield_section(s: &'static str) {
+    // (a capture off the owner thread holds no owner section: the settle rebuild's, record_collected)
+    if !crate::owner::is_owner() { return; }
     let prev = std::mem::replace(&mut *YIELD_SECTION.lock().unwrap_or_else(|e| e.into_inner()), s);
     // (on the owner thread, inside its service span: every section is set and cleared there)
     if crate::owner::is_owner() && crate::inspect::timeline::recording() {
@@ -5067,6 +5069,135 @@ fn set_mid_cache_dir(dir: &std::path::Path) {
 // the front images' line once the program presented (a process ended by its framework
 // never prints the exit summary): files mapped, images not matching, arrays copied back
 static FRONT_REPORTED: AtomicBool = AtomicBool::new(false);
+
+thread_local! {
+    /// this thread captures the collected program under a front read (record_collected): it
+    /// makes no request the owner thread must serve (owner.rs request_dyn)
+    static CAPTURING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// This thread captures the collected program under a front read now.
+pub(crate) fn capturing() -> bool {
+    CAPTURING.try_with(|c| c.get()).unwrap_or(false)
+}
+
+/// What stops the collected capture under its front read: a front writer waits (a load, a live
+/// edit: it then waits for one stop interval), or the run ends.
+pub(crate) fn capture_stop() -> bool {
+    crate::preempt::writer_waiting() || crate::preempt::is_stopped()
+}
+
+/// The collected program, recorded off the owner thread. One owner step takes the front images
+/// of files loaded since this write took them (`imaged_files`: the program's file count they
+/// cover), the encoder's inputs, and the front-write count all of it describes. On this thread a
+/// front read then holds that program while it is encoded: the owner goes on compiling, and a
+/// front writer (a load, a live edit) waits for at most one stop interval, which drops the
+/// encode for a later write. The store write and the commit run with no lock. A front write
+/// between the two steps, or a table changed under the read (the shape guard: a change made
+/// without the front write), leaves the record to a later write.
+fn record_collected(up: *mut Unit, wait: bool, imaged_files: usize, crates_left: bool) {
+    let t = Instant::now();
+    // the cache files' pages the run has resident go first (a settle's trim drops them too):
+    // the record's copy of the program comes on top of what the process holds
+    crate::pack::release_resident();
+    // files the post-boot loader loaded since this write took its front images (a run that did
+    // not restore loads for seconds after present): their images are taken in the owner step
+    // (the front-write count read there says the program is still the one they are of)
+    let late = wait && front_recordable() && crate::owner::publish(|| unsafe { (*up).prog.files.len() } != imaged_files);
+    let step = || {
+        let u = unsafe { &mut *up };
+        let (mut imaged, mut left, mut late_spill) = (imaged_files, crates_left, None);
+        if late {
+            let stop = || crate::owner::request_waiting();
+            if let Some(c) = u.cache.as_mut() {
+                let (_, all_taken) = push_front_images(&u.prog, c, &stop);
+                left = !(all_taken && c.record_front_crates_until(&u.prog, &stop));
+                late_spill = c.spill_take();
+                if !left { imaged = u.prog.files.len(); }
+            }
+        }
+        (u.cache.as_ref().map(|c| c.collected_record_inputs()), late_spill, imaged, left, jit::front_epoch())
+    };
+    // (no late files: one bounded publish copies the encoder's inputs)
+    let (inputs, late_spill, imaged, left, epoch) = if late { crate::owner::call(crate::owner::Class::Program, step) } else { crate::owner::publish(step) };
+    let owner_ms = t.elapsed().as_secs_f64() * 1e3;
+    let Some(inputs) = inputs else { return };
+    if left { mid_yielded(); }
+    // the late files' images are in the store before the record that maps them
+    if late_spill.is_some_and(|s| s.write().is_err()) {
+        collected_skip("the late files' front images were not written");
+        return;
+    }
+    let t_capture = Instant::now();
+    let record = {
+        let _c = crate::zone_alloc::compiler();
+        let read = jit::front_read("cache collected");
+        // the program the front images were taken of, and it stays so while the read is held
+        if jit::front_epoch() != epoch {
+            collected_skip("a front write came after the front images were taken");
+            return;
+        }
+        let (prog, tcx) = read.unit(up);
+        if prog.files.len() != imaged {
+            collected_skip(if left { "the crate records stopped for a waiting request" } else { "files were loaded since the front images were taken" });
+            return;
+        }
+        if !front_recordable() || prog.has_edit_versions() {
+            collected_skip("the session was edited live");
+            return;
+        }
+        let _capturing = CapturingNow::enter();
+        match inputs.capture(prog, tcx, &capture_stop) {
+            Ok(record) => (record, inputs.crates(prog)),
+            Err(why) => {
+                crate::inspect::flightrec::event("cache.collected", &why, 0, 0);
+                eprintln!("relax collected: not recorded: {why}");
+                return;
+            }
+        }
+    };
+    let capture_ms = t_capture.elapsed().as_secs_f64() * 1e3;
+    let (record, crates) = record;
+    let retired = match record {
+        crate::cache::CollectedRecord::Ready(dest, payload) => {
+            MID_COLLECTED_TRIED.store(true, Ordering::Relaxed);
+            let report = VERBOSE.load(Ordering::Relaxed).then_some(crates);
+            let Some(written) = crate::cache::Cache::commit_collected(report, dest, payload, &|| false) else { return };
+            COLLECTED_CURRENT.store(true, Ordering::Relaxed);
+            crate::zone_alloc::kept_with(|| *COLLECTED_WRITTEN.lock().unwrap_or_else(|e| e.into_inner()) = Some(Box::new(written.clone())));
+            true
+        }
+        crate::cache::CollectedRecord::Current => {
+            MID_COLLECTED_TRIED.store(true, Ordering::Relaxed);
+            COLLECTED_CURRENT.store(true, Ordering::Relaxed);
+            true
+        }
+        crate::cache::CollectedRecord::Yielded => {
+            mid_yielded();
+            verbose!("relax collected: record yielded to a front writer after {:.1} ms; retried later", capture_ms);
+            false
+        }
+        crate::cache::CollectedRecord::Failed => {
+            MID_COLLECTED_TRIED.store(true, Ordering::Relaxed);
+            false
+        }
+    };
+    // (one bounded publish marks it; the retired boot snapshot is dropped here)
+    if retired {
+        let retired_boot = crate::owner::publish(|| unsafe { &mut *up }.cache.as_mut().map(|c| c.finish_collected()));
+        drop(retired_boot);
+    }
+    verbose!("relax cache: collected record off the owner: the owner step {:.1} ms, the capture under a front read {:.1} ms, in all {:.1} ms", owner_ms, capture_ms, t.elapsed().as_secs_f64() * 1e3);
+}
+
+/// CAPTURING for as long as it lives.
+struct CapturingNow;
+impl CapturingNow {
+    fn enter() -> Self { CAPTURING.with(|c| c.set(true)); CapturingNow }
+}
+impl Drop for CapturingNow {
+    fn drop(&mut self) { let _ = CAPTURING.try_with(|c| c.set(false)); }
+}
 
 /// `wait`: the warm record's writes (after first present, at a quit) wait for the owner thread to
 /// complete its work (which a cold run's compiles fill nearly all the time); other writes skip a busy unit.
@@ -5213,87 +5344,10 @@ fn mid_flush(quiet: bool, wait: bool) -> Option<(usize, usize)> {
     }
     let graph_ready = jit::live_startup_done()
         && crate::cache::Cache::flush_front_graphs().is_ok();
-    // the collected program, once per run and only when the program is quiet (it is encoded
-    // under the unit and front-end locks): not at the exit
+    // the collected program, once per run and only when the program is quiet: recorded off the
+    // owner thread (record_collected)
     if graph_ready && quiet && !COLLECTED_CURRENT.load(Ordering::Relaxed) && !MID_COLLECTED_TRIED.load(Ordering::Relaxed) {
-        // not when a file was loaded since this write took its front images (its restore maps
-        // every file from them); a later quiet flush or the exit tries again. Files the lazy
-        // selection still skips travel in the image (skipped_files, deferred imports).
-        // Encoded on the owner thread, but never in the main thread's way: the encode stops when
-        // the main thread waits for the owner thread (a frame's lazy compile) and a later pass
-        // tries again; the store write runs after the owner thread releases it.
-        let cprobe = YieldProbe::new();
-        // the cache files' pages the run has resident go first (a settle's trim drops them too):
-        // the record's copy of the program comes on top of what the process holds
-        crate::pack::release_resident();
-        if let Some((ready, retired_boot, late_spill, t)) = unit_call(wait, || {
-            cprobe.start();
-            yield_section("collected");
-            let mut ready = None;
-            let mut retired_boot = None;
-            let mut late_spill = None;
-            let t = Instant::now();
-            // asked at each step and through the encode: a waiting request (a frame's lazy
-            // compile, a live patch, a back end's Job) goes first, and a later pass tries again
-            let stop = || { cprobe.tick("collected"); crate::owner::request_waiting() };
-            // the front-end lock: for at most 50 ms, and not while a request waits for the owner
-            // thread this holds
-            let front = {
-                let t = Instant::now();
-                loop {
-                    if let Some(g) = jit::front_write_within(1) { break Some(g); }
-                    if stop() || t.elapsed() >= std::time::Duration::from_millis(50) { break None; }
-                }
-            };
-            if front.is_none() { collected_skip("the front-end lock is busy"); }
-            if let Some(_front) = front {
-                let u = unsafe { &mut *up };
-                // files the post-boot loader loaded since this write took its front images (a
-                // run that did not restore loads for seconds after present): their images are
-                // taken now, under the locks, so the record can be made in this pass (their store
-                // write runs after the owner thread is released, before the record's commit)
-                if wait && u.prog.files.len() != imaged_files && front_recordable() {
-                    if stop() { crates_left = true; mid_yielded(); } else if let Some(c) = u.cache.as_mut() {
-                        let (_, all_taken) = push_front_images(&u.prog, c, &stop);
-                        crates_left = !(all_taken && c.record_front_crates_until(&u.prog, &stop));
-                        late_spill = c.spill_take();
-                        if !crates_left { imaged_files = u.prog.files.len(); }
-                    }
-                }
-                if u.prog.files.len() != imaged_files {
-                    collected_skip(if crates_left { "the crate records stopped for a waiting request" } else { "files were loaded since the front images were taken" });
-                }
-                if let Some(c) = u.cache.as_mut().filter(|_| u.prog.files.len() == imaged_files) {
-                    match c.encode_collected(&u.prog, &u.tcx, &stop) {
-                        crate::cache::CollectedRecord::Ready(dest, payload) => { MID_COLLECTED_TRIED.store(true, Ordering::Relaxed); ready = Some((u.prog.session.options.verbose.then_some(c.collected_crates(&u.prog)), dest, payload)); }
-                        crate::cache::CollectedRecord::Current => { MID_COLLECTED_TRIED.store(true, Ordering::Relaxed); COLLECTED_CURRENT.store(true, Ordering::Relaxed); retired_boot = Some(c.finish_collected()); }
-                        crate::cache::CollectedRecord::Yielded => { mid_yielded(); verbose!("relax collected: record yielded to a waiting request after {:.1} ms; retried later", t.elapsed().as_secs_f64() * 1e3); }
-                        crate::cache::CollectedRecord::Failed => MID_COLLECTED_TRIED.store(true, Ordering::Relaxed),
-                    }
-                }
-            }
-            cprobe.tick("collected end");
-            yield_section("");
-            (ready, retired_boot, late_spill, t)
-        }) {
-            cprobe.report("collected record");
-            verbose!("relax cache: collected record held the owner {:.1} ms", t.elapsed().as_secs_f64() * 1e3);
-            drop(retired_boot);
-            // the late files' images are in the store before the record that maps them
-            let late_written = late_spill.map_or(true, |s| s.write().is_ok());
-            if !late_written && ready.is_some() {
-                MID_COLLECTED_TRIED.store(false, Ordering::Relaxed);
-                collected_skip("the late files' front images were not written");
-            }
-            if let Some((report, dest, payload)) = ready.filter(|_| late_written) {
-                if let Some(written) = crate::cache::Cache::commit_collected(report, dest, payload, &|| false) {
-                    COLLECTED_CURRENT.store(true, Ordering::Relaxed);
-                    crate::zone_alloc::kept_with(|| *COLLECTED_WRITTEN.lock().unwrap_or_else(|e| e.into_inner()) = Some(Box::new(written.clone())));
-                    let retired_boot = crate::owner::call(crate::owner::Class::Program, || unsafe { &mut *up }.cache.as_mut().map(|c| c.finish_collected()));
-                    drop(retired_boot);
-                }
-            }
-        }
+        record_collected(up, wait, imaged_files, crates_left);
     }
     verbose!("relax cache: mid write held the owner {:.1} ms (records to {:.1}, manifest to {:.1}, front images to {:.1}, crate records to {:.1}, then spill); before it the record drain took {:.1} ms and the wait for the owner {:.1} ms (behind {} queued program requests; meanwhile it served {} requests, {} of them the main thread's ahead of the queue), the spill's write {:.1} ms; front writes so far {}", held1, parts[3], parts[0], parts[1], parts[2], drain_ms, owner_wait_ms, behind.0, passed.0, passed.1, spill_ms, jit::front_epoch());
     crate::inspect::flightrec::event("cache.write", &format!("mid write: {} records, {} images; held the owner {:.1} ms (manifest {:.1}, front images {:.1}, crate records {:.1})", n, n_imgs, held1, parts[0], parts[1], parts[2]), (held1 * 1e6) as u64, 0);

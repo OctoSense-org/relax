@@ -1073,6 +1073,8 @@ fn request<R>(site: &'static std::panic::Location<'static>, class: Class, deadli
 /// closure): false when the request was withdrawn or given back, and the caller asks again.
 fn request_dyn(site: &'static std::panic::Location<'static>, class: Class, deadline: Option<std::time::Instant>, yields: bool, probe: bool, run: &mut dyn FnMut()) -> bool {
     assert_no_leaf("a request to the compiler's owner");
+    // the owner may wait for that read to take a front write: a waited request here deadlocks
+    debug_assert!(!crate::run::capturing(), "relax: an owner request from the collected capture under its front read ({site})");
     // a front reader that must not wait (lowering ahead) gives the work back first; a back
     // end's finish is never refused (its slots stay in flight until it is served)
     if !class.is_finish() {
