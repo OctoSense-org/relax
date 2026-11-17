@@ -9509,9 +9509,11 @@ impl Unit {
         }
     }
 
-    /// RELAX_SPECV_TRACE: what slot `id`'s pending verdict waits on: the checker's entry for
-    /// its owner, the epoch, and the check's (rank, checks ahead) when it is queued.
+    /// What slot `id`'s pending verdict waits on (`live`'s unverified_why, RELAX_SPECV_TRACE): the
+    /// checker's entry for its owner, the epoch, what the checker runs, and the check's (rank,
+    /// checks ahead) when it is queued.
     pub(crate) fn pending_why(&self, id: u32) -> String {
+        if specv_held() { return "verdicts are held (SPEC-V hold)".into(); }
         let Some(d) = self.verdict_owner(id) else { return "no owner".into() };
         let epoch = self.tcx.collect_epoch.load(Ordering::SeqCst);
         let src = self.front.checker_id;

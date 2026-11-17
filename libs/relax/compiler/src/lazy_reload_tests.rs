@@ -334,7 +334,8 @@ fn a_background_check_panic_leaves_the_query_to_the_apps_compile() {
 /// SPEC-V: a patch runs before its verdict as baseline code with `noalias` dropped; a rejected one
 /// is never promoted, is reported and reverts; a clean one is promoted with its `noalias` facts, its
 /// check queued again when an epoch move drops it. A constant-evaluation twin's first code queues
-/// its base's check.
+/// its base's check. A group that waits for its verdict says what it waits on (`live`'s
+/// unverified_why), and says nothing once it settles.
 #[test]
 fn specv_patch_before_verdict() {
     const CHILD: &str = "RELAX_SPECV_TEST";
@@ -425,6 +426,12 @@ fn specv_patch_before_verdict() {
     let mut pending = vec![crate::reload::PendingPatch { group: outcome.group, what: "lib.rs".into(), ids, event_seq: crate::inspect::events::last_seq(), installed: std::time::Instant::now() }];
     crate::reload::UNVERIFIED_PATCHES.fetch_add(1, Ordering::AcqRel);
     assert!(!crate::reload::observations_verified());
+    // its verdict held: the group waits, and says on what
+    crate::jit::SPECV_HOLD.store(1, Ordering::Relaxed);
+    crate::reload::settle_verdicts(up, &mut pending, &mut undos);
+    let why = crate::reload::unverified_why();
+    assert!(pending.len() == 1 && why.starts_with(&format!("lib.rs: patch group {} has run unverified ", outcome.group)) && why.ends_with("its check: verdicts are held (SPEC-V hold)"), "the waiting group says what it waits on: {why}");
+    crate::jit::specv_release();
     // the worker acknowledges a settle request between checks: the second one is answered after the queued check ran
     crate::borrowck::settle().recv().unwrap();
     crate::borrowck::settle().recv().unwrap();
@@ -445,6 +452,7 @@ fn specv_patch_before_verdict() {
     }
     assert!(pending.is_empty(), "the verdict arrived");
     assert!(crate::reload::observations_verified());
+    assert_eq!(crate::reload::unverified_why(), "", "no group waits: nothing said");
     if case == "bad" {
         assert!(undos.is_empty(), "the failed patch group was rolled back");
         run(11); // the previous code runs again

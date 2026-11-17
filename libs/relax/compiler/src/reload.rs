@@ -8837,6 +8837,20 @@ pub extern "C" fn __relax_restart_now(state: *const u8, len: usize) {
 /// Observations made meanwhile (inspect answers, events) say `verified:false`.
 pub(crate) static UNVERIFIED_PATCHES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
+/// What the oldest patch group awaiting its verdict waits on (`live`'s `unverified_why`): its edit,
+/// how long it has run unverified, and where its first pending slot's check stands
+/// (Unit::pending_why). settle_verdicts refreshes it at most once a second and clears it when a
+/// group settles; empty when no group waits. Before, only RELAX_SPECV_TRACE said it: an edit
+/// installed in 3.6 s whose verdict had not come 60 s later, with the checker idle, said nothing
+/// about it (W11955, 11-17).
+static UNVERIFIED_WHY: std::sync::Mutex<(Option<Instant>, String)> = std::sync::Mutex::new((None, String::new()));
+
+/// [`UNVERIFIED_WHY`] now ("" when no patch group waits for its verdict).
+pub(crate) fn unverified_why() -> String {
+    if UNVERIFIED_PATCHES.load(Ordering::Acquire) == 0 { return String::new(); }
+    UNVERIFIED_WHY.lock().unwrap_or_else(|e| e.into_inner()).1.clone()
+}
+
 /// Whether the code the program runs now all has its clean verdict (no patch group awaits one).
 pub fn observations_verified() -> bool {
     UNVERIFIED_PATCHES.load(Ordering::Acquire) == 0
@@ -8878,6 +8892,8 @@ pub(crate) fn settle_verdicts(up: *mut Unit, pending: &mut Vec<PendingPatch>, un
         let p = &pending[i];
         // Some(None): verified, Some(Some(events)): rejected, None: not yet
         let mut unchecked: Vec<String> = Vec::new();
+        // the oldest waiting group says what it waits on (UNVERIFIED_WHY), once a second at most
+        let say_why = i == 0 && UNVERIFIED_WHY.lock().unwrap_or_else(|e| e.into_inner()).0.is_none_or(|at| at.elapsed().as_secs() >= 1);
         let state: Option<Option<Vec<crate::borrowck::event::GandalfEvent>>> = unsafe {
             crate::owner::call(crate::owner::Class::Program, || {
                 let u = &*up;
@@ -8894,6 +8910,10 @@ pub(crate) fn settle_verdicts(up: *mut Unit, pending: &mut Vec<PendingPatch>, un
                         // never verified, never reported: the slots stay unverified (baseline)
                         Verdict::Unverifiable(why) => unchecked.push(format!("{}: {}", u.fns[id as usize].name, why)),
                         Verdict::Pending => {
+                            if say_why && !waiting {
+                                let why = format!("{}: patch group {} has run unverified {:.0} s; its check: {}", p.what, p.group, p.installed.elapsed().as_secs_f64(), u.pending_why(id));
+                                *UNVERIFIED_WHY.lock().unwrap_or_else(|e| e.into_inner()) = (Some(Instant::now()), why);
+                            }
                             waiting = true;
                             if crate::jit::specv_trace() { waits.push(format!("#{id} {}", u.pending_why(id))); }
                         }
@@ -8908,6 +8928,10 @@ pub(crate) fn settle_verdicts(up: *mut Unit, pending: &mut Vec<PendingPatch>, un
                 }
             })
         };
+        if state.is_some() {
+            // a group settles: the next waiting one says its own
+            *UNVERIFIED_WHY.lock().unwrap_or_else(|e| e.into_inner()) = (None, String::new());
+        }
         match state {
             None => { i += 1; }
             Some(None) => {
@@ -12980,6 +13004,7 @@ pub(crate) unsafe fn reset_statics() {
     reset(&PATCHED, relax_session::sync::Mutex::new(Patched::new()));
     reset(&RESTORED_STATE, std::sync::OnceLock::new());
     reset(&UNVERIFIED_PATCHES, std::sync::atomic::AtomicUsize::new(0));
+    reset(&UNVERIFIED_WHY, std::sync::Mutex::new((None, String::new())));
     reset(&SOURCES_WAIT, std::sync::atomic::AtomicBool::new(false));
     reset(&RESTART_CONFIRMED, std::sync::atomic::AtomicBool::new(false));
     reset(&RESTART_PENDING, std::sync::Mutex::new(Vec::new()));
