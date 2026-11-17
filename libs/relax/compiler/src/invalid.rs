@@ -656,6 +656,8 @@ pub(crate) fn frame_in(u: &Unit, slots: &crate::fxhash::HashSet<u32>) -> Result<
     // the hosts of copies of a closure a patch kept on its old code, for linked code below O3 (the
     // image and disk-cache links note `inlined_into`, not a list per code body)
     let hosts: crate::fxhash::HashMap<u32, u32> = u.kept_old.keys().flat_map(|&k| u.fns[k as usize].history().inlined_into.iter().map(move |&h| (h, k))).collect();
+    // a closure by the fn that makes it and its place, not by the JIT's number for it
+    let shown = |slot: u32| crate::reload::slot_shown(u, slot);
     let mut unread = None;
     for c in caps {
         if let Some(e) = c.err {
@@ -680,10 +682,10 @@ pub(crate) fn frame_in(u: &Unit, slots: &crate::fxhash::HashSet<u32>) -> Result<
             let Some((start, _, slot)) = code.entry_at(a) else { continue };
             let f = &u.fns[slot as usize];
             if slots.contains(&slot) {
-                return Ok(Some(format!("`{}` is running on thread {}", f.name, thread)));
+                return Ok(Some(format!("{} is running on thread {}", shown(slot), thread)));
             }
             if let Some(retired) = crate::reload::retired_text(u, slot) {
-                return Ok(Some(format!("`{}` runs on thread {} {}", f.name, thread, retired)));
+                return Ok(Some(format!("{} runs on thread {} {}", shown(slot), thread, retired)));
             }
             // a copy of such code inlined into this version
             // (code built in this run lists what it inlined when it inlined anything: none listed,
@@ -694,13 +696,13 @@ pub(crate) fn frame_in(u: &Unit, slots: &crate::fxhash::HashSet<u32>) -> Result<
                 None => None,
             };
             if let Some((c, retired)) = copy {
-                return Ok(Some(format!("`{}` runs on thread {} in code that holds a copy of `{}`, {}", f.name, thread, u.fns[c as usize].name, retired)));
+                return Ok(Some(format!("{} runs on thread {} in code that holds a copy of {}, {}", shown(slot), thread, shown(c), retired)));
             }
             if let Some(over) = crate::reload::over_retired(u, slot) {
-                return Ok(Some(format!("`{}` runs on thread {} and can still call {}", f.name, thread, over)));
+                return Ok(Some(format!("{} runs on thread {} and can still call {}", shown(slot), thread, over)));
             }
             if start != f.code {
-                return Ok(Some(format!("`{}` runs code from before an earlier edit on thread {}", f.name, thread)));
+                return Ok(Some(format!("{} runs code from before an earlier edit on thread {}", shown(slot), thread)));
             }
         }
     }

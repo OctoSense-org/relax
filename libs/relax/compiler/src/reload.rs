@@ -3218,6 +3218,16 @@ fn override_of(prog: &crate::program::Program, tcx: &crate::tcx::Tcx, d: DefId, 
     Some((def.parent, *prog.trait_item_def_id.get(&d)?))
 }
 
+/// Slot `s` as a restart's reason names it: a closure (or async block) by the fn that makes it and
+/// its place, a library's closure by the program's closure it carries (closure_desc), anything
+/// else by its path in backticks. A closure's own name (`{closure#462}@21`) is the JIT's number.
+pub(crate) fn slot_shown(u: &Unit, s: u32) -> String {
+    match &u.fns[s as usize].key {
+        FnKey::Closure(file, e, _) => closure_desc(u, *file, *e, slot_instance(u, s), None),
+        _ => format!("`{}`", u.fns[s as usize].name),
+    }
+}
+
 /// The instance slot `s` is code of (a closure's: its fn's).
 fn slot_instance(u: &Unit, s: u32) -> Option<(DefId, &[TyId])> {
     let mut k = s;

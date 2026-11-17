@@ -3565,9 +3565,11 @@ fn a_layout_edit_that_rebinds_a_running_closure_is_refused() {
     assert_eq!(old.len(), 1, "the thread's closure has code");
     let name = rig.name(old[0]);
     let o = rig.edit("lib.rs", &[("let s = S { n: 5 }; spin(a); a[2].store(read(&s), Ordering::SeqCst);", "spin(a); a[2].store(5, Ordering::SeqCst);"), ("pub struct S { pub n: u64 }", "pub struct S { pub m: u64, pub n: u64 }")]);
-    let refused = refused_with(&o, &["struct `S` changed its layout", &name, "is running on thread"]);
+    // named by the fn that makes it and its place, not by the JIT's number for it (`{name}`)
+    let refused = refused_with(&o, &["struct `S` changed its layout", "the closure in `", "start` at ", "lib.rs:", "is running on thread"]);
     let got = rig.release();
-    assert!(refused.0, "a frame in the closure this edit rebinds refuses its layout change, naming it (`{name}`): {}", refused.1);
+    let said = o.lines.iter().find(|l| l.contains("is running on thread")).cloned().unwrap_or_default();
+    assert!(refused.0 && !said.contains(&name), "a frame in the closure this edit rebinds refuses its layout change, naming it by its fn and place (not `{name}`): {}", refused.1);
     assert_eq!(got, 5, "the thread's value, read by the code it was made for");
 }
 
