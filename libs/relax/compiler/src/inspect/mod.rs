@@ -690,10 +690,19 @@ pub struct Captured {
 }
 
 impl Captured {
-    /// Where the walk ended short of the stack's outermost frame and why: "walk stops at <pc>: <why>".
+    /// Where the walk ended short of the stack's outermost frame and why: "walk stops at <pc>
+    /// (<function>+<d> in <image>): <why>", the function named for host code (symbols.rs, the
+    /// image's own symbol table: the loader's functions export no name). A report of a walk that
+    /// stopped in host code said only its address, which no other box or later build places.
     pub fn stops(&self) -> Option<String> {
         let why = self.stop?;
-        Some(format!("walk stops at {:#x}: {why}", self.frames.last().copied().unwrap_or(0)))
+        let pc = self.frames.last().copied().unwrap_or(0);
+        let at = if crate::jit::in_jit_code(pc) {
+            String::new()
+        } else {
+            symbols::host_symbol(pc).map_or_else(String::new, |(name, image, d)| format!(" ({name}+{d:#x} in {image})"))
+        };
+        Some(format!("walk stops at {pc:#x}{at}: {why}"))
     }
 }
 
