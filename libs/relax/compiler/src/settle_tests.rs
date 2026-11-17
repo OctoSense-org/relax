@@ -1729,6 +1729,56 @@ fn preempted_check_under_a_front_read_gives_way() {
     std::fs::remove_dir_all(dir).unwrap();
 }
 
+/// A type check ahead that a waiting front writer preempts gives its work up once a pause of the
+/// compile jobs waits for its job (a program's fork: `relax_fork` pauses them). It retried behind
+/// the writer, every 5 ms, while the writer waited for a thread the pause held: the fork waited for
+/// the job for good (a test's spawn, about 1 run in 8 under a full suite's load, 11-17).
+#[test]
+fn a_preempted_check_gives_way_to_a_pause() {
+    isolated_test!(a_preempted_check_gives_way_to_a_pause);
+    crate::borrowck::lazy::disable_gandalf();
+    std::env::set_var("RELAX_STD", concat!(env!("CARGO_MANIFEST_DIR"), "/std"));
+    let dir = std::env::temp_dir().join(format!("relax_preempted_pause_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("input.rs");
+    std::fs::write(&path, "pub fn checked(x: u32) -> u32 { x + 1 }\nfn main() { let _ = checked(1); }\n").unwrap();
+    let session = std::sync::Arc::new(crate::Session::default());
+    let (prog, core, krate) = crate::load_with_std(&session, path.to_str().unwrap(), "preempted_pause", false).unwrap();
+    let def = prog.defs.iter().enumerate().find_map(|(i, d)| {
+        let id = DefId(i as u32);
+        (d.krate == krate && prog.name(id) == "checked").then_some(id)
+    }).unwrap();
+    let mut tcx = Tcx::new();
+    tcx.collect(&prog);
+    assert!(tcx.errors.is_empty(), "{:?}", tcx.errors);
+    let u = Unit::new(prog, tcx, core);
+    let front = u.front.clone();
+    // a writer waits from the start, and never takes the front: the check is preempted at its
+    // first point, every time it is done again
+    let writer = crate::preempt::WriterWaiting::new();
+    let (running_tx, running_rx) = std::sync::mpsc::channel();
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _job = compile_job();
+        running_tx.send(()).unwrap();
+        let _preemptible = crate::preempt::Preemptible::on();
+        typeck_ahead(&front, def, Vec::new(), 0, false, false);
+        done_tx.send(()).unwrap();
+    });
+    // the job runs: a fork pauses the jobs and waits for it
+    running_rx.recv().unwrap();
+    let pause = std::thread::spawn(|| {
+        pause_compile_jobs("test: a fork", false);
+        resume_compile_jobs(false);
+    });
+    let gave_way = done_rx.recv_timeout(std::time::Duration::from_secs(30)).is_ok();
+    drop(writer);
+    pause.join().unwrap();
+    assert!(gave_way, "a preempted check waited for the writer while a pause waited for its job");
+    drop(u);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
 /// The run monitor's settle sweep runs in steps, one owner request each (JITOWNER: one request
 /// over every slot held the owner 10-50 ms while a large app's UI dragged on a cold start): a main-thread
 /// request that comes during a step is served when that step ends, while the sweep still has steps to go,

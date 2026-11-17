@@ -29565,9 +29565,12 @@ fn typeck_ahead(f: &FrontShared, d: DefId, args: Vec<TyId>, depth: u32, queued: 
             if crate::preempt::is_stopped() { return next; }
             drop(fr);
             // a writer waits: this check waits for it to finish and is done again -- unless this
-            // thread holds another front read, which the writer waits for: then the check is
-            // given up (its build checks the body itself), never waited for under that read
-            if front_reads_held() > 0 {
+            // thread holds another front read, which the writer waits for, or a pause of the
+            // compile jobs (a fork, an allocator swap, a unit retired) waits for this one, while
+            // the writer may wait for a thread the pause holds: then the check is given up (its
+            // build checks the body itself), never waited for. (A test's fork waited for a job in
+            // this retry, the job for a writer that never came, about 1 run in 8, 11-17.)
+            if front_reads_held() > 0 || BG_PAUSE.load(Ordering::SeqCst) {
                 return next;
             }
             todo.push((key.0, key.1, depth, normal));
