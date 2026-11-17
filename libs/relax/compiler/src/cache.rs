@@ -5134,7 +5134,7 @@ impl Cache {
         let late = crate::sip::late_inputs();
         let moved = crate::sip::late_moved();
         pack::ensure_private_dir(&self.dir)?;
-        let _io = SPILL_IO.write().unwrap_or_else(|e| e.into_inner());
+        let _io = spill_io_write();
         let ncode = self.code_path.len() as u32;
         for ((c, front), entries) in self.by_store_shared(pending) {
             if self.reads_moved(self.crate_of_store(c), front, &moved) {
@@ -5498,6 +5498,46 @@ fn spill_slowest(path: &std::path::Path, t: std::time::Instant, n: usize) {
 /// their store's lock, so independent stores can progress during serial collection.
 pub static SPILL_IO: std::sync::RwLock<()> = std::sync::RwLock::new(());
 
+thread_local! {
+    /// The SPILL_IO guards this thread holds (`spill_io_write`, `spill_io_read`): no write barrier
+    /// runs under one (store.rs order_writes asserts it), or the cache writer and every spill
+    /// behind it wait on the disk.
+    static SPILL_IO_HELD: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// A SPILL_IO guard, counted for `spill_io_held`.
+pub struct SpillIoGuard<G>(G);
+
+impl<G> Drop for SpillIoGuard<G> {
+    fn drop(&mut self) {
+        SPILL_IO_HELD.with(|h| h.set(h.get() - 1));
+    }
+}
+
+impl<G: std::ops::Deref<Target = ()>> std::ops::Deref for SpillIoGuard<G> {
+    type Target = ();
+    fn deref(&self) -> &() {
+        &self.0
+    }
+}
+
+fn spill_io_write() -> SpillIoGuard<std::sync::RwLockWriteGuard<'static, ()>> {
+    let g = SPILL_IO.write().unwrap_or_else(|e| e.into_inner());
+    SPILL_IO_HELD.with(|h| h.set(h.get() + 1));
+    SpillIoGuard(g)
+}
+
+fn spill_io_read() -> SpillIoGuard<std::sync::RwLockReadGuard<'static, ()>> {
+    let g = SPILL_IO.read().unwrap_or_else(|e| e.into_inner());
+    SPILL_IO_HELD.with(|h| h.set(h.get() + 1));
+    SpillIoGuard(g)
+}
+
+/// Whether this thread holds SPILL_IO.
+pub(crate) fn spill_io_held() -> bool {
+    SPILL_IO_HELD.with(|h| h.get() != 0)
+}
+
 // Weak entries coordinate concurrent compiler worlds without retaining old stores.
 static PATHS: relax_session::sync::Mutex<Option<HashMap<PathBuf, std::sync::Weak<relax_session::sync::Mutex<()>>>>> = relax_session::sync::Mutex::new(None);
 
@@ -5514,7 +5554,7 @@ fn front_store_lock(path: &std::path::Path) -> std::sync::Arc<relax_session::syn
 impl Spill {
     pub fn write(self) -> Result<usize, String> {
         let t = std::time::Instant::now();
-        let _g = SPILL_IO.write().unwrap_or_else(|e| e.into_inner());
+        let _g = spill_io_write();
         let gate = t.elapsed();
         let late = crate::sip::late_inputs();
         let (files, shared) = (self.files.len(), self.shared.len());
@@ -7285,7 +7325,7 @@ fn write_front_graph(job: &FrontGraphWrite) -> Option<()> {
     mark("demand-encode");
     let payload = crate::crate_image::encode(&graph);
     entries.push(NewEntry { key: front_graph_key(recipe.identity), kind: KIND_FRONT_GRAPH, payload });
-    let _io = SPILL_IO.write().unwrap_or_else(|e| e.into_inner());
+    let _io = spill_io_write();
     mark("io-lock");
     let _commit = crate::load_profile::span(job.profile, "front-graph-commit", "graph writer");
     crate::store::append(&path, entries, true).ok()?;
@@ -7352,7 +7392,7 @@ pub(crate) fn record_added_crates(prog: &crate::program::Program, dir: &std::pat
         let path = dir.join(front_store_name(&prog.session.options, prog.syms.str(prog.crates[ci].name), stored[ci]));
         let lock = front_store_lock(&path);
         let _store = lock.lock().unwrap_or_else(|e| e.into_inner());
-        let guard = SPILL_IO.read().unwrap_or_else(|e| e.into_inner());
+        let guard = spill_io_read();
         Spill { dir: dir.to_owned(), files: vec![(path, false, entries)], shared: Vec::new(), marks: marks.clone() }.write_locked(&guard, &late)?;
     }
     let mut probes: std::collections::BTreeMap<String, bool> = base.probes.iter().cloned().collect();
@@ -7370,7 +7410,7 @@ pub(crate) fn record_added_crates(prog: &crate::program::Program, dir: &std::pat
         inputs, stamps, probes: probes.into_iter().collect(), demand_image: None,
     };
     let entry = NewEntry { key: front_graph_key(recipe.identity), kind: KIND_FRONT_GRAPH, payload: crate::crate_image::encode(&graph) };
-    let _io = SPILL_IO.write().unwrap_or_else(|e| e.into_inner());
+    let _io = spill_io_write();
     crate::store::append(&front_graph_path(dir, recipe.identity), vec![entry], true).map_err(|e| format!("the graph write: {e}"))?;
     Ok(stored)
 }
@@ -8585,7 +8625,7 @@ fn write_front_record(job: FrontWrite) -> Result<Option<usize>, String> {
     if entries.is_empty() { return Ok(None); }
     let lock = front_store_lock(&path);
     let _store = lock.lock().unwrap_or_else(|e| e.into_inner());
-    let guard = SPILL_IO.read().unwrap_or_else(|e| e.into_inner());
+    let guard = spill_io_read();
     let _profile = crate::load_profile::span(profile, "front-record-write", name);
     // Keep code/old parts, even if the boot record was rejected. Cache::open decides
     // staleness after loading; an early write must not retire still-linkable code.

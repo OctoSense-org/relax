@@ -482,6 +482,7 @@ fn sync_fs(f: &std::fs::File) -> std::io::Result<()> {
     extern "C" {
         fn syncfs(fd: i32) -> i32;
     }
+    debug_assert!(!crate::cache::spill_io_held(), "a write barrier under SPILL_IO: the cache writer, and every spill behind it, would wait on the disk");
     #[cfg(test)]
     tests::BARRIERS.with(|b| b.set(b.get() + 1));
     if unsafe { syncfs(f.as_raw_fd()) } == 0 { Ok(()) } else { Err(std::io::Error::last_os_error()) }
@@ -1112,6 +1113,7 @@ pub fn profiling() -> bool {
 /// `F_FULLFSYNC` there, a full flush of the drive's cache per call (a large app's cold launch made ~3.7k
 /// of them); elsewhere (and where the barrier is refused) `sync_data`.
 fn order_writes(f: &std::fs::File) -> std::io::Result<()> {
+    debug_assert!(!crate::cache::spill_io_held(), "a write barrier under SPILL_IO: the cache writer, and every spill behind it, would wait on the disk");
     #[cfg(test)]
     tests::BARRIERS.with(|b| b.set(b.get() + 1));
     #[cfg(target_vendor = "apple")]
@@ -1218,9 +1220,6 @@ struct RunState {
     committed: usize,
     /// payloads being written (their index slots are reserved)
     in_flight: usize,
-    active: u32,
-    /// the header's slots as the last commit wrote them
-    slots: [Slot; 2],
     /// the written payloads' mappings, by key
     mapped: std::collections::HashMap<u128, &'static [u8]>,
     /// what keeps them mapped: as long as this store lives
@@ -1264,7 +1263,7 @@ impl RunStore {
         write_at(&file, &h.bytes(), 0)?;
         mark_live(&path, &path, false);
         Ok(RunStore { name: name.into(), path, file, cap,
-            state: relax_session::sync::Mutex::new(RunState { end: start, written: start, slots: h.slots, ..Default::default() }),
+            state: relax_session::sync::Mutex::new(RunState { end: start, written: start, ..Default::default() }),
             commit: relax_session::sync::Mutex::new(()) })
     }
 
@@ -1317,9 +1316,9 @@ impl RunStore {
         }
     }
 
-    /// Makes every payload written so far durable and visible to Store::open: data synced, then
-    /// the merged index into the inactive slot and the header flipped (under the file lock that
-    /// readers take shared).
+    /// Makes every payload written so far visible to Store::open: the merged index into the
+    /// inactive slot and the header flipped (under the file lock that readers take shared); the
+    /// seal thread's barrier then makes it durable (`commit_as`).
     pub fn commit(&self) -> std::io::Result<()> {
         self.commit_upto(usize::MAX)
     }
@@ -1339,43 +1338,50 @@ impl RunStore {
         r
     }
 
-    /// `commit_upto`; `ordered`: with the write barrier before the commit (else as an exit commits).
+    /// `commit_upto`; `ordered`: sealed after by the seal thread (`queue_seal`), else as an exit
+    /// commits (the next open verifies it).
+    ///
+    /// The commit goes in without a barrier, as a cache store's append does (`append_inner`): its
+    /// slot's `tail` stays at or below the payloads it adds, so an open meanwhile (another
+    /// process's) verifies them, and the seal thread's barrier then moves `tail` to the end. A
+    /// barrier here ran on the cache writer under SPILL_IO (a cache store's references to these
+    /// images commit them first: cache.rs append_store), 11.6 s once on a busy disk while every
+    /// spill behind it waited. Another process sees these pages through the page cache before any
+    /// barrier; only a machine crash can lose them, and the next open's verification of the tail
+    /// turns that into a miss. The header is read under the lock: a seal (this process's, or an
+    /// open's in another) may have moved the last commit's `tail` since.
     fn commit_as(&self, n: usize, ordered: bool) -> std::io::Result<()> {
         let _c = self.commit.lock().unwrap_or_else(|e| e.into_inner());
-        let (mut ix, end, n, active, slots, fresh) = {
+        let (mut ix, end, n, fresh) = {
             let s = self.state.lock().unwrap_or_else(|e| e.into_inner());
             if s.committed >= n.min(s.index.len()) { return Ok(()); }
             // the lowest payload this commit adds: payloads finish out of order, so one may lie
             // below the last commit's end
             let fresh = s.index[s.committed..].iter().map(|e| e.off).min().unwrap_or(s.written);
-            (s.index.clone(), s.written, s.index.len(), s.active, s.slots, fresh)
+            (s.index.clone(), s.written, s.index.len(), fresh)
         };
         ix.sort_by_key(|e| e.key);
         ix.dedup_by_key(|e| e.key);
-        // the payloads before the index and header that commit them, outside the file lock (no
-        // open waits on the disk for it; see `seal`)
-        if ordered {
-            let mut trace = WriteTrace::new(&self.path);
-            trace.how = "run store commit";
-            order_writes(&self.file)?;
-            trace.mark("barrier");
-        }
         let ib = encode_index(&ix);
-        let next = 1 - active;
-        let mut h = Header { active: next, cap: self.cap, slots };
-        let tail = if ordered { end } else { slots[active as usize].tail.min(fresh) };
-        h.slots[next as usize] = Slot { n: ix.len() as u64, end, sum: sum64(&ib), tail };
         self.file.lock()?;
-        let r = (|| {
+        let r = (|| -> std::io::Result<[u8; HEADER]> {
+            let mut now = [0u8; HEADER];
+            read_at(&self.file, &mut now, 0)?;
+            let was = Header::parse(&now).ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "run store header"))?;
+            let next = 1 - was.active;
+            let mut h = Header { active: next, cap: self.cap, slots: was.slots };
+            h.slots[next as usize] = Slot { n: ix.len() as u64, end, sum: sum64(&ib), tail: was.slots[was.active as usize].tail.min(fresh) };
             write_at(&self.file, &ib, h.slot_off(next))?;
-            write_at(&self.file, &h.bytes(), 0)
+            let hb = h.bytes();
+            write_at(&self.file, &hb, 0)?;
+            Ok(hb)
         })();
         let _ = self.file.unlock();
-        r?;
-        let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        s.committed = n;
-        s.active = next;
-        s.slots = h.slots;
+        let hb = r?;
+        if ordered {
+            queue_seal(&self.path, &hb);
+        }
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).committed = n;
         Ok(())
     }
 
@@ -1425,6 +1431,24 @@ impl Write for PosWriter<'_> {
         }
         Ok(())
     }
+}
+
+#[cfg(unix)]
+fn read_at(file: &std::fs::File, b: &mut [u8], off: u64) -> std::io::Result<()> {
+    use std::os::unix::fs::FileExt;
+    file.read_exact_at(b, off)
+}
+
+#[cfg(not(unix))]
+fn read_at(file: &std::fs::File, mut b: &mut [u8], mut off: u64) -> std::io::Result<()> {
+    use std::os::windows::fs::FileExt;
+    while !b.is_empty() {
+        let n = file.seek_read(b, off)?;
+        if n == 0 { return Err(std::io::ErrorKind::UnexpectedEof.into()); }
+        b = &mut b[n..];
+        off += n as u64;
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -1765,6 +1789,13 @@ pub(crate) fn seal_now(p: &Path) {
     let mut hb = [0u8; HEADER];
     std::fs::File::open(&file).unwrap().read_exact(&mut hb).unwrap();
     seal(&file, &hb).unwrap();
+}
+
+/// Tests: `held`: this thread's commits are not queued for the seal thread (its process ends
+/// before their seal would come).
+#[cfg(test)]
+pub(crate) fn hold_seals(held: bool) {
+    tests::SEAL_HELD.with(|h| h.set(held));
 }
 
 #[cfg(test)]
