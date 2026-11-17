@@ -4730,7 +4730,14 @@ pub(crate) static MANIFEST_GIVES_WAY: std::sync::atomic::AtomicU32 = std::sync::
 
 #[cfg(test)]
 fn manifest_test_gives_way() -> bool {
-    MANIFEST_GIVES_WAY.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1)).is_ok()
+    let mut n = MANIFEST_GIVES_WAY.load(Ordering::SeqCst);
+    while n > 0 {
+        match MANIFEST_GIVES_WAY.compare_exchange(n, n - 1, Ordering::SeqCst, Ordering::SeqCst) {
+            Ok(_) => return true,
+            Err(now) => n = now,
+        }
+    }
+    false
 }
 
 #[cfg(not(test))]
