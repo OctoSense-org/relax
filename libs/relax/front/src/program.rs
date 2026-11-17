@@ -1738,6 +1738,7 @@ impl Program {
     }
 
     fn load_file(&mut self, path: &str, edition: u16, krate: u32) -> Result<u32, String> {
+        load_step();
         crate::why::event("load", path, 0, "", None);
         let _profile = crate::load_profile::span(self.session.runtime.profile, "load-file", path);
         // a check's committed version of the module being loaded (a file declared as two
@@ -6486,27 +6487,71 @@ fn shared_std_put(path: &str, sp: SharedParse) {
     if let Some(m) = g.as_mut() {
         m.insert(path.to_string(), std::sync::Arc::new(sp));
     }
+    load_step();
     SHARED_CV.notify_all();
+}
+
+/// Steps of this process's loads: each file the preload pool scans or parses, each file a loader
+/// loads, each std parse the program shares. The proc-macro world's wait for a std parse of the
+/// program's ends as a stall only when no step was taken for its interval (`shared_std_wait`): a
+/// load that moves, however slowly (a child of a `check -p` on two cores of a full machine, std
+/// taken from its images), is waited for.
+static LOAD_STEPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// A load took a step (`LOAD_STEPS`).
+pub(crate) fn load_step() {
+    LOAD_STEPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// How long the loads may take no step while the world waits for a std parse of the program's
+/// before the wait counts as a cycle (`shared_std_wait`).
+const STD_WAIT_STALL: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// What the world's wait for one of the program's std parses came to.
+enum StdWait {
+    Shared(std::sync::Arc<SharedParse>),
+    /// the program's load does not share it (it ended, or never shares; a thread waits for the
+    /// world): the world parses it itself
+    Alone,
+    /// no load took a step for the interval: a wait cycle between the world and the load
+    Stalled,
 }
 
 /// The program's parse of `path`, waiting for it while the program's std load runs.
 fn shared_std_wait(path: &str) -> Option<std::sync::Arc<SharedParse>> {
+    match shared_std_wait_on(path, &LOAD_STEPS, STD_WAIT_STALL) {
+        StdWait::Shared(sp) => Some(sp),
+        StdWait::Alone => None,
+        StdWait::Stalled => {
+            // never silent: a stall here is a wait cycle between the world and the load
+            eprintln!("relax: the proc-macro world waited for the program's parse of {}, and no load took a step for {} s; parsing it itself", path, STD_WAIT_STALL.as_secs());
+            None
+        }
+    }
+}
+
+/// `shared_std_wait` with its steps and the interval with none that is a stall.
+fn shared_std_wait_on(path: &str, steps: &std::sync::atomic::AtomicU64, stall: std::time::Duration) -> StdWait {
     let mut g = SHARED_STD.lock().unwrap_or_else(|e| e.into_inner());
+    let mut seen = steps.load(std::sync::atomic::Ordering::Relaxed);
     loop {
-        let m = g.as_ref()?;
+        let Some(m) = g.as_ref() else { return StdWait::Alone };
         if let Some(sp) = m.get(path) {
-            return Some(sp.clone());
+            return StdWait::Shared(sp.clone());
         }
         if !SHARING.load(std::sync::atomic::Ordering::Acquire) || WORLD_WAITERS.load(std::sync::atomic::Ordering::Acquire) != 0 {
-            return None;
+            return StdWait::Alone;
         }
-        // a program that registered a graph but loads no std (never expected): parse alone
-        let (ng, to) = SHARED_CV.wait_timeout(g, std::time::Duration::from_secs(10)).unwrap_or_else(|e| e.into_inner());
+        let (ng, to) = SHARED_CV.wait_timeout(g, stall).unwrap_or_else(|e| e.into_inner());
         g = ng;
-        if to.timed_out() && g.as_ref().map_or(true, |m| !m.contains_key(path)) {
-            // never silent: a stall here is a wait cycle between the world and the load
-            eprintln!("relax: the proc-macro world waited 10 s for the program's parse of {}; parsing it itself", path);
-            return None;
+        if to.timed_out() {
+            // a program that registered a graph but loads no std (never expected), or a cycle:
+            // no step for the interval, and the file is not here
+            let now = steps.load(std::sync::atomic::Ordering::Relaxed);
+            if now == seen && g.as_ref().map_or(true, |m| !m.contains_key(path)) {
+                return StdWait::Stalled;
+            }
+            seen = now;
         }
     }
 }
@@ -7050,6 +7095,45 @@ pub fn take_missing() -> Vec<(u32, String)> {
 }
 
 #[cfg(test)]
+mod std_wait_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{Duration, Instant};
+
+    /// The world's wait for a std parse the program's load has not shared yet: while the loads
+    /// take steps, however slowly, it goes on through several of its intervals and ends when the
+    /// load ends its sharing (the world parses alone, nothing said); loads that take no step for
+    /// the interval are a stall, and the wait ends there (the cycle guard, which says so).
+    #[test]
+    fn a_slow_load_that_moves_is_waited_for_and_a_still_one_is_a_stall() {
+        let path = "/relax-std-wait-test/core/lib.rs";
+        let stall = Duration::from_millis(100);
+        let steps = AtomicU64::new(0);
+        share_std_begin();
+        let t = Instant::now();
+        let moving = std::thread::scope(|s| {
+            s.spawn(|| {
+                while t.elapsed() < 4 * stall {
+                    steps.fetch_add(1, Ordering::Relaxed);
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                share_std_end();
+            });
+            shared_std_wait_on(path, &steps, stall)
+        });
+        assert!(matches!(moving, StdWait::Alone), "a load that moves is waited for, then the world parses alone");
+        assert!(t.elapsed() >= 4 * stall, "through several intervals: {:?}", t.elapsed());
+        share_std_begin();
+        let t = Instant::now();
+        let still = shared_std_wait_on(path, &AtomicU64::new(0), stall);
+        share_std_end();
+        drop_shared_std();
+        assert!(matches!(still, StdWait::Stalled), "no step for the interval is a stall");
+        assert!(t.elapsed() >= stall, "it waits the interval out first: {:?}", t.elapsed());
+    }
+}
+
+#[cfg(test)]
 mod missing_tests {
     use super::*;
 
@@ -7292,6 +7376,7 @@ pub(crate) unsafe fn reset_statics() {
     reset(&SHARED_STD, relax_session::sync::Mutex::new(None));
     reset(&SHARING, std::sync::atomic::AtomicBool::new(false));
     reset(&WORLD_WAITERS, std::sync::atomic::AtomicUsize::new(0));
+    reset(&LOAD_STEPS, std::sync::atomic::AtomicU64::new(0));
     reset(&PARSE_AGAIN, std::sync::atomic::AtomicU64::new(0));
     reset(&COLLECTING, std::sync::atomic::AtomicBool::new(false));
     reset(&COLLECT_MISSES, relax_session::sync::Mutex::new(Vec::new()));
