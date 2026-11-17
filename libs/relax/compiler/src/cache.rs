@@ -250,7 +250,7 @@ const LEDGER_KEY: u128 = 0;
 // 36: a coroutine's closure type has tags of its own (enc_ty 29 for 17's form, 30 for 28's).
 // 37: a type its tree has written before is a back-reference (TY_BACKREF) when that is shorter,
 // and a callee key the entry's relocation list has written before is one (RELOC_KEY_REF).
-const ENTRY_VERSION: u32 = 37;
+const ENTRY_VERSION: u32 = 38;
 /// enc_ty's tag for "the n-th type this tree wrote in full" (a u32 n follows): written for a type
 /// whose first write was longer than this back-reference.
 const TY_BACKREF: u8 = 63;
@@ -724,6 +724,8 @@ pub(crate) struct PendingRecord {
     epoch: u64,
     /// O3 code: its inlined slots and nounwind inputs (`record_o3`)
     o3: Option<(Vec<u32>, Vec<(u32, bool)>)>,
+    /// what the code was built from (gate.rs), taken at the install
+    digest: Option<std::sync::Arc<crate::gate::CodeDigest>>,
 }
 
 /// Is a deferred record still describing the sources its code was built from?
@@ -768,6 +770,27 @@ fn record_inlined(u: &Unit, id: u32, extra: &[u32]) -> Vec<u32> {
     inlined.sort_unstable();
     inlined.dedup();
     inlined
+}
+
+/// The digest gate's identities (gate.rs): a slot by its key identity bytes, a definition by its
+/// crate and key, as the entries name them (they hold across runs).
+impl crate::gate::Ids for Cache {
+    fn slot(&mut self, u: &Unit, x: u32) -> Option<u128> {
+        let b = self.slot_bytes(u, x)?;
+        Some(relax_session::sip::hash_bytes(&b))
+    }
+    fn def(&mut self, u: &Unit, d: DefId) -> Option<u128> {
+        if self.crate_ident.get(u.prog.def(d).krate as usize).is_none() {
+            return None;
+        }
+        // (not one of an entry's named definitions: enc_defs collects a key's)
+        let named = self.enc_defs.take();
+        let mut e = E::default();
+        let mut cr = Vec::new();
+        self.enc_def(u, d, &mut e, &mut cr);
+        self.enc_defs = named;
+        Some(relax_session::sip::hash_bytes(&e.0))
+    }
 }
 
 pub struct Cache {
@@ -948,6 +971,11 @@ pub struct Cache {
     pub last_tier1: Option<Vec<u32>>,
     /// ... and the callees that build kept as calls for lack of a body (jit.rs cached_tier1)
     pub last_kept: Vec<u32>,
+    /// ... and the digests its entry recorded (gate.rs), noted with its code at the install
+    pub(crate) last_digest: Option<std::sync::Arc<crate::gate::CodeDigest>>,
+    /// the entry being encoded: its inlined slots in the order their keys were written (the
+    /// digest gate's contexts name them by position)
+    cur_inl: Vec<u32>,
     /// the hit just linked is O2 code (a `#[relax(O2)]` slot's, or a slot an earlier run found
     /// hot): no O2 build for it this run
     pub last_o2: bool,
@@ -1433,6 +1461,8 @@ impl Cache {
             last_callees: Vec::new(),
             last_tier1: None,
             last_kept: Vec::new(),
+            last_digest: None,
+            cur_inl: Vec::new(),
             last_o2: false,
             last_provisional: None,
             last_base: false,
@@ -3955,12 +3985,13 @@ impl Cache {
             pending: rir.map_or_else(Vec::new, |r| r.pending.clone()),
             epoch: crate::jit::patch_epoch(),
             o3: None,
+            digest: rir.map(|r| crate::gate::of_func(r)),
         })
     }
 
     /// `record_o3`'s inputs for an encoding later (the O3 install is a publish: the record's key and
     /// certificate encoding runs in the bounded record batches instead). None: it would store nothing.
-    pub(crate) fn defer_record_o3(&self, u: &Unit, id: u32, code: &[u8], relocs: &[RelocAt], pc_map: &[(u32, u64)], inlined: &[u32], nounwind: &[(u32, bool)]) -> Option<PendingRecord> {
+    pub(crate) fn defer_record_o3(&self, u: &Unit, id: u32, code: &[u8], relocs: &[RelocAt], pc_map: &[(u32, u64)], inlined: &[u32], nounwind: &[(u32, bool)], digest: std::sync::Arc<crate::gate::CodeDigest>) -> Option<PendingRecord> {
         if matches!(u.fns[id as usize].key, FnKey::Ctfe(_)) { return None; }
         if self.mode == Mode::ReadOnly || u.fns[id as usize].patch_gen != 0 {
             return None;
@@ -3979,6 +4010,7 @@ impl Cache {
             pending: Vec::new(),
             epoch: crate::jit::patch_epoch(),
             o3: Some((inlined.to_vec(), nounwind.to_vec())),
+            digest: Some(digest),
         })
     }
 
@@ -4338,12 +4370,16 @@ impl Cache {
                     self.why(what);
                     return None;
                 };
-                keys.push(b);
+                keys.push((b, x));
             }
             keys.sort_unstable();
             e.u32(keys.len() as u32);
-            for b in &keys {
+            for (b, _) in &keys {
                 e.bytes(b);
+            }
+            // (the digest gate names an inline context's slot by its key's position here)
+            if what == "inlined slot key" {
+                self.cur_inl = keys.into_iter().map(|k| k.1).collect();
             }
         }
         // its nounwind inputs: stable keys replace session slots; false answers are included
@@ -4506,6 +4542,16 @@ impl Cache {
                 e.u128(0);
             }
         }
+        // last, the digest gate's tail (gate.rs): what the code was built from -- the pending
+        // record's (taken at the install), else the slot's RIR (an O1 record made at its build)
+        let digest = match pending {
+            Some(p) => p.digest.clone(),
+            None if o3.is_none() => u.fns[id as usize].rir.as_ref().map(|r| crate::gate::of_func(r)),
+            None => None,
+        };
+        let inl = std::mem::take(&mut self.cur_inl);
+        let mut r = crate::gate::Resolver::new(u, self);
+        crate::gate::encode(&mut |g| r.resolve(g), id, digest.as_deref(), &inl, &mut e.0);
         Some((e.0, sealed))
     }
 
@@ -9762,6 +9808,74 @@ mod data_tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    /// The digest gate's tail (gate.rs) crosses runs: an entry recorded from a slot's RIR carries
+    /// its digests, which a later run links back -- its own by the identities of what it names, a
+    /// context by the position of its slot's key in the entry, its own code as itself -- and so
+    /// does the startup image written from that entry.
+    #[test]
+    fn a_records_digests_link_back_from_its_entry_and_its_image() {
+        isolated_test!(a_records_digests_link_back_from_its_entry_and_its_image);
+        use crate::gate::{CodeDigest, Dg, NO_SLOT};
+        use relax_backend::rir::BodyDigest;
+        let _unit = CACHE_UNIT.lock().unwrap_or_else(|e| e.into_inner());
+        let mut session = crate::Session::default();
+        session.options.tier1 = false; session.options.tyck_ahead = false;
+        let session = std::sync::Arc::new(session);
+        let dir = std::env::temp_dir().join(format!("relax-gate-tail-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.rs"), "#![no_std] pub fn kept() -> u32 { 1 } pub fn inner() -> u32 { 2 }").unwrap();
+        let mut prog = crate::program::Program::new(&session);
+        prog.load_crate("a", dir.join("a.rs").to_str().unwrap(), 2021, crate::cfg::CfgSet::host(&session, &[]), vec![]).unwrap();
+        let mut tcx = crate::tcx::Tcx::new();
+        tcx.collect(&prog);
+        let mut u = Unit::new(prog, tcx, 0);
+        let def = |u: &Unit, name: &str| (0..u.prog.defs.len() as u32).map(DefId).find(|&d| u.prog.name(d) == name).unwrap();
+        let (kept_def, inner_def) = (def(&u, "kept"), def(&u, "inner"));
+        let (kept, inner) = (u.fn_id(FnKey::Inst(kept_def, vec![])), u.fn_id(FnKey::Inst(inner_def, vec![])));
+        let krate = u.prog.def(kept_def).krate;
+        // kept's code: its lowering names inner; it took in inner's body (a copy that can wait)
+        // and itself (an inlined recursive call, no digest)
+        let own = std::sync::Arc::new(BodyDigest { raw: 7, slots: vec![inner], syms: vec![] });
+        let copied = std::sync::Arc::new(BodyDigest { raw: 8, slots: vec![], syms: vec![] });
+        let mut f = relax_backend::rir::Func::new("kept".into(), 0);
+        f.digest = Some(own.clone());
+        f.inl_slots = vec![inner, kept];
+        f.inl_digest = vec![Some(copied.clone()), None];
+        f.inl_waits = vec![true, false];
+        u.fns[kept as usize].rir = Some(std::sync::Arc::new(f));
+        let cache_dir = dir.join("cache");
+        let mut cache = open_test_cache(&u, &cache_dir);
+        cache.record(&u, kept, &[0xc3], &[], &[]);
+        assert!(cache.record_manifest(&u, krate, &[kept], 1, &|| false));
+        cache.flush().unwrap();
+        drop(cache);
+        // the next run: resolved by identity, as the record was; it loads the manifest as a start does
+        let mut cache = open_test_cache(&u, &cache_dir);
+        cache.load_manifest(krate);
+        assert!(cache.has_startup_manifest(), "the manifest was recorded and loads");
+        let want = {
+            let mut r = crate::gate::Resolver::new(&u, &mut cache);
+            (r.resolve(&Dg::Taken(own)), r.resolve(&Dg::Taken(copied)))
+        };
+        assert!(want.0.is_some() && want.1.is_some(), "both resolve: {want:?}");
+        let check = |d: &CodeDigest, from: &str| {
+            let v = |g: &Dg| match g {
+                Dg::Resolved(x) => Some(*x),
+                _ => None,
+            };
+            assert_eq!(v(&d.own), want.0, "{from}: its own digest");
+            let ctx: Vec<(u32, Option<u128>, bool)> = d.ctx.iter().map(|(s, g, w)| (*s, v(g), *w)).collect();
+            assert_eq!(ctx, vec![(inner, want.1, true), (kept, None, false)], "{from}: its contexts");
+            assert!(d.ctx.iter().all(|c| c.0 != NO_SLOT));
+        };
+        assert!(cache.lookup(&mut u, kept).is_some(), "kept links from its entry");
+        check(&cache.last_digest.take().expect("the entry's digests"), "the entry");
+        assert!(cache.has_startup_image(), "the manifest wrote a startup image");
+        check(&cache.image_digest(&u, kept).expect("the image slot's digests"), "the image");
+        drop(cache);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     /// A proc macro's read of cargo's `[env]` (macro_reg::call_krate_env past the crate's own
     /// variables) is a late input of the invoking crate (sip LATE_CONFIG_ENV), present or absent:
     /// the crate's code store is stale when that configuration's value changes, and not when only
@@ -12061,6 +12175,9 @@ impl Linker {
             // never another file's (file 0 printed std's cmp.rs:1:1 for inlined code)
             files.push(self.cache().dec_file(u, &mut d).unwrap_or(u32::MAX));
         }
+        // the digest gate's tail, last (gate.rs): noted with the code at its install
+        let digest = crate::gate::decode(&d.b[d.p..], id, &|i| inl.get(i as usize).copied());
+        self.cache().last_digest = digest;
         let pc = raw.into_iter().map(|(o, p)| (o, (*files.get(relax_backend::rir::pos_file(p) as usize).unwrap_or(&u32::MAX) as u64) << 32 | (p & 0xffff_ffff) | (p & !relax_backend::rir::pos_plain(u64::MAX)))).collect();
         self.cache().last_callees = callees;
         // trait objects this code makes: the vtables it names (an impl's removal checks their makers)

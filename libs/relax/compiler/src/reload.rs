@@ -5385,6 +5385,7 @@ unsafe fn apply_mode(up: *mut Unit, edits: Vec<Edit>, sources: &[Edit], partial:
     }
     crate::owner::call(crate::owner::Class::Program, || {
         (*up).reload_rir = None;
+        crate::gate::patch_closed(up);
         jit::close_patch();
         // (a panic's transaction left the tables half-made: its crates stay edited)
         if !matches!(r.failure, Some(makepad_remote::hot::Outcome::Panic)) { settle_edited_crates(up); }
@@ -6510,6 +6511,7 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
     out.ms[0] = (t1 - t0).as_secs_f64() * 1e3;
     trace_sub("gp_ctfe_scan");
     jit::open_patch();
+    crate::gate::patch_opened();
     // Record only RIR first materialized during this attempt, including concurrent
     // lazy compilation while the transaction releases the owner thread.
     let journal_start = u.fns.len();

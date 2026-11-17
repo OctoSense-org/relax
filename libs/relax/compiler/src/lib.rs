@@ -362,6 +362,8 @@ pub mod store;
 pub mod codegen_id;
 pub mod kernel_store;
 pub mod cache;
+/// the digest gate's digests and its patch count (JITPERF)
+pub(crate) mod gate;
 pub mod clean;
 pub mod mainprof;
 pub mod inspect;

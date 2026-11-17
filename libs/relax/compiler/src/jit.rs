@@ -187,12 +187,14 @@ pub struct SpecCode {
     pub relocs: Vec<relax_backend::rir::RelocAt>,
     /// Whether the disk cache records it: false for code that came from the cache.
     pub record: bool,
+    /// code from the cache: the digests its entry recorded (gate.rs)
+    pub(crate) digest: Option<std::sync::Arc<crate::gate::CodeDigest>>,
 }
 
 impl SpecCode {
     fn new(code: &[u8], map: &[(u32, u64)], relocs: &[relax_backend::rir::RelocAt], record: bool) -> Box<Self> {
         crate::zone_alloc::slots_with(|| Box::new(Self {
-            code: code.to_vec(), map: map.to_vec(), relocs: relocs.to_vec(), record,
+            code: code.to_vec(), map: map.to_vec(), relocs: relocs.to_vec(), record, digest: None,
         }))
     }
 }
@@ -303,6 +305,14 @@ pub struct Site {
     file_bytes_with_nul: &'static [u8],
     line: u32,
     col: u32,
+}
+
+impl Site {
+    /// The site's file path (with its nul), line and column: what its panic's Location says
+    /// (the digest gate names a site by these, not by this run's file version).
+    pub(crate) fn location(&self) -> (&'static [u8], u32, u32) {
+        (self.file_bytes_with_nul, self.line, self.col)
+    }
 }
 
 const THUNK_SIZE: usize = x64::THUNK_SIZE;
@@ -864,6 +874,9 @@ pub struct CodeTables {
     /// the slots an O3 body inlined (fresh or from the cache), by code start: an inlined frame
     /// names its fn, `versions` its inliners
     inlined: HashMap<u64, Box<[u32]>>,
+    /// the digest gate (gate.rs): what each code body was built from, by code start -- its own
+    /// lowering's digest and its inline contexts' (built, linked from the cache or the image)
+    digests: HashMap<u64, std::sync::Arc<crate::gate::CodeDigest>>,
     /// what each code body references, by code start, recorded at its install whatever made it
     /// (a build, the disk cache, the startup image, a forwarder): the real-time walk reads these
     refs: HashMap<u64, CodeRefs>,
@@ -934,6 +947,22 @@ impl CodeTables {
     fn note_inlined(&mut self, start: u64, inlined: &[u32]) {
         let _k = crate::zone_alloc::kept();
         self.inlined.insert(start, inlined.into());
+    }
+
+    /// The digests the code body at `start` was built from (gate.rs).
+    pub(crate) fn digest_at(&self, start: u64) -> Option<std::sync::Arc<crate::gate::CodeDigest>> {
+        self.digests.get(&start).cloned()
+    }
+
+    fn note_digest(&mut self, start: u64, d: Option<std::sync::Arc<crate::gate::CodeDigest>>) {
+        if !crate::gate::keeping() {
+            return;
+        }
+        let _k = crate::zone_alloc::kept();
+        match d {
+            Some(d) => self.digests.insert(start, d),
+            None => self.digests.remove(&start),
+        };
     }
 
     /// The slots whose callable address any code body installed so far takes (CodeRefs::taken).
@@ -2224,8 +2253,12 @@ unsafe fn install_prelinked_slot(up: *mut Unit, s: crate::cache::PrelinkedSlot, 
         note_guard_reads(u, s.guards.iter().copied());
         u.install_prelinked(s.id, s.at, s.len, s.trailer, s.pc, s.refs);
     }
-    if tier1 {
-        u.code.write().unwrap_or_else(|e| e.into_inner()).note_inlined(s.at, &s.inlined);
+    {
+        let mut code = u.code.write().unwrap_or_else(|e| e.into_inner());
+        if tier1 {
+            code.note_inlined(s.at, &s.inlined);
+        }
+        code.note_digest(s.at, s.digest.clone());
     }
     // (perf maps and the cache trace name the slot: prelink_startup decoded the identities first)
     if perf_map_on() {
@@ -9368,9 +9401,12 @@ impl Unit {
                     inl_slots.sort_unstable();
                     inl_slots.dedup();
                     inl_slots.retain(|&s| s != id);
+                    let digest = crate::gate::keeping().then(|| crate::gate::of_func(rir));
+                    let mut code = self.code.write().unwrap_or_else(|e| e.into_inner());
                     if !inl_slots.is_empty() {
-                        self.code.write().unwrap_or_else(|e| e.into_inner()).note_inlined(at, &inl_slots);
+                        code.note_inlined(at, &inl_slots);
                     }
+                    code.note_digest(at, digest);
                 }
             }
         }
@@ -10886,11 +10922,13 @@ unsafe fn ready_code_locked(up: *mut Unit, id: u32) -> Option<u64> {
     // linked from the disk cache ahead by a speculative worker: install it as it is
     if u.fns[id as usize].spec.as_ref().is_some_and(|s| !s.record) && !matches!(u.cache.as_ref().map(|c| c.mode), Some(crate::cache::Mode::Verify)) {
         if let Some(spec) = u.fns[id as usize].spec.take() {
-            let SpecCode { code, map, relocs, .. } = *spec;
+            let SpecCode { code, map, relocs, digest, .. } = *spec;
             u.reload_specs.remove(&id);
             u.fns[id as usize].spec_state = 2;
             main_how(1);
-            return Some(install_compiled(up, id, &code, map, &relocs, false));
+            let a = install_compiled(up, id, &code, map, &relocs, false);
+            note_linked_digest(up, id, digest);
+            return Some(a);
         }
     }
     // the disk cache (cache.rs): linked code from an earlier run, no front end or back end. A cold
@@ -10932,11 +10970,16 @@ unsafe fn ready_code_locked(up: *mut Unit, id: u32) -> Option<u64> {
         if (&mut *up).cache.as_mut().is_some_and(|c| std::mem::take(&mut c.last_o2)) {
             o2_cached(up, id);
         }
+        let digest = (&mut *up).cache.as_mut().and_then(|c| c.last_digest.take());
         let a = install_compiled(up, id, &code, map, &crelocs, false);
-        if let Some(inl) = &t1 {
+        {
             let u = &*up;
             let at = u.fns[id as usize].code;
-            u.code.write().unwrap_or_else(|e| e.into_inner()).note_inlined(at, inl);
+            let mut c = u.code.write().unwrap_or_else(|e| e.into_inner());
+            if let Some(inl) = &t1 {
+                c.note_inlined(at, inl);
+            }
+            c.note_digest(at, digest);
         }
         // an entry an earlier run made from an unverified lowering (it calls SPEC-V twins): its
         // verified O1 rebuild becomes the entry (o1v_begin checks the verdict)
@@ -10959,11 +11002,13 @@ unsafe fn ready_code_locked(up: *mut Unit, id: u32) -> Option<u64> {
     }
     // built ahead by a speculative worker: the first call installs it
     if let Some(spec) = u.fns[id as usize].spec.take() {
-        let SpecCode { code, map, relocs, record } = *spec;
+        let SpecCode { code, map, relocs, record, digest } = *spec;
         u.reload_specs.remove(&id);
         u.fns[id as usize].spec_state = 2;
         main_how(2);
-        return Some(install_compiled(up, id, &code, map, &relocs, record));
+        let a = install_compiled(up, id, &code, map, &relocs, record);
+        note_linked_digest(up, id, digest);
+        return Some(a);
     }
     None
 }
@@ -11375,11 +11420,24 @@ pub(crate) unsafe fn install_failed(up: *mut Unit, id: u32, e: &str) -> u64 {
 
 /// Hot reload: installs a patched slot's code as part of patch group `gen` (kept for rollback),
 /// with a fresh O3 counter.
+/// Linked code's digests (its cache entry's: gate.rs), noted with the code slot `id` now runs.
+/// None leaves what the install noted.
+unsafe fn note_linked_digest(up: *mut Unit, id: u32, d: Option<std::sync::Arc<crate::gate::CodeDigest>>) {
+    if d.is_none() {
+        return;
+    }
+    let u = &*up;
+    let at = u.fns[id as usize].code;
+    u.code.write().unwrap_or_else(|e| e.into_inner()).note_digest(at, d);
+}
+
 pub(crate) unsafe fn install_patched(up: *mut Unit, id: u32, code: &[u8], map: Vec<(u32, u64)>, relocs: &[relax_backend::rir::RelocAt], gen: u32) -> Result<u64, String> {
     let u = &mut *up;
     let t = if u.fns[id as usize].rir.as_ref().is_some_and(|r| r.baseline) { tier::BASELINE } else { tier::O1 };
     let _as = code_as(CodeKind::new(t, origin::PATCH));
+    let old = crate::gate::before_install(u, id);
     let a = u.install(id, code, relocs, map, gen)?;
+    crate::gate::installed(u, id, old, a);
     if matches!(u.fns[id as usize].key, FnKey::Sandbox(_)) {
         u.rearm_sandbox_counter(id, a);
     } else {
@@ -11395,7 +11453,9 @@ pub(crate) unsafe fn install_unforwarded(up: *mut Unit, id: u32, code: &[u8], ma
     let u = &mut *up;
     let t = if u.fns[id as usize].rir.as_ref().is_some_and(|r| r.baseline) { tier::BASELINE } else { tier::O1 };
     let _as = code_as(CodeKind::new(t, origin::PATCH));
+    let old = crate::gate::before_install(u, id);
     let a = u.install_code(id, code, relocs, map, gen)?;
+    crate::gate::installed(u, id, old, a);
     u.arm_after_patch(id, a);
     Ok(a)
 }
@@ -14539,7 +14599,9 @@ unsafe fn prepare_rir_from(up: *mut Unit, id: u32, defer: bool, lowered: Option<
         None => {
             let prev = PREP_LOWER.with(|p| p.replace(true));
             let tl = if owner::bailing() { cpu_ns() } else { 0 };
+            let tg = cpu_ns();
             let r = build_rir_inner(up, id);
+            crate::gate::note_lowering(cpu_ns().saturating_sub(tg));
             if tl != 0 { o3_owner(19, tl); }
             PREP_LOWER.with(|p| p.set(prev));
             r
@@ -14577,6 +14639,9 @@ unsafe fn prepare_rir_from(up: *mut Unit, id: u32, defer: bool, lowered: Option<
             crate::sandbox::redirect_wrapper(up, &mut func);
         }
     }
+    // the digest gate (gate.rs): the digest of the body as lowered, before the build's settings,
+    // inlining and passes; it rides the body through them and into its callers' contexts
+    func.digest = Some(crate::gate::take(&func));
     let u = &mut *up;
     let baseline = baseline && !u.pairs_sincos(&func);
     // a baseline body keeps its lowering: its upgrade to normal RIR starts from that, not from the
@@ -23899,6 +23964,8 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
         let remarks = relax_backend::remark::begin();
         let (optimized, inline_rules) = optimize()?;
         func = optimized;
+        // the digest gate: what this O3 body was built from (its root's lowering, its contexts)
+        let o3_digest = crate::gate::of_func(&func);
         let mut inlined = Vec::with_capacity(inline_rules.len());
         for (c, _) in inline_rules { inlined.push(c); }
         inlined.extend_from_slice(&func.inl_slots);
@@ -24052,7 +24119,7 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
         // the result leaves the job arena; the job's own copies die with it
         let c = copied_out(c);
         let (left, cold_left, absent, inlined, nounwind_used) = crate::zone_alloc::copy_out(|| (left.clone(), cold_left.clone(), absent.clone(), inlined.clone(), nounwind_used.clone()));
-        Ok((c.code, c.pc_map, c.relocs, (inlined, left, cold_left, absent, c.frame_size, self_call, nounwind_used)))
+        Ok((c.code, c.pc_map, c.relocs, (inlined, left, cold_left, absent, c.frame_size, self_call, nounwind_used, o3_digest)))
     }));
     if export_o3_mode() {
         return false;
@@ -24089,7 +24156,7 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
         u.stats.tier1_locked_ns += owner_ns.get();
         u.stats.tier1_free_ns += t2 - t1;
         let ok = match built {
-            Ok(Ok((code, map, relocs, (inlined, left_calls, cold_left, absent, frame_size, self_call, nounwind_used)))) if !rt.cut && PATCH_EPOCH.load(Ordering::SeqCst) == epoch && !PATCH_OPEN.load(Ordering::SeqCst) && u.fns[id as usize].version == version && (!crate::inspect::instrument::active(id) || inspect_o3_on()) && !inlined_rejected(u, &unverified_in, &inlined)
+            Ok(Ok((code, map, relocs, (inlined, left_calls, cold_left, absent, frame_size, self_call, nounwind_used, o3_digest)))) if !rt.cut && PATCH_EPOCH.load(Ordering::SeqCst) == epoch && !PATCH_OPEN.load(Ordering::SeqCst) && u.fns[id as usize].version == version && (!crate::inspect::instrument::active(id) || inspect_o3_on()) && !inlined_rejected(u, &unverified_in, &inlined)
                 // (a lean code window keeps a slot's code: an O3-always build is a slot's first)
                 && (o3_first() || !u.code_lean())
                 // (code of an invalidated group -- an unloaded module's -- is never built again)
@@ -24242,7 +24309,7 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
                     if let Some(mut c) = u.cache.take() {
                         c.note_retier_over(u, id, crate::cache::warm_count::RETIER_O3_OVER);
                         let tr = cpu_ns();
-                        let p = c.defer_record_o3(u, id, &code, &relocs, &map, &inlined, &nounwind_used).map(|p| p.with_kept(kept_calls));
+                        let p = c.defer_record_o3(u, id, &code, &relocs, &map, &inlined, &nounwind_used, o3_digest.clone()).map(|p| p.with_kept(kept_calls));
                         u.cache = Some(c);
                         if let Some(p) = p {
                             u.pending_cache_records.push(Some(p));
@@ -24304,7 +24371,9 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
                     {
                         let u = &*up;
                         let at = u.fns[id as usize].code;
-                        u.code.write().unwrap_or_else(|e| e.into_inner()).note_inlined(at, &inlined);
+                        let mut c = u.code.write().unwrap_or_else(|e| e.into_inner());
+                        c.note_inlined(at, &inlined);
+                        c.note_digest(at, Some(o3_digest.clone()));
                     }
                     O3_FIRST_AT.with(|c| c.set(a));
                     true
@@ -24341,7 +24410,9 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
                 if !blob {
                     let _as = code_as(inspect_o3_kind().unwrap_or(CodeKind::new(tier::O3, origin::FRESH)));
                     u.index_code(at, code.len() as u32, id, info);
-                    u.code.write().unwrap_or_else(|e| e.into_inner()).note_inlined(at, &inlined);
+                    let mut c = u.code.write().unwrap_or_else(|e| e.into_inner());
+                    c.note_inlined(at, &inlined);
+                    c.note_digest(at, Some(o3_digest.clone()));
                 }
                 if perf_map_on() {
                     perf_map(at, code.len(), &format!("{} [O3]", u.fns[id as usize].name));
@@ -24933,7 +25004,7 @@ static PATCH_EPOCH: AtomicU64 = AtomicU64::new(0);
 /// (back ends of its compile batch) before its patch group installs -- or is refused. A O3
 /// build must not install meanwhile: it may have inlined RIR built from the new versions into
 /// a slot the group does not replace, code that stays if the edit is refused.
-static PATCH_OPEN: AtomicBool = AtomicBool::new(false);
+pub(crate) static PATCH_OPEN: AtomicBool = AtomicBool::new(false);
 
 /// Opens a reload transaction (unit lock held): builds whose snapshots predate it are stale.
 pub fn open_patch() {
@@ -27584,6 +27655,7 @@ unsafe fn split_begin(up: *mut Unit, id: u32, spec: bool) -> Begin {
             let callees = u.cache.as_mut().map(|c| std::mem::take(&mut c.last_callees)).unwrap_or_default();
             let t1 = u.cache.as_mut().and_then(|c| c.last_tier1.take());
             let kept = u.cache.as_mut().map(|c| std::mem::take(&mut c.last_kept)).unwrap_or_default();
+            let digest = u.cache.as_mut().and_then(|c| c.last_digest.take());
             if u.cache.as_mut().is_some_and(|c| std::mem::take(&mut c.last_o2)) {
                 o2_cached(up, id);
             }
@@ -27602,13 +27674,16 @@ unsafe fn split_begin(up: *mut Unit, id: u32, spec: bool) -> Begin {
                 if u.fns[id as usize].baseline_hint.load(Ordering::Relaxed) {
                     u.exec_note(id, crate::exec_profile::SPEC);
                     install_compiled(up, id, &code, map, &crelocs, false);
+                    note_linked_digest(up, id, digest);
                     let u = &mut *up;
                     let d = u.fns[id as usize].spec_depth;
                     spec_enqueue_cached(up, &callees, d);
                     return Begin::Done(Split::Spec);
                 }
                 u.reload_specs.insert(id);
-                u.fns[id as usize].spec = Some(SpecCode::new(&code, &map, &crelocs, false));
+                let mut sc = SpecCode::new(&code, &map, &crelocs, false);
+                sc.digest = digest;
+                u.fns[id as usize].spec = Some(sc);
                 u.fns[id as usize].spec_state = 1;
                 u.exec_note(id, crate::exec_profile::SPEC);
                 note_spec_built(options, &*up, id);
