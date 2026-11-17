@@ -186,7 +186,8 @@ struct Slot {
     tail: u64,
     /// the epoch (`epoch`) of the process that made this commit; 0: one with no epoch
     epoch: u64,
-    /// the payloads at or past this offset were written under `epoch` (tail <= epoch_from <= end)
+    /// the payloads at or past this offset were written under `epoch` (at most `end`; those below
+    /// `tail` are proven whatever their epoch)
     epoch_from: u64,
 }
 
@@ -344,7 +345,8 @@ fn payload_matches(f: &mut std::fs::File, e: &Ix, end: u64) -> std::io::Result<b
 /// epoch is checked at its first read (`Store::get_at`).
 fn slot_index(f: &mut std::fs::File, h: &Header, k: u32, len: u64) -> Option<Vec<Ix>> {
     let s = h.slots[k as usize];
-    if s.n > h.cap as u64 || s.end < h.data_start() || s.end > len || s.tail > s.epoch_from || s.epoch_from > s.end {
+    // (a seal may move `tail` past `epoch_from`: an earlier epoch's commit is proven to its end)
+    if s.n > h.cap as u64 || s.end < h.data_start() || s.end > len || s.tail > s.end || s.epoch_from > s.end {
         return None;
     }
     let mut ib = vec![0u8; s.n as usize * INDEX_ENTRY];
@@ -2345,6 +2347,21 @@ mod tests {
         let sealed = seal_suspects(&|| false);
         assert_eq!((sealed.stores, sealed.removed), (0, 1));
         assert!(!p.exists(), "a store with a failed payload is removed, not sealed over");
+
+        // a clean store wholly of A's: sealed to its end, and it still opens and serves unchecked
+        set_epoch(A);
+        let r = d.join("core-00112233445566a3.rcs");
+        append(&r, vec![entry(1, 1)], false).unwrap();
+        set_epoch(B);
+        drop(Store::open(&r).unwrap());
+        assert_eq!(seal_suspects(&|| false).stores, 1);
+        let (s, _) = active(&r);
+        assert_eq!(s.tail, s.end, "an earlier epoch's whole commit is sealed to its end");
+        let st = Store::open(&r).expect("a store sealed to its end opens");
+        reads();
+        assert_eq!(st.get(1).unwrap().1, &payload(1)[..]);
+        assert_eq!(reads(), 0, "and its reads check nothing");
+        drop(st);
 
         // a clean store of A's, appended to in B: sealed up to B's own payloads, by a header write
         set_epoch(A);
