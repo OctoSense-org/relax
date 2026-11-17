@@ -23,7 +23,7 @@ use super::mir_nll::LocationMap;
 use super::polonius::PoloniusContext;
 use super::universal_regions::UniversalRegions;
 use crate::mir::move_paths::MoveData;
-use super::region_infer::{NllRegionVariableOrigin, TypeTest};
+use super::region_infer::{Advisory, NllRegionVariableOrigin, TypeTest};
 use super::region_infer::values::{LivenessValues, PlaceholderIndices};
 use crate::lang_items::LangItem;
 use crate::consts::GenericArg;
@@ -186,6 +186,7 @@ pub struct MirTypeckRegionConstraints {
     /// Insertion-ordered (FxIndexMap in nightly).
     pub universe_causes: Vec<(UniverseIndex, UniverseInfo)>,
     pub type_tests: Vec<TypeTest>,
+    pub advisories: Vec<Advisory>,
     /// The open binder scopes that assume an alias outlives one of their placeholders, innermost last, with the
     /// alias obligations each holds until it closes (`binder_scope.rs`).
     binder_frames: Vec<binder_scope::BinderFrame>,
@@ -194,7 +195,7 @@ impl MirTypeckRegionConstraints {
     pub fn new(num_points: usize) -> Self {
         Self { placeholder_indices: Default::default(), placeholder_index_to_region: vec![],
             liveness_constraints: LivenessValues::new(0, num_points), outlives_constraints: Default::default(),
-            universe_causes: vec![], type_tests: vec![], binder_frames: vec![] }
+            universe_causes: vec![], type_tests: vec![], advisories: vec![], binder_frames: vec![] }
     }
     /// The region for a placeholder (an interned `RePlaceholder`), created once.
     pub fn placeholder_region(&mut self, infcx: &mut dyn BorrowckTypeOps, tcx: &Tcx, placeholder: RegionId) -> RegionId {

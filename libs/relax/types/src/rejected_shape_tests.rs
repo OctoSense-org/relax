@@ -475,3 +475,57 @@ fn a_nested_higher_ranked_relation_is_set_aside_by_its_binder() {
     assert!(!has(&e, "extend", ""), "extend: {e:?}");
 }
 
+/// Signature lifetimes produce actionable warnings without changing acceptance; explicit bounds, bound
+/// signature regions, static outputs and inference regions that grow to meet it satisfy the rule.
+#[test]
+fn a_callable_whose_signature_may_not_outlive_a_region_warns() {
+    const CHILD: &str = "RELAX_CALLABLE_OUTLIVES_TEST";
+    if std::env::var(CHILD).is_err() {
+        let out = crate::test_child::output(std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "rejected_shape_tests::a_callable_whose_signature_may_not_outlive_a_region_warns", "--nocapture", "--test-threads=1", "--format=terse"])
+            .env(CHILD, "1").env("RELAX_LINT_FLAGS", ""));
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(out.status.success() && stdout.contains("1 passed"), "callable warning test did not pass: {stdout}\n{}", String::from_utf8_lossy(&out.stderr));
+        return;
+    }
+    let source = r#"
+        fn need<F: 'static>(_: F) {}
+        fn early<'a: 'a>(x: &'a u8) -> &'a u8 { x }
+        pub fn early_fn<'x>() { need(early::<'x>); }
+        fn plain() {}
+        fn id<'a>(x: &'a u8) -> &'a u8 { x }
+        pub fn plain_fn() { need(plain); }
+        pub fn bound_fn() { need(id); }
+        pub fn bound_closure() { need(|x: &u8| *x); }
+        pub fn static_closure() { need(|| -> &'static str { "" }); }
+        pub struct Link<'s>(pub &'s str);
+        pub struct Doc(u8);
+        impl Doc {
+            pub fn resolve<'s>(&self) -> impl FnMut(Link<'s>) -> (&'s str, u8) + '_ { let value = &self.0; move |link: Link<'s>| (link.0, *value) }
+            pub fn resolve_bound<'a, 's: 'a>(&'a self) -> impl FnMut(Link<'s>) -> (&'s str, u8) + 'a { let value = &self.0; move |link: Link<'s>| (link.0, *value) }
+        }
+        pub struct Trees(pub [u8; 2], pub [u8; 2]);
+        impl Trees {
+            pub fn all(&self) -> impl Iterator<Item = u8> + '_ { [&self.0, &self.1].into_iter().flat_map(|t| (0..2usize).map(move |i| t[i])) }
+        }
+    "#;
+    crate::lint::enable();
+    let (e, reports) = crate::lint::capture(|| errors(source));
+    assert!(e.is_empty(), "callable advisories changed acceptance, including a helper: {e:?}");
+    assert!(reports.iter().all(|r| r.level < crate::lint::Level::Deny), "callable cases emitted a lint error: {:?}", reports.iter().map(|r| &r.line).collect::<Vec<_>>());
+    let warnings: Vec<_> = reports.iter().filter(|r| r.lint == crate::lint::CALLABLE_OUTLIVES.name).map(|r| &r.line).collect();
+    let line = |item: &str| source.lines().position(|l| l.contains(&format!("fn {item}"))).expect("test item") + 1;
+    let warning_line = |w: &String| w.split(": warning: ").next().unwrap().rsplit(':').nth(1).and_then(|n| n.parse::<usize>().ok()).expect("warning location");
+    for (item, signature) in [("early_fn", "the signature of `"), ("resolve<", "this closure's signature")] {
+        let found: Vec<_> = warnings.iter().filter(|w| warning_line(w) == line(item)).collect();
+        assert!(!found.is_empty(), "{item}: missing signature lifetime warning: {warnings:?}");
+        assert!(found.iter().all(|w| w.contains(signature) && w.contains("note: a callable outlives a lifetime only if every lifetime its signature names does")
+            && w.contains("help: state the bound where both lifetimes are declared")), "{item}: warning lost the callable, rule or fix: {found:?}");
+    }
+    assert!(warnings.iter().any(|w| warning_line(w) == line("early_fn") && w.contains("early`") && w.contains("`'x: 'static`")), "early_fn: warning lost the function path or named lifetime bound: {warnings:?}");
+    assert!(warnings.iter().any(|w| warning_line(w) == line("resolve<") && w.contains("names `'s`") && w.contains("fn f<'a, 's: 'a>")), "resolve: warning lost the named signature lifetime or anonymous receiver fix: {warnings:?}");
+    for item in ["need<", "early<", "plain()", "id<", "plain_fn", "bound_fn", "bound_closure", "static_closure", "resolve_bound", "all("] {
+        assert!(!warnings.iter().any(|w| warning_line(w) == line(item)), "{item}: a satisfied signature lifetime requirement warned: {warnings:?}");
+    }
+    assert!(warnings.iter().all(|w| [line("early_fn"), line("resolve<")].contains(&warning_line(w))), "unexpected callable warning outside the two unproven requirements: {warnings:?}");
+}

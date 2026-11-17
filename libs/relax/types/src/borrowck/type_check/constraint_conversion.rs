@@ -3,7 +3,8 @@ use super::{Locations, MirTypeckRegionConstraints};
 use crate::mir::Span;
 use crate::borrowck::constraints::{ConstraintCategory, OutlivesConstraint, RegionVid};
 use crate::borrowck::infer_ctxt::BorrowckInferCtxt;
-use crate::borrowck::region_infer::{TypeTest, VerifyBound};
+use crate::borrowck::region_infer::{Advisory, TypeTest, VerifyBound};
+use crate::infer::outlives::components::Callable;
 use crate::borrowck::universal_regions::UniversalRegions;
 use crate::infer::outlives::obligations::{TypeOutlives, TypeOutlivesDelegate};
 use crate::infer::outlives::verify;
@@ -201,6 +202,20 @@ impl TypeOutlivesDelegate for ConstraintConversion<'_, '_> {
         let b = self.to_region_vid(b);
         let a = self.to_region_vid(a);
         self.add_outlives(b, a, constraint_category, self.span);
+    }
+
+    fn push_advisory_region_constraint(&mut self, a: RegionId, b: RegionId, category: ConstraintCategory, callable: Callable) {
+        let placeholder = |r| match self.infcx.tcx.tys.region_kind(r) {
+            RegionKind::RePlaceholder { .. } => true,
+            RegionKind::ReVar(v) => matches!(self.infcx.infcx.region_var_origin(v),
+                crate::infer::region_constraints::RegionVariableOrigin::Nll(crate::borrowck::region_infer::NllRegionVariableOrigin::Placeholder(_))),
+            _ => false,
+        };
+        // Higher-ranked requirements need their binder's assumptions, including placeholders already mapped to vids.
+        if placeholder(a) || placeholder(b) { return; }
+        let sup = self.to_region_vid(b);
+        let sub = self.to_region_vid(a);
+        self.constraints.advisories.push(Advisory { sup, sub, span: self.span, category, callable });
     }
 
     fn push_verify(&mut self, kind: TyId, a: RegionId, bound: verify::VerifyBound) {

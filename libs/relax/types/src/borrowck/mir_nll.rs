@@ -2,7 +2,7 @@
 use super::constraints::OutlivesConstraintSet;
 use super::dataflow::RegionScope;
 use super::handle_placeholders::compute_sccs_applying_placeholder_outlives_constraints;
-use super::region_infer::{RegionDefinition, RegionInferenceContext, TypeTest};
+use super::region_infer::{Advisory, RegionDefinition, RegionInferenceContext, TypeTest};
 use super::region_infer::values::LivenessValues;
 use super::type_check::free_region_relations::UniversalRegionRelations;
 use crate::mir::{Body, Location, Region};
@@ -89,6 +89,7 @@ pub struct RegionInput {
     pub relations: UniversalRegionRelations,
     pub liveness: LivenessValues,
     pub type_tests: Vec<TypeTest>,
+    pub advisories: Vec<Advisory>,
     /// Why each universe was created (diagnostics of placeholder errors).
     pub universe_causes: Vec<(UniverseIndex, super::type_check::UniverseInfo)>,
 }
@@ -99,6 +100,7 @@ pub struct MirRegionResult {
     pub regioncx: RegionInferenceContext,
     pub locations: LocationMap,
     pub type_tests: Vec<TypeTest>,
+    pub advisories: Vec<Advisory>,
     pub universe_causes: Vec<(UniverseIndex, super::type_check::UniverseInfo)>,
 }
 impl RegionScope for MirRegionResult {
@@ -114,8 +116,8 @@ pub fn compute_regions(tcx: &Tcx, prog: &Program, body: &Body, input: RegionInpu
     let lowered = compute_sccs_applying_placeholder_outlives_constraints(
         input.definitions, input.outlives, input.relations.universal_regions.fr_static);
     let regioncx = RegionInferenceContext::solve(tcx, prog, lowered, input.relations, input.liveness,
-        locations.num_points(), &input.type_tests, nested);
-    MirRegionResult { polonius: input.polonius, nested, tainted_by_errors: input.tainted_by_errors, regioncx, locations, type_tests: input.type_tests, universe_causes: input.universe_causes }
+        locations.num_points(), &input.type_tests, &input.advisories, nested);
+    MirRegionResult { polonius: input.polonius, nested, tainted_by_errors: input.tainted_by_errors, regioncx, locations, type_tests: input.type_tests, advisories: input.advisories, universe_causes: input.universe_causes }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -221,9 +223,9 @@ impl MirTypeck {
     pub fn into_region_input(self, infcx: &dyn RegionDriverOps) -> RegionInput {
         let definitions = self.definitions(infcx);
         let relations = self.relations(definitions.len());
-        let MirTypeckRegionConstraints { outlives_constraints, liveness_constraints, type_tests, universe_causes, .. } = self.constraints;
+        let MirTypeckRegionConstraints { outlives_constraints, liveness_constraints, type_tests, advisories, universe_causes, .. } = self.constraints;
         RegionInput { polonius: self.polonius, tainted_by_errors: self.tainted_by_errors, definitions, outlives: outlives_constraints,
-            relations, liveness: liveness_constraints, type_tests, universe_causes }
+            relations, liveness: liveness_constraints, type_tests, advisories, universe_causes }
     }
 }
 

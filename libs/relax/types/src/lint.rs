@@ -65,6 +65,8 @@ pub const fn lint(name: &'static str) -> Lint {
 }
 
 pub const UNUSED_MUT: Lint = lint("unused_mut");
+/// Warn when a callable must outlive a lifetime that its signature's free lifetimes may not outlive.
+pub const CALLABLE_OUTLIVES: Lint = Lint { name: "relax_callable_outlives", default: Level::Warn, default_2024: Level::Warn, groups: &[] };
 pub const OVERFLOWING_LITERALS: Lint = lint("overflowing_literals");
 pub const UNUSED_UNSAFE: Lint = lint("unused_unsafe");
 pub const UNSAFE_OP_IN_UNSAFE_FN: Lint = lint("unsafe_op_in_unsafe_fn");

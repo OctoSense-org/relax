@@ -1,5 +1,5 @@
 // ported from N:rustc_infer/src/infer/outlives/obligations.rs @8d1a764
-use super::{components::{self, Component}, verify::{Verify, VerifyBound, VerifyBoundCx}};
+use super::{components::{self, Callable, Component}, verify::{Verify, VerifyBound, VerifyBoundCx}};
 use crate::borrowck::constraints::ConstraintCategory;
 use crate::infer::InferCtxt;
 use crate::program::Program;
@@ -12,6 +12,8 @@ use crate::next_solver::{Predicate, PredicateKind, ClauseKind};
 pub trait TypeOutlivesDelegate {
     fn delayed_bug(&mut self, message: String);
     fn push_sub_region_constraint(&mut self, a: RegionId, b: RegionId, category: ConstraintCategory);
+    /// Signature-only requirements are advisory; lexical region resolution does not record them.
+    fn push_advisory_region_constraint(&mut self, _a: RegionId, _b: RegionId, _category: ConstraintCategory, _callable: Callable) {}
     fn push_verify(&mut self, ty: TyId, a: RegionId, bound: VerifyBound);
     /// Whether an open binder scope holds the alias obligation `ty: a` to decide it when it closes (borrowck's
     /// `binder_scope.rs`); lexical region resolution opens no scopes.
@@ -29,6 +31,13 @@ impl<'a> TypeOutlives<'a> {
         let mut components = Vec::new();
         components::push_outlives_components(self.tcx, self.verify_bound.prog, ty, &mut components);
         self.components_must_outlive(&components, region, category);
+        let mut signatures = Vec::new();
+        components::push_signature_regions(self.tcx, self.verify_bound.prog, ty, &mut signatures);
+        for (r, callable) in signatures {
+            if matches!(self.tcx.tys.region_kind(r), crate::types::RegionKind::ReStatic)
+                || components.iter().any(|c| matches!(c, Component::Region(existing) if *existing == r)) { continue; }
+            self.delegate.push_advisory_region_constraint(region, r, category, callable);
+        }
     }
     fn components_must_outlive(&mut self, components: &[Component], region: RegionId, category: ConstraintCategory) {
         for component in components {
