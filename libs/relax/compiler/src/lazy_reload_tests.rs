@@ -2841,7 +2841,8 @@ pub fn {name}(p: *mut u64) {{
     };
     let old = closures(&u);
     assert_eq!(old.len(), 1, "the thread's closure has code");
-    let old_name = u.fns[old[0] as usize].name.to_string();
+    // named as a refused edit names a frame's closure: by the fn that makes it and its place
+    let old_name = crate::reload::slot_shown(&u, old[0]);
     let file = u.prog.def(start).file;
     let apply_text = |text: String| unsafe { apply(up, vec![Edit { file, path: app.clone(), src: text.into_bytes() }]) };
     // edit 1: the closure captures another value -- the running one keeps its old code
@@ -2858,9 +2859,12 @@ pub fn {name}(p: *mut u64) {{
     assert_eq!(o.rung, Rung::Patch, "the closure without S applies: {:?}", o.lines);
     let o = apply_text(src_of("start", "pub m: u64, pub n: u64", "5u64", "let k = 0u64;", "s + k"));
     let parent_clean = (refused(&o), format!("{:?} {:?}", o.rung, o.lines));
+    // (whether that patch applied, by its verdict: what the edits below send does not hang on
+    // the reason's wording)
+    let clean_applied = o.rung == Rung::Patch;
     // the parent renamed (edit 3): its slots and the old closure's are no longer the program's
     // (S as the program has it now: with `m` if the patch above applied)
-    let (fields, made) = if parent_clean.0 { ("pub n: u64", "n: 5") } else { ("pub m: u64, pub n: u64", "m: 0, n: 5") };
+    let (fields, made) = if clean_applied { ("pub m: u64, pub n: u64", "m: 0, n: 5") } else { ("pub n: u64", "n: 5") };
     let o = apply_text(named_src("begin", fields, made, "let k = 0u64;", " + k"));
     assert_eq!(o.rung, Rung::Patch, "the rename applies: {:?}", o.lines);
     let o = apply_text(named_src("begin", &format!("pub z: u64, {fields}"), &format!("z: 0, {made}"), "let k = 0u64;", " + k"));
@@ -2868,9 +2872,9 @@ pub fn {name}(p: *mut u64) {{
     flags[0].store(1, Ordering::SeqCst);
     wait(3);
     let got = flags[2].load(Ordering::SeqCst);
-    assert!(parent_kept.0, "while its parent is the program's, a frame in the closure edit 1 replaced refuses the layout patch, naming it (`{old_name}`): {}", parent_kept.1);
-    assert!(parent_clean.0, "once its parent's text no longer names S, the closure edit 1 kept refuses it still, naming it (`{old_name}`): {}", parent_clean.1);
-    assert!(parent_gone.0, "once its parent was renamed too, the frame refuses it still, naming it (`{old_name}`): {}; the thread then read {got}", parent_gone.1);
+    assert!(parent_kept.0, "while its parent is the program's, a frame in the closure edit 1 replaced refuses the layout patch, naming it ({old_name}): {}", parent_kept.1);
+    assert!(parent_clean.0, "once its parent's text no longer names S, the closure edit 1 kept refuses it still, naming it ({old_name}): {}", parent_clean.1);
+    assert!(parent_gone.0, "once its parent was renamed too, the frame refuses it still, naming it ({old_name}): {}; the thread then read {got}", parent_gone.1);
     assert_eq!(got, 5, "the thread's value, read by the code it was made for");
     std::mem::forget(u);
     std::fs::remove_dir_all(dir).unwrap();
@@ -2995,6 +2999,12 @@ impl KeptRig {
     fn name(&self, slot: u32) -> String {
         self.unit.fns[slot as usize].name.to_string()
     }
+
+    /// Slot `slot` as a refused edit names a frame in it: a closure by the fn that makes it and
+    /// its place (reload::slot_shown)
+    fn shown(&self, slot: u32) -> String {
+        crate::reload::slot_shown(&self.unit, slot)
+    }
 }
 
 impl Drop for KeptRig {
@@ -3042,13 +3052,13 @@ pub fn start(p: *mut u64) {
     rig.wait(1);
     let old = rig.closures("worker");
     assert_eq!(old.len(), 1, "the thread's closure has code");
-    let name = rig.name(old[0]);
+    let name = rig.shown(old[0]);
     let o = rig.edit("lib.rs", &[("    let c = move || { let s = S { n: 5 }; spin(a); read(&s) };\n    a[2].store(c(), Ordering::SeqCst);", "    a[2].store(0, Ordering::SeqCst);")]);
     assert_eq!(o.rung, crate::reload::Rung::Patch, "the closure's removal applies: {:?}", o.lines);
     let o = rig.edit("lib.rs", &[("pub struct S { pub n: u64 }", "pub struct S { pub m: u64, pub n: u64 }")]);
     let refused = refused_with(&o, &["struct `S` changed its layout", &name, "patch gen 1 kept it on"]);
     let got = rig.release();
-    assert!(refused.0, "a frame in the closure edit 1 removed refuses the layout patch, naming it (`{name}`) and edit 1: {}", refused.1);
+    assert!(refused.0, "a frame in the closure edit 1 removed refuses the layout patch, naming it ({name}) and edit 1: {}", refused.1);
     assert_eq!(got, 5, "the thread's value, read by the code it was made for");
 }
 
@@ -3103,6 +3113,8 @@ pub fn start(p: *mut u64) {
     let old = rig.closures("worker");
     assert_eq!(old.len(), 1, "the closure has code");
     let name = rig.name(old[0]);
+    // (a frame over code holding a copy of it names it as a refused edit names a frame's closure)
+    let shown = rig.shown(old[0]);
     // (the frame of the first wait stays in the instance's first code)
     let pumps = rig.tier_up("pump");
     assert_eq!(pumps.len(), 1, "one instance of pump");
@@ -3120,12 +3132,12 @@ pub fn start(p: *mut u64) {
     at(&rig, 2);
     // (the refused text again)
     let o = rig.edit("lib.rs", &[("pub struct S { pub m: u64, pub n: u64 }", "pub struct S { pub m: u64, pub n: u64 }")]);
-    let tiered = refused_with(&o, &["struct `S` changed its layout", "pump", "holds a copy of", &name, "patch gen 1 kept"]);
+    let tiered = refused_with(&o, &["struct `S` changed its layout", "pump", "holds a copy of", &shown, "patch gen 1 kept"]);
     rig.flags[0].store(2, Ordering::SeqCst);
     rig.wait(3);
     assert!(refused.0, "a frame of an instance over the closure edit 1 kept refuses the layout patch, naming it and the closure (`{name}`): {}", refused.1);
     assert!(kept, "the edits leave the instance's O3 code in place");
-    assert!(tiered.0, "a frame in the instance's O3 code, which holds a copy of the closure, refuses it naming the copy: {}", tiered.1);
+    assert!(tiered.0, "a frame in the instance's O3 code, which holds a copy of the closure, refuses it naming the copy ({shown}): {}", tiered.1);
     assert_eq!(rig.flag(2), 10, "the second calls, by the code the closure was made with");
 }
 
@@ -3391,7 +3403,7 @@ pub fn start(p: *mut u64) {
     rig.wait(1);
     let old = rig.closures("worker");
     assert_eq!(old.len(), 1, "the thread's closure has code");
-    let name = rig.name(old[0]);
+    let name = rig.shown(old[0]);
     let mut o1 = rig.set("lib.rs", &t1);
     assert_eq!(o1.rung, crate::reload::Rung::Patch, "edit 1 (captures) applies: {:?}", o1.lines);
     let mut o2 = rig.set("lib.rs", &t2);
