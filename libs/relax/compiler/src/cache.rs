@@ -4883,7 +4883,12 @@ impl Cache {
             None => {
                 let at = self.replaced.len();
                 let img = if self.mode != Mode::Verify {
-                    match self.build_image(u, &image_ids, stop) { Err(()) => return false, Ok(img) => img }
+                    let t = std::time::Instant::now();
+                    let built = self.build_image(u, &image_ids, stop);
+                    if self.verbose {
+                        eprintln!("relax cache: startup image of {} slots {} in {:.1} ms", image_ids.len(), if built.is_ok() { "built" } else { "gave way" }, t.elapsed().as_secs_f64() * 1e3);
+                    }
+                    match built { Err(()) => return false, Ok(img) => img }
                 } else { None };
                 (img, at)
             }

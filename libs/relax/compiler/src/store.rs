@@ -270,6 +270,47 @@ static EXITING: AtomicBool = AtomicBool::new(false);
 /// than ordered on the disk.
 pub fn set_exiting() {
     EXITING.store(true, Ordering::Relaxed);
+    let since = SEAL_SINCE.load(Ordering::Relaxed);
+    if since != 0 && crate::run::VERBOSE.load(Ordering::Relaxed) {
+        eprintln!("relax store: the exit begins with a seal in its barrier since t={} ms (at t={:.0} ms)", since - 1, crate::clock::ms_since_start());
+    }
+}
+
+/// When the seal thread's barrier in flight began (ms since the start, plus one; 0: none), for the
+/// exit's trace line: a barrier cannot be interrupted, and the process waits for it to end.
+static SEAL_SINCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// A store write's trace (RELAX_VERBOSE): each one over `SLOW_WRITE_MS` says when it began, its
+/// time and where that went, to set it beside the seal thread's barriers (`seal`).
+struct WriteTrace<'a> {
+    file: &'a Path,
+    at: f64,
+    t: std::time::Instant,
+    how: &'static str,
+    marks: Vec<(&'static str, f64)>,
+}
+
+const SLOW_WRITE_MS: f64 = 100.0;
+
+impl<'a> WriteTrace<'a> {
+    fn new(file: &'a Path) -> Self {
+        WriteTrace { file, at: crate::clock::ms_since_start(), t: std::time::Instant::now(), how: "append", marks: Vec::new() }
+    }
+    fn mark(&mut self, what: &'static str) {
+        self.marks.push((what, self.t.elapsed().as_secs_f64() * 1e3));
+    }
+}
+
+impl Drop for WriteTrace<'_> {
+    fn drop(&mut self) {
+        let ms = self.t.elapsed().as_secs_f64() * 1e3;
+        if ms < SLOW_WRITE_MS || !crate::run::VERBOSE.load(Ordering::Relaxed) { return; }
+        let mut last = 0.0;
+        let mut parts: Vec<String> = self.marks.iter().map(|&(w, at)| { let d = at - last; last = at; format!("{w} {d:.1}") }).collect();
+        parts.push(format!("the rest {:.1}", ms - last));
+        eprintln!("relax store: a slow {} at t={:.0} ms: {ms:.1} ms ({}) {}", self.how, self.at, parts.join(", "),
+            self.file.file_name().unwrap_or_default().to_string_lossy());
+    }
 }
 
 /// Whether a commit puts a write barrier between its payloads and the header (not while exiting).
@@ -382,7 +423,14 @@ fn queue_seal(file: &Path, hb: &[u8]) {
 /// barrier or the lock failed, and the commit stays to be verified by the next open.
 fn seal(file: &Path, hb: &[u8; HEADER]) -> std::io::Result<()> {
     let Ok(mut f) = std::fs::OpenOptions::new().read(true).write(true).open(file) else { return Ok(()) };
-    order_writes(&f)?;
+    let (at, t) = (crate::clock::ms_since_start(), std::time::Instant::now());
+    SEAL_SINCE.store(at as u64 + 1, Ordering::Relaxed);
+    let barrier = order_writes(&f);
+    SEAL_SINCE.store(0, Ordering::Relaxed);
+    if crate::run::VERBOSE.load(Ordering::Relaxed) {
+        eprintln!("relax store: seal at t={at:.0} ms: the barrier in {:.1} ms {}", t.elapsed().as_secs_f64() * 1e3, file.file_name().unwrap_or_default().to_string_lossy());
+    }
+    barrier?;
     f.lock()?;
     let mut now = [0u8; HEADER];
     if f.read_exact(&mut now).is_ok() && now == *hb {
@@ -403,6 +451,7 @@ pub(crate) unsafe fn reset_statics() {
     relax_session::reset_static(&EXITING, AtomicBool::new(false));
     relax_session::reset_static(&TO_SEAL, relax_session::sync::Mutex::new(Vec::new()));
     relax_session::reset_static(&SEALING, AtomicBool::new(false));
+    relax_session::reset_static(&SEAL_SINCE, std::sync::atomic::AtomicU64::new(0));
 }
 
 fn encode_index(ix: &[Ix]) -> Vec<u8> {
@@ -870,6 +919,7 @@ fn append_inner<T: Entry>(base: &Path, mut entries: Vec<T>, drop_all: bool, orde
     let removed: std::collections::HashSet<u128> = entries.iter().filter(|e| e.kind() == KIND_REMOVED).map(|e| e.key()).collect();
     entries.retain(|e| e.kind() != KIND_REMOVED);
     let dir = base.parent().unwrap_or(Path::new("."));
+    let mut trace = WriteTrace::new(base);
     // the current generation, locked; a newer one written meanwhile (another process's
     // rewrite) is taken instead
     let (mut f, gen_file) = loop {
@@ -878,11 +928,13 @@ fn append_inner<T: Entry>(base: &Path, mut entries: Vec<T>, drop_all: bool, orde
             Ok(f) => f,
             Err(_) => {
                 let entries = match with_ledger(entries, &mut merge, None) { Ok(e) => e, Err(e) => return Ok(Some(e)) };
+                trace.how = "new store";
                 return rewrite(base, dir, Vec::new(), None, entries, ordered).map(|_| None);
             }
         };
         f.lock()?;
         if !gen_path(base, g + 1).exists() {
+            trace.mark("lock");
             break (f, path);
         }
         let _ = f.unlock();
@@ -899,6 +951,7 @@ fn append_inner<T: Entry>(base: &Path, mut entries: Vec<T>, drop_all: bool, orde
         // not all reach the disk (they are written over)
         Ok(usable_slot(&mut f, &h, len).map(|(k, ix)| (h, k, ix)))
     })()?;
+    trace.mark("read");
     // a merged ledger: the one on disk now, under the lock (a payload that fails its checksum
     // refuses the batch: the merge would drop what it held)
     let entries = if merge.is_some() {
@@ -924,6 +977,7 @@ fn append_inner<T: Entry>(base: &Path, mut entries: Vec<T>, drop_all: bool, orde
         Some(x) if !drop_all => x,
         // unreadable or stale: replaced whole
         _ => {
+            trace.how = "rewrite (stale)";
             let res = rewrite(path, dir, Vec::new(), None, entries, ordered);
             let _ = f.unlock();
             return res.map(|_| None);
@@ -935,6 +989,7 @@ fn append_inner<T: Entry>(base: &Path, mut entries: Vec<T>, drop_all: bool, orde
     let new_keys: std::collections::HashSet<u128> = entries.iter().map(|e| e.key()).collect();
     let merged_n = old.iter().filter(|e| !new_keys.contains(&{ e.key })).count() + entries.len();
     if merged_n as u64 > h.cap as u64 {
+        trace.how = "rewrite (full)";
         let res = rewrite(path, dir, old, Some(&f), entries, ordered);
         let _ = f.unlock();
         return res.map(|_| None);
@@ -948,12 +1003,14 @@ fn append_inner<T: Entry>(base: &Path, mut entries: Vec<T>, drop_all: bool, orde
         for e in entries { ix.push(write_entry(&mut out, &mut off, &e)?); }
         out.flush()?;
     }
+    trace.mark("payloads");
     ix.sort_by_key(|e| e.key);
     // Encoded lengths are now known. Use the same compaction threshold without pre-encoding
     // all new images. Only a dead-space compaction needs to copy the just-appended bytes.
     let live: u64 = ix.iter().map(|e| e.len as u64).sum();
     let dead = end.saturating_sub(h.data_start()).saturating_sub(live.min(end));
     if dead * 4 > live && dead > 1 << 20 {
+        trace.how = "rewrite (compaction)";
         let res = rewrite::<T>(path, dir, ix, Some(&f), Vec::new(), ordered);
         let _ = f.unlock();
         return res.map(|_| None);
@@ -975,6 +1032,7 @@ fn append_inner<T: Entry>(base: &Path, mut entries: Vec<T>, drop_all: bool, orde
     let hb = nh.bytes();
     f.seek(SeekFrom::Start(0))?;
     f.write_all(&hb)?;
+    trace.mark("header");
     let _ = f.unlock();
     drop(f);
     if ordered {
@@ -1237,7 +1295,10 @@ impl RunStore {
         // the payloads before the index and header that commit them, outside the file lock (no
         // open waits on the disk for it; see `seal`)
         if ordered {
+            let mut trace = WriteTrace::new(&self.path);
+            trace.how = "run store commit";
             order_writes(&self.file)?;
+            trace.mark("barrier");
         }
         let ib = encode_index(&ix);
         let next = 1 - active;
