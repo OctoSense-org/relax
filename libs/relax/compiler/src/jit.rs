@@ -16288,8 +16288,15 @@ unsafe fn load_modules(up: *mut Unit, mods: &[u32], why: &str) {
     }
 }
 
+/// Whether the run loads the files the lazy selection skipped in the background: the completion
+/// thread, or for a run no present comes to, the background type check (typeck_bg). Off
+/// (RELAX_LAZY_COMPLETE=0), a skipped file comes only when the program or an edit loads it.
+pub(crate) fn background_loads() -> bool {
+    !std::env::var("RELAX_LAZY_COMPLETE").is_ok_and(|v| v == "0")
+}
+
 pub fn start_completion(up: *mut Unit) {
-    if std::env::var("RELAX_LAZY_COMPLETE").is_ok_and(|v| v == "0") { return; }
+    if !background_loads() { return; }
     if unsafe { (*up).prog.skipped_files.is_empty() } { return; }
     let upn = up as usize;
     { let _k = crate::zone_alloc::kept();

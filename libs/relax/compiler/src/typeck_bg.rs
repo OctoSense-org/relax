@@ -227,9 +227,11 @@ fn file_keys(u: &Unit, crates: &[(u32, u128)], known: &HashSet<u32>) -> Vec<(u32
 }
 
 /// No present will come to this run (a test run, a headless program): the completion thread,
-/// which waits for one, loads no skipped file, so this check loads the ones it needs.
+/// which waits for one, loads no skipped file, so this check loads the ones it needs -- unless the
+/// run loads none in the background (jit::background_loads): then, as in a windowed run, the check
+/// waits for the program or an edit to load them.
 fn no_present_coming() -> bool {
-    jit::past_startup_headless() && !jit::FIRST_PRESENT.load(Ordering::Acquire)
+    jit::past_startup_headless() && !jit::FIRST_PRESENT.load(Ordering::Acquire) && jit::background_loads()
 }
 
 fn run(up: *mut Unit, scope: &Scope) {
