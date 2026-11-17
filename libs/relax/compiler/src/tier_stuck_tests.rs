@@ -702,6 +702,92 @@ fn a_front_made_after_a_patch_of_its_file_is_taken() {
     std::fs::remove_dir_all(dir).unwrap();
 }
 
+/// A hot fn whose O3 take gives way for a cause that lasts (TAKE_GIVES_WAY stands in for one: a
+/// front never made off the owner, a wait that never ends) is tried again once per change, not
+/// once per call. A take that gave way counted the slot again from the cost it had, over the
+/// threshold, so its next call queued it for the same take: a live session's O3 workers ran ~68
+/// builds a second for minutes with nothing edited (11-17). A build on the owner or an edit is a
+/// change: one more take each.
+#[test]
+fn a_take_that_gives_way_waits_for_a_change() {
+    isolated_test!(a_take_that_gives_way_waits_for_a_change);
+    crate::borrowck::lazy::disable_gandalf();
+    if std::env::var_os("RELAX_STD").is_none() {
+        std::env::set_var("RELAX_STD", concat!(env!("CARGO_MANIFEST_DIR"), "/std"));
+    }
+    let dir = std::env::temp_dir().join(format!("relax-take-gives-way-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("input.rs");
+    std::fs::write(&path, TAKE_SOURCE).unwrap();
+    let (prog, core, krate) = crate::load_with_std(&std::sync::Arc::new(crate::Session::default()), path.to_str().unwrap(), "gives_way", false).unwrap();
+    let def = |prog: &Program, n: &str| prog.defs.iter().enumerate().find_map(|(i, d)| {
+        let id = DefId(i as u32);
+        (d.krate == krate && d.kind == DefKind::Fn && prog.name(id) == n).then_some(id)
+    }).unwrap();
+    let (twice, main) = (def(&prog, "twice"), def(&prog, "main"));
+    let mut tcx = Tcx::new();
+    tcx.collect(&prog);
+    assert!(tcx.errors.is_empty(), "{:?}", tcx.errors);
+    let mut u = Unit::new(prog, tcx, core);
+    let up = &mut *u as *mut Unit;
+    unsafe { UNIT = up };
+    assert!(u.tier1.is_some(), "the fixture needs O3");
+    enable_pipelining(&u.prog.session.options);
+    // twice runs its first code under its count stub; its takes give way
+    let id = crate::owner::call(crate::owner::Class::Program, || {
+        let id = u.fn_id(FnKey::Inst(twice, Vec::new()));
+        let c = unsafe { compile_fn(up, id) }.unwrap();
+        u.install(id, &c.0, &c.2, c.1, 0).unwrap();
+        let code = u.fns[id as usize].code;
+        u.arm_counter_as(id, code, true);
+        id
+    });
+    TAKE_GIVES_WAY.store(id, Ordering::Relaxed);
+    let rec = crate::owner::call(crate::owner::Class::Program, || tier_rec(&u.slots, id) as usize) as *const AtomicU64;
+    let state = || unsafe { (*rec.add(3)).load(Ordering::Acquire) };
+    assert_eq!(state(), T_COUNTING, "twice counts its calls");
+    // a call turned it hot and queued it (queue_counting, without the inbox: no worker runs here)
+    let queue_again = || unsafe {
+        let (code, stub) = ((*rec.add(1)).load(Ordering::Relaxed), (*rec.add(2)).load(Ordering::Relaxed));
+        let _ = crate::owner::call(crate::owner::Class::Program, || SlotWord::of(&(&*up).slots, id).compare_exchange(stub, code, Ordering::SeqCst, Ordering::SeqCst));
+        assert!((*rec.add(3)).compare_exchange(T_COUNTING, T_QUEUED, Ordering::SeqCst, Ordering::SeqCst).is_ok(), "twice was counting");
+    };
+    queue_again();
+    let mut takes = 0;
+    loop {
+        takes += 1;
+        assert!(!unsafe { compile_tier1(up, id) }, "twice's take gave way");
+        if state() != T_COUNTING || takes == 6 {
+            break;
+        }
+        queue_again();
+    }
+    assert_eq!(takes, 2, "with nothing changed, a take that gave way counted twice again after each of its {} takes: each next call queued it for the same take", takes);
+    assert_eq!(state(), T_QUEUED, "twice waits for a change: its calls are not counted");
+    // `why-tier stuck` names it, and what it waits for
+    crate::inspect::tierlog::drain();
+    crate::owner::call(crate::owner::Class::Program, || {
+        let stuck = tier_stuck(&u);
+        assert!(stuck.iter().any(|s| s.0 == id && s.1.contains("nothing changed")), "twice is stuck below O3 and says why: {:?}", stuck);
+    });
+    // a build on the owner is a change: one more take, then it waits again
+    crate::owner::call(crate::owner::Class::Program, || {
+        let m = u.fn_id(FnKey::Inst(main, Vec::new()));
+        let c = unsafe { compile_fn(up, m) }.unwrap();
+        u.install(m, &c.0, &c.2, c.1, 0).unwrap();
+    });
+    rearm_bailed(up);
+    assert_eq!(state(), T_COUNTING, "twice counts again after a build on the owner");
+    queue_again();
+    assert!(!unsafe { compile_tier1(up, id) }, "twice's take gave way again");
+    assert_eq!(state(), T_QUEUED, "one take per change: twice waits for the next one");
+    rearm_bailed(up);
+    assert_eq!(state(), T_QUEUED, "nothing changed since: twice still waits");
+    // (process exit owns the runtime's teardown)
+    std::mem::forget(u);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
 const LEFT_SOURCE: &str = r#"
 const K1: u32 = 40 + 2;
 const K2: u32 = 6 * 7;

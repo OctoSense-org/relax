@@ -21164,8 +21164,108 @@ unsafe fn queued_cold(rec: *const AtomicU64, threshold: u64, now: u64) -> Option
 /// take's rounds, e.g. right after a patch) counts again in its count stub, from the cost it has:
 /// it was picked on evidence, so queued again it is built at its next pick (PICK_RECOUNTED). Left
 /// queued without its stub, nothing queued it again: hot code stayed below O3 for the rest of the
-/// run. Atomics only, as o3_pick_cold (the take's thread holds no unit lock here).
-unsafe fn count_again_after_bail(up: *mut Unit, id: u32) {
+/// run. Once per change (bail_stamp): a take that gives way again with nothing changed since the
+/// last one leaves the slot queued without its stub, and the next change counts it again
+/// (rearm_bailed). Counted again after every take, a cause that lasts made a loop at the rate of
+/// the slot's calls: each next call queued it for the same take (a live session's O3 workers, ~68
+/// takes a second for minutes with nothing edited, 11-17). `why`: what the take gave way on (the
+/// bail, the slot whose front it needed, why that front was not made: AF_*). Atomics and a short
+/// lock, as o3_pick_cold (the take's thread holds no unit lock here).
+unsafe fn count_again_after_bail(up: *mut Unit, id: u32, why: (&'static str, Option<u32>, u8)) {
+    let u = &*up;
+    if u.tier1.is_none() || id as usize >= u.fns.len() || (*tier_rec(&u.slots, id).add(3)).load(Ordering::Acquire) != T_QUEUED {
+        return;
+    }
+    let stamp = bail_stamp(up);
+    let (wait, say) = {
+        let mut b = BAILED.lock().unwrap_or_else(|e| e.into_inner());
+        crate::zone_alloc::kept_with(|| {
+            let e = b.get_or_insert_with(HashMap::new).entry((up as usize, id)).or_insert(([u64::MAX; 3], false, false));
+            if e.0 != stamp {
+                e.0 = stamp;
+                return (false, false);
+            }
+            if !e.1 {
+                e.1 = true;
+                BAILED_WAITING.fetch_add(1, Ordering::Relaxed);
+            }
+            (true, !std::mem::replace(&mut e.2, true))
+        })
+    };
+    if !wait {
+        count_again_now(up, id);
+        return;
+    }
+    crate::inspect::tierlog::note(id, crate::inspect::tierlog::ev::O3_REFUSED, crate::inspect::tierlog::REFUSE_UNCHANGED, 0, 0);
+    if say || tier1_trace() {
+        let (what, slot, af) = why;
+        let name = owner::publish(|| {
+            let u = &*up;
+            let name = |s: u32| format!("#{} {}", s, short_name(&u.fns[s as usize].name));
+            (name(id), slot.filter(|&s| (s as usize) < u.fns.len()).map(name))
+        });
+        let on = match name.1 {
+            Some(s) => format!("{what} of {s}{}", if af == AF_OK { String::new() } else { format!(": its front is not made off the owner ({})", PREFRONT_FAIL_NAMES[af as usize]) }),
+            None => what.to_string(),
+        };
+        eprintln!("relax: the O3 take of {} gave way on {} again, with nothing changed since its last one: it waits for a build on the owner or an edit before its next take -- Relax bug, report it", name.0, on);
+    }
+}
+
+/// (unit, slot) -> the bail_stamp of its last O3 take that gave way, whether it waits for that to
+/// move (rearm_bailed), and whether that was said (once a run)
+static BAILED: relax_session::sync::Mutex<Option<HashMap<(usize, u32), ([u64; 3], bool, bool)>>> = relax_session::sync::Mutex::new(None);
+/// slots BAILED holds waiting (the tick's look is one load while none waits)
+static BAILED_WAITING: AtomicU64 = AtomicU64::new(0);
+
+/// What an O3 take that gave way waits for: an edit (a patch, a new collection of the program's
+/// declarations) or a build on the owner, which makes the fronts and initializers a take may not
+/// and ends the waits it gives way on. Atomics: the tick reads it without the owner. (A verdict
+/// is no change here: the checker records them in the background for minutes, and a take that
+/// waits for one is not given way but refused, Unit::o3_allowed.)
+unsafe fn bail_stamp(up: *const Unit) -> [u64; 3] {
+    [PATCH_EPOCH.load(Ordering::SeqCst), (*up).tcx.collect_epoch.load(Ordering::SeqCst), COMPILED_FNS.load(Ordering::Relaxed)]
+}
+
+/// The slots of unit `up` that wait after their O3 take gave way twice (count_again_after_bail)
+/// count again once something changed since: one more take each per change. The tick (run_tick).
+pub(crate) fn rearm_bailed(up: *mut Unit) {
+    if up.is_null() || BAILED_WAITING.load(Ordering::Relaxed) == 0 {
+        return;
+    }
+    let stamp = unsafe { bail_stamp(up) };
+    let go: Vec<u32> = {
+        let mut b = BAILED.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(m) = b.as_mut() else { return };
+        let mut go = Vec::new();
+        for (&(k, id), e) in m.iter_mut() {
+            if k == up as usize && e.1 && e.0 != stamp {
+                e.0 = stamp;
+                e.1 = false;
+                go.push(id);
+            }
+        }
+        BAILED_WAITING.fetch_sub(go.len() as u64, Ordering::Relaxed);
+        go
+    };
+    for id in go {
+        unsafe { count_again_now(up, id) };
+    }
+}
+
+/// Slot `id` of `up` got O3 code: its takes that gave way are history.
+fn bail_done(up: *mut Unit, id: u32) {
+    let mut b = BAILED.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((_, waiting, _)) = b.as_mut().and_then(|m| m.remove(&(up as usize, id))) {
+        if waiting {
+            BAILED_WAITING.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+}
+
+/// count_again_after_bail's count: queued slot `id`'s count stub goes back in front of its code,
+/// from the cost it has.
+unsafe fn count_again_now(up: *mut Unit, id: u32) {
     let u = &*up;
     let Some(threshold) = u.tier1.as_ref().map(|t| t.threshold) else { return };
     if id as usize >= u.fns.len() {
@@ -21189,6 +21289,10 @@ unsafe fn count_again_after_bail(up: *mut Unit, id: u32) {
         eprintln!("O3q @{:.3} #{} counts again after its take gave way: cost {} of {}", wall_ns() as f64 / 1e9, id, cost, threshold);
     }
 }
+
+/// (tests) the slot whose O3 takes give way at their start, as a take whose cause lasts does
+#[cfg(test)]
+pub(crate) static TAKE_GIVES_WAY: AtomicU32 = AtomicU32::new(u32::MAX);
 
 /// A queued slot whose entry left at its pick counts again in its count stub, from the cost it has
 /// now: code that still runs queues itself again soon. `recount`: it left to be counted again (a
@@ -23213,6 +23317,8 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
     let mut rounds = 0u32;
     // the take gave way (a front it needs not made in its rounds): the slot counts again
     let mut bailed = false;
+    // what it gave way on (count_again_after_bail): the bail, the slot whose front it needed, AF_*
+    let mut bail_why: (&'static str, Option<u32>, u8) = ("", None, AF_OK);
     let mut needs: Vec<u32> = Vec::new();
     // a round's walk state between its publishes, and "the last publish stopped mid-walk"
     let walk = std::cell::RefCell::new(None);
@@ -23263,6 +23369,11 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
     let r = (|| {
     let s0 = cpu_ns();
         trace_tier1_phase(id, "snapshot");
+        // (a test's slot whose takes give way for a cause that lasts: TAKE_GIVES_WAY)
+        #[cfg(test)]
+        if TAKE_GIVES_WAY.load(Ordering::Relaxed) == id {
+            owner::forbid_in_publish("a wait", u32::MAX);
+        }
         cost_name(up, id);
         // the owner's item while this take runs, and only then: every exit (a give-back, a walk's
         // WALK_ITEMS stop, a bail's unwind, the snapshot) ends it -- the boot bar showed the last
@@ -23528,6 +23639,7 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
                 eprintln!("O3 take of #{} bailed: {} (slots {:?})", id, b.what, b.slots);
             }
             bailed = true;
+            bail_why = (b.what, b.slots.first().copied(), front_why);
             break None;
         }
     };
@@ -23650,7 +23762,7 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
     let t1 = cpu_ns();
     let Some((rir, version, (epoch, host_ver), sandboxed, assembled, callees, inline_all, ro, env, cfg, name, counts, hot_root)) = snapped else {
         if bailed {
-            count_again_after_bail(up, id);
+            count_again_after_bail(up, id, bail_why);
         }
         return false;
     };
@@ -24261,6 +24373,7 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
                     twin_base_build(up, id);
                 }
                 o3_owner(5, tt);
+                bail_done(up, id);
                 u.stats.code_bytes += code.len() as u64;
                 u.stats.tier1_code_bytes += code.len() as u64;
                 u.stats.tier1_installed += 1;
@@ -33183,6 +33296,7 @@ fn run_tick() {
     crate::lifeline::beat();
     crate::inspect::tierlog::drain();
     sweep_verdicts();
+    rearm_bailed(TIER_UNIT.load(Ordering::Acquire));
     pgo_poll();
     queue::cleanup_ahead();
     drain_slow_base();
@@ -33231,6 +33345,8 @@ pub(crate) unsafe fn reset_statics() {
     }
     reset(&INSTALL_AHEAD_FIRST_MAIN, AtomicU64::new(u64::MAX));
     reset(&TIER1_PANICS, AtomicU64::new(0));
+    reset(&BAILED, relax_session::sync::Mutex::new(None));
+    reset(&BAILED_WAITING, AtomicU64::new(0));
     reset(&O3_OPT_PANICS, [AtomicU64::new(0), AtomicU64::new(0)]);
     reset(&O3_OPT_PANICKED, relax_session::sync::Mutex::new(std::collections::BTreeSet::new()));
     reset(&FAULTS_FATAL, AtomicBool::new(false));
