@@ -105,8 +105,11 @@ impl<A: Codec, B: Codec, C: Codec, D: Codec> Codec for (A, B, C, D) {
 }
 impl<T: Codec> Codec for OnceLock<T> {
     fn put(&self, w: &mut Vec<u8>) {
-        self.get().is_some().put(w);
-        if let Some(v) = self.get() { v.put(w); }
+        // read once: another thread may fill the cell meanwhile (an image written under a front
+        // read, beside lazy compiles); two reads wrote its empty flag and then its value
+        let v = self.get();
+        v.is_some().put(w);
+        if let Some(v) = v { v.put(w); }
     }
     fn get(r: &mut Decode<'_>) -> Option<Self> {
         Some(if bool::get(r)? { Self::from(T::get(r)?) } else { Self::new() })
