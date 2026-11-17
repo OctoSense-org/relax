@@ -1758,6 +1758,15 @@ pub fn delete_checked(p: &Path) -> bool {
     name_ok && magic_ok && std::fs::remove_file(p).is_ok()
 }
 
+/// Tests: seals the store's commit as the seal thread does (or did already).
+#[cfg(test)]
+pub(crate) fn seal_now(p: &Path) {
+    let file = current(&base_path(p));
+    let mut hb = [0u8; HEADER];
+    std::fs::File::open(&file).unwrap().read_exact(&mut hb).unwrap();
+    seal(&file, &hb).unwrap();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1767,14 +1776,6 @@ mod tests {
         pub(super) static BARRIERS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
         /// This thread's commits are not queued for the seal thread: the process ends first
         pub(super) static SEAL_HELD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    }
-
-    /// Seals the store's commit as the seal thread does (or did already).
-    fn seal_now(p: &Path) {
-        let file = current(&base_path(p));
-        let mut hb = [0u8; HEADER];
-        std::fs::File::open(&file).unwrap().read_exact(&mut hb).unwrap();
-        seal(&file, &hb).unwrap();
     }
 
     fn tmpdir(tag: &str) -> PathBuf {

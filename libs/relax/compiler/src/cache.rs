@@ -12633,6 +12633,8 @@ mod prune_tests {
         let store = |name: &str, age_s: u64| -> PathBuf {
             let p = dir.join(name);
             crate::store::append(&p, vec![NewEntry { key: 1, kind: KIND_DATA, payload: vec![7; 4096] }], true).unwrap();
+            // sealed before its stamp: the seal thread's header write would stamp it now
+            crate::store::seal_now(&p);
             let t = std::time::SystemTime::now() - std::time::Duration::from_secs(age_s);
             std::fs::File::options().write(true).open(&p).unwrap().set_modified(t).unwrap();
             p
@@ -12778,6 +12780,8 @@ mod prune_tests {
         let store = |name: &str, age_s: u64, build: Option<u64>| -> PathBuf {
             let p = dir.join(name);
             crate::store::append(&p, vec![NewEntry { key: 1, kind: KIND_DATA, payload: vec![7; 4096] }], true).unwrap();
+            // sealed before its stamp: the seal thread's header write would stamp it now
+            crate::store::seal_now(&p);
             if let Some(b) = build {
                 crate::store::set_build_for_test(&p, b);
             }
@@ -12828,6 +12832,8 @@ mod prune_tests {
         let store = |name: &str, age_s: u64, build: Option<u64>| -> PathBuf {
             let p = dir.join(name);
             crate::store::append(&p, vec![NewEntry { key: 1, kind: KIND_DATA, payload: vec![7; 4096] }], true).unwrap();
+            // sealed before its stamp: the seal thread's header write would stamp it now
+            crate::store::seal_now(&p);
             if let Some(b) = build {
                 crate::store::set_build_for_test(&p, b);
             }
