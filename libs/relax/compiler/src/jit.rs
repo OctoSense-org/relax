@@ -202,8 +202,9 @@ impl SpecCode {
 pub struct SlotHistory {
     /// previous code versions (for rollback), newest last
     pub prev: Vec<(u64, u32, PcMap, u32)>,
-    /// code replaced by O3 code (frames may still run in it): for PC lookups only
-    pub retired: Vec<(u64, u32, PcMap)>,
+    /// code replaced by O3 code, an invalidation or a restore (frames may still run in it): for
+    /// pc lookups, with the patch group that made it (the landing check's `made`)
+    pub retired: Vec<(u64, u32, PcMap, u32)>,
     /// slots that inlined this function (recompiled when it is patched)
     pub inlined_into: Vec<u32>,
     /// a live session: the slots whose copy version code that reads this slot's patch flag also
@@ -6319,7 +6320,7 @@ impl Unit {
         let stub = self.slots.stub(id);
         let f = &mut self.fns[id as usize];
         let old_map = std::mem::take(&mut f.pc_map);
-        crate::zone_alloc::slots_with(|| f.history.get_or_insert_with(Default::default).retired.push((f.code, f.code_len, old_map)));
+        crate::zone_alloc::slots_with(|| f.history.get_or_insert_with(Default::default).retired.push((f.code, f.code_len, old_map, f.patch_gen)));
         f.code = stub;
         f.code_len = 0;
         f.compiled = false;
@@ -9053,7 +9054,7 @@ impl Unit {
                     found = (*c, m);
                 }
             }
-            for (c, l, m) in &f.history().retired {
+            for (c, l, m, _) in &f.history().retired {
                 if pc >= *c && pc < *c + *l as u64 {
                     found = (*c, m);
                 }
@@ -9774,7 +9775,7 @@ impl Unit {
             let f = &mut self.fns[id as usize];
             if f.patch_gen >= first && f.patch_gen > 0 && f.code_len > 0 {
                 let m = crate::zone_alloc::slots_with(|| f.pc_map.clone());
-                crate::zone_alloc::slots_with(|| f.history.get_or_insert_with(Default::default).retired.push((f.code, f.code_len, m)));
+                crate::zone_alloc::slots_with(|| f.history.get_or_insert_with(Default::default).retired.push((f.code, f.code_len, m, f.patch_gen)));
             }
         }
         loop {
@@ -24063,7 +24064,7 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
                 }
                 let f = &mut u.fns[id as usize];
                 let old_map = std::mem::take(&mut f.pc_map);
-                crate::zone_alloc::slots_with(|| f.history.get_or_insert_with(Default::default).retired.push((f.code, f.code_len, old_map)));
+                crate::zone_alloc::slots_with(|| f.history.get_or_insert_with(Default::default).retired.push((f.code, f.code_len, old_map, f.patch_gen)));
                 f.code = at;
                 f.code_len = code.len() as u32;
                 f.pc_map = PcMap::new(&map);

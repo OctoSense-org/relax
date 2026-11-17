@@ -2971,13 +2971,13 @@ impl KeptRig {
         unsafe { crate::reload::apply(self.up, vec![crate::reload::Edit { file: index, path, src: text.as_bytes().to_vec() }]) }
     }
 
-    /// O3 code for every instance of generic fn `name` that has code (tiering is otherwise off:
-    /// no count reaches the threshold): their slots.
+    /// O3 code for every instance of fn `name` that has code (one for a fn that is not generic;
+    /// tiering is otherwise off: no count reaches the threshold): their slots.
     fn tier_up(&mut self, name: &str) -> Vec<u32> {
         let session = unsafe { crate::jit::unit_session(self.up) };
         self.unit.tier1 = crate::jit::Tier1Cfg::from_options(&session.options).map(|mut t| { t.threshold = u64::MAX; t });
         let u = &self.unit;
-        let slots: Vec<u32> = (0..u.fns.len() as u32).filter(|&s| u.fns[s as usize].compiled && matches!(&u.fns[s as usize].key, crate::jit::FnKey::Inst(d, a) if u.prog.name(*d) == name && !a.is_empty())).collect();
+        let slots: Vec<u32> = (0..u.fns.len() as u32).filter(|&s| u.fns[s as usize].compiled && matches!(&u.fns[s as usize].key, crate::jit::FnKey::Inst(d, _) if u.prog.name(*d) == name)).collect();
         for &s in &slots {
             assert!(unsafe { crate::jit::compile_tier1(self.up, s) }, "O3 code for `{}`", self.unit.fns[s as usize].name);
         }
@@ -3227,6 +3227,50 @@ pub fn later(p: *mut u64) {
     assert_eq!(rebound, (6, 8), "the calls through pump's hosts run the new bodies (the one only inline, the one with code): {:?}", edit1.lines);
     assert_eq!(edit2.rung, crate::reload::Rung::Patch, "the field applies: {:?}", edit2.lines);
     assert_eq!(layout, (6, 8), "the calls after the field, by the new bodies in the new layout");
+}
+
+/// A thread loops in `hot`'s first code; O3 code replaces that code under its frame (a tier-up
+/// moves no frame), then an edit of `hot`'s body is patched. The landing check of the patch finds
+/// the thread in code from before it, naming `hot`: that loop never runs the edit. The tier-up's
+/// retired code is code of the slot's earlier patch group like any replaced version (before,
+/// the check took code it found in neither the slot's code nor its patch versions for the
+/// patch's own: a stale pass).
+#[test]
+fn a_loop_entered_before_its_tier_up_is_old_code_to_the_landing_check() {
+    isolated_test!(a_loop_entered_before_its_tier_up_is_old_code_to_the_landing_check);
+    let lib = format!("{KEPT_FLAGS}{}", r#"#[inline(never)]
+pub fn hot(a: &[AtomicU64; 4]) -> u64 {
+    a[1].store(1, Ordering::SeqCst);
+    let mut n = 0u64;
+    while a[0].load(Ordering::SeqCst) == 0 { n = n.wrapping_add(1); std::hint::spin_loop(); }
+    n * 0 + 5
+}
+pub fn worker() {
+    let a = flags();
+    a[2].store(hot(a), Ordering::SeqCst);
+    a[3].store(1, Ordering::SeqCst);
+}
+pub fn start(p: *mut u64) {
+    AT.store(p as usize, Ordering::SeqCst);
+    std::thread::spawn(worker);
+}
+"#);
+    let mut rig = KeptRig::new("tierloop", &[("lib.rs", &lib)], &["start"]);
+    rig.call("start");
+    rig.wait(1);
+    let first = |rig: &KeptRig, s: u32| rig.unit.fns[s as usize].code;
+    let hot = rig.tier_up("hot");
+    assert_eq!(hot.len(), 1, "hot has code, and O3 code now");
+    let (slot, name) = (hot[0], rig.name(hot[0]));
+    let o3 = first(&rig, slot);
+    let o = rig.edit("lib.rs", &[("n * 0 + 5", "n * 0 + 6")]);
+    let gen = rig.unit.patch_log.iter().filter(|(s, _)| *s == slot).map(|(_, g)| *g).max();
+    let old = gen.map(|g| crate::reload::running_old_code(&rig.unit, g));
+    let got = rig.release();
+    assert_eq!(o.rung, crate::reload::Rung::Patch, "the body's edit applies: {:?}", o.lines);
+    assert!(gen.is_some_and(|g| g > 0) && first(&rig, slot) != o3, "the patch installs new code for `{name}`: {:?}", o.lines);
+    assert!(matches!(&old, Some(Ok(Some(n))) if *n == name), "the landing check names `{name}`, whose loop runs the code the tier-up replaced: {old:?}");
+    assert_eq!(got, 5, "the thread ends in the code it was in");
 }
 
 /// T3c T11 (Q2, I3): a closure a patch retired is never built again from its text. Phase 1: the

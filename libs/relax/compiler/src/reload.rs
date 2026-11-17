@@ -9000,10 +9000,12 @@ const LANDING: std::time::Duration = std::time::Duration::from_secs(1);
 /// that ended short (a thread blocked in a libc call whose caller its CFI does not give) is not
 /// enough: the rest of that thread's stack is read for return addresses into the old code. A
 /// stale word there costs a restart; a frame missed would draw wrong data with no word said.
-fn running_old_code(u: &Unit, gen: u32) -> Option<String> {
+///
+/// Err: the stacks could not be read, so whether the patch landed is not known.
+pub(crate) fn running_old_code(u: &Unit, gen: u32) -> Result<Option<String>, String> {
     let slots: std::collections::HashSet<u32> = u.patch_log.iter().filter(|(_, g)| *g == gen).map(|(id, _)| *id).collect();
     if slots.is_empty() {
-        return None;
+        return Ok(None);
     }
     let layout = gen <= LAYOUT_GROUP.load(std::sync::atomic::Ordering::Relaxed);
     let caps = match crate::inspect::capture_all(&crate::inspect::instrument::program_thread) {
@@ -9012,7 +9014,7 @@ fn running_old_code(u: &Unit, gen: u32) -> Option<String> {
             if layout {
                 eprintln!("relax live: the landing check after a field's change could not read the stacks ({e}): a frame still running code from before the edit reads the old layout -- restart the app if it misbehaves");
             }
-            return None;
+            return Err(e.to_string());
         }
     };
     let code = u.code.read().unwrap_or_else(|e| e.into_inner());
@@ -9023,24 +9025,28 @@ fn running_old_code(u: &Unit, gen: u32) -> Option<String> {
             return None;
         }
         let f = &u.fns[slot as usize];
-        // the patch group that made this code (a replaced version keeps it in the history)
-        let made = if start == f.code { f.patch_gen } else { f.history().prev.iter().find(|p| p.0 == start).map_or(gen, |p| p.3) };
-        (made < gen).then(|| f.name.to_string())
+        // the patch group that made this code: a replaced version keeps it in the history, one a
+        // tier-up, an invalidation or a restore replaced too (a loop entered before its O3 code
+        // stays in the code it entered). Code found in neither is old: a stale word costs a
+        // restart, a missed frame a loop that never runs the edit
+        let h = f.history();
+        let made = if start == f.code { Some(f.patch_gen) } else { h.prev.iter().find(|p| p.0 == start).map(|p| p.3).or_else(|| h.retired.iter().find(|r| r.0 == start).map(|r| r.3)) };
+        made.is_none_or(|m| m < gen).then(|| f.name.to_string())
     };
     for c in caps {
         for (k, &a) in c.frames.iter().enumerate() {
             // pc, then return addresses (the call is the byte before)
             if let Some(name) = old(if k == 0 { a } else { a.wrapping_sub(1) }) {
-                return Some(name);
+                return Ok(Some(name));
             }
         }
         if layout && c.stop.is_some() && c.sp != 0 {
             if let Some(name) = return_address_above(c.sp, &old) {
-                return Some(name);
+                return Ok(Some(name));
             }
         }
     }
-    None
+    Ok(None)
 }
 
 /// What `old` says of the first word of the stack above `sp` it knows as a return address. A
@@ -10937,7 +10943,7 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
                     let behind = if old.1.as_millis() >= 20 { format!("; behind {}", crate::owner::served_during(w0, w0 + old.1.as_nanos() as u64)) } else { String::new() };
                     eprintln!("relax live: landing check of patch group {gen} at t={:.0} ms: {:.1} ms ({:.1} ms waiting for the owner{behind})", crate::clock::ms_since_start(), t_land.elapsed().as_secs_f64() * 1e3, old.1.as_secs_f64() * 1e3);
                 }
-                if let Some(name) = old.0 {
+                if let Ok(Some(name)) = old.0 {
                     let lines = vec![format!("`{name}` still runs the code from before the edit: a call made before the patch has not returned (a loop) -- restart the app")];
                     log_edit(up, &what, &paths, &Outcome { failure: None, kept: 0, pending: false, rung: Rung::Restart, files: Vec::new(), lines: lines.clone(), names: Vec::new(), changed: 0, test_changes: None, bodies: Vec::new(), first_code: Vec::new(), group: gen, ms: [0.0; 4], undo: None, work: [0; 5], deferred: Vec::new() }, None, Instant::now());
                     restart_for_edit(&what, &lines, &paths);
