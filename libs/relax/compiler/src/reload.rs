@@ -10352,6 +10352,10 @@ impl Look {
 /// last, so an edit whose file was in place when the ledger was renamed is whole, and a save after
 /// it is not settled by it (its file came later). Told by the files' and the ledger's change times,
 /// set by this machine's clock at each rename (a modified time is the saver's, set to its save).
+/// An edit taken back has no file, and ship-done removes it before the ship's other files are in:
+/// whole once the ledger no longer names it (or a whiteout does). Taken as whole at its removal,
+/// a two-file ship patched as two groups, the tests ran the first alone, and that verdict was
+/// taken for the ship's (11-17).
 fn committed_by_ledger<'a>(mut paths: impl Iterator<Item = &'a str>) -> bool {
     #[cfg(unix)]
     {
@@ -10361,8 +10365,10 @@ fn committed_by_ledger<'a>(mut paths: impl Iterator<Item = &'a str>) -> bool {
         let mut any = false;
         let whole = paths.all(|p| {
             any = true;
-            // an edit taken back has no file: the ledger's rewrite removed it
-            crate::vfs::in_store(p) && crate::vfs::edited_disk_path(p).is_none_or(|d| std::fs::metadata(d).is_ok_and(|m| changed_at(&m) <= changed_at(&ledger)))
+            crate::vfs::in_store(p) && match crate::vfs::edited_disk_path(p) {
+                Some(d) => std::fs::metadata(d).is_ok_and(|m| changed_at(&m) <= changed_at(&ledger)),
+                None => !crate::vfs::take_back_pending(p),
+            }
         });
         any && whole
     }
@@ -12700,6 +12706,49 @@ mod commit_tests {
         assert!(whole(&[a.as_str(), b.as_str()]), "its own ledger commits it");
         assert!(!whole(&[a.as_str(), "/tmp/not-in-a-store.rs"]), "a disk file settles as any save does");
         assert!(!whole(&[]), "nothing changed is nothing committed");
+        crate::vfs::set_edits(None);
+        let _ = std::fs::remove_dir_all(&edits);
+    }
+
+    /// A ship that takes one edit back and changes another file is whole only at its ledger:
+    /// ship-done removes the taken-back file first, renames the ship's files in, then the
+    /// whiteouts and the ledger. The removal alone was taken as whole, one look before the other
+    /// file was in: a two-file ship patched as two groups, and the tests' verdict on the first
+    /// was taken for the ship's (11-17).
+    #[test]
+    fn a_taken_back_edit_is_whole_only_at_its_ledger() {
+        isolated_test!(a_taken_back_edit_is_whole_only_at_its_ledger);
+        let fixture = vfs_store::Fixture::new(&[("app/a.rs", b"a"), ("app/b.rs", b"b")]);
+        let root = "/relax-live-takeback/vfs/m";
+        crate::vfs::mount(root, fixture.store.clone(), &fixture.commit).unwrap();
+        let edits = std::env::temp_dir().join(format!("relax-live-takeback-{}", std::process::id()));
+        std::fs::create_dir_all(edits.join("app")).unwrap();
+        crate::vfs::set_edits(Some(edits.clone()));
+        let (a, b) = (format!("{root}/app/a.rs"), format!("{root}/app/b.rs"));
+        let put = |rel: &str, text: &str| {
+            let tmp = edits.join(format!("{rel}.part"));
+            std::fs::write(&tmp, text).unwrap();
+            std::fs::rename(&tmp, edits.join(rel)).unwrap();
+        };
+        let tick = || std::thread::sleep(std::time::Duration::from_millis(20));
+        let whole = |paths: &[&str]| super::committed_by_ledger(paths.iter().copied());
+        put("app/a.rs", "a2");
+        put("app/b.rs", "b2");
+        put(".makepad-run-edits", "app/a.rs\tnew\napp/b.rs\tnew\n");
+        tick();
+        std::fs::remove_file(edits.join("app/a.rs")).unwrap();
+        assert!(!whole(&[a.as_str()]), "the ledger still names the taken-back edit: the rest of its ship may not be in yet");
+        put("app/b.rs", "b3");
+        tick();
+        put(".makepad-run-deleted", "");
+        put(".makepad-run-edits", "app/b.rs\tnew\n");
+        assert!(whole(&[a.as_str(), b.as_str()]), "its ledger commits the take-back and the new file together");
+        // a whiteout's list is renamed after every file of its ship
+        tick();
+        std::fs::remove_file(edits.join("app/b.rs")).unwrap();
+        assert!(!whole(&[b.as_str()]), "an edit gone that no whiteout names yet waits");
+        put(".makepad-run-deleted", "app/b.rs\n");
+        assert!(whole(&[b.as_str()]), "its whiteout comes after the ship's files: whole");
         crate::vfs::set_edits(None);
         let _ = std::fs::remove_dir_all(&edits);
     }
