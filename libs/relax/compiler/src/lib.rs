@@ -114,9 +114,10 @@ mod test_child {
         command.output().unwrap()
     }
 
-    /// `output`, the child ended once it has run `secs`: Err with what it wrote until then.
+    /// `output`, the child ended once it has run `secs`: Err with what it wrote until then and
+    /// its state before it was ended (`hung_state`).
     #[cfg(unix)]
-    fn output_within(command: &mut Command, secs: u64) -> Result<Output, Output> {
+    fn output_within(command: &mut Command, secs: u64) -> Result<Output, (Output, String)> {
         extern "C" {
             fn kill(pid: i32, sig: i32) -> i32;
         }
@@ -130,10 +131,73 @@ mod test_child {
         match rx.recv_timeout(std::time::Duration::from_secs(secs)) {
             Ok(out) => Ok(out),
             Err(_) => {
+                let state = hung_state(pid as u32);
                 unsafe { kill(pid, 9) };
-                Err(rx.recv().unwrap())
+                Err((rx.recv().unwrap(), state))
             }
         }
+    }
+
+    /// A child past its deadline, as it is (a hang diagnoses itself the first time it happens):
+    /// its JIT's `why-hung` (the wait chain, every thread's stack with each frame's code version
+    /// and tier) and `jit queue`, each given 20 s; when its JIT does not answer (its inspector
+    /// waits too, as in a malloc lock), the system's view: `sample` on macOS, each thread's state
+    /// and wait channel on Linux.
+    #[cfg(unix)]
+    fn hung_state(pid: u32) -> String {
+        let mut out = String::new();
+        for line in ["why-hung", "jit queue"] {
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let mut got: Vec<String> = Vec::new();
+                let r = match makepad_remote::discovery::by_pid(pid) {
+                    Some(app) => crate::inspect::client::ask(&app, line, &mut |l| {
+                        got.push(l.to_string());
+                        true
+                    })
+                    .map_err(|e| e.to_string()),
+                    None => Err("no inspect server (no discovery file)".to_string()),
+                };
+                let _ = tx.send(r.map(|_| got.join("\n")));
+            });
+            match rx.recv_timeout(std::time::Duration::from_secs(20)) {
+                Ok(Ok(text)) => out.push_str(&format!("-- {line}\n{text}\n")),
+                Ok(Err(why)) => {
+                    out.push_str(&format!("-- {line}: {why}\n"));
+                    break;
+                }
+                Err(_) => {
+                    out.push_str(&format!("-- {line}: no answer in 20 s\n"));
+                    break;
+                }
+            }
+        }
+        if !out.contains("-- jit queue\n") {
+            out.push_str(&os_threads(pid));
+        }
+        out
+    }
+
+    #[cfg(target_os = "macos")]
+    fn os_threads(pid: u32) -> String {
+        match Command::new("/usr/bin/sample").args([&pid.to_string(), "2", "-mayDie", "-file", "/dev/stdout"]).output() {
+            Ok(o) => format!("-- sample\n{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr)),
+            Err(e) => format!("-- sample: {e}\n"),
+        }
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    fn os_threads(pid: u32) -> String {
+        let mut out = String::from("-- threads (tid, name, state, wait channel)\n");
+        let Ok(tasks) = std::fs::read_dir(format!("/proc/{pid}/task")) else { return out + "(no /proc)\n" };
+        for t in tasks.flatten() {
+            let dir = t.path();
+            let read = |f: &str| std::fs::read_to_string(dir.join(f)).unwrap_or_default();
+            let stat = read("stat");
+            let state = stat.rsplit_once(") ").and_then(|(_, rest)| rest.split_whitespace().next()).unwrap_or("?").to_string();
+            out.push_str(&format!("  {} {} {} {}\n", t.file_name().to_string_lossy(), read("comm").trim(), state, read("wchan").trim()));
+        }
+        out
     }
 
     /// `command` (a child of this test binary) run to its end in a slot.
@@ -175,8 +239,8 @@ mod test_child {
         let output = match within {
             None => output(&mut command),
             #[cfg(unix)]
-            Some(secs) => output_within(&mut command, secs).unwrap_or_else(|out| {
-                panic!("{test} in its own process: it had not ended {secs} s after it started (ended)\n{}\n{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr))
+            Some(secs) => output_within(&mut command, secs).unwrap_or_else(|(out, state)| {
+                panic!("{test} in its own process: it had not ended {secs} s after it started (ended)\n{}\n{}\n-- its state at the deadline\n{state}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr))
             }),
             #[cfg(not(unix))]
             Some(_) => output(&mut command),
