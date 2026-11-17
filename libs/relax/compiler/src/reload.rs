@@ -12973,6 +12973,7 @@ pub(crate) unsafe fn reset_statics() {
     reset(&SOURCES_WAIT, std::sync::atomic::AtomicBool::new(false));
     reset(&RESTART_CONFIRMED, std::sync::atomic::AtomicBool::new(false));
     reset(&RESTART_PENDING, std::sync::Mutex::new(Vec::new()));
+    reset(&HELD_FROM, std::sync::Mutex::new(Vec::new()));
     reset(&LOADED_HEADS, std::sync::Mutex::new(None));
     reset(&RELAUNCH_ASKED, std::sync::atomic::AtomicBool::new(false));
     reset(&STREAMS, relax_session::sync::Mutex::new(Vec::new()));
