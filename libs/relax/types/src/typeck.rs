@@ -7412,11 +7412,13 @@ impl<'a> Fcx<'a> {
         self.loops = save_loops;
         self.in_loop_condition = save_condition;
         self.coerce_or_unify(bt, rt, Some(body), self.ast().expr(body).lo);
-        // a coerced body keeps its own type: lowering converts it to the return type. So does one
-        // whose pointer-to-dyn coercion waits for its pointee (`|s| s` returning `&mut dyn Tr` for
-        // a `&mut ?S`): typed as the return type, its thin value was lowered as a fat one (relax
+        // a coerced body keeps its own type: lowering converts it to the return type. So does a
+        // reborrowed one (`|| f()` with `f` returning `&mut T` for a `&T` return type: typed as the
+        // return type, the call would write a `&mut T` into a `&T` place), and one whose
+        // pointer-to-dyn coercion waits for its pointee (`|s| s` returning `&mut dyn Tr` for a
+        // `&mut ?S`): typed as the return type, its thin value was lowered as a fat one (relax
         // issue 202).
-        if self.b.coerce(body.0).is_none() && !self.deferred_dyn.iter().any(|&(x, ..)| x.0 == body.0) {
+        if self.b.coerce(body.0).is_none() && self.b.reborrow(body.0).is_none() && !self.deferred_dyn.iter().any(|&(x, ..)| x.0 == body.0) {
             self.set_ty(body, rt);
         }
         self.ret_stack.pop();

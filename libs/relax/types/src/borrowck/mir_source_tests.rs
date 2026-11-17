@@ -947,6 +947,22 @@ fn a_closure_stored_in_a_local_then_returned_as_an_opaque_type_is_e0597() {
 }
 
 #[test]
+fn a_closure_body_call_reborrowed_to_a_shared_return_type_is_checked() {
+    // A closure whose body is a call returning `&mut u8`, with the `&u8` return type from the expected
+    // signature: the call writes a value of its own type and the reborrow converts it, so the body is
+    // borrow-checked, and a borrow of a local escaping through it is E0597.
+    let (errors, unchecked) = borrowck_source_in("
+        fn take<T, F: FnOnce() -> T>(f: F) -> T { f() }
+        fn idm(x: &'static mut u8) -> &'static mut u8 { x }
+        fn idl<'a>(x: &'a mut u8) -> &'a mut u8 { x }
+        pub fn expected(x: &'static mut u8) -> &'static u8 { take::<&'static u8, _>(move || idm(x)) }
+        pub fn pointer(x: &'static mut u8) -> &'static u8 { let f: fn(&'static mut u8) -> &'static u8 = |x| idm(x); f(x) }
+        pub fn escapes() -> &'static u8 { let mut y = 0u8; take::<&'static u8, _>(|| idl(&mut y)) }", 2021);
+    assert!(unchecked.is_empty(), "{unchecked:?}");
+    assert!(errors.len() == 1 && errors[0].starts_with("E0597") && errors[0].contains("`y`"), "{errors:?}");
+}
+
+#[test]
 fn an_ambiguous_subtype_predicate_is_a_type_annotation_error() {
     // type/type-check/cannot_infer_local_or_array.rs: the local's variable is related to the array type's.
     let errors = typeck_errors_source("pub fn main() { let x = []; }", 2021);
