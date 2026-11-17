@@ -5469,6 +5469,17 @@ fn append_store(path: &std::path::Path, entries: Vec<NewEntry>, stale: bool, mar
     crate::store::append(path, entries, stale).map_err(|e| format!("{}: {}", path.display(), e))
 }
 
+/// The slowest store a spill wrote (diagnostics, verbose): path, ms, entries
+static SPILL_SLOWEST: relax_session::sync::Mutex<Option<(PathBuf, f64, usize)>> = relax_session::sync::Mutex::new(None);
+
+fn spill_slowest(path: &std::path::Path, t: std::time::Instant, n: usize) {
+    if !crate::run::VERBOSE.load(std::sync::atomic::Ordering::Relaxed) { return; }
+    let ms = t.elapsed().as_secs_f64() * 1e3;
+    let mut s = SPILL_SLOWEST.lock().unwrap_or_else(|e| e.into_inner());
+    // (process state: kept heap)
+    if s.as_ref().is_none_or(|x| x.1 < ms) { crate::zone_alloc::kept_with(|| *s = Some((path.to_path_buf(), ms, n))); }
+}
+
 /// Spills/flushes exclude all writers. Cold writers share the gate only while holding
 /// their store's lock, so independent stores can progress during serial collection.
 pub static SPILL_IO: std::sync::RwLock<()> = std::sync::RwLock::new(());
@@ -5488,9 +5499,17 @@ fn front_store_lock(path: &std::path::Path) -> std::sync::Arc<relax_session::syn
 
 impl Spill {
     pub fn write(self) -> Result<usize, String> {
+        let t = std::time::Instant::now();
         let _g = SPILL_IO.write().unwrap_or_else(|e| e.into_inner());
+        let gate = t.elapsed();
         let late = crate::sip::late_inputs();
-        self.write_locked(&_g, &late)
+        let (files, shared) = (self.files.len(), self.shared.len());
+        let r = self.write_locked(&_g, &late);
+        if crate::run::VERBOSE.load(std::sync::atomic::Ordering::Relaxed) {
+            let (slow, slow_ms, slow_n) = crate::zone_alloc::kept_with(|| SPILL_SLOWEST.lock().unwrap_or_else(|e| e.into_inner()).take()).unwrap_or_default();
+            eprintln!("relax cache: spill write: the gate in {:.1} ms, {} stores and {} shared batches written in {:.1} ms (slowest {} of {} entries, {:.1} ms)", gate.as_secs_f64() * 1e3, files, shared, (t.elapsed() - gate).as_secs_f64() * 1e3, slow.display(), slow_n, slow_ms);
+        }
+        r
     }
 
     /// The caller holds SPILL_IO exclusively, or shared plus the cold store's lock.
@@ -5506,7 +5525,9 @@ impl Spill {
                 n += entries.len();
                 entries.insert(0, NewEntry { key: LEDGER_KEY, kind: KIND_LEDGER, payload: own_ledger(&path, late) }.into());
             }
+            let (t, n_entries) = (std::time::Instant::now(), entries.len());
             append_store(&path, entries, stale, &self.marks)?;
+            spill_slowest(&path, t, n_entries);
             if !code.is_empty() {
                 // process state: kept heap
                 let mut w = WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
@@ -5518,8 +5539,10 @@ impl Spill {
         for SharedSpill { path, entries, merge, fallback, fallback_ledger } in self.shared {
             n += entries.len();
             let code: Vec<u128> = entries.iter().filter(|e| e.kind == KIND_CODE || e.kind == KIND_DATA).map(|e| e.key).collect();
+            let (t, n_entries) = (std::time::Instant::now(), entries.len());
             let back = crate::store::append_ledgered(&path, entries, LEDGER_KEY, &mut |disk| merge.merge(disk).map(|payload| NewEntry { key: LEDGER_KEY, kind: KIND_LEDGER, payload }))
                 .map_err(|e| format!("{}: {}", path.display(), e))?;
+            spill_slowest(&path, t, n_entries);
             let at = match back {
                 None => path,
                 Some(mut back) => {
