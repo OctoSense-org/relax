@@ -1401,6 +1401,9 @@ fn pick(q: &mut Queue, mode: Mode) -> Option<usize> {
             if let Some(i) = lane.iter().position(|r| from_main(*r)) {
                 let r = lane.remove(i).unwrap();
                 dequeued(c, r);
+                if i > 0 || q.lanes.iter().enumerate().any(|(k, l)| k != c && !l.is_empty()) {
+                    MAIN_AHEAD.fetch_add(1, Ordering::Relaxed);
+                }
                 return Some(r);
             }
         }
@@ -1439,6 +1442,15 @@ fn pick(q: &mut Queue, mode: Mode) -> Option<usize> {
 /// Requests the owner has begun serving (a reader that saw no new one knows no unit state moved:
 /// run.rs flush_errors).
 pub static SERVED: AtomicU64 = AtomicU64::new(0);
+
+/// The main thread's requests served ahead of other queued requests (pick's main-first rule):
+/// what a waiting request was passed over by (diagnostics)
+pub static MAIN_AHEAD: AtomicU64 = AtomicU64::new(0);
+
+/// Requests queued in `class`'s lane now (diagnostics).
+pub fn queued_in(class: Class) -> usize {
+    Q.lock().unwrap_or_else(|e| e.into_inner()).lanes[class as usize].len()
+}
 
 fn serve(r: usize) {
     let req = unsafe { &*(r as *const Req) };

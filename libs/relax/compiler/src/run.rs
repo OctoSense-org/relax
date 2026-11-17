@@ -5107,8 +5107,11 @@ fn mid_flush(quiet: bool, wait: bool) -> Option<(usize, usize)> {
     let mut crates_left = false;
     let probe = YieldProbe::new();
     let asked = Instant::now();
+    let behind = (crate::owner::queued_in(crate::owner::Class::Program), crate::owner::SERVED.load(Ordering::Relaxed), crate::owner::MAIN_AHEAD.load(Ordering::Relaxed));
+    let mut passed = (0, 0);
     let Some(Some((held, spill))) = unit_call(wait, || {
     let held = Instant::now();
+    passed = (crate::owner::SERVED.load(Ordering::Relaxed).saturating_sub(behind.1 + 1), crate::owner::MAIN_AHEAD.load(Ordering::Relaxed).saturating_sub(behind.2));
     probe.start();
     yield_section("mid write");
     let spill = {
@@ -5139,7 +5142,9 @@ fn mid_flush(quiet: bool, wait: bool) -> Option<(usize, usize)> {
                 // first: the manifest is made again by a later write
                 let stop = || { probe.tick("manifest"); quit_write_gives_way() };
                 let root = crate::layout::root_crate();
+                let t_made = Instant::now();
                 let made = if tail { c.record_tail(u, root, &order, &stop) } else { c.record_manifest(u, root, &order, present, &stop) };
+                verbose!("relax cache: {} of {} slots ({} after the recorded manifest's) {} in {:.1} ms", if tail { "manifest tail" } else { "startup manifest" }, order.len(), len.saturating_sub(MID_MANIFEST_LEN.load(Ordering::Relaxed)), if made { "recorded" } else { "yielded" }, t_made.elapsed().as_secs_f64() * 1e3);
                 if made {
                     MID_MANIFEST_LEN.store(len, Ordering::Relaxed);
                 } else {
@@ -5290,7 +5295,7 @@ fn mid_flush(quiet: bool, wait: bool) -> Option<(usize, usize)> {
             }
         }
     }
-    verbose!("relax cache: mid write held the owner {:.1} ms (records to {:.1}, manifest to {:.1}, front images to {:.1}, crate records to {:.1}, then spill); before it the record drain took {:.1} ms and the wait for the owner {:.1} ms, the spill's write {:.1} ms", held1, parts[3], parts[0], parts[1], parts[2], drain_ms, owner_wait_ms, spill_ms);
+    verbose!("relax cache: mid write held the owner {:.1} ms (records to {:.1}, manifest to {:.1}, front images to {:.1}, crate records to {:.1}, then spill); before it the record drain took {:.1} ms and the wait for the owner {:.1} ms (behind {} queued program requests; meanwhile it served {} requests, {} of them the main thread's ahead of the queue), the spill's write {:.1} ms; front writes so far {}", held1, parts[3], parts[0], parts[1], parts[2], drain_ms, owner_wait_ms, behind.0, passed.0, passed.1, spill_ms, jit::front_epoch());
     crate::inspect::flightrec::event("cache.write", &format!("mid write: {} records, {} images; held the owner {:.1} ms (manifest {:.1}, front images {:.1}, crate records {:.1})", n, n_imgs, held1, parts[0], parts[1], parts[2]), (held1 * 1e6) as u64, 0);
     // All temporary encoders and retired boot arrays are now outside compiler locks.
     crate::memstat::trim();

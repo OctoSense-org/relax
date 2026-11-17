@@ -28178,13 +28178,24 @@ unsafe fn build_rir_or_skip(up: *mut Unit, id: u32, mode: RirMode) -> Option<Res
 pub static FRONT_RW: std::sync::RwLock<()> = std::sync::RwLock::new(());
 
 
+/// The front writes taken so far (FRONT_RW's write guards that may change the program): a
+/// reader that sees the same count under its read as an earlier step saw reads the program
+/// that step saw.
+static FRONT_WRITES: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn front_epoch() -> u64 {
+    FRONT_WRITES.load(Ordering::Acquire)
+}
+
 /// FRONT_RW's write lock if it is free now (no wait, no pump).
 pub fn front_try_write() -> Option<std::sync::RwLockWriteGuard<'static, ()>> {
-    match FRONT_RW.try_write() {
-        Ok(g) => Some(g),
-        Err(std::sync::TryLockError::Poisoned(e)) => Some(e.into_inner()),
-        Err(std::sync::TryLockError::WouldBlock) => None,
-    }
+    let g = match FRONT_RW.try_write() {
+        Ok(g) => g,
+        Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => return None,
+    };
+    FRONT_WRITES.fetch_add(1, Ordering::AcqRel);
+    Some(g)
 }
 
 /// The front end's write lock within `ms`, or None: the exit's last writes give up rather than
@@ -28230,7 +28241,9 @@ pub fn front_write_noted(mut said: Option<(std::time::Duration, &mut dyn FnMut(O
     // point instead of finishing first (relax_types::preempt)
     let _waiting = crate::preempt::WriterWaiting::new();
     if !owner::is_owner() {
-        return FRONT_RW.write().unwrap_or_else(|e| e.into_inner());
+        let g = FRONT_RW.write().unwrap_or_else(|e| e.into_inner());
+        FRONT_WRITES.fetch_add(1, Ordering::AcqRel);
+        return g;
     }
     // the owner: a reader may be waiting for one of its answers (a constant for a type check),
     // so it serves them while it waits; a request served nested inside another's wait gives
