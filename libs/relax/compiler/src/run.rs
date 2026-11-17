@@ -3979,9 +3979,14 @@ fn try_settle(drops: &mut jit::SettleDrops, trim: bool) -> bool {
     // trimmed, 37 s of trims): a writer waits from here on, so the readers stop at their next preemption
     // point, and the wait for the front to come free runs here, off the owner, which goes on
     // serving meanwhile (the main thread's requests, the questions the readers wait on).
+    // Not while the collected program is captured: the capture holds its front read for seconds
+    // and starts over for a waiting writer, and the monitor asks this again next round (settles
+    // every 330 ms under RELAX_SETTLE_STRESS had a 2.6 s capture start over 183 times, and the
+    // run's collected image, so its settle rebuild, waited for the whole run).
+    if capture_running() { return false; }
     let _waiting = crate::preempt::WriterWaiting::new();
     while jit::front_try_write().is_none() {
-        if jit::QUIT_SEEN.load(Ordering::Relaxed) || crate::preempt::is_stopped() { return false; }
+        if jit::QUIT_SEEN.load(Ordering::Relaxed) || crate::preempt::is_stopped() || capture_running() { return false; }
         crate::lifeline::beat();
         std::thread::sleep(std::time::Duration::from_millis(1));
     }
@@ -4889,6 +4894,15 @@ fn quit_mark() {
     }
 }
 
+/// (tests) One settle of unit `up`, as the run monitor tries it: whether it settled.
+#[cfg(test)]
+pub(crate) unsafe fn settle_pass(up: *mut Unit) -> bool {
+    RUN_UNIT = up;
+    let r = try_settle(&mut jit::SettleDrops::default(), false);
+    RUN_UNIT = std::ptr::null_mut();
+    r
+}
+
 /// (tests) One pass of the quit write over unit `up`, as quit_mark's thread runs it: the entries
 /// and front images it wrote.
 #[cfg(test)]
@@ -5105,9 +5119,32 @@ pub(crate) fn capturing() -> bool {
 }
 
 /// What stops the collected capture under its front read: a front writer waits (a load, a live
-/// edit: it then waits for one stop interval), or the run ends.
+/// edit: it then waits for one stop interval), or the run ends. A settle does not wait while one
+/// runs (try_settle).
 pub(crate) fn capture_stop() -> bool {
     crate::preempt::writer_waiting() || crate::preempt::is_stopped()
+}
+
+/// Captures of the collected program under way on any thread, from just before their front read.
+static CAPTURES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// A capture of the collected program is under way (a settle gives way to it).
+pub(crate) fn capture_running() -> bool {
+    CAPTURES.load(Ordering::Acquire) != 0
+}
+
+/// A capture under way for as long as it lives.
+pub(crate) struct CaptureLive(());
+impl CaptureLive {
+    pub(crate) fn enter() -> Self {
+        CAPTURES.fetch_add(1, Ordering::AcqRel);
+        CaptureLive(())
+    }
+}
+impl Drop for CaptureLive {
+    fn drop(&mut self) {
+        CAPTURES.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 /// The collected program, recorded off the owner thread. One owner step takes the front images
@@ -5154,6 +5191,7 @@ fn record_collected(up: *mut Unit, wait: bool, imaged_files: usize, crates_left:
     let t_capture = Instant::now();
     let record = {
         let _c = crate::zone_alloc::compiler();
+        let _live = CaptureLive::enter();
         let read = jit::front_read("cache collected");
         // the program the front images were taken of, and it stays so while the read is held
         if jit::front_epoch() != epoch {

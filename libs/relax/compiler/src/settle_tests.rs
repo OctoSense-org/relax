@@ -2031,3 +2031,35 @@ fn hot_twin_asks_for_its_base_verdict() {
     std::mem::forget(u);
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+/// A settle that comes while the collected program is captured gives way and takes no front
+/// write: the capture holds its front read for seconds and starts over for a waiting writer, and
+/// the monitor asks the settle again next round. Settles every 330 ms (RELAX_SETTLE_STRESS) had a
+/// 2.6 s capture start over 183 times, and the settle rebuild, which waits for the run's
+/// collected image, never ran.
+#[test]
+fn a_settle_gives_way_to_the_collected_capture() {
+    isolated_test!(a_settle_gives_way_to_the_collected_capture);
+    crate::borrowck::lazy::disable_gandalf();
+    let dir = std::env::temp_dir().join(format!("relax-settle-capture-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("lib.rs");
+    std::fs::write(&path, "#![no_std]\npub fn one() -> u32 { 1 }").unwrap();
+    let session = std::sync::Arc::new(crate::Session::default());
+    let mut prog = Program::new(&session);
+    prog.load_crate("settle_capture", path.to_str().unwrap(), 2021, crate::cfg::CfgSet::host(&session, &[]), vec![]).unwrap();
+    let mut tcx = Tcx::new();
+    tcx.collect(&prog);
+    let mut u = Unit::new(prog, tcx, 0);
+    let up = &mut *u as *mut Unit;
+    let epoch = front_epoch();
+    {
+        let _capture = crate::run::CaptureLive::enter();
+        assert!(!unsafe { crate::run::settle_pass(up) }, "a settle during the capture gives way");
+        assert_eq!(front_epoch(), epoch, "a settle during the capture took no front write");
+    }
+    unsafe { crate::run::settle_pass(up) };
+    assert!(front_epoch() > epoch, "with no capture under way the settle takes the front write");
+    std::mem::forget(u);
+    std::fs::remove_dir_all(dir).unwrap();
+}
