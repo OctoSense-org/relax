@@ -640,7 +640,8 @@ pub(crate) fn hold_old_frames(u: &Unit, gen: u32, layout: &str, paused: bool) ->
 /// A patch that changes a struct's layout in place (reload.rs fresh_layout_struct), about to
 /// install with the program threads paused (inspect::instrument::pause_for_patch): the first frame
 /// of a program thread in code of one of `slots` (any version: what the patch rebuilds was built
-/// for the old layout), in a slot of text the program no longer has (reload::retired_text: a fn
+/// for the old layout; named with what of retired text it runs or reaches, below, when it does),
+/// in a slot of text the program no longer has (reload::retired_text: a fn
 /// an edit removed or replaced, a closure inside one, a closure a patch kept on its old code), in
 /// a version that holds a copy of such code (an inlining tier's), in a slot that can still call
 /// such code (reload::over_retired: an instance over a kept closure),
@@ -681,25 +682,31 @@ pub(crate) fn frame_in(u: &Unit, slots: &crate::fxhash::HashSet<u32>) -> Result<
         for a in at {
             let Some((start, _, slot)) = code.entry_at(a) else { continue };
             let f = &u.fns[slot as usize];
-            if slots.contains(&slot) {
-                return Ok(Some(format!("{} is running on thread {}", shown(slot), thread)));
-            }
-            if let Some(retired) = crate::reload::retired_text(u, slot) {
-                return Ok(Some(format!("{} runs on thread {} {}", shown(slot), thread, retired)));
-            }
-            // a copy of such code inlined into this version
-            // (code built in this run lists what it inlined when it inlined anything: none listed,
-            // none taken in, whatever a later version of the slot took)
-            let copy = match code.inlined_at(start) {
-                Some(list) => list.iter().find_map(|&c| crate::reload::retired_text(u, c).map(|r| (c, r))),
-                None if matches!(code.kind_of(start).origin, crate::jit::origin::CACHE | crate::jit::origin::IMAGE) => hosts.get(&slot).and_then(|&c| crate::reload::retired_text(u, c).map(|r| (c, r))),
-                None => None,
+            // what of retired text the frame runs or reaches; for a slot the patch rebuilds too, so
+            // the reason names both
+            let retired = || {
+                if let Some(retired) = crate::reload::retired_text(u, slot) {
+                    return Some(retired);
+                }
+                // a copy of such code inlined into this version
+                // (code built in this run lists what it inlined when it inlined anything: none listed,
+                // none taken in, whatever a later version of the slot took)
+                let copy = match code.inlined_at(start) {
+                    Some(list) => list.iter().find_map(|&c| crate::reload::retired_text(u, c).map(|r| (c, r))),
+                    None if matches!(code.kind_of(start).origin, crate::jit::origin::CACHE | crate::jit::origin::IMAGE) => hosts.get(&slot).and_then(|&c| crate::reload::retired_text(u, c).map(|r| (c, r))),
+                    None => None,
+                };
+                if let Some((c, retired)) = copy {
+                    return Some(format!("in code that holds a copy of {}, {}", shown(c), retired));
+                }
+                crate::reload::over_retired(u, slot).map(|over| format!("and can still call {over}"))
             };
-            if let Some((c, retired)) = copy {
-                return Ok(Some(format!("{} runs on thread {} in code that holds a copy of {}, {}", shown(slot), thread, shown(c), retired)));
+            if slots.contains(&slot) {
+                let more = retired().map_or_else(String::new, |r| format!(" {r}"));
+                return Ok(Some(format!("{} is running on thread {}{}", shown(slot), thread, more)));
             }
-            if let Some(over) = crate::reload::over_retired(u, slot) {
-                return Ok(Some(format!("{} runs on thread {} and can still call {}", shown(slot), thread, over)));
+            if let Some(r) = retired() {
+                return Ok(Some(format!("{} runs on thread {} {}", shown(slot), thread, r)));
             }
             if start != f.code {
                 return Ok(Some(format!("{} runs code from before an earlier edit on thread {}", shown(slot), thread)));
