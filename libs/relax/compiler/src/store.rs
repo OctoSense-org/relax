@@ -270,6 +270,8 @@ static EXITING: AtomicBool = AtomicBool::new(false);
 /// than ordered on the disk.
 pub fn set_exiting() {
     EXITING.store(true, Ordering::Relaxed);
+    // a seal thread at the gate leaves its queue to the next open
+    wake_seal_gate();
     let since = SEAL_SINCE.load(Ordering::Relaxed);
     if since != 0 && crate::run::VERBOSE.load(Ordering::Relaxed) {
         eprintln!("relax store: the exit begins with a seal in its barrier since t={} ms (at t={:.0} ms)", since - 1, crate::clock::ms_since_start());
@@ -389,20 +391,20 @@ fn queue_seal(file: &Path, hb: &[u8]) {
         return;
     }
     drop(q);
+    crate::run_threads::on_end(wake_seal_gate);
     let started = crate::run_threads::spawn("store-seal", || {
         let _z = crate::zone_alloc::compiler_thread();
         loop {
+            // no barrier before the program's start ends
+            wait_at_seal_gate();
             let batch = {
                 let mut q = TO_SEAL.lock().unwrap_or_else(|e| e.into_inner());
-                // a run that ends, or an exit, leaves the rest to the next open
-                if crate::run_threads::ending() || !ordered() {
+                // a run that ends, or a quit, leaves the rest to the next open
+                if !barriers_allowed() {
                     q.clear();
                 }
-                // all of it: the newest commit of a file seals the ones queued before it
-                let mut batch: Vec<(PathBuf, [u8; HEADER])> = Vec::with_capacity(q.len());
-                for (file, hb) in q.drain(..).rev() {
-                    if !batch.iter().any(|(p, _)| *p == file) { batch.push((file, hb)); }
-                }
+                // all of it, each file's newest
+                let batch = newest_per_file(q.drain(..));
                 if batch.is_empty() { SEALING.store(false, Ordering::Release); }
                 batch
             };
@@ -442,50 +444,78 @@ fn seal_barrier(n: usize, barrier: impl FnOnce() -> std::io::Result<()>, what: &
     r
 }
 
-/// Seals the commits of a drained batch (each file's newest): their barrier, then each header
-/// `seal` writes. Linux: one barrier for the batch's stores on each filesystem (`syncfs`): a busy
-/// disk's barrier is a journal commit of everything written so far, 1-10 s each on a cold run's
-/// node, and a barrier per store ran back to back for half a minute (each one also stalled the
-/// cache writer's appends). Elsewhere, and where syncfs fails, each store's own barrier.
+/// Seals the commits of a drained batch (each file's newest): per store its own barrier, then the
+/// header `seal` writes. A store's barrier waits for that file's data and one journal commit; one
+/// over the whole filesystem (syncfs) waited for every job's dirty pages on a shared box, once over
+/// 68 s, and the process could not exit until it returned (its tree went 42 s after the exit
+/// line). No barrier starts once the quit is asked for or the run ends (`barriers_allowed`): the
+/// rest goes to the next open's verification, so an exit waits for one barrier in flight at most.
 fn seal_batch(batch: &[(PathBuf, [u8; HEADER])]) {
-    let mut open: Vec<(std::fs::File, &[u8; HEADER])> = batch.iter()
-        .filter_map(|(file, hb)| std::fs::OpenOptions::new().read(true).write(true).open(file).ok().map(|f| (f, hb)))
-        .collect();
-    #[cfg(target_os = "linux")]
-    let synced: Vec<bool> = {
-        use std::os::unix::fs::MetadataExt;
-        let devs: Vec<Option<u64>> = open.iter().map(|(f, _)| f.metadata().ok().map(|m| m.dev())).collect();
-        let mut synced = vec![false; open.len()];
-        for i in 0..open.len() {
-            let Some(dev) = devs[i] else { continue };
-            if synced[i] || devs[..i].contains(&Some(dev)) { continue }
-            let on: Vec<usize> = (i..open.len()).filter(|&j| devs[j] == Some(dev)).collect();
-            if seal_barrier(on.len(), || sync_fs(&open[i].0), "(syncfs)").is_ok() {
-                for j in on { synced[j] = true; }
-            }
+    for (file, hb) in batch {
+        if !barriers_allowed() {
+            return;
         }
-        synced
-    };
-    #[cfg(not(target_os = "linux"))]
-    let synced = vec![false; open.len()];
-    for ((f, hb), synced) in open.iter_mut().zip(synced) {
-        if !synced && seal_barrier(1, || order_writes(f), "").is_err() { continue }
-        let _ = mark_sealed(f, *hb);
+        let Ok(mut f) = std::fs::OpenOptions::new().read(true).write(true).open(file) else { continue };
+        if seal_barrier(1, || order_writes(&f), &file.file_name().unwrap_or_default().to_string_lossy()).is_err() {
+            continue;
+        }
+        let _ = mark_sealed(&mut f, hb);
     }
 }
 
-/// Makes everything written to the filesystem that `f` is on reach the disk (Linux `syncfs`): one
-/// barrier for the stores of a seal batch.
-#[cfg(target_os = "linux")]
-fn sync_fs(f: &std::fs::File) -> std::io::Result<()> {
-    use std::os::fd::AsRawFd;
-    extern "C" {
-        fn syncfs(fd: i32) -> i32;
+/// Each file's newest commit of the queue `q` (oldest first): it seals the ones queued before it.
+fn newest_per_file(q: impl DoubleEndedIterator<Item = (PathBuf, [u8; HEADER])>) -> Vec<(PathBuf, [u8; HEADER])> {
+    let mut batch: Vec<(PathBuf, [u8; HEADER])> = Vec::new();
+    for (file, hb) in q.rev() {
+        if !batch.iter().any(|(p, _)| *p == file) {
+            batch.push((file, hb));
+        }
     }
-    debug_assert!(!crate::cache::spill_io_held(), "a write barrier under SPILL_IO: the cache writer, and every spill behind it, would wait on the disk");
-    #[cfg(test)]
-    tests::BARRIERS.with(|b| b.set(b.get() + 1));
-    if unsafe { syncfs(f.as_raw_fd()) } == 0 { Ok(()) } else { Err(std::io::Error::last_os_error()) }
+    batch
+}
+
+/// Whether the seal thread may start a barrier: not once the quit is asked for (jit::QUIT_SEEN, or
+/// the exit's set_exiting) or the run ends.
+fn barriers_allowed() -> bool {
+    ordered() && !crate::run_threads::ending() && !crate::jit::QUIT_SEEN.load(Ordering::Relaxed)
+}
+
+/// Whether the seal thread may make its barriers yet. A run of a program closes it at its start
+/// (`close_seal_gate`) and opens it when the start ends (`open_seal_gate`: the first present, or
+/// the quiet of a program that never presents: jit::started). A barrier forces a journal commit
+/// of the filesystem, and on a busy disk the process's other metadata operations wait behind it:
+/// a boot window presented nothing for 30 s, its open blocked in the kernel opening the pipeline
+/// cache's folder while the seal thread sat in fdatasync. What waits at the gate is not lost: the
+/// open that queued a seal verified what it seals, and an exit leaves it to the next open's
+/// verification, as it does every unsealed commit.
+static SEAL_GATE: relax_session::sync::Mutex<bool> = relax_session::sync::Mutex::new(true);
+static SEAL_GATE_MOVED: relax_session::sync::Condvar = relax_session::sync::Condvar::new();
+
+/// A program's run begins: the seal thread's barriers wait for its start to end.
+pub(crate) fn close_seal_gate() {
+    *SEAL_GATE.lock().unwrap_or_else(|e| e.into_inner()) = false;
+}
+
+/// The program's start ended (its first present, or its quiet): the seal thread's barriers run.
+pub(crate) fn open_seal_gate() {
+    *SEAL_GATE.lock().unwrap_or_else(|e| e.into_inner()) = true;
+    SEAL_GATE_MOVED.notify_all();
+}
+
+/// The run ends or the exit begins: a seal thread at the gate goes on, to drop its queue.
+fn wake_seal_gate() {
+    let _g = SEAL_GATE.lock().unwrap_or_else(|e| e.into_inner());
+    SEAL_GATE_MOVED.notify_all();
+}
+
+/// The seal thread, before each batch: waits while the gate is closed and barriers are allowed.
+fn wait_at_seal_gate() {
+    let mut open = SEAL_GATE.lock().unwrap_or_else(|e| e.into_inner());
+    while !*open && barriers_allowed() {
+        #[cfg(test)]
+        tests::AT_GATE.store(true, Ordering::SeqCst);
+        open = SEAL_GATE_MOVED.wait(open).unwrap_or_else(|e| e.into_inner());
+    }
 }
 
 /// A seal's header, after its barrier: under the lock, and only while the header still is `hb`,
@@ -513,6 +543,7 @@ pub(crate) unsafe fn reset_statics() {
     relax_session::reset_static(&TO_SEAL, relax_session::sync::Mutex::new(Vec::new()));
     relax_session::reset_static(&SEALING, AtomicBool::new(false));
     relax_session::reset_static(&SEAL_SINCE, std::sync::atomic::AtomicU64::new(0));
+    relax_session::reset_static(&SEAL_GATE, relax_session::sync::Mutex::new(true));
 }
 
 fn encode_index(ix: &[Ix]) -> Vec<u8> {
@@ -1809,6 +1840,9 @@ mod tests {
         pub(super) static SEAL_HELD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     }
 
+    /// The seal thread waits at the gate (`wait_at_seal_gate`).
+    pub(super) static AT_GATE: AtomicBool = AtomicBool::new(false);
+
     fn tmpdir(tag: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!("rcs-test-{}-{}", tag, std::process::id()));
         let _ = std::fs::create_dir_all(&d);
@@ -2159,16 +2193,53 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
     }
 
-    /// The seal thread seals what it drained as one batch: on Linux one barrier for all of its
-    /// stores on a filesystem (syncfs; a busy disk took 1-10 s for each store's own, back to back),
-    /// elsewhere each store's own; and every commit of the batch is sealed.
+    /// The seal thread seals what it drained as one batch: each file's newest commit once (it seals
+    /// the ones queued before it), each with its own barrier (one over the whole filesystem waited
+    /// for every job's writes on a shared box), and every commit of the batch is sealed.
     #[test]
-    fn a_drained_batch_of_commits_is_sealed_under_one_barrier() {
+    fn a_drained_batch_seals_each_files_newest_commit_once() {
         let d = tmpdir("seal-batch");
         let stores: Vec<PathBuf> = (0..3).map(|i| d.join(format!("core-0011223344556{i}aa.rcs"))).collect();
+        let header = |p: &PathBuf| {
+            let file = current(&base_path(p));
+            let mut hb = [0u8; HEADER];
+            std::fs::File::open(&file).unwrap().read_exact(&mut hb).unwrap();
+            (file, hb)
+        };
         SEAL_HELD.with(|h| h.set(true));
+        let mut queued = Vec::new();
         for (i, p) in stores.iter().enumerate() {
             append_as(p, vec![NewEntry { key: 1, kind: 1, payload: vec![i as u8; 5000] }], false, true).unwrap();
+            queued.push(header(p));
+        }
+        // a second commit of the first store, queued after the others
+        append_as(&stores[0], vec![NewEntry { key: 2, kind: 1, payload: vec![9; 5000] }], false, true).unwrap();
+        queued.push(header(&stores[0]));
+        SEAL_HELD.with(|h| h.set(false));
+        let batch = newest_per_file(queued.into_iter());
+        assert_eq!(batch.len(), 3, "each file once");
+        assert!(batch.contains(&header(&stores[0])), "the first store by its newest commit");
+        BARRIERS.with(|b| b.set(0));
+        seal_batch(&batch);
+        assert_eq!(BARRIERS.with(|b| b.get()), 3, "a barrier per store");
+        for (p, n) in stores.iter().zip([2, 1, 1]) {
+            let (s, ix) = active(p);
+            assert_eq!((s.tail, ix.len()), (s.end, n), "every commit of the batch is sealed: {}", p.display());
+        }
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Once the quit is asked for, the seal thread starts no barrier: a process cannot exit while
+    /// a barrier runs, and a busy disk's took over a minute. What the batch still holds, and a seal
+    /// thread waiting at the gate, go to the next open's verification.
+    #[test]
+    fn no_barrier_starts_once_the_quit_is_asked_for() {
+        isolated_test!(no_barrier_starts_once_the_quit_is_asked_for);
+        let d = tmpdir("seal-quit");
+        let stores: Vec<PathBuf> = (0..2).map(|i| d.join(format!("core-0011223344557{i}aa.rcs"))).collect();
+        SEAL_HELD.with(|h| h.set(true));
+        for p in &stores {
+            append_as(p, vec![NewEntry { key: 1, kind: 1, payload: vec![1; 5000] }], false, true).unwrap();
         }
         SEAL_HELD.with(|h| h.set(false));
         let batch: Vec<(PathBuf, [u8; HEADER])> = stores.iter().map(|p| {
@@ -2177,15 +2248,45 @@ mod tests {
             std::fs::File::open(&file).unwrap().read_exact(&mut hb).unwrap();
             (file, hb)
         }).collect();
-        assert!(stores.iter().all(|p| { let (s, _) = active(p); s.tail < s.end }), "the commits wait for their seal");
+        crate::jit::QUIT_SEEN.store(true, Ordering::Relaxed);
         BARRIERS.with(|b| b.set(0));
         seal_batch(&batch);
-        let want = if cfg!(target_os = "linux") { 1 } else { stores.len() as u32 };
-        assert_eq!(BARRIERS.with(|b| b.get()), want, "the batch's barriers (Linux: one for the filesystem)");
-        for p in &stores {
-            let (s, ix) = active(p);
-            assert_eq!((s.tail, ix.len()), (s.end, 1), "every commit of the batch is sealed: {}", p.display());
-        }
+        assert_eq!(BARRIERS.with(|b| b.get()), 0, "a barrier started after the quit");
+        assert!(stores.iter().all(|p| { let (s, _) = active(p); s.tail < s.end }), "left to the next open's verification");
+        // and the gate holds no seal thread past the quit
+        close_seal_gate();
+        wait_at_seal_gate();
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A boot's seals wait for its start to end: a commit queued for the seal thread while a
+    /// program's start goes on (a warm boot's opens queue the seals of what the last run's exit
+    /// left unsealed) gets no barrier, so none holds the boot's other file operations behind a
+    /// journal commit (a window's open waited 30 s in the kernel beside one); once the start ends
+    /// (its first present, or its quiet) the thread seals it.
+    #[test]
+    fn a_seal_queued_during_the_start_waits_for_its_end() {
+        isolated_test!(a_seal_queued_during_the_start_waits_for_its_end);
+        let until = |what: &str, done: &dyn Fn() -> bool| {
+            let t0 = std::time::Instant::now();
+            while !done() {
+                assert!(t0.elapsed().as_secs() < 30, "{what} never came");
+                std::thread::yield_now();
+            }
+        };
+        let d = tmpdir("seal-gate");
+        let p = d.join("core-00112233445566ff.rcs");
+        close_seal_gate();
+        append_as(&p, vec![NewEntry { key: 1, kind: 1, payload: vec![1; 5000] }], false, true).unwrap();
+        // the seal thread at the gate: its batch not taken, no barrier made
+        until("the seal thread at the gate", &|| AT_GATE.load(Ordering::SeqCst));
+        let (s, _) = active(&p);
+        assert!(s.tail < s.end, "a seal made before the start ended");
+        assert_eq!(TO_SEAL.lock().unwrap().len(), 1, "the seal waits in the queue");
+        open_seal_gate();
+        until("the seal thread's end", &|| !SEALING.load(Ordering::SeqCst));
+        let (s, ix) = active(&p);
+        assert_eq!((s.tail, ix.len()), (s.end, 1), "the start ended: the seal thread sealed it");
         let _ = std::fs::remove_dir_all(&d);
     }
 

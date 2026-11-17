@@ -262,6 +262,10 @@ pub(crate) fn hosted_run() -> bool {
 pub fn cmd_run(sess: &std::sync::Arc<crate::Session>, args: &[String]) -> i32 {
     #[cfg(any(target_os = "linux", target_vendor = "apple"))]
     crate::run_end::leftovers::mark();
+    // a program's run: no seal barrier before its start ends (store.rs SEAL_GATE)
+    if !args.iter().any(|a| a == "--check") {
+        crate::store::close_seal_gate();
+    }
     let json = args.iter().any(|a| a == "--json") && args.iter().any(|a| a == "--check");
     let start = std::time::Instant::now();
     if json { crate::diag::enable(); }

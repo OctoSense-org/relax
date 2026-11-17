@@ -24366,6 +24366,7 @@ pub(crate) fn live_edits_open() -> bool {
 fn headless_started() {
     if !FIRST_PRESENT.load(Ordering::Acquire) && live_startup_done() {
         let _ = QUIET_START_NS.compare_exchange(0, wall_ns().max(1), Ordering::AcqRel, Ordering::Relaxed);
+        crate::store::open_seal_gate();
         crate::cache::start_deferred_front("a quiet start");
     }
 }
@@ -24504,6 +24505,7 @@ pub extern "C" fn relax_first_present() {
                 exec_check_now("first frame");
             }
             FIRST_PRESENT_NS.store(wall_ns(), Ordering::Release);
+            crate::store::open_seal_gate();
             crate::postframe::wake_image_window();
             // the queue holds O3 until the present
             tier_wake_all();
