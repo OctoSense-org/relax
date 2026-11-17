@@ -8865,6 +8865,8 @@ pub(crate) struct PendingPatch {
     pub(crate) event_seq: u64,
     /// when it was installed (its verdict reports how long the program ran it unverified)
     pub(crate) installed: Instant,
+    /// the (owner slot, collect epoch) pairs whose checks the settle asked for (Unit::ask_verdict)
+    pub(crate) asked: Vec<(u32, u64)>,
 }
 
 /// RELAX_SPECV_TRACE: the slots a patch group's verdict waits on, printed when they change
@@ -8894,9 +8896,13 @@ pub(crate) fn settle_verdicts(up: *mut Unit, pending: &mut Vec<PendingPatch>, un
         let mut unchecked: Vec<String> = Vec::new();
         // the oldest waiting group says what it waits on (UNVERIFIED_WHY), once a second at most
         let say_why = i == 0 && UNVERIFIED_WHY.lock().unwrap_or_else(|e| e.into_inner()).0.is_none_or(|at| at.elapsed().as_secs() >= 1);
+        // the checks the settle asks for (owner slot, epoch), and what the checker had for them
+        let mut asked: Vec<(u32, u64)> = Vec::new();
+        let mut repairs: Vec<String> = Vec::new();
         let state: Option<Option<Vec<crate::borrowck::event::GandalfEvent>>> = unsafe {
             crate::owner::call(crate::owner::Class::Program, || {
                 let u = &*up;
+                let epoch = u.tcx.collect_epoch.load(Ordering::SeqCst);
                 let mut failed = Vec::new();
                 let mut waiting = false;
                 let mut waits: Vec<String> = Vec::new();
@@ -8910,12 +8916,18 @@ pub(crate) fn settle_verdicts(up: *mut Unit, pending: &mut Vec<PendingPatch>, un
                         // never verified, never reported: the slots stay unverified (baseline)
                         Verdict::Unverifiable(why) => unchecked.push(format!("{}: {}", u.fns[id as usize].name, why)),
                         Verdict::Pending => {
+                            // the settle asks for the check itself, once per owner and epoch: the
+                            // install's request may have gone nowhere, and nothing else asks again
+                            if let Some(o) = u.borrowck_owner_slot(of).filter(|o| !p.asked.contains(&(*o, epoch)) && !asked.contains(&(*o, epoch))) {
+                                asked.push((o, epoch));
+                                repairs.extend(u.ask_verdict(o, p.group));
+                            }
                             if say_why && !waiting {
-                                let why = format!("{}: patch group {} has run unverified {:.0} s; its check: {}", p.what, p.group, p.installed.elapsed().as_secs_f64(), u.pending_why(id));
+                                let why = format!("{}: patch group {} has run unverified {:.0} s; its check: {}", p.what, p.group, p.installed.elapsed().as_secs_f64(), u.pending_why(of));
                                 *UNVERIFIED_WHY.lock().unwrap_or_else(|e| e.into_inner()) = (Some(Instant::now()), why);
                             }
                             waiting = true;
-                            if crate::jit::specv_trace() { waits.push(format!("#{id} {}", u.pending_why(id))); }
+                            if crate::jit::specv_trace() { waits.push(format!("#{id} {}", u.pending_why(of))); }
                         }
                     }
                 }
@@ -8928,6 +8940,10 @@ pub(crate) fn settle_verdicts(up: *mut Unit, pending: &mut Vec<PendingPatch>, un
                 }
             })
         };
+        for w in &repairs {
+            eprintln!("relax live: {}: patch group {} waited for a check nobody had queued; {w}", pending[i].what, pending[i].group);
+        }
+        pending[i].asked.extend(asked);
         if state.is_some() {
             // a group settles: the next waiting one says its own
             *UNVERIFIED_WHY.lock().unwrap_or_else(|e| e.into_inner()) = (None, String::new());
@@ -10704,7 +10720,7 @@ unsafe fn test_edit(up: *mut Unit, paths: Vec<String>, o: &mut Outcome, undos: &
         let ids = crate::owner::call(crate::owner::Class::Program, || unverified_patch(up, o.group));
         if !ids.is_empty() {
             UNVERIFIED_PATCHES.fetch_add(1, Ordering::AcqRel);
-            pending.push(PendingPatch { group: o.group, what: what.clone(), ids, event_seq: crate::inspect::events::last_seq(), installed: Instant::now() });
+            pending.push(PendingPatch { group: o.group, what: what.clone(), ids, event_seq: crate::inspect::events::last_seq(), installed: Instant::now(), asked: Vec::new() });
         }
         undos.push(undo);
     }
@@ -11664,7 +11680,7 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
             let ids: Vec<u32> = crate::owner::call(crate::owner::Class::Program, || unverified_patch(up, group));
             if !ids.is_empty() {
                 UNVERIFIED_PATCHES.fetch_add(1, Ordering::AcqRel);
-                pending.push(PendingPatch { group, what: what.clone(), ids, event_seq: crate::inspect::events::last_seq(), installed: Instant::now() });
+                pending.push(PendingPatch { group, what: what.clone(), ids, event_seq: crate::inspect::events::last_seq(), installed: Instant::now(), asked: Vec::new() });
                 awaits_check = true;
             }
             undos.push(u);

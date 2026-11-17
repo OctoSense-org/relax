@@ -468,7 +468,10 @@ pub fn note_compiled(options: &crate::options::Options, src: &Arc<dyn FrontSourc
 }
 fn enqueue(options: &crate::options::Options, src: &Arc<dyn FrontSource>, def: DefId, args: Option<Vec<TyId>>, cache_key: Option<u128>, epoch: u64, rank: Option<u32>, cached: Option<StoredVerdict>) {
     if !gandalf_enabled(options) { return; }
-    {
+    // (every way out below wakes the worker: the epoch move may have queued wanted checks again,
+    // and a worker waiting on an empty queue waits until it is woken; only a check queued here
+    // starts it)
+    let queued = 'locked: {
         let mut guard = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
         let q = guard.get_or_insert_with(Queue::default);
         let epoch = q.canon(src.identity(), epoch);
@@ -485,7 +488,7 @@ fn enqueue(options: &crate::options::Options, src: &Arc<dyn FrontSource>, def: D
                         q.items.remove(&at);
                     }
                     v.reuse(key);
-                    return;
+                    break 'locked false;
                 }
             }
             // Discovery may have queued this owner first. A compiled instance
@@ -499,12 +502,12 @@ fn enqueue(options: &crate::options::Options, src: &Arc<dyn FrontSource>, def: D
                     q.order.insert(next); q.items.insert(next, item); q.rank_of.insert(key, next);
                 }
             }
-            return;
+            break 'locked false;
         }
         q.seen.insert(key, ());
         if let Some(v) = cached {
             v.reuse(key);
-            return;
+            break 'locked false;
         }
         let k = (key.0, def);
         let pending = q.pending_ranks.remove(&k);
@@ -512,14 +515,72 @@ fn enqueue(options: &crate::options::Options, src: &Arc<dyn FrontSource>, def: D
         let rank = if def == crate::program::NO_DEF { RANK_DISCOVER } else if args.is_none() { RANK_OWNER } else { rank.or(pending).unwrap_or(RANK_DEFAULT) };
         record(key, FnVerdict::Pending);
         q.insert(Item { key, args, cache_key, src: src.clone(), discovery: 0 }, rank);
-    }
+        true
+    };
+    if queued { start_worker(src, options.verbose); } else { WAKE.notify_one(); }
+}
+/// The worker runs (started by the first check asked for) and looks at the queue again.
+fn start_worker(src: &Arc<dyn FrontSource>, verbose: bool) {
     if !STARTED.swap(true, Ordering::SeqCst) {
-        let s = src.clone(); let verbose = options.verbose;
+        let s = src.clone();
         { let _k = crate::zone_alloc::kept();
         let _ = crate::run_threads::spawn("gandalf", move || { let _z = crate::zone_alloc::compiler_thread(); worker(s, verbose) });
         }
     }
     WAKE.notify_one();
+}
+/// A live patch group (`group`) waits for `def`'s verdict: the watcher's settle asks for it (once per
+/// owner and epoch). It is wanted for the group from now on, and queued at the edit's rank unless a
+/// check of it is queued there, runs, or has its verdict. The install of the group's code asks for
+/// these checks; a request that went nowhere left the group waiting for good with the checker idle
+/// (an app, 11-17: the install of an unverified-mode twin queued nothing for its base, which had no
+/// code of its own). Returns what the checker had when no check was under way (None: one was, or
+/// its verdict is in), for the group's `unverified_why` and the log.
+pub fn ask(options: &crate::options::Options, src: &Arc<dyn FrontSource>, def: DefId, args: Vec<TyId>, epoch: u64, group: u32) -> Option<String> {
+    if !gandalf_enabled(options) { return None; }
+    let id = src.identity();
+    // (every way out wakes the worker: the epoch move below may have queued wanted checks again)
+    let found = 'locked: {
+        let mut guard = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
+        let q = guard.get_or_insert_with(Queue::default);
+        let w = q.wanted.entry((id, def)).or_insert_with(|| Wanted { src: src.clone(), args: Vec::new(), groups: Vec::new() });
+        w.args = args.clone();
+        if !w.groups.contains(&group) { w.groups.push(group); }
+        let epoch = q.canon(id, epoch);
+        let was = q.epoch.get(&id).copied();
+        if !q.advance(id, epoch) {
+            break 'locked Some(format!("the checker is at epoch {}, past the program's {epoch}", was.unwrap_or(0)));
+        }
+        // (an epoch move nothing had told the checker of: the wanted checks are queued again)
+        let behind = was.filter(|&e| e < epoch).map(|e| format!("the checker was at epoch {e}, behind the program's {epoch}"));
+        let key = (id, def, epoch);
+        if let Some(at) = q.rank_of.get(&key).copied() {
+            if at.0 <= RANK_EDIT { break 'locked behind; }
+            // behind the background's checks (they wait for the compiles to go quiet)
+            q.order.remove(&at);
+            let item = q.items.remove(&at).unwrap();
+            let next = (RANK_EDIT, at.1);
+            q.order.insert(next); q.items.insert(next, item); q.rank_of.insert(key, next);
+            crate::preempt::set_urgent(true);
+            Some(format!("queued at rank {}, behind the background's checks: moved to the edit's rank", at.0))
+        } else {
+            let had = VERDICTS.lock().unwrap_or_else(|e| e.into_inner()).get(&def).and_then(|i| i.get(&key)).cloned();
+            let running = RUNNING.lock().unwrap_or_else(|e| e.into_inner()).is_some_and(|r| r.1 == def);
+            let why = match had {
+                Some(FnVerdict::Pending) if running => break 'locked behind,
+                Some(FnVerdict::Pending) => "pending with no check queued or running".to_string(),
+                Some(FnVerdict::Unchecked(why)) if matches!(why.as_str(), "stale" | "not queued" | "changed") => why,
+                Some(_) => break 'locked behind,
+                None => "not queued".to_string(),
+            };
+            q.seen.insert(key, ());
+            record(key, FnVerdict::Pending);
+            q.insert(Item { key, args: Some(args), cache_key: None, src: src.clone(), discovery: 0 }, RANK_EDIT);
+            Some(format!("{why}: queued at the edit's rank"))
+        }
+    };
+    start_worker(src, options.verbose);
+    found
 }
 /// (trace) Where `def`'s check stands: its rank and the checks queued ahead of it; None: not queued.
 /// What the worker checks now: (rank, definition (NO_DEF: discovery), since wall ns).

@@ -9448,14 +9448,13 @@ impl Unit {
         // stream): its verdict stayed pending for the whole run, and the closure ran unverified code.
         // A constant-evaluation twin is checked with its base the same way: a static whose initializer
         // runs as code (a OnceLock) has only its twin's code, so its check was never queued, and a
-        // live patch group holding the twin waited for that verdict for good
+        // live patch group holding the twin waited for that verdict for good. So is an unverified-mode
+        // twin: a base whose callers ran before their verdicts may have only its twin's code, and a
+        // patch that builds the twin again (it folded a changed const, it inlined a changed fn) left
+        // its group waiting for the base's verdict for good (an app, 11-17)
         // a live patch's code (its group): its check is wanted until the group is settled
         let group = self.fns[id as usize].patch_gen;
-        let mut id = id;
-        while let FnKey::Closure(_, _, parent) | FnKey::Ctfe(parent) = self.fns[id as usize].key {
-            if parent as usize >= self.fns.len() { return; }
-            id = parent;
-        }
+        let Some(id) = self.borrowck_owner_slot(id) else { return };
         if let Some((d, a)) = match &self.fns[id as usize].key {
             FnKey::Inst(d, a) if crate::borrowck::event::admit(&self.prog, self.prog.def(*d).krate) => Some((*d, a.clone())),
             _ => None,
@@ -9489,6 +9488,28 @@ impl Unit {
         }
     }
 
+    /// The slot whose body the borrow checker checks for slot `id`'s code: a closure's parent, a
+    /// twin's base (constant-evaluation or unverified-mode), up the chain. None: a slot out of range.
+    pub(crate) fn borrowck_owner_slot(&self, mut id: u32) -> Option<u32> {
+        while let FnKey::Closure(_, _, parent) | FnKey::Ctfe(parent) | FnKey::Plain(parent) = self.fns[id as usize].key {
+            if parent as usize >= self.fns.len() { return None; }
+            id = parent;
+        }
+        Some(id)
+    }
+
+    /// SPEC-V: live patch group `group` waits for slot `id`'s verdict: the watcher's settle asks the
+    /// borrow checker for its owner's check (lazy::ask). Some: what the checker had when no check
+    /// was under way, by the owner's name.
+    pub(crate) fn ask_verdict(&self, id: u32, group: u32) -> Option<String> {
+        let id = self.borrowck_owner_slot(id)?;
+        let FnKey::Inst(d, a) = &self.fns[id as usize].key else { return None };
+        if !crate::borrowck::event::admit(&self.prog, self.prog.def(*d).krate) { return None; }
+        let src: std::sync::Arc<dyn crate::borrowck::lazy::FrontSource> = std::sync::Arc::new(BorrowckFront(self.front.clone()));
+        let epoch = self.tcx.collect_epoch.load(Ordering::SeqCst);
+        crate::borrowck::lazy::ask(&self.prog.session.options, &src, *d, a.clone(), epoch, group).map(|w| format!("the check of {}: {w}", self.prog.def_path(*d)))
+    }
+
     /// SPEC-V: whether slot `id`'s body may run as verified code: the borrow checker's verdict for its
     /// owner is clean, or the body is outside what the checker covers (framework, dependency and std
     /// code, glue, twins; no checker at all: `--check-first` has already refused what fails, and
@@ -9514,6 +9535,8 @@ impl Unit {
     /// checks ahead) when it is queued.
     pub(crate) fn pending_why(&self, id: u32) -> String {
         if specv_held() { return "verdicts are held (SPEC-V hold)".into(); }
+        // (an unverified-mode twin waits for its base's verdict)
+        let id = match self.fns[id as usize].key { FnKey::Plain(b) if (b as usize) < self.fns.len() => b, _ => id };
         let Some(d) = self.verdict_owner(id) else { return "no owner".into() };
         let epoch = self.tcx.collect_epoch.load(Ordering::SeqCst);
         let src = self.front.checker_id;

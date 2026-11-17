@@ -423,7 +423,7 @@ fn specv_patch_before_verdict() {
     }
     let mut undos = vec![outcome.undo.unwrap()];
     let ids = vec![id];
-    let mut pending = vec![crate::reload::PendingPatch { group: outcome.group, what: "lib.rs".into(), ids, event_seq: crate::inspect::events::last_seq(), installed: std::time::Instant::now() }];
+    let mut pending = vec![crate::reload::PendingPatch { group: outcome.group, what: "lib.rs".into(), ids, event_seq: crate::inspect::events::last_seq(), installed: std::time::Instant::now(), asked: Vec::new() }];
     crate::reload::UNVERIFIED_PATCHES.fetch_add(1, Ordering::AcqRel);
     assert!(!crate::reload::observations_verified());
     // its verdict held: the group waits, and says on what
@@ -593,7 +593,7 @@ fn specv_aliased_call_from_unverified_body() {
     assert!(!unsafe { crate::jit::compile_tier1(up, value) }, "no O3 build of a patch without its verdict");
     // the verdict rejects the patch: it reverts
     let mut undos = vec![outcome.undo.unwrap()];
-    let mut pending = vec![crate::reload::PendingPatch { group: outcome.group, what: "lib.rs".into(), ids: vec![value, value_ptr, value_dyn], event_seq: crate::inspect::events::last_seq(), installed: std::time::Instant::now() }];
+    let mut pending = vec![crate::reload::PendingPatch { group: outcome.group, what: "lib.rs".into(), ids: vec![value, value_ptr, value_dyn], event_seq: crate::inspect::events::last_seq(), installed: std::time::Instant::now(), asked: Vec::new() }];
     crate::reload::UNVERIFIED_PATCHES.fetch_add(1, Ordering::AcqRel);
     let t0 = std::time::Instant::now();
     while !pending.is_empty() && t0.elapsed().as_secs() < 20 {
@@ -698,6 +698,105 @@ fn specv_verified_rebuild_runs_twin_code_not_lazy_compiles() {
     // a patch-free rerun stays on code
     run("again");
     assert_eq!(crate::jit::LAZY_FRONTS.load(Ordering::Relaxed) - lazy0, 0);
+    std::mem::forget(u);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// SPEC-V: a live patch group's verdict always arrives, and says what it waits on until then. `mid`
+/// runs only as its unverified-mode twin (its caller ran before its verdict), and the twin folded
+/// const `K`. An edit of `K` builds the twin again, unverified, and not `mid` (it never ran): the
+/// group waits for `mid`'s verdict, which no install asked for -- the install of a twin queued
+/// nothing (a closure or a constant-evaluation twin queues its owner's check; an unverified-mode
+/// twin did not), and the watcher's settle only read verdicts. An app, 11-17: a patch that built
+/// 183 fns again ran unverified for good while the checker sat idle with an empty queue.
+#[test]
+fn specv_a_patched_twin_s_verdict_arrives() {
+    const CHILD: &str = "RELAX_SPECV_TWIN_PATCH_TEST";
+    if std::env::var_os(CHILD).is_none() {
+        let output = crate::test_child::output(std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "lazy_reload_tests::specv_a_patched_twin_s_verdict_arrives", "--nocapture", "--test-threads=1", "--format=terse"])
+            .env(CHILD, "1").env("RELAX_GANDALF_ALL", "0"));
+        assert!(output.status.success(), "{}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+        return;
+    }
+    use std::sync::atomic::Ordering;
+    crate::jit::CHECK_FIRST.store(false, Ordering::Relaxed);
+    crate::jit::SPECV_HOLD.store(1, Ordering::Relaxed);
+    std::env::set_var("RELAX_STD", concat!(env!("CARGO_MANIFEST_DIR"), "/std"));
+    let dir = std::env::temp_dir().join(format!("relax-specv-twin-patch-{}", std::process::id()));
+    std::fs::create_dir_all(dir.join("app/src")).unwrap();
+    std::fs::write(dir.join("Cargo.toml"), "[workspace]\nmembers = [\"app\"]\n").unwrap();
+    std::fs::write(dir.join("app/Cargo.toml"), "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n").unwrap();
+    let src = "pub const K: u32 = 1;\n\
+        #[inline(never)] pub fn leaf(a: &mut u32, b: &u32) -> u32 { *a += *b; *a }\n\
+        #[inline(never)] pub fn mid(a: &mut u32, b: &u32) -> u32 { leaf(a, b) + leaf(a, b) + K }\n\
+        pub fn root(out: &mut u32) { let mut x = 1u32; let y = 2u32; *out = mid(&mut x, &y); }\n";
+    std::fs::write(dir.join("app/src/lib.rs"), src).unwrap();
+    let app = dir.join("app/src/lib.rs").to_string_lossy().into_owned();
+    let session = Arc::new(crate::Session::default());
+    let (prog, core, app_crate) = crate::load_with_std(&session, &app, "specv_twin_patch", false).unwrap();
+    let graph = format!(r#"{{"units":[{{"pkg_id":"path+file://{}/app#app@0.1.0","target":{{"name":"app","src_path":{}}}}}]}}"#, dir.display().to_string().replace('\\', "\\\\"), crate::diag::quote(&app));
+    let roots = crate::reload::gandalf_app_roots(&crate::unitgraph::Units::from_json(graph.as_bytes()).unwrap(), dir.join("app").to_str().unwrap());
+    let find = |name: &str| prog.defs.iter().enumerate().find_map(|(i, d)| {
+        let id = crate::program::DefId(i as u32);
+        (d.krate == app_crate && prog.name(id) == name).then_some(id)
+    }).unwrap();
+    let (mid_def, root_def) = (find("mid"), find("root"));
+    let mut tcx = crate::tcx::Tcx::new();
+    tcx.collect(&prog);
+    crate::borrowck::event::set_app_scope(roots);
+    let mut u = crate::jit::Unit::new(prog, tcx, core);
+    let up = &mut *u as *mut crate::jit::Unit;
+    crate::syms::set_unit(up);
+    let (mid, root_entry) = crate::owner::call(crate::owner::Class::Program, || {
+        let m = u.fn_id(crate::jit::FnKey::Inst(mid_def, vec![]));
+        let r = u.fn_id(crate::jit::FnKey::Inst(root_def, vec![]));
+        (m, u.entry(r))
+    });
+    let run = |label: &str, expected: u32| {
+        let mut result = 0u32;
+        unsafe { crate::jit::call_jit(up, root_entry, &mut result as *mut u32 as u64) }.unwrap_or_else(|p| panic!("JIT call panicked: {}", p.message));
+        assert_eq!(result, expected, "{label}");
+    };
+    // held verdicts: root runs as unverified code and calls mid's twin; mid itself never gets code
+    run("unverified", 9);
+    let twin = u.plain_twin_of(mid).expect("mid's twin");
+    assert!(u.fns[twin as usize].compiled && !u.fns[mid as usize].compiled, "mid runs only as its twin");
+    // K is edited: its reader, mid's twin, is built again (unverified); mid is not (it never ran)
+    let file = u.prog.def(mid_def).file;
+    let outcome = unsafe { crate::reload::apply(up, vec![crate::reload::Edit { file, path: app.clone(), src: src.replace("K: u32 = 1", "K: u32 = 2").into_bytes() }]) };
+    assert_eq!(outcome.rung, crate::reload::Rung::Patch, "{:?}", outcome.lines);
+    run("patched", 10);
+    let group = outcome.group;
+    let ids: Vec<u32> = (0..u.fns.len() as u32).filter(|&i| u.fns[i as usize].patch_gen == group && u.fns[i as usize].unverified.load(Ordering::Relaxed)).collect();
+    assert!(ids.contains(&twin) && !u.fns[mid as usize].compiled, "the group runs mid's twin, and mid has no code: {ids:?}");
+    let mut undos = vec![outcome.undo.unwrap()];
+    let mut pending = vec![crate::reload::PendingPatch { group, what: "lib.rs".into(), ids, event_seq: crate::inspect::events::last_seq(), installed: std::time::Instant::now(), asked: Vec::new() }];
+    crate::reload::UNVERIFIED_PATCHES.fetch_add(1, Ordering::AcqRel);
+    // the twin's install asked for mid's check (it is queued, running or done), and it runs while
+    // the verdicts are held
+    let (checker, epoch) = (u.front.checker_id, u.tcx.collect_epoch.load(Ordering::SeqCst));
+    let verdict = || crate::borrowck::lazy::verdict(checker, mid_def, &[], epoch);
+    assert!(!matches!(verdict(), crate::borrowck::lazy::FnVerdict::Unchecked(w) if w == "not queued"), "the install of mid's twin queues mid's check");
+    let t0 = std::time::Instant::now();
+    while verdict() != crate::borrowck::lazy::FnVerdict::Clean {
+        assert!(t0.elapsed().as_secs() < 10, "mid is checked: {:?}", verdict());
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    // the epoch moves on and nothing tells the checker (a newer group's rollback moves it so): mid's
+    // verdict is of the epoch before. The watcher's settle asks for the check again
+    u.tcx.collect_epoch.fetch_add(1, Ordering::SeqCst);
+    crate::jit::specv_release();
+    let t0 = std::time::Instant::now();
+    let mut why = String::new();
+    while !pending.is_empty() && t0.elapsed().as_secs() < 10 {
+        crate::reload::settle_verdicts(up, &mut pending, &mut undos);
+        if !pending.is_empty() { why = crate::reload::unverified_why(); }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert!(pending.is_empty(), "the patched twin's group gets its verdict; it waited on: {why}");
+    assert!(why.contains("::mid ("), "while it waits, the group names the check it waits for: {why}");
+    assert!(crate::reload::observations_verified());
     std::mem::forget(u);
     std::fs::remove_dir_all(dir).unwrap();
 }
