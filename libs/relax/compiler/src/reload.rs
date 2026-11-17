@@ -669,8 +669,8 @@ pub unsafe fn rollback(up: *mut Unit, undo: Undo, why: &str) -> Result<Vec<Strin
         if let Some(&later) = u.layout_groups.iter().find(|&&l| l > undo.group) {
             if let Some(s) = superseded_by(u, undo.group) {
                 let why = format!(
-                    "patch gen {} superseded `{}`, and patch gen {} gave a struct its new layout after it, leaving that closure on code of the layout before: rolling gen {} back would run that code again -- restart the app",
-                    undo.group, u.fns[s as usize].name, later, undo.group
+                    "patch gen {} superseded {}, and patch gen {} gave a struct its new layout after it, leaving that closure on code of the layout before: rolling gen {} back would run that code again -- restart the app",
+                    undo.group, slot_shown(u, s), later, undo.group
                 );
                 return Err(RollbackRestart { undo, why });
             }
@@ -2876,7 +2876,7 @@ fn retired_hit(u: &Unit, t: TyId, depth: u32) -> Option<(String, u64)> {
             if u.kept_at.contains(&(file, expr)) {
                 let kept = u.kept_old.iter().filter(|e| matches!(u.fns[*e.0 as usize].key, FnKey::Closure(f, x, _) if (f, x) == (file, expr))).min_by_key(|e| *e.0);
                 return Some(match kept {
-                    Some((k, (gen, why))) => (format!("`{}`, which patch gen {gen} kept on its old code ({why})", u.fns[*k as usize].name), closure_rank(u, *k)),
+                    Some((k, (gen, why))) => (format!("{}, which patch gen {gen} kept on its old code ({why})", slot_shown(u, *k)), closure_rank(u, *k)),
                     None => ("a closure a patch kept on its old code".to_string(), UNNAMED),
                 });
             }
@@ -2885,7 +2885,7 @@ fn retired_hit(u: &Unit, t: TyId, depth: u32) -> Option<(String, u64)> {
                     // (a closure has a slot per parent slot that lowered it: the one with code)
                     let slot = u.closures_of_files(&[file]).into_iter().filter(|&k| matches!(u.fns[k as usize].key, FnKey::Closure(f, e, _) if (f, e) == (file, expr))).min_by_key(|&k| (!u.fns[k as usize].compiled, k));
                     return Some(match slot {
-                        Some(k) => (format!("`{}`, of text an edit retired", u.fns[k as usize].name), closure_rank(u, k)),
+                        Some(k) => (format!("{}, of text an edit retired", slot_shown(u, k)), closure_rank(u, k)),
                         None => (format!("a closure of `{}`, of text an edit retired", u.prog.def_path(d)), UNNAMED),
                     });
                 }
@@ -3005,12 +3005,12 @@ fn stored_in_objects(u: &Unit, ty_hit: &dyn Fn(TyId) -> Option<(String, u64)>, s
 /// pointer to a removed fn, a closure coerced to one). Decided before the threads are paused.
 fn kept_stored(u: &Unit) -> Option<String> {
     let ty_hit = |t: TyId| retired_hit(u, t, 0);
-    let slot_hit = |sl: u32| retired_text(u, sl).map(|r| format!("`{}` {r}", u.fns[sl as usize].name)).or_else(|| over_retired(u, sl));
+    let slot_hit = |sl: u32| retired_text(u, sl).map(|r| format!("{} {r}", slot_shown(u, sl))).or_else(|| over_retired(u, sl));
     if let Some((of, x)) = stored_in_objects(u, &ty_hit, &slot_hit) {
         return Some(format!("the running code made trait objects of {of}, which hold {x}"));
     }
     let taken = u.code.read().unwrap_or_else(|e| e.into_inner()).taken_slots();
-    taken.into_iter().find_map(|sl| retired_text(u, sl).map(|r| format!("the address of `{}` is taken, and a stored pointer can still run it {r}", u.fns[sl as usize].name)))
+    taken.into_iter().find_map(|sl| retired_text(u, sl).map(|r| format!("the address of {} is taken, and a stored pointer can still run it {r}", slot_shown(u, sl))))
 }
 
 /// The def of closure slot `c`'s owning fn: up its parents to the instance (a twin as its slot).

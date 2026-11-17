@@ -3112,9 +3112,8 @@ pub fn start(p: *mut u64) {
     at(&rig, 1);
     let old = rig.closures("worker");
     assert_eq!(old.len(), 1, "the closure has code");
-    let name = rig.name(old[0]);
-    // (a frame over code holding a copy of it names it as a refused edit names a frame's closure)
-    let shown = rig.shown(old[0]);
+    // named as a refused edit names a closure: by the fn that makes it and its place
+    let name = rig.shown(old[0]);
     // (the frame of the first wait stays in the instance's first code)
     let pumps = rig.tier_up("pump");
     assert_eq!(pumps.len(), 1, "one instance of pump");
@@ -3132,12 +3131,12 @@ pub fn start(p: *mut u64) {
     at(&rig, 2);
     // (the refused text again)
     let o = rig.edit("lib.rs", &[("pub struct S { pub m: u64, pub n: u64 }", "pub struct S { pub m: u64, pub n: u64 }")]);
-    let tiered = refused_with(&o, &["struct `S` changed its layout", "pump", "holds a copy of", &shown, "patch gen 1 kept"]);
+    let tiered = refused_with(&o, &["struct `S` changed its layout", "pump", "holds a copy of", &name, "patch gen 1 kept"]);
     rig.flags[0].store(2, Ordering::SeqCst);
     rig.wait(3);
-    assert!(refused.0, "a frame of an instance over the closure edit 1 kept refuses the layout patch, naming it and the closure (`{name}`): {}", refused.1);
+    assert!(refused.0, "a frame of an instance over the closure edit 1 kept refuses the layout patch, naming it and the closure ({name}): {}", refused.1);
     assert!(kept, "the edits leave the instance's O3 code in place");
-    assert!(tiered.0, "a frame in the instance's O3 code, which holds a copy of the closure, refuses it naming the copy ({shown}): {}", tiered.1);
+    assert!(tiered.0, "a frame in the instance's O3 code, which holds a copy of the closure, refuses it naming the copy ({name}): {}", tiered.1);
     assert_eq!(rig.flag(2), 10, "the second calls, by the code the closure was made with");
 }
 
@@ -3165,7 +3164,7 @@ pub fn later(p: *mut u64) {
     assert_eq!(rig.flag(2), 5, "the stored closure runs");
     let old = rig.closures("start");
     assert_eq!(old.len(), 1, "the stored closure has code");
-    let name = rig.name(old[0]);
+    let name = rig.shown(old[0]);
     let o = rig.edit("lib.rs", &[("let k = 0u64;", "let k = 0u64;\n    let j = 0u64;"), ("read(&s) + k }", "read(&s) + k + j }")]);
     assert_eq!(o.rung, crate::reload::Rung::Patch, "the captures edit applies: {:?}", o.lines);
     let o = rig.edit("lib.rs", &[("{ let s = S { n: 5 }; read(&s) + k + j }", "5u64 + k + j")]);
@@ -3174,7 +3173,7 @@ pub fn later(p: *mut u64) {
     let refused = refused_with(&o, &["struct `S` changed its layout", "trait objects", &name, "patch gen 1 kept"]);
     rig.flags[2].store(0, std::sync::atomic::Ordering::SeqCst);
     rig.call("later");
-    assert!(refused.0, "a stored value of the closure edit 1 kept refuses the layout patch, naming it (`{name}`) and edit 1: {}", refused.1);
+    assert!(refused.0, "a stored value of the closure edit 1 kept refuses the layout patch, naming it ({name}) and edit 1: {}", refused.1);
     assert_eq!(rig.flag(2), 5, "the stored closure's call after it");
 }
 
@@ -3364,7 +3363,7 @@ pub fn konst(p: *mut u64) {
     let (fields_boot, konst_boot) = (run(&rig, "fields"), run(&rig, "konst"));
     assert_eq!(konst_back, 5, "konst's groups rolled back: its boot text runs");
     let why = refused.unwrap_or_default();
-    assert!(why.contains("restart the app") && why.contains(&rig.name(old1[0])), "the refusal names the retired closure and asks for a restart: {why}");
+    assert!(why.contains("restart the app") && why.contains(&rig.shown(old1[0])), "the refusal names the retired closure and asks for a restart: {why}");
     assert!(still_kept && fields_still == 3, "a refused rollback changes nothing: the closure stays retired ({still_kept}), the new text runs ({fields_still})");
     assert_eq!(fields_boot, 5, "newest first, the layout patch and then the retiring group roll back: the boot text runs");
     assert_eq!(konst_boot, 5, "konst too");
@@ -3591,13 +3590,13 @@ pub fn later(p: *mut u64) {
     assert_eq!(rig.flag(2), 5, "the stored closure runs");
     let old = rig.closures("start");
     assert_eq!(old.len(), 1, "the stored closure has code");
-    let name = rig.name(old[0]);
+    let name = rig.shown(old[0]);
     let o = rig.edit("lib.rs", &[("let k = 0u64;", "let k = 0u64;\n    let j = 0u64;"), ("read(&s) + k }", "read(&s) + k + j }"), ("pub struct S { pub n: u64 }", "pub struct S { pub m: u64, pub n: u64 }"), ("S { n: 5 }", "S { m: 0, n: 5 }")]);
     let refused = refused_with(&o, &["struct `S` changed its layout", "trait objects", &name, "patch gen 1 kept"]);
     let left = rig.unit.kept_old.len();
     rig.flags[2].store(0, std::sync::atomic::Ordering::SeqCst);
     rig.call("later");
-    assert!(refused.0, "the closure this edit keeps refuses its layout change, naming it (`{name}`) and the edit: {}", refused.1);
+    assert!(refused.0, "the closure this edit keeps refuses its layout change, naming it ({name}) and the edit: {}", refused.1);
     assert_eq!(left, 0, "a refused patch leaves no record entry");
     assert_eq!(rig.flag(2), 5, "the stored closure's call after it");
 }
