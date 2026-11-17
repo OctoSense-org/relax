@@ -838,6 +838,98 @@ fn main() {}
     std::mem::forget(u);
 }
 
+/// The startup manifest is the install order as its window's close left it, whichever try
+/// records it, and the quit write adds what the session installed later as its tail: a first try
+/// that gives way while installs go on does not take them into the manifest (and its image), the
+/// quit write records the tail and leaves the manifest as it was, and the next launch links both
+/// from the cache.
+#[test]
+fn the_startup_manifest_keeps_its_windows_order_and_the_quit_adds_the_tail() {
+    const CHILD: &str = "RELAX_MANIFEST_WINDOW_TEST";
+    const DIR: &str = "RELAX_MANIFEST_WINDOW_TEST_DIR";
+    let Ok(phase) = std::env::var(CHILD) else {
+        let dir = std::env::temp_dir().join(format!("relax-manifest-window-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("input.rs"), r#"
+pub fn first(out: &mut u32) { *out = 11; }
+pub fn later(out: &mut u32) { *out = 22; }
+fn main() {}
+"#).unwrap();
+        for phase in ["cold", "warm"] {
+            let output = crate::test_child::output(std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "jit::settle_tests::the_startup_manifest_keeps_its_windows_order_and_the_quit_adds_the_tail", "--nocapture", "--test-threads=1"])
+                .env(CHILD, phase).env(DIR, &dir).env("RELAX_SPEC", "0"));
+            assert!(output.status.success(), "{phase}: {}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+        return;
+    };
+    crate::borrowck::lazy::disable_gandalf();
+    std::env::set_var("RELAX_STD", concat!(env!("CARGO_MANIFEST_DIR"), "/std"));
+    let dir = std::path::PathBuf::from(std::env::var_os(DIR).unwrap());
+    std::env::set_var("RELAX_CACHE_DIR", dir.join("cache"));
+    let session = std::sync::Arc::new(crate::Session::default());
+    let (prog, core, krate) = crate::load_with_std(&session, dir.join("input.rs").to_str().unwrap(), "manifest_window", false).unwrap();
+    let def = |name: &str| prog.defs.iter().enumerate().find_map(|(i, d)| {
+        let id = DefId(i as u32);
+        (d.krate == krate && prog.name(id) == name).then_some(id)
+    }).unwrap();
+    let (first_def, later_def) = (def("first"), def("later"));
+    let mut tcx = Tcx::new();
+    tcx.collect(&prog);
+    assert!(tcx.errors.is_empty(), "{:?}", tcx.errors);
+    let mut u = Unit::new(prog, tcx, core);
+    let up = &mut *u as *mut Unit;
+    let (first, later) = crate::owner::call(crate::owner::Class::Program, || {
+        let ids = (u.fn_id(FnKey::Inst(first_def, Vec::new())), u.fn_id(FnKey::Inst(later_def, Vec::new())));
+        let mut cache = crate::cache::Cache::open(&u, crate::cache::Mode::ReadOnly).unwrap();
+        cache.mode = crate::cache::Mode::On;
+        u.cache = Some(Box::new(crate::cache::CacheCell::new(cache)));
+        ids
+    });
+    let compile = |id: u32| match crate::owner::call(crate::owner::Class::Program, || unsafe { compile_slot_locked(up, id, false) }) {
+        Compiled::Code(c) => c,
+        Compiled::Back(_) => panic!("a nested compile builds here"),
+    };
+    let run = |entry: u64| {
+        let mut out = 0u32;
+        unsafe { call_jit(up, entry, &mut out as *mut u32 as u64) }.unwrap_or_else(|p| panic!("JIT call panicked: {}", p.message));
+        out
+    };
+    if phase == "cold" {
+        assert_eq!(run(compile(first)), 11);
+        // the start ends, and the manifest's window with it (ORDER_UNTIL_NS stays 0)
+        QUIET_START_NS.store(wall_ns().max(1), Ordering::Release);
+        // the first write past the window: its manifest gives way, as to a waiting request
+        crate::run::MANIFEST_GIVES_WAY.store(1, Ordering::SeqCst);
+        let gave_way = unsafe { crate::run::quit_write_pass(up) };
+        assert_eq!(crate::run::MANIFEST_GIVES_WAY.load(Ordering::SeqCst), 0, "the first write past the window tried the manifest: {gave_way:?}");
+        // the session installs on, then the next write records the manifest
+        assert_eq!(run(compile(later)), 22);
+        let recorded = unsafe { crate::run::quit_write_pass(up) };
+        assert!(recorded.is_some(), "the write after it ran");
+        // the quit write: the session's tail
+        QUIT_SEEN.store(true, Ordering::Relaxed);
+        let quit = unsafe { crate::run::quit_write_pass(up) };
+        assert!(quit.is_some(), "the quit write ran");
+    } else {
+        let held = crate::owner::call(crate::owner::Class::Program, || {
+            let mut cache = u.cache.take().unwrap();
+            cache.load_manifest(crate::layout::root_crate());
+            let held = (cache.manifest_holds(&u, first), cache.manifest_holds(&u, later));
+            u.cache = Some(cache);
+            held
+        });
+        assert_eq!(held, (Some(true), Some(false)), "the manifest holds the slot its window installed, the tail the one installed after it (manifest, tail)");
+        let entries = crate::owner::call(crate::owner::Class::Program, || unsafe { (ready_code_locked(up, first), ready_code_locked(up, later)) });
+        let (Some(a), Some(b)) = entries else { panic!("the next launch links both from the cache: {entries:?}") };
+        assert_eq!((run(a), run(b)), (11, 22));
+        assert!(u.cache.as_ref().unwrap().stats.hits >= 2, "both came from the cache, not a build");
+    }
+    // As in the settling fixture, process exit owns the runtime's teardown.
+    std::mem::forget(u);
+}
+
 #[test]
 fn prebuild_link_needing_initializer_bails() {
     // Rule I-PUB (a remote-XR app on a node: "O3 build of slot N panicked: initializer inside a

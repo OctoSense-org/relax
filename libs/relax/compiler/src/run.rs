@@ -4181,11 +4181,10 @@ fn start_monitor(runtime: &crate::options::RuntimeOptions, options: &crate::opti
                 mid_flushed = n;
                 mid_last = main_ms;
                 let busy = mid_busy.clone();
-                let quiet = record || mid_still;
                 let _ = crate::run_threads::spawn("run-cache-write", move || { let _z = crate::zone_alloc::compiler_thread();
                     let _mem = crate::memstat::tag(crate::memstat::Tag::CacheStore);
                     let t = Instant::now();
-                    let r = mid_flush(quiet, record);
+                    let r = mid_flush(record);
                     if crate::memstat::enabled() || crate::cache::trace_on() {
                         verbose!("relax cache: mid-run write at t={:.0} ms: {:?} (entries, front images) in {:.1} ms", crate::clock::ms_since_start(), r, t.elapsed().as_secs_f64() * 1e3);
                     }
@@ -4719,6 +4718,25 @@ fn mid_yielded() {
 /// The install order's length when a mid-run write last recorded the manifest (or its tail): the
 /// quit write records the session's later installs as its tail
 static MID_MANIFEST_LEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// The install order's length when the startup manifest's window closed, as the first write past
+/// it found it (MAX: not yet): the startup manifest is that much of it, whichever try records it.
+/// A cold run installs for minutes after its window; a manifest of the whole order so far was
+/// another record each try, and a try that gave way left the next one more to do.
+static MANIFEST_WINDOW_LEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(usize::MAX);
+
+/// A test's startup manifest gives way this many times more, as to a waiting request.
+#[cfg(test)]
+pub(crate) static MANIFEST_GIVES_WAY: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+#[cfg(test)]
+fn manifest_test_gives_way() -> bool {
+    MANIFEST_GIVES_WAY.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1)).is_ok()
+}
+
+#[cfg(not(test))]
+fn manifest_test_gives_way() -> bool {
+    false
+}
 /// The last mid-run write found an in-session rebuild of the startup image due (cache
 /// image_refresh_due): the next one opens the stores spills wrote first, as the image takes their
 /// entries
@@ -4840,7 +4858,7 @@ fn quit_mark() {
             // (the exit's write does the rest)
             if EXIT_STAGE.load(Ordering::SeqCst) != 0 { break; }
             let yields = MID_YIELDS.load(Ordering::Relaxed);
-            let pass = mid_flush(true, true);
+            let pass = mid_flush(true);
             r = pass.or(r);
             let whole = MID_YIELDS.load(Ordering::Relaxed) == yields;
             if whole && (QUIT_WRITE_FINISHING.load(Ordering::SeqCst)
@@ -4871,7 +4889,7 @@ fn quit_mark() {
 #[cfg(test)]
 pub(crate) unsafe fn quit_write_pass(up: *mut Unit) -> Option<(usize, usize)> {
     RUN_UNIT = up;
-    let r = mid_flush(true, true);
+    let r = mid_flush(true);
     RUN_UNIT = std::ptr::null_mut();
     r
 }
@@ -4895,7 +4913,7 @@ pub(crate) extern "C" fn relax_self_spawn() {
     }
     let _one = ONE.lock().unwrap_or_else(|e| e.into_inner());
     let t = Instant::now();
-    let r = mid_flush(true, true);
+    let r = mid_flush(true);
     verbose!("relax cache: written before a run of this program again: {:?} (entries, front images) in {:.1} ms", r, t.elapsed().as_secs_f64() * 1e3);
 }
 
@@ -5201,7 +5219,7 @@ impl Drop for CapturingNow {
 
 /// `wait`: the warm record's writes (after first present, at a quit) wait for the owner thread to
 /// complete its work (which a cold run's compiles fill nearly all the time); other writes skip a busy unit.
-fn mid_flush(quiet: bool, wait: bool) -> Option<(usize, usize)> {
+fn mid_flush(wait: bool) -> Option<(usize, usize)> {
     // the compiled kernels offered so far
     crate::kernel_store::flush();
     // the first write comes after the start: the mapped front images are checksummed now
@@ -5264,14 +5282,22 @@ fn mid_flush(quiet: bool, wait: bool) -> Option<(usize, usize)> {
         let refresh = !quit && done && u.cache.as_ref().is_some_and(|c| c.image_refresh_due());
         if u.cache.is_some() && jit::started() && jit::wall_ns() >= jit::ORDER_UNTIL_NS.load(Ordering::Relaxed) && (!done || tail || refresh) {
             MID_MANIFEST_DONE.store(true, Ordering::Relaxed);
-            let len = u.start_order.len();
+            // the startup manifest: the install order as the first write past its window found it,
+            // whichever try records it (a refresh and a manifest the quit records first included);
+            // the session's later installs are its tail, which the quit records after it
+            // (record_tail). A cold run installs for minutes after its window: a manifest of the
+            // whole order so far was more to record, and to build an image of, at every try.
+            if MANIFEST_WINDOW_LEN.load(Ordering::Relaxed) == usize::MAX {
+                MANIFEST_WINDOW_LEN.store(u.start_order.len(), Ordering::Relaxed);
+            }
+            let len = if tail { u.start_order.len() } else { MANIFEST_WINDOW_LEN.load(Ordering::Relaxed).min(u.start_order.len()) };
             yield_section("manifest order");
-            let (order, present) = jit::manifest_order(&*u, u.start_order.clone(), jit::ORDER_PRESENT_LEN.load(Ordering::Relaxed));
+            let (order, present) = jit::manifest_order(&*u, u.start_order[..len].to_vec(), jit::ORDER_PRESENT_LEN.load(Ordering::Relaxed));
             let mut cache = u.cache.take();
             if let Some(c) = cache.as_mut() {
                 // a waiting request (a frame's lazy compile, a live patch, a back end's Job) goes
                 // first: the manifest is made again by a later write
-                let stop = || { probe.tick("manifest"); quit_write_gives_way() };
+                let stop = || { probe.tick("manifest"); quit_write_gives_way() || manifest_test_gives_way() };
                 let root = crate::layout::root_crate();
                 let t_made = Instant::now();
                 let made = if tail { c.record_tail(u, root, &order, &stop) } else { c.record_manifest(u, root, &order, present, &stop) };
@@ -5344,9 +5370,10 @@ fn mid_flush(quiet: bool, wait: bool) -> Option<(usize, usize)> {
     }
     let graph_ready = jit::live_startup_done()
         && crate::cache::Cache::flush_front_graphs().is_ok();
-    // the collected program, once per run and only when the program is quiet: recorded off the
-    // owner thread (record_collected)
-    if graph_ready && quiet && !COLLECTED_CURRENT.load(Ordering::Relaxed) && !MID_COLLECTED_TRIED.load(Ordering::Relaxed) {
+    // the collected program, once per run, as soon as its pieces are in the stores: recorded off
+    // the owner thread (record_collected), so it does not wait for the program to go quiet (a
+    // cold run compiles for minutes after its present, and its quit recorded it, seconds long)
+    if graph_ready && !COLLECTED_CURRENT.load(Ordering::Relaxed) && !MID_COLLECTED_TRIED.load(Ordering::Relaxed) {
         record_collected(up, wait, imaged_files, crates_left);
     }
     verbose!("relax cache: mid write held the owner {:.1} ms (records to {:.1}, manifest to {:.1}, front images to {:.1}, crate records to {:.1}, then spill); before it the record drain took {:.1} ms and the wait for the owner {:.1} ms (behind {} queued program requests; meanwhile it served {} requests, {} of them the main thread's ahead of the queue), the spill's write {:.1} ms; front writes so far {}", held1, parts[3], parts[0], parts[1], parts[2], drain_ms, owner_wait_ms, behind.0, passed.0, passed.1, spill_ms, jit::front_epoch());
@@ -5994,6 +6021,7 @@ pub(crate) unsafe fn reset_statics() {
     reset(&MID_COLLECTED_TRIED, AtomicBool::new(false));
     reset(&MID_MANIFEST_DONE, AtomicBool::new(false));
     reset(&MID_MANIFEST_LEN, std::sync::atomic::AtomicUsize::new(0));
+    reset(&MANIFEST_WINDOW_LEN, std::sync::atomic::AtomicUsize::new(usize::MAX));
     reset(&IMAGE_REFRESH_WANTED, AtomicBool::new(false));
     reset(&MID_CACHE_DIR, relax_session::sync::Mutex::new(None));
     reset(&MAIN_START_WALL, AtomicU64::new(0));

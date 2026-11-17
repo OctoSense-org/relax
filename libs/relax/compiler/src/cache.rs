@@ -4650,6 +4650,15 @@ impl Cache {
 
     /// Reads the newest startup manifest of the program rooted at crate `root` (and its
     /// prelinked startup image, if it has one).
+    /// Where the loaded startup manifest holds slot `id`: Some(true) among its own slots,
+    /// Some(false) in the session tail after them, None not at all.
+    #[cfg(test)]
+    pub(crate) fn manifest_holds(&mut self, u: &Unit, id: u32) -> Option<bool> {
+        let b = self.slot_bytes(u, id)?;
+        let i = self.manifest.iter().position(|m| *m == b)?;
+        Some(i < self.manifest_main)
+    }
+
     pub fn load_manifest(&mut self, root: u32) {
         self.manifest_root = Some(root);
         let Some(key) = self.manifest_key(root) else { return };
