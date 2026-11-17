@@ -836,7 +836,7 @@ fn build_loop() {
             let what = format!("rebuild produced no change: cargo left the {tool} this process runs as it was (the edit is not in what {tool} is built from, or was undone)", tool = crate::tool_name());
             // a live test session's tests already ran on this binary: no run answers it but this
             if crate::harness::live::enabled() { super::patch_refused_event(&why, true, std::slice::from_ref(&what)); }
-            else { super::patch_verified_event(&format!("{why}: {what}"), 0, &[]); }
+            else { super::patch_verified_event(&format!("{why}: {what}"), 0, &[], &[]); }
             super::live_log(&format!("{{\"event\":\"host_rebuild\",\"ok\":true,\"s\":{secs:.1},\"unchanged\":true}}"));
             let mut st = STATE.lock().unwrap_or_else(|e| e.into_inner());
             if st.again { drop(st); continue; }

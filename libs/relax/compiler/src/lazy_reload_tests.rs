@@ -423,7 +423,7 @@ fn specv_patch_before_verdict() {
     }
     let mut undos = vec![outcome.undo.unwrap()];
     let ids = vec![id];
-    let mut pending = vec![crate::reload::PendingPatch { group: outcome.group, what: "lib.rs".into(), ids, event_seq: crate::inspect::events::last_seq(), installed: std::time::Instant::now(), asked: Vec::new() }];
+    let mut pending = vec![crate::reload::PendingPatch { group: outcome.group, what: "lib.rs".into(), ids, event_seq: crate::inspect::events::last_seq(), installed: std::time::Instant::now(), asked: Vec::new(), held: Vec::new() }];
     crate::reload::UNVERIFIED_PATCHES.fetch_add(1, Ordering::AcqRel);
     assert!(!crate::reload::observations_verified());
     // its verdict held: the group waits, and says on what
@@ -593,7 +593,7 @@ fn specv_aliased_call_from_unverified_body() {
     assert!(!unsafe { crate::jit::compile_tier1(up, value) }, "no O3 build of a patch without its verdict");
     // the verdict rejects the patch: it reverts
     let mut undos = vec![outcome.undo.unwrap()];
-    let mut pending = vec![crate::reload::PendingPatch { group: outcome.group, what: "lib.rs".into(), ids: vec![value, value_ptr, value_dyn], event_seq: crate::inspect::events::last_seq(), installed: std::time::Instant::now(), asked: Vec::new() }];
+    let mut pending = vec![crate::reload::PendingPatch { group: outcome.group, what: "lib.rs".into(), ids: vec![value, value_ptr, value_dyn], event_seq: crate::inspect::events::last_seq(), installed: std::time::Instant::now(), asked: Vec::new(), held: Vec::new() }];
     crate::reload::UNVERIFIED_PATCHES.fetch_add(1, Ordering::AcqRel);
     let t0 = std::time::Instant::now();
     while !pending.is_empty() && t0.elapsed().as_secs() < 20 {
@@ -771,7 +771,7 @@ fn specv_a_patched_twin_s_verdict_arrives() {
     let ids: Vec<u32> = (0..u.fns.len() as u32).filter(|&i| u.fns[i as usize].patch_gen == group && u.fns[i as usize].unverified.load(Ordering::Relaxed)).collect();
     assert!(ids.contains(&twin) && !u.fns[mid as usize].compiled, "the group runs mid's twin, and mid has no code: {ids:?}");
     let mut undos = vec![outcome.undo.unwrap()];
-    let mut pending = vec![crate::reload::PendingPatch { group, what: "lib.rs".into(), ids, event_seq: crate::inspect::events::last_seq(), installed: std::time::Instant::now(), asked: Vec::new() }];
+    let mut pending = vec![crate::reload::PendingPatch { group, what: "lib.rs".into(), ids, event_seq: crate::inspect::events::last_seq(), installed: std::time::Instant::now(), asked: Vec::new(), held: Vec::new() }];
     crate::reload::UNVERIFIED_PATCHES.fetch_add(1, Ordering::AcqRel);
     // the twin's install asked for mid's check (it is queued, running or done), and it runs while
     // the verdicts are held
@@ -2873,6 +2873,93 @@ pub fn value(out: &mut u32) {{
     assert!(held.len() == 1 && held[0].contains("make`") && held[0].contains("keep its old code (its captures or signature changed)"), "the stored closure, and only it, waits for a restart: {:?}", o.lines);
     // the stored box keeps its old code; `sum` runs its new one
     assert_eq!(run(), 1609);
+    std::mem::forget(u);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// A field of a struct the app holds (its event loop's closure owns the app) changes its type, and
+/// the fns using it change with it: the struct's layout cannot change under the running value, so
+/// the edit's items wait for a restart (hold_back: a save's apply_update) while the save lands. Its
+/// verdict says what is held: the save's report named it "patched" while the program ran the old
+/// code (a drum board's `ClosedBox::say` took a parameter and its `said` tuple a field, 11-17).
+#[test]
+fn an_app_held_structs_retyped_field_waits_for_a_restart_and_says_so() {
+    const CHILD: &str = "RELAX_APP_HELD_RETYPE_TEST";
+    if std::env::var(CHILD).is_err() {
+        let output = crate::test_child::output(std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "lazy_reload_tests::an_app_held_structs_retyped_field_waits_for_a_restart_and_says_so", "--nocapture", "--test-threads=1", "--format=terse"])
+            .env(CHILD, "1").env("RELAX_GANDALF_ALL", "0"));
+        let out = String::from_utf8_lossy(&output.stdout);
+        assert!(output.status.success() && out.contains("1 passed"), "{out}\n{}", String::from_utf8_lossy(&output.stderr));
+        return;
+    }
+    use crate::jit::{FnKey, Unit};
+    use crate::reload::{apply_update, Edit, Rung, HELD};
+    crate::jit::CHECK_FIRST.store(false, std::sync::atomic::Ordering::Relaxed);
+    std::env::set_var("RELAX_STD", concat!(env!("CARGO_MANIFEST_DIR"), "/std"));
+    let dir = std::env::temp_dir().join(format!("relax-app-held-retype-{}", std::process::id()));
+    std::fs::create_dir_all(dir.join("app/src")).unwrap();
+    std::fs::write(dir.join("Cargo.toml"), "[workspace]\nmembers = [\"app\"]\n").unwrap();
+    std::fs::write(dir.join("app/Cargo.toml"), "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n").unwrap();
+    let src = |field: &str, params: &str, said: &str, call: &str, read: &str| format!(r#"use std::cell::RefCell;
+pub struct ClosedBox {{ said: Option<({field})>, n: u32 }}
+impl ClosedBox {{
+    fn say(&mut self, {params}) {{ self.said = Some(({said})); self.n += 1; }}
+    pub fn handle_event(&mut self, out: &mut u32) {{
+        {call};
+        *out = {read};
+    }}
+}}
+pub struct App {{ closed_box: ClosedBox }}
+thread_local! {{ static LOOP: RefCell<Option<Box<dyn FnMut(&mut u32)>>> = RefCell::new(None); }}
+#[inline(never)]
+fn event_loop() -> Box<dyn FnMut(&mut u32)> {{
+    let mut app: Option<App> = None;
+    Box::new(move |out: &mut u32| {{
+        if app.is_none() {{ app = Some(App {{ closed_box: ClosedBox {{ said: None, n: 0 }} }}); }}
+        app.as_mut().unwrap().closed_box.handle_event(out);
+    }})
+}}
+pub fn value(out: &mut u32) {{
+    LOOP.with(|l| {{
+        if l.borrow().is_none() {{ *l.borrow_mut() = Some(event_loop()); }}
+        (l.borrow_mut().as_mut().unwrap())(out);
+    }});
+}}
+"#);
+    let v1 = src("usize, usize, bool, i64, &'static str", "a: usize, b: usize", "a, b, true, -1, \"held\"", "self.say(1, 2)", "self.said.map_or(0, |s| s.0 as u32 + 10)");
+    std::fs::write(dir.join("app/src/lib.rs"), &v1).unwrap();
+    let app = dir.join("app/src/lib.rs").to_string_lossy().into_owned();
+    let session = Arc::new(crate::Session::default());
+    let (prog, core, app_crate) = crate::load_with_std(&session, &app, "app_held_retype", false).unwrap();
+    let value = prog.defs.iter().enumerate().find_map(|(i, d)| {
+        let id = crate::program::DefId(i as u32);
+        (d.krate == app_crate && prog.name(id) == "value").then_some(id)
+    }).unwrap();
+    let mut tcx = crate::tcx::Tcx::new();
+    tcx.collect(&prog);
+    let mut u = crate::jit::Unit::new(prog, tcx, core);
+    let up = &mut *u as *mut Unit;
+    let entry = crate::owner::call(crate::owner::Class::Program, || { let f = u.fn_id(FnKey::Inst(value, vec![])); u.entry(f) });
+    let run = || {
+        let mut result = 0u32;
+        unsafe { crate::jit::call_jit(up, entry, &mut result as *mut u32 as u64) }.unwrap_or_else(|p| panic!("JIT call panicked: {}", p.message));
+        result
+    };
+    assert_eq!(run(), 11, "the app's first event");
+    let file = u.prog.def(value).file;
+    let v2 = src("usize, usize, bool, i64, &'static str, usize", "a: usize, b: usize, down: usize", "a, b, true, -1, \"held\", down", "self.say(1, 2, 3)", "self.said.map_or(0, |s| s.5 as u32 + 20)");
+    let o = unsafe { apply_update(up, vec![Edit { file, path: app.clone(), src: v2.into_bytes() }]) };
+    // the save lands; the struct, and the fns that need its new form, keep their running code
+    assert_eq!(o.rung, Rung::Patch, "{:?}", o.lines);
+    let held = crate::reload::held_items(&o);
+    assert!(held.iter().any(|l| l.starts_with(HELD) && l.contains("struct `ClosedBox` changed its layout")), "ClosedBox waits for a restart: {:?}", o.lines);
+    assert!(held.len() >= 2, "the fns that need ClosedBox's new form are held with it: {:?}", o.lines);
+    assert_eq!(run(), 11, "what is held runs its old code until a restart");
+    // and its verdict says what is held (a verdict without it read "patched")
+    crate::reload::patch_verified_event("lib.rs", o.group, &[], &held);
+    let verdict = crate::inspect::events::newest().unwrap();
+    assert!(verdict.contains("\"event\":\"patchverified\"") && verdict.contains("\"held\":[") && verdict.contains("ClosedBox"), "the verdict names what is held: {verdict}");
     std::mem::forget(u);
     std::fs::remove_dir_all(dir).unwrap();
 }

@@ -1562,6 +1562,15 @@ const HELD_REACHES: &str = "held, as it needs a held item: ";
 /// An outcome line of an edit that could not hold its restart-only items back: a held item's
 /// running text does not type-check against the rest of the edit (at the running text's line).
 pub(crate) const NOT_HELD: &str = "not held back, as a held item's running text does not compile against the edit: ";
+
+/// What a patch kept at its running code until a restart: its [`HELD`] lines (hold_back's
+/// restart-only items, a stored closure's old code) and its [`HELD_REACHES`] ones (the items that
+/// need a held one). A save with any is patched in part, and its verdict says so: one that read
+/// "patched" while the program ran the old code of the very fns it edited (a field of a struct
+/// the app holds retyped, and the fns using it) was the live loop's worst answer (11-17).
+pub(crate) fn held_items(o: &Outcome) -> Vec<String> {
+    o.lines.iter().filter(|l| l.starts_with(HELD) || l.starts_with(HELD_REACHES)).cloned().collect()
+}
 /// The hold_back round apply_locked runs next: per file, where its held running texts are (the
 /// edit's own text ends before the first) and the line each runs at.
 static HELD_FROM: std::sync::Mutex<Vec<(u32, crate::parser::LineOrigins)>> = std::sync::Mutex::new(Vec::new());
@@ -8867,6 +8876,8 @@ pub(crate) struct PendingPatch {
     pub(crate) installed: Instant,
     /// the (owner slot, collect epoch) pairs whose checks the settle asked for (Unit::ask_verdict)
     pub(crate) asked: Vec<(u32, u64)>,
+    /// what the save kept at its running code until a restart (held_items): its verdict says it
+    pub(crate) held: Vec<String>,
 }
 
 /// RELAX_SPECV_TRACE: the slots a patch group's verdict waits on, printed when they change
@@ -8964,7 +8975,7 @@ pub(crate) fn settle_verdicts(up: *mut Unit, pending: &mut Vec<PendingPatch>, un
                 eprintln!("relax live: {}: verified: the borrow checker passed its {} fn(s), {:.1} s after the install{}", p.what, p.ids.len().saturating_sub(unchecked.len()), ms / 1e3,
                     if unchecked.is_empty() { String::new() } else { format!(" ({} not checked)", unchecked.len()) });
                 live_log(&format!("{{\"event\":\"patch_verified\",\"edit\":{},\"group\":{},\"fns\":{},\"unchecked\":{},\"ms\":{:.1}}}", json_str(&p.what), p.group, p.ids.len(), unchecked.len(), ms));
-                patch_verified_event(&p.what, p.group, &seqs);
+                patch_verified_event(&p.what, p.group, &seqs, &p.held);
             }
             Some(Some(events)) => {
                 let group = pending[i].group;
@@ -9679,12 +9690,15 @@ fn verdict_key(what: &str) -> String {
 }
 
 /// An applied edit's one verdict: every patch reports it, also one with nothing left to check.
-pub(crate) fn patch_verified_event(what: &str, group: u32, seqs: &[String]) {
+/// `held`: what the save kept at its running code until a restart (held_items), said with it: a
+/// verdict without it read as "patched" while the program ran the old code of the edited fns.
+pub(crate) fn patch_verified_event(what: &str, group: u32, seqs: &[String], held: &[String]) {
     crate::hot_failure::verified(group);
+    let held = if held.is_empty() { String::new() } else { format!(",\"held\":[{}]", held.iter().map(|l| json_str(l)).collect::<Vec<_>>().join(",")) };
     crate::inspect::events::emit(
         "patchverified",
         &verdict_key(&group.to_string()),
-        &format!("\"edit\":{},\"group\":{},\"verified_events\":[{}]", json_str(what), group, seqs.join(",")),
+        &format!("\"edit\":{},\"group\":{},\"verified_events\":[{}]{held}", json_str(what), group, seqs.join(",")),
     );
 }
 
@@ -9894,7 +9908,8 @@ fn log_edit(up: *mut Unit, what: &str, paths: &[String], o: &Outcome, saved: Opt
     SESSION.lock().unwrap_or_else(|e| e.into_inner()).push((rung, total));
     // engine requests: a program waiting on an engine change hears that code changed under it
     if matches!(rung, "patch" | "partial" | "restart") {
-        crate::inspect::engine_req::code_update(if rung == "restart" { "restart" } else { "patched" }, what, o.changed as u64);
+        let restart = rung == "restart" || !held_items(o).is_empty();
+        crate::inspect::engine_req::code_update(if restart { "restart" } else { "patched" }, what, o.changed as u64);
     }
     let reasons: Vec<String> = o.lines.iter().take(8).map(|l| json_str(l)).collect();
     let paths: Vec<String> = paths.iter().map(|p| json_str(p)).collect();
@@ -10720,11 +10735,11 @@ unsafe fn test_edit(up: *mut Unit, paths: Vec<String>, o: &mut Outcome, undos: &
         let ids = crate::owner::call(crate::owner::Class::Program, || unverified_patch(up, o.group));
         if !ids.is_empty() {
             UNVERIFIED_PATCHES.fetch_add(1, Ordering::AcqRel);
-            pending.push(PendingPatch { group: o.group, what: what.clone(), ids, event_seq: crate::inspect::events::last_seq(), installed: Instant::now(), asked: Vec::new() });
+            pending.push(PendingPatch { group: o.group, what: what.clone(), ids, event_seq: crate::inspect::events::last_seq(), installed: Instant::now(), asked: Vec::new(), held: Vec::new() });
         }
         undos.push(undo);
     }
-    if pending.is_empty() { patch_verified_event(&what, o.group, &[]); }
+    if pending.is_empty() { patch_verified_event(&what, o.group, &[], &[]); }
     while !pending.is_empty() {
         let back = settle_verdicts(up, &mut pending, undos);
         if !back.is_empty() { return back; }
@@ -11277,7 +11292,7 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
                     let mut o = idle_outcome(None, "Cargo graph unchanged");
                     let back = test_edit(up, manifests.iter().map(|&k| files[k].0.clone()).collect(), &mut o, &mut undos);
                     for (old, new) in back { for f in &mut files { if f.1 == new { f.1 = old; } } }
-                } else { patch_verified_event(&format!("{} manifest(s)", manifests.len()), 0, &[]); }
+                } else { patch_verified_event(&format!("{} manifest(s)", manifests.len()), 0, &[], &[]); }
                 continue;
             }
         }
@@ -11330,7 +11345,7 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
                         let mut o = idle_outcome(None, &what);
                         let back = test_edit(up, unloaded.iter().map(|&k| files[k].0.clone()).collect(), &mut o, &mut undos);
                         for (old, new) in back { for f in &mut files { if f.1 == new { f.1 = old; } } }
-                    } else { patch_verified_event(&what, 0, &[]); }
+                    } else { patch_verified_event(&what, 0, &[], &[]); }
                 }
                 continue;
             }
@@ -11538,7 +11553,7 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
                 continue;
             }
             eprintln!("relax live: {}: patched (0 item(s) changed, 0 fn(s) installed) in 0.0 ms", what.join(", "));
-            patch_verified_event(&what.join(", "), 0, &[]);
+            patch_verified_event(&what.join(", "), 0, &[], &[]);
             continue;
         }
         let names: Vec<String> = edits.iter().map(|e| e.path.rsplit('/').next().unwrap_or("").to_string()).collect();
@@ -11642,7 +11657,17 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
             for (old, new) in back { for f in &mut files { if f.1 == new { f.1 = old; } } }
             continue;
         }
+        // a save that kept items at their running code (hold_back, a stored closure) is patched in
+        // part, said first: those wait for a restart
+        let held = held_items(&o);
         match o.rung {
+            Rung::Patch if !held.is_empty() => eprintln!(
+                "relax live: {}: patched in part ({} item(s) changed, {} fn(s) installed) in {:.1} ms: what is held below runs its old code until a restart",
+                what,
+                o.changed,
+                o.names.len(),
+                o.ms.iter().sum::<f64>()
+            ),
             Rung::Patch => eprintln!(
                 "relax live: {}: patched ({} item(s) changed, {} fn(s) installed) in {:.1} ms",
                 what,
@@ -11680,7 +11705,7 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
             let ids: Vec<u32> = crate::owner::call(crate::owner::Class::Program, || unverified_patch(up, group));
             if !ids.is_empty() {
                 UNVERIFIED_PATCHES.fetch_add(1, Ordering::AcqRel);
-                pending.push(PendingPatch { group, what: what.clone(), ids, event_seq: crate::inspect::events::last_seq(), installed: Instant::now(), asked: Vec::new() });
+                pending.push(PendingPatch { group, what: what.clone(), ids, event_seq: crate::inspect::events::last_seq(), installed: Instant::now(), asked: Vec::new(), held: held.clone() });
                 awaits_check = true;
             }
             undos.push(u);
@@ -11690,7 +11715,7 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
             }
         }
         if patched && !awaits_check {
-            patch_verified_event(&what, group, &[]);
+            patch_verified_event(&what, group, &[], &held);
         }
     }
 }
