@@ -230,23 +230,26 @@ mod tests {
 
     /// The folder the writer (this test's child process) writes in.
     const WRITER: &str = "RELAX_TEST_RUN_STORE_WRITER";
-    /// A folder per way the writer's unsealed commit reached the disk: all of it (only the process
+    /// A folder per way the writer's second commit reached the disk: all of it (only the process
     /// died), and three ways a machine crash leaves it.
     const SHAPES: [&str; 4] = ["whole", "zeroed", "cut", "stale"];
     const CRATE_STORE: &str = "core-00112233445566ee.rcs";
     const IMAGE: usize = 3000;
+    /// The writer's epoch (store.rs set_epoch): an earlier boot's, to the test's process.
+    const WRITER_EPOCH: u64 = 0x5eed_0001;
 
     fn image(b: u8) -> Vec<u8> {
         (0..IMAGE).map(|i| b.wrapping_add(i as u8)).collect()
     }
 
-    /// The writer: in each shape's folder a run store with a sealed commit (image 1) and one
-    /// whose seal never comes (image 2, committed as a crate store's write commits the images its
-    /// references name: under SPILL_IO, cache.rs append_store), a crate store referring to both,
-    /// and on stdout what a collected program would certify of the run store's commit (its index
-    /// and generation).
+    /// The writer: in each shape's folder a run store with two commits (image 1, then image 2,
+    /// committed as a crate store's write commits the images its references name: cache.rs
+    /// append_store), a crate store referring to both, and on stdout what a collected program
+    /// would certify of the run store's commit (its index and generation).
     fn write_and_end(root: &Path) {
-        crate::store::hold_seals(true);
+        crate::store::set_epoch(WRITER_EPOCH);
+        // (the harness's "test <name> ... " has no line end of its own)
+        println!();
         for shape in SHAPES {
             let dir = root.join(shape);
             std::fs::create_dir_all(&dir).unwrap();
@@ -257,12 +260,8 @@ mod tests {
             };
             let one = put(1);
             run.commit().unwrap();
-            crate::store::seal_now(&run.path);
             let two = put(2);
-            {
-                let _io = spill_io_read();
-                run.commit_upto(run.written()).unwrap();
-            }
+            run.commit_upto(run.written()).unwrap();
             let refs = [(1u128, one), (2, two)].into_iter()
                 .map(|(k, key)| NewEntry { key: k, kind: KIND_FRONT_REF, payload: encode_ref(&ImageLoc { store: run.name.to_string().into(), key }) })
                 .collect();
@@ -274,20 +273,18 @@ mod tests {
             }).collect();
             println!("certificate {shape} {} {one:x} {two:x} {}", st.generation, ix.join(","));
         }
-        // the process ends with the second commits unsealed
     }
 
-    /// A run store's commit leaves its barrier to the seal thread (a barrier on the cache writer,
-    /// under SPILL_IO, once stalled every spill behind it for 11.6 s). Another process that
-    /// follows a crate store's reference into the run store before the seal reads the image, as
-    /// does one whose collected program certified the commit. A writer that died between the commit
-    /// and its seal, with a machine crash leaving the commit's header on the disk but not its
-    /// payload (zeroed: the writes landed out of order), the file cut at the old tail, or the
-    /// payload's place holding stale bytes, leaves a miss there, never a bad read: the reference
-    /// gives way (its file is parsed again) and so does the certified index, while the image of
-    /// the sealed commit before stays warm.
+    /// A run store's commits wait on no barrier (one on the cache writer, under SPILL_IO, once
+    /// stalled every spill behind it for 11.6 s). A process of a later boot (here: of another epoch
+    /// than the writer's) that follows a crate store's reference into the run store, or whose
+    /// collected program certified the commit, checks each image at its first read. One whose
+    /// payload did not reach the disk before its machine went down (zeroed: the writes landed out
+    /// of order; the file cut at the first commit's end; or stale bytes in its place) is a miss
+    /// there, never a bad read: the reference gives way (its file is parsed again) and so does the
+    /// certified index's entry, while the first commit's image stays warm.
     #[test]
-    fn a_run_store_commit_is_read_before_its_seal_and_a_lost_one_is_a_miss() {
+    fn an_earlier_boots_run_store_image_is_checked_and_a_lost_one_is_a_miss() {
         if let Some(root) = std::env::var_os(WRITER) {
             write_and_end(Path::new(&root));
             return;
@@ -295,7 +292,7 @@ mod tests {
         let root = std::env::temp_dir().join(format!("relax-run-seal-{}-{}", std::process::id(), crate::clock::wall_ns()));
         std::fs::create_dir_all(&root).unwrap();
         let out = crate::test_child::output(std::process::Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", "cache::front_run::tests::a_run_store_commit_is_read_before_its_seal_and_a_lost_one_is_a_miss", "--nocapture", "--test-threads=1"])
+            .args(["--exact", "cache::front_run::tests::an_earlier_boots_run_store_image_is_checked_and_a_lost_one_is_a_miss", "--nocapture", "--test-threads=1"])
             .env(WRITER, &root));
         let stdout = String::from_utf8_lossy(&out.stdout);
         assert!(out.status.success() && stdout.contains(" 1 passed;"), "the writer: {stdout}\n{}", String::from_utf8_lossy(&out.stderr));
@@ -330,12 +327,15 @@ mod tests {
             }
             drop(f);
             let whole = shape == "whole";
-            // a collected program's certified index of the commit (before any open here: none seals it)
+            // a collected program's certified index of the commit
             let certified = Store::open_certified(&run, Box::leak(index.clone().into_boxed_slice()), generation);
-            if whole {
-                assert_eq!(certified.expect("the certified commit, before its seal").get(two).unwrap().1, &image(2)[..]);
+            if shape == "cut" {
+                assert!(certified.is_none(), "cut: a certified commit past the file's end was opened");
             } else {
-                assert!(certified.is_none(), "{shape}: a certified commit whose payload did not reach the disk was served");
+                let certified = certified.expect("the certified commit");
+                assert_eq!(certified.get(one).unwrap().1, &image(1)[..], "{shape}: the first commit's certified image");
+                let got = certified.get(two).map(|x| x.1.to_vec());
+                assert_eq!(got, whole.then(|| image(2)), "{shape}: the certified image of the second commit");
             }
             // a crate store's references into it
             let st = Arc::new(Store::open(&dir.join(CRATE_STORE)).unwrap());
@@ -344,12 +344,12 @@ mod tests {
                 front_entry(&st, e, k, check).map(|(_, img)| img.to_vec())
             };
             if whole {
-                assert_eq!(entry(2, false), Some(image(2)), "the image of a commit not sealed yet, read by another process");
+                assert_eq!(entry(2, false), Some(image(2)), "the image of an earlier boot's commit, checked at its read");
             } else {
                 assert_eq!(entry(2, false), None, "{shape}: an image that did not reach the disk was served");
                 assert_eq!(entry(2, true), None, "{shape}: an image that did not reach the disk was served, checked");
             }
-            assert_eq!(entry(1, true), Some(image(1)), "{shape}: the sealed commit's image stays warm");
+            assert_eq!(entry(1, true), Some(image(1)), "{shape}: the first commit's image stays warm");
         }
         let _ = std::fs::remove_dir_all(&root);
     }

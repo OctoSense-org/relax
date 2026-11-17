@@ -216,26 +216,38 @@ fn pin_front(st: &std::sync::Arc<Store>, used: Option<usize>) {
 /// Checksums the front images this run mapped, on a low-priority background thread (after the
 /// start). A mismatch -- a store damaged on disk -- removes that store file, so the next run
 /// parses and compiles that crate afresh; this run already validated the images' structure
-/// (offsets, lengths, alignment) and, against its own parse, their source bytes.
+/// (offsets, lengths, alignment) and, against its own parse, their source bytes. The same pass
+/// then seals what the stores this run opened hold of an earlier boot's (store.rs seal_suspects),
+/// stopping at the quit.
 pub fn verify_front_images() {
     let used = std::mem::take(&mut *FRONT_USED.lock().unwrap_or_else(|x| x.into_inner()));
-    if used.is_empty() {
+    if used.is_empty() && !crate::store::suspects_pending() {
         return;
     }
     { let _k = crate::zone_alloc::kept();
     let _ = crate::run_threads::spawn("run-cache-verify", move || { let _z = crate::zone_alloc::compiler_thread();
         makepad_cpu_budget::set_thread_class(makepad_cpu_budget::BACKGROUND);
+        let verbose = crate::run::VERBOSE.load(std::sync::atomic::Ordering::Relaxed);
+        let t = std::time::Instant::now();
         let mut bad: Vec<std::path::PathBuf> = Vec::new();
+        let mut bytes = 0u64;
         for (st, i) in &used {
+            bytes += st.index.get(*i).map_or(0, |e| e.len as u64);
             if !st.verify_at(*i) && !bad.contains(&st.path) {
                 bad.push(st.path.clone());
             }
         }
         for p in bad {
-            if crate::run::VERBOSE.load(std::sync::atomic::Ordering::Relaxed) {
+            if verbose {
                 eprintln!("relax cache: a front image in {} does not match its checksum: the store is removed (the next run rebuilds it)", p.display());
             }
             let _ = std::fs::remove_file(crate::store::current(&p));
+        }
+        let images = t.elapsed();
+        let sealed = crate::store::seal_suspects(&|| crate::jit::QUIT_SEEN.load(std::sync::atomic::Ordering::Relaxed));
+        if verbose {
+            eprintln!("relax cache: background checks: {} front images ({} bytes) in {:.1} ms; an earlier boot's payloads: {} stores sealed ({} bytes), {} removed, in {:.1} ms; epoch reads {}",
+                used.len(), bytes, images.as_secs_f64() * 1e3, sealed.stores, sealed.bytes, sealed.removed, (t.elapsed() - images).as_secs_f64() * 1e3, sealed.epoch_reads);
         }
     });
     }
@@ -5498,44 +5510,12 @@ fn spill_slowest(path: &std::path::Path, t: std::time::Instant, n: usize) {
 /// their store's lock, so independent stores can progress during serial collection.
 pub static SPILL_IO: std::sync::RwLock<()> = std::sync::RwLock::new(());
 
-thread_local! {
-    /// The SPILL_IO guards this thread holds (`spill_io_write`, `spill_io_read`): no write barrier
-    /// runs under one (store.rs order_writes asserts it), or the cache writer and every spill
-    /// behind it wait on the disk.
-    static SPILL_IO_HELD: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+fn spill_io_write() -> std::sync::RwLockWriteGuard<'static, ()> {
+    SPILL_IO.write().unwrap_or_else(|e| e.into_inner())
 }
 
-/// A SPILL_IO guard, counted for `spill_io_held`.
-pub struct SpillIoGuard<G>(G);
-
-impl<G> Drop for SpillIoGuard<G> {
-    fn drop(&mut self) {
-        SPILL_IO_HELD.with(|h| h.set(h.get() - 1));
-    }
-}
-
-impl<G: std::ops::Deref<Target = ()>> std::ops::Deref for SpillIoGuard<G> {
-    type Target = ();
-    fn deref(&self) -> &() {
-        &self.0
-    }
-}
-
-fn spill_io_write() -> SpillIoGuard<std::sync::RwLockWriteGuard<'static, ()>> {
-    let g = SPILL_IO.write().unwrap_or_else(|e| e.into_inner());
-    SPILL_IO_HELD.with(|h| h.set(h.get() + 1));
-    SpillIoGuard(g)
-}
-
-fn spill_io_read() -> SpillIoGuard<std::sync::RwLockReadGuard<'static, ()>> {
-    let g = SPILL_IO.read().unwrap_or_else(|e| e.into_inner());
-    SPILL_IO_HELD.with(|h| h.set(h.get() + 1));
-    SpillIoGuard(g)
-}
-
-/// Whether this thread holds SPILL_IO.
-pub(crate) fn spill_io_held() -> bool {
-    SPILL_IO_HELD.with(|h| h.get() != 0)
+fn spill_io_read() -> std::sync::RwLockReadGuard<'static, ()> {
+    SPILL_IO.read().unwrap_or_else(|e| e.into_inner())
 }
 
 // Weak entries coordinate concurrent compiler worlds without retaining old stores.
@@ -12673,8 +12653,6 @@ mod prune_tests {
         let store = |name: &str, age_s: u64| -> PathBuf {
             let p = dir.join(name);
             crate::store::append(&p, vec![NewEntry { key: 1, kind: KIND_DATA, payload: vec![7; 4096] }], true).unwrap();
-            // sealed before its stamp: the seal thread's header write would stamp it now
-            crate::store::seal_now(&p);
             let t = std::time::SystemTime::now() - std::time::Duration::from_secs(age_s);
             std::fs::File::options().write(true).open(&p).unwrap().set_modified(t).unwrap();
             p
@@ -12820,8 +12798,6 @@ mod prune_tests {
         let store = |name: &str, age_s: u64, build: Option<u64>| -> PathBuf {
             let p = dir.join(name);
             crate::store::append(&p, vec![NewEntry { key: 1, kind: KIND_DATA, payload: vec![7; 4096] }], true).unwrap();
-            // sealed before its stamp: the seal thread's header write would stamp it now
-            crate::store::seal_now(&p);
             if let Some(b) = build {
                 crate::store::set_build_for_test(&p, b);
             }
@@ -12872,8 +12848,6 @@ mod prune_tests {
         let store = |name: &str, age_s: u64, build: Option<u64>| -> PathBuf {
             let p = dir.join(name);
             crate::store::append(&p, vec![NewEntry { key: 1, kind: KIND_DATA, payload: vec![7; 4096] }], true).unwrap();
-            // sealed before its stamp: the seal thread's header write would stamp it now
-            crate::store::seal_now(&p);
             if let Some(b) = build {
                 crate::store::set_build_for_test(&p, b);
             }

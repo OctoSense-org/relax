@@ -63,8 +63,9 @@ fn remember(package: &str, state: &str, ms: u64) -> std::io::Result<()> {
     for (package, state, ms, jit) in keep.into_iter().rev() { text.push_str(&format!("{package} {state} {ms} {jit}\n")); }
     file.rewind()?;
     file.write_all(text.as_bytes())?;
-    file.set_len(text.len() as u64)?;
-    file.sync_data()
+    // no barrier: one forces a journal commit of the whole filesystem, which on a busy disk held
+    // the process's other file operations behind it; a row a crash loses is one measurement
+    file.set_len(text.len() as u64)
 }
 
 /// The deadline of a start in `state` (warm / cold): 3x the median of its measured first frames,

@@ -262,10 +262,6 @@ pub(crate) fn hosted_run() -> bool {
 pub fn cmd_run(sess: &std::sync::Arc<crate::Session>, args: &[String]) -> i32 {
     #[cfg(any(target_os = "linux", target_vendor = "apple"))]
     crate::run_end::leftovers::mark();
-    // a program's run: no seal barrier before its start ends (store.rs SEAL_GATE)
-    if !args.iter().any(|a| a == "--check") {
-        crate::store::close_seal_gate();
-    }
     let json = args.iter().any(|a| a == "--json") && args.iter().any(|a| a == "--check");
     let start = std::time::Instant::now();
     if json { crate::diag::enable(); }
@@ -4845,8 +4841,6 @@ fn quit_mark() {
     jit::QUIT_SEEN.store(true, Ordering::Relaxed);
     // nothing parked waits for a decision now, and a paused program goes on to its quit
     crate::inspect::events::quit_releases();
-    // the quit write and the exit's commit without waiting on the disk (store.rs Slot::tail)
-    crate::store::set_exiting();
     if ONCE.swap(true, Ordering::SeqCst) || unsafe { RUN_UNIT }.is_null() { return; }
     if jit::started() {
         jit::ORDER_UNTIL_NS.fetch_min(jit::wall_ns(), Ordering::Relaxed);
@@ -5404,8 +5398,7 @@ fn summary_inner(why: &str) {
     // Independent of owner thread state: still emit when exit quiescence times out.
     if why != "stats" { crate::exec_profile::report(false); }
     if why != "stats" {
-        // the exit's writes commit without waiting on the disk (store.rs Slot::tail)
-        crate::store::set_exiting();
+        crate::store::note_checks("by the exit");
         // the run is ending: background borrow checks stop at their next preemption point
         // (nothing waits for them; finished verdicts are stored below)
         crate::borrowck::lazy::stop();
