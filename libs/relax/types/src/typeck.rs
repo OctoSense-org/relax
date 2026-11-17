@@ -1838,13 +1838,15 @@ impl<'a> Fcx<'a> {
                     } else {
                         self.rollback_to(snap);
                         // rustc check_ref_cast: &[T; N] -> *const T first coerces
-                        // to a pointer to the array, using the source mutability.
+                        // to a pointer to the array, using the source mutability
+                        // (`array_ptr_type`); the cast then goes from it to the element.
                         let inner = self.shallow(inner);
                         if let TyKind::Array(element, _) = self.tcx.tys.kind(inner).clone() {
                             let snap = self.start_snapshot();
                             if self.eq(element, pointee) {
                                 self.commit_from(snap);
-                                self.set_coerce(e.0, Coerce::RefToRaw(sm), target);
+                                let array_ptr = self.tcx.tys.intern(TyKind::Ptr(sm, inner));
+                                self.set_coerce(e.0, Coerce::RefToRaw(sm), array_ptr);
                             } else { self.rollback_to(snap); }
                         }
                     }

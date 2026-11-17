@@ -8,6 +8,11 @@ use crate::mir::build::{BuildCx, BuildResult, BuildRoot};
 use crate::tcx::{EvalCx, EvalState, TypingEnv};
 
 fn build<R>(source: &str, name: &str, f: impl FnOnce(BuildResult<ThirBody>) -> R) -> R {
+    build_in(source, name, |_, r| f(r))
+}
+
+/// `build`, with the types the body was built in.
+fn build_in<R>(source: &str, name: &str, f: impl FnOnce(&crate::types::Types, BuildResult<ThirBody>) -> R) -> R {
     let (prog, tcx) = program(source);
     let def = named(&prog, name);
     let body = tcx.typeck(&prog, def);
@@ -17,7 +22,7 @@ fn build<R>(source: &str, name: &str, f: impl FnOnce(BuildResult<ThirBody>) -> R
     let eval = EvalCx::new(&prog, &tcx, env, &state);
     let root = BuildRoot::new(BuildCx { prog: &prog, tcx: &tcx, env, eval: &eval }, &body).unwrap();
     let cx = Cx::new(&root, CheckedBody { owner: def, kind: if name.chars().next().unwrap().is_uppercase() { BodyKind::Const } else { BodyKind::Function } });
-    f(cx.thir_body())
+    f(&tcx.tys, cx.thir_body())
 }
 
 fn kinds(source: &str, name: &str) -> Vec<String> {
@@ -97,6 +102,26 @@ fn borrows_and_casts() {
                 assert!(matches!(value.kind, ExprKind::Cast { .. }), "inner cast retained");
             }
         }
+    });
+    // `&mut [T; N] as *const T`: the reference is borrowed raw to a pointer to the array (of the
+    // reference's mutability), which is then cast to the element
+    let source = "pub fn f(a: &mut [u32; 2], b: &[u32; 2]) -> (*const u32, *mut u32, *const u32) { (a as *const u32, a as *mut u32, b as *const u32) }";
+    build_in(source, "f", |tys, r| {
+        use crate::types::TyKind;
+        let t = r.unwrap_or_else(|e| panic!("{e:?}"));
+        let mut casts = vec![];
+        for e in t.thir.exprs.iter() {
+            let ExprKind::PointerCoercion { cast: crate::mir::PointerCoercion::ArrayToPointer, source, .. } = e.kind else { continue };
+            let TyKind::Ptr(to_mut, _) = *tys.kind(e.ty) else { panic!("the cast is to a raw pointer") };
+            let mut raw = &t.thir.exprs[source.0 as usize];
+            while let ExprKind::Scope { value, .. } = raw.kind { raw = &t.thir.exprs[value.0 as usize]; }
+            let ExprKind::RawBorrow { mutability, .. } = raw.kind else { panic!("the cast's source is a raw borrow: {:?}", raw.kind) };
+            let TyKind::Ptr(from_mut, array) = *tys.kind(raw.ty) else { panic!("the raw borrow is typed as a raw pointer") };
+            assert_eq!(from_mut, mutability == crate::mir::Mutability::Mut, "the raw borrow's type has its mutability");
+            assert!(matches!(tys.kind(array), TyKind::Array(..)), "the raw borrow points to the array, not to the element");
+            casts.push((from_mut, to_mut));
+        }
+        assert_eq!(casts, [(true, false), (true, true), (false, false)], "one array-to-pointer cast per `as`");
     });
 }
 
