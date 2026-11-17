@@ -156,8 +156,11 @@ pub fn start(app: &str) {
     // run_dir: the cache this run uses (devhub's JIT cache clear names the apps running on it)
     let run_dir = crate::dirs::relax_dir().display().to_string();
     let extra = format!(",\"session_log\":{},\"run\":{},\"run_dir\":{},\"agent\":{},\"test_run\":{}", json_str(&log), json_str(crate::jit::PROVENANCE), json_str(&run_dir), AGENT.load(Relaxed), TEST_RUN.load(Relaxed));
-    #[cfg(windows)]
-    let extra = match crate::restart_parent::parent_pid() {
+    // the run's own live log (its path crosses each restart, while this pid does not)
+    let extra = format!("{extra},\"live_log\":{}", json_str(&crate::reload::live_log_file()));
+    // the parent this run stands behind (Windows, macOS: restart_parent.rs), whose pid stays
+    let run_pid = crate::restart_parent::parent_pid();
+    let extra = match run_pid {
         Some(parent) => format!("{extra},\"restart_parent\":{parent}"),
         None => extra,
     };
@@ -186,7 +189,9 @@ pub fn start(app: &str) {
     };
     // (a `--silent` run's stderr is the program's: a test reading it sees only the program)
     if crate::harness::live::enabled() || !TEST_RUN.load(Relaxed) && !crate::run::silent() {
-        eprintln!("{t}-remote: pid {} app {} socket {} ({t} inspect {} help)", pid, app, sock.display(), pid, t = crate::tool_name());
+        // `run`: the pid that stays across the run's restarts as new processes (its parent's, else
+        // this one's), for a reader that has only the output
+        eprintln!("{t}-remote: pid {} app {} run {} socket {} ({t} inspect {} help)", pid, app, run_pid.unwrap_or(pid), sock.display(), pid, t = crate::tool_name());
     }
     events::start();
     timeline::hitch_init();

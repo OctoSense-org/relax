@@ -26707,6 +26707,9 @@ pub(crate) fn loader_symbol(name: &[u8]) -> Option<usize> {
         b"__relax_tls_fixed" => Some(os::tls::relax_tls_fixed as *const () as usize),
         b"__relax_host_jit_code" => Some(relax_host_jit_code as *const () as usize),
         b"__relax_host_switch_return_pc" => Some(relax_host_switch_return_pc as *const () as usize),
+        // a loader run as the program: the run's parent this runner took (restart_parent.rs)
+        #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
+        b"__relax_host_restart_parent" => Some(crate::restart_parent::relax_host_restart_parent as *const () as usize),
         b"__relax_sstack" => Some(crate::sstack::relax_sstack as *const () as usize),
         b"__relax_sstack_grow" => Some(crate::sstack::relax_sstack_grow as *const () as usize),
         b"__relax_sstack_trim" => Some(crate::sstack::relax_sstack_trim as *const () as usize),

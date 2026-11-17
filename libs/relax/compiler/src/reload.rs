@@ -9372,7 +9372,7 @@ pub(crate) fn restart_state_file(st: &[u8]) -> Result<std::path::PathBuf, String
 
 /// `bytes` in a file made at `path` (0600 on Unix), never one that is there already, nor a link's
 /// target: another file or link at `path` is an error.
-fn write_new_private(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+pub(crate) fn write_new_private(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
     let mut o = std::fs::OpenOptions::new();
     o.write(true).create_new(true);
@@ -9435,8 +9435,8 @@ fn a_run_ended_in_its_boot_hands_on_the_state_it_was_started_with() {
 }
 
 /// A run with no app domain starts again as a process: the loader binary with the same command
-/// line. An exec in place; Windows has none, there its parent process starts the next run
-/// (restart_parent.rs). Returns only on failure.
+/// line, started by the run's parent process (Windows, macOS: restart_parent.rs), else by an exec
+/// in place. Returns only on failure.
 fn exec_restart(state: Option<&[u8]>) -> Result<(), String> {
     #[cfg(any(unix, windows))]
     {
@@ -9461,16 +9461,14 @@ fn exec_restart(state: Option<&[u8]>) -> Result<(), String> {
             }
         }
         // the run's end as at exit: compiles stop and this run's code goes into the disk cache,
-        // so the restarted run links it instead of compiling it again (exec skips the exit handlers)
+        // so the restarted run links it instead of compiling it again (neither an exec nor the
+        // parent's request runs the exit handlers)
         crate::run::summary("restart");
         // a restart is a clean end of this process (its transcript is not kept)
         crate::tui::exit_code(0);
         crate::tui::finish(false);
         eprintln!("relax live: restarting ({})", RESTART_REASON.lock().unwrap_or_else(|e| e.into_inner()));
-        #[cfg(unix)]
-        let e = std::os::unix::process::CommandExt::exec(&mut cmd);
-        #[cfg(windows)]
-        let e = crate::restart_parent::request(&cmd);
+        let e = crate::restart_parent::replace(&mut cmd);
         Err(format!("restart failed: {e}"))
     }
     #[cfg(not(any(unix, windows)))]
@@ -9747,15 +9745,21 @@ fn refusal_lines(first: Vec<String>, retry: Vec<String>) -> Vec<String> {
 /// outcome (the program's kept/lost report, through std::relax::live_log), appended across the
 /// restarts of one session (the path travels in RELAX_LIVE_LOG; default: the temp dir).
 fn live_log_path() -> String {
-    if let Ok(p) = std::env::var("RELAX_LIVE_LOG") {
-        if !p.is_empty() {
-            return p;
-        }
+    let p = live_log_file();
+    if std::env::var_os("RELAX_LIVE_LOG").is_none_or(|v| v.is_empty()) {
+        // restarts inherit it: one session, one log
+        std::env::set_var("RELAX_LIVE_LOG", &p);
     }
-    let p = std::env::temp_dir().join(format!("relax-live-{}.jsonl", std::process::id())).to_string_lossy().into_owned();
-    // exec'd restarts inherit it: one session, one log
-    std::env::set_var("RELAX_LIVE_LOG", &p);
     p
+}
+
+/// Where this run's session log is (or will be once it writes one): its discovery file says so,
+/// since the log's name is the first run's pid and a restart as a new process has another.
+pub(crate) fn live_log_file() -> String {
+    match std::env::var("RELAX_LIVE_LOG") {
+        Ok(p) if !p.is_empty() => p,
+        _ => std::env::temp_dir().join(format!("relax-live-{}.jsonl", std::process::id())).to_string_lossy().into_owned(),
+    }
 }
 
 pub(crate) fn live_log(line: &str) {
