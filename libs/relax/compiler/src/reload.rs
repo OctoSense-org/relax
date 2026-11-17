@@ -10389,6 +10389,17 @@ fn committed_by_ledger<'a>(mut paths: impl Iterator<Item = &'a str>) -> bool {
     }
 }
 
+/// Whether a changed watched path that no running file has is one a round answers for (a live
+/// test session reruns its tests: a data file they may read): a file, never a folder. A folder is
+/// a directory identity: its stamp moves whenever an entry in it is made, renamed or removed, a
+/// shipped file on its way in among them, and it is no edit of its own. Asked of the vfs: a
+/// mounted store's folders are on no disk, so the disk's answer took every one for a file. A
+/// round that saw a ship's folder before the file in it answered the ship with a rerun of the
+/// code from before it, and a red written against a shader passed (11-17).
+fn answers_unloaded(path: &str) -> bool {
+    !crate::vfs::is_dir(path)
+}
+
 fn gate_note(g: u8) {
     static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(255);
     if LAST.swap(g, Ordering::Relaxed) != g && live_trace() {
@@ -11158,7 +11169,7 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
             for &k in &unloaded { files[k].2 = settled_stamps[k]; }
             changed = rest;
             if changed.is_empty() {
-                let unloaded: Vec<_> = unloaded.into_iter().filter(|&k| !std::path::Path::new(&files[k].0).is_dir()).collect();
+                let unloaded: Vec<_> = unloaded.into_iter().filter(|&k| answers_unloaded(&files[k].0)).collect();
                 if !unloaded.is_empty() {
                     let names: Vec<String> = unloaded.iter().take(3).map(|&k| short(&files[k].0)).collect();
                     let what = format!("{}{}: not loaded by the app (nothing to patch)", names.join(", "), if unloaded.len() > 3 { ", ..." } else { "" });
@@ -11199,7 +11210,7 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
             let (host_side, rest): (Vec<usize>, Vec<usize>) = if harness { (changed.clone(), Vec::new()) } else {
                 changed.iter().partition(|&&k| inputs.process_input(&files[k].0))
             };
-            let what = if host_side.iter().any(|&k| std::path::Path::new(&files[k].0).is_dir()) { "source inputs" } else { "files" };
+            let what = if host_side.iter().any(|&k| crate::vfs::is_dir(&files[k].0)) { "source inputs" } else { "files" };
             let names: Vec<String> = host_side.iter().take(3).map(|&k| short(&files[k].0)).collect();
             let why = format!("{} {what} changed ({}{}): {reason}", host_side.len(), names.join(", "), if host_side.len() > 3 { ", ..." } else { "" });
             let paths = inputs.process_paths(&|_| true);
@@ -11219,7 +11230,7 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
                 changed = rest;
             } else {
                 let package = std::env::var("RELAX_PACKAGE").unwrap_or_else(|_| "<pkg>".into());
-                let what = if changed.iter().any(|&k| std::path::Path::new(&files[k].0).is_dir()) { "source inputs" } else { "files" };
+                let what = if changed.iter().any(|&k| crate::vfs::is_dir(&files[k].0)) { "source inputs" } else { "files" };
                 // provided crates and std are built into this binary: cargo rebuilds it on the way
                 let restart = if inputs.host_restart_required(changed.iter().map(|&k| files[k].0.as_str())) {
                     host::note_cannot_build();
@@ -12759,6 +12770,27 @@ mod commit_tests {
         assert!(!whole(&[b.as_str()]), "an edit gone that no whiteout names yet waits");
         put(".makepad-run-deleted", "app/b.rs\n");
         assert!(whole(&[b.as_str()]), "its whiteout comes after the ship's files: whole");
+        crate::vfs::set_edits(None);
+        let _ = std::fs::remove_dir_all(&edits);
+    }
+
+    /// A ship's folder is no edit: a round that sees a mounted store's folder change (a shipped
+    /// file on its way into it) and nothing else answers nothing, and the file's own round answers
+    /// the ship. A data file the program has not loaded is answered (the tests may read it). The
+    /// disk's `is_dir` said "a file" of every virtual folder, and a red's ship was answered with a
+    /// rerun of the code from before it: it passed (11-17).
+    #[test]
+    fn a_ships_folder_is_never_answered_as_its_edit() {
+        isolated_test!(a_ships_folder_is_never_answered_as_its_edit);
+        let fixture = vfs_store::Fixture::new(&[("app/src/canvas/draw.rs", b"a"), ("app/data.txt", b"d")]);
+        let root = "/relax-live-folder/vfs/m";
+        crate::vfs::mount(root, fixture.store.clone(), &fixture.commit).unwrap();
+        let edits = std::env::temp_dir().join(format!("relax-live-folder-{}", std::process::id()));
+        std::fs::create_dir_all(edits.join("app/src/added")).unwrap();
+        crate::vfs::set_edits(Some(edits.clone()));
+        assert!(!super::answers_unloaded(&format!("{root}/app/src/canvas")), "a folder of the store: no edit of its own");
+        assert!(!super::answers_unloaded(&format!("{root}/app/src/added")), "a folder only the edits folder has: no edit of its own");
+        assert!(super::answers_unloaded(&format!("{root}/app/data.txt")), "a data file the program has not loaded: its tests answer it");
         crate::vfs::set_edits(None);
         let _ = std::fs::remove_dir_all(&edits);
     }
