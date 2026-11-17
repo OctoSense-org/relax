@@ -598,7 +598,6 @@ pub(crate) fn hold_old_frames(u: &Unit, gen: u32, layout: &str, paused: bool) ->
     match caps {
         Err(e) => eprintln!("relax: layout patch gen {}: the program's stacks could not be read ({}): a thread still in first-version code of a rebuilt fn is not held", gen, e),
         Ok(caps) => {
-            let code = u.code.read().unwrap_or_else(|e| e.into_inner());
             for c in caps {
                 // pc, return addresses; a leaf's caller (arm64 lr; x86-64 the word at sp: a
                 // frameless leaf, a prologue)
@@ -612,10 +611,14 @@ pub(crate) fn hold_old_frames(u: &Unit, gen: u32, layout: &str, paused: bool) ->
                         at.push((usize::MAX, u64::from_le_bytes(w[..8].try_into().unwrap()).wrapping_sub(1)));
                     }
                 }
-                let hit = at.iter().find_map(|&(k, a)| {
-                    let (start, len, slot) = code.entry_at(a)?;
-                    (affected.contains(&slot) && start != u.fns[slot as usize].code && crate::stale::lookup(a).is_none()).then_some((k, start, len, slot))
-                });
+                // (the code tables' lock for the lookup alone: never across the thread's hold)
+                let hit = {
+                    let code = u.code.read().unwrap_or_else(|e| e.into_inner());
+                    at.iter().find_map(|&(k, a)| {
+                        let (start, len, slot) = code.entry_at(a)?;
+                        (affected.contains(&slot) && start != u.fns[slot as usize].code && crate::stale::lookup(a).is_none()).then_some((k, start, len, slot))
+                    })
+                };
                 if let Some((k, start, len, slot)) = hit {
                     let ok = crate::inspect::instrument::hold_for_good(&c.t);
                     let pc = at.iter().find(|x| x.0 == k).map_or(start, |x| x.1);
@@ -651,7 +654,6 @@ pub(crate) fn hold_old_frames(u: &Unit, gen: u32, layout: &str, paused: bool) ->
 /// found, and a stack could not be read to its end (what it hides is not known).
 pub(crate) fn frame_in(u: &Unit, slots: &crate::fxhash::HashSet<u32>) -> Result<Option<String>, String> {
     let caps = crate::inspect::capture_all(&crate::inspect::instrument::program_thread)?;
-    let code = u.code.read().unwrap_or_else(|e| e.into_inner());
     // (a thread is named as reports name it: one nobody named is its program thread, or `unnamed`)
     let listed: Vec<crate::inspect::threads::Thread> = caps.iter().map(|c| c.t.clone()).collect();
     // the hosts of copies of a closure a patch kept on its old code, for linked code below O3 (the
@@ -680,7 +682,13 @@ pub(crate) fn frame_in(u: &Unit, slots: &crate::fxhash::HashSet<u32>) -> Result<
         }
         let thread = format!("`{}` (tid {})", crate::inspect::shown_name(&c.t, &listed), c.t.os_id);
         for a in at {
-            let Some((start, _, slot)) = code.entry_at(a) else { continue };
+            // (the code tables' lock for the lookups alone: naming a closure below asks type
+            // queries, and one can run code whose install takes the lock to write)
+            let found = {
+                let code = u.code.read().unwrap_or_else(|e| e.into_inner());
+                code.entry_at(a).map(|(start, _, slot)| (start, slot, code.inlined_at(start).map(|l| l.to_vec()), code.kind_of(start).origin))
+            };
+            let Some((start, slot, inlined, origin)) = found else { continue };
             let f = &u.fns[slot as usize];
             // what of retired text the frame runs or reaches; for a slot the patch rebuilds too, so
             // the reason names both
@@ -691,9 +699,9 @@ pub(crate) fn frame_in(u: &Unit, slots: &crate::fxhash::HashSet<u32>) -> Result<
                 // a copy of such code inlined into this version
                 // (code built in this run lists what it inlined when it inlined anything: none listed,
                 // none taken in, whatever a later version of the slot took)
-                let copy = match code.inlined_at(start) {
+                let copy = match inlined.as_deref() {
                     Some(list) => list.iter().find_map(|&c| crate::reload::retired_text(u, c).map(|r| (c, r))),
-                    None if matches!(code.kind_of(start).origin, crate::jit::origin::CACHE | crate::jit::origin::IMAGE) => hosts.get(&slot).and_then(|&c| crate::reload::retired_text(u, c).map(|r| (c, r))),
+                    None if matches!(origin, crate::jit::origin::CACHE | crate::jit::origin::IMAGE) => hosts.get(&slot).and_then(|&c| crate::reload::retired_text(u, c).map(|r| (c, r))),
                     None => None,
                 };
                 if let Some((c, retired)) = copy {

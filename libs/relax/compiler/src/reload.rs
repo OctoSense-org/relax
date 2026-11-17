@@ -4157,15 +4157,21 @@ fn lay_out_stored_holders(u: &Unit, d: DefId, visible: &[bool]) -> Result<(), St
     let mut keys: Vec<(DefId, Vec<TyId>)> = Vec::new();
     let mut types: Vec<TyId> = Vec::new();
     {
-        let code = u.code.read().unwrap_or_else(|e| e.into_inner());
+        // the slots whose code came from the disk cache or the startup image, read with the code
+        // tables' lock held for that alone: what follows asks type queries, which can evaluate a
+        // const by running its initializer, whose lazy compile installs code (index_code takes the
+        // lock to write it: under this read, on this thread, it waited for good -- an app, 11-17)
+        let stored: Vec<u32> = {
+            let code = u.code.read().unwrap_or_else(|e| e.into_inner());
+            u.fns.iter().enumerate().filter(|(_, f)| {
+                let o = code.kind_of(f.code).origin;
+                o == origin::CACHE || o == origin::IMAGE || (o == origin::UNKNOWN && !f.history().inlined_into.is_empty())
+            }).map(|(i, _)| i as u32).collect()
+        };
         let mut done: crate::fxhash::HashSet<u32> = Default::default();
-        for (i, f) in u.fns.iter().enumerate() {
-            let o = code.kind_of(f.code).origin;
-            if !(o == origin::CACHE || o == origin::IMAGE || (o == origin::UNKNOWN && !f.history().inlined_into.is_empty())) {
-                continue;
-            }
+        for i in stored {
             // a closure's body is checked with its owner's
-            let mut k = i as u32;
+            let mut k = i;
             while let FnKey::Closure(_, _, p) | FnKey::Sandbox(p) | FnKey::Plain(p) | FnKey::Ctfe(p) = u.fns[k as usize].key {
                 k = p;
             }

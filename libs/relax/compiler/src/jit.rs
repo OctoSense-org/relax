@@ -19115,26 +19115,18 @@ fn rt_loop_hot(counter: u64, fp: u64) {
         if w5 & LOOP_CHARGED != 0 {
             return;
         }
+        // the code tables busy (an install): the callers go uncharged, and the slot's next hot loop
+        // walks them
+        let mut found = [0u32; LOOP_FRAMES];
+        let Some(n) = loop_callers(u, fp, &mut found) else { return };
         (*rec.add(5)).fetch_or(LOOP_CHARGED, Ordering::Relaxed);
-        // the frame's JIT callers (frame records: [fp] = the caller's fp, [fp + 8] = the return
-        // address into it); a frame that is not JIT code ends the walk before its fp is read
-        let mut fp = fp;
-        let mut at = id;
-        let callers = std::iter::from_fn(|| {
-            if fp == 0 || fp % 8 != 0 {
-                return None;
+        if tier1_trace() {
+            let mut at = id;
+            for &c in &found[..n] {
+                eprintln!("O3q loop #{}: caller {} (state {})", at, c, (*tier_rec(&u.slots, c).add(3)).load(Ordering::Relaxed));
+                at = c;
             }
-            let ra = *((fp + 8) as *const u64);
-            let found = u.find_fn(ra);
-            if tier1_trace() {
-                eprintln!("O3q loop #{}: caller {:?} (state {})", at, found, found.map_or(0, |c| (*tier_rec(&u.slots, c).add(3)).load(Ordering::Relaxed)));
-            }
-            let c = found?;
-            at = c;
-            let next = *(fp as *const u64);
-            fp = if next <= fp { 0 } else { next };
-            Some(c)
-        });
+        }
         // SPEC-V: a frame calling a twin is that twin's caller (indirect and helper-lowered calls
         // leave no record at lowering): recorded, and if the twin is hot its caller is brought to
         // the base slot (twin_seen)
@@ -19143,9 +19135,33 @@ fn rt_loop_hot(counter: u64, fp: u64) {
                 twin_seen(u, c, callee);
             }
         };
-        loop_walk(id, threshold, callers.take(LOOP_FRAMES), |c| tier_rec(&u.slots, c), twin);
+        loop_walk(id, threshold, found[..n].iter().copied(), |c| tier_rec(&u.slots, c), twin);
     }
 }
+}
+
+/// rt_loop_hot's JIT callers under the frame at `fp`, innermost first, into `out`: how many, None
+/// when the code tables are busy. Frame records: [fp] = the caller's fp, [fp + 8] = the return
+/// address into it; a frame that is not JIT code ends the walk before its fp is read. One try of
+/// the tables' lock, let go before anything else runs: an app thread never waits here on an install
+/// (`index_code` holding the lock, or waiting for it, which makes a read wait too), and asks for
+/// nothing under it (a read held while another read waits behind a queued writer never ends: a
+/// live session's app thread and its owner, 11-17).
+unsafe fn loop_callers(u: &Unit, mut fp: u64, out: &mut [u32; LOOP_FRAMES]) -> Option<usize> {
+    let table = match u.code.try_read() {
+        Ok(t) => t,
+        Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => return None,
+    };
+    let mut n = 0;
+    while n < LOOP_FRAMES && fp != 0 && fp % 8 == 0 {
+        let Some(c) = table.slot_at(*((fp + 8) as *const u64)) else { break };
+        out[n] = c;
+        n += 1;
+        let next = *(fp as *const u64);
+        fp = if next <= fp { 0 } else { next };
+    }
+    Some(n)
 }
 
 /// rt_loop_hot's walk over the JIT callers under the loop that turned hot in slot `at`, innermost
@@ -19779,6 +19795,56 @@ mod tier_cost_tests {
         assert_eq!(credited(4), Some(false), "nor credited");
         assert_eq!(charged(6), (false, false));
         assert_eq!(seen, [(1, 0), (2, 1), (3, 2), (4, 3), (5, 4), (7, 5)], "the twin callers: every frame down to the one queued for O3");
+    }
+
+    /// Why: a live session froze for good. Its owner held the code tables' read lock across a type
+    /// query, whose const evaluation compiled lazily and asked for the write lock to index the code
+    /// (`index_code`); the app's thread, walking the callers under its hot loop (`rt_loop_hot`),
+    /// asked for a read behind that queued writer, and so waited on the owner, which waited on
+    /// itself. An app thread's walk never waits on the tables: with a reader holding them and an
+    /// install queued it returns at once, and once the install is done it finds the caller.
+    #[test]
+    fn a_hot_loop_s_caller_walk_never_waits_behind_a_queued_install() {
+        let path = std::env::temp_dir().join(format!("relax-loop-callers-{}.rs", std::process::id()));
+        std::fs::write(&path, "#![no_std] pub fn caller() {}").unwrap();
+        let session = std::sync::Arc::new(crate::Session::default());
+        let mut prog = crate::program::Program::new(&session);
+        prog.load_crate("loop_callers", path.to_str().unwrap(), 2021, crate::cfg::CfgSet::host(&session, &[]), vec![]).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        let mut tcx = crate::tcx::Tcx::new();
+        tcx.collect(&prog);
+        let mut u = Unit::new(prog, tcx, 0);
+        let d = (0..u.prog.defs.len() as u32).map(DefId).find(|&d| u.prog.name(d) == "caller").unwrap();
+        let id = u.fn_id(FnKey::Inst(d, vec![]));
+        // a caller's body (its addresses alone: nothing runs it) and a frame record returning into it
+        let body = vec![0u8; 64];
+        let at = body.as_ptr() as u64;
+        let frame: [u64; 2] = [0, at + 16];
+        let fp = frame.as_ptr() as u64;
+        let up = &mut *u as *mut Unit as usize;
+
+        let held = u.code.read().unwrap();
+        // the install, as the owner's compile makes it: its write lock waits for the reader
+        let install = std::thread::spawn(move || unsafe { (*(up as *mut Unit)).index_code(at, 64, id, None) });
+        let queued = std::time::Instant::now();
+        while u.code.try_read().is_ok() {
+            assert!(queued.elapsed().as_secs() < 20, "the install's write lock never queued");
+            std::thread::yield_now();
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        let walk = std::thread::spawn(move || {
+            let mut out = [0u32; LOOP_FRAMES];
+            tx.send(unsafe { loop_callers(&*(up as *const Unit), fp, &mut out) }).unwrap();
+        });
+        let busy = rx.recv_timeout(std::time::Duration::from_secs(10));
+        drop(held);
+        install.join().unwrap();
+        walk.join().unwrap();
+        assert_eq!(busy, Ok(None), "the walk returns at once, its callers uncharged, while a reader holds the tables and an install waits");
+        let mut out = [0u32; LOOP_FRAMES];
+        assert_eq!(unsafe { loop_callers(&u, fp, &mut out) }, Some(1), "with the tables free, the walk finds the caller");
+        assert_eq!(out[0], id, "the caller is the installed body's slot");
+        drop(body);
     }
 
     /// Idle code decays to nothing (no work while it is idle: the decay is applied at its next check).
