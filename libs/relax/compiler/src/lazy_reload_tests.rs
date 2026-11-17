@@ -411,7 +411,7 @@ fn specv_patch_before_verdict() {
     }
     let mut undos = vec![outcome.undo.unwrap()];
     let ids = vec![id];
-    let mut pending = vec![crate::reload::PendingPatch { group: outcome.group, what: "lib.rs".into(), ids, event_seq: crate::inspect::events::last_seq() }];
+    let mut pending = vec![crate::reload::PendingPatch { group: outcome.group, what: "lib.rs".into(), ids, event_seq: crate::inspect::events::last_seq(), installed: std::time::Instant::now() }];
     crate::reload::UNVERIFIED_PATCHES.fetch_add(1, Ordering::AcqRel);
     assert!(!crate::reload::observations_verified());
     // the worker acknowledges a settle request between checks: the second one is answered after the queued check ran
@@ -564,7 +564,7 @@ fn specv_aliased_call_from_unverified_body() {
     assert!(!unsafe { crate::jit::compile_tier1(up, value) }, "no O3 build of a patch without its verdict");
     // the verdict rejects the patch: it reverts
     let mut undos = vec![outcome.undo.unwrap()];
-    let mut pending = vec![crate::reload::PendingPatch { group: outcome.group, what: "lib.rs".into(), ids: vec![value, value_ptr, value_dyn], event_seq: crate::inspect::events::last_seq() }];
+    let mut pending = vec![crate::reload::PendingPatch { group: outcome.group, what: "lib.rs".into(), ids: vec![value, value_ptr, value_dyn], event_seq: crate::inspect::events::last_seq(), installed: std::time::Instant::now() }];
     crate::reload::UNVERIFIED_PATCHES.fetch_add(1, Ordering::AcqRel);
     let t0 = std::time::Instant::now();
     while !pending.is_empty() && t0.elapsed().as_secs() < 20 {

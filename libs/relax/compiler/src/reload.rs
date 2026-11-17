@@ -4698,16 +4698,67 @@ fn item_mentions(prog: &crate::program::Program, d: DefId, names: &[&[u8]]) -> b
     toks(pf, it.lo, it.hi, &[]).iter().any(|t| names.contains(t))
 }
 
+/// Where a mention of a name an edit adds can resolve to the added item.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum NameReach {
+    /// anywhere
+    Any,
+    /// as a member only: a method call (`.name(`, `.name::<`) or a path through a type
+    /// (`::name`). An inherent impl's method or associated item: a bare word of that name is a
+    /// local or a fn of a module, and `.name` with no call after it a field, never it
+    Member,
+    /// in a path only, never after a `.` (a method call or a field): an item of a module
+    Path,
+}
+
+/// Whether token texts `ts` mention one of `names` where it can reach (NameReach).
+fn mentions_at(ts: &[&[u8]], names: &[(&[u8], NameReach)]) -> bool {
+    ts.iter().enumerate().any(|(i, t)| names.iter().any(|&(n, r)| n == *t && match r {
+        NameReach::Any => true,
+        NameReach::Member => {
+            // (`::` may be one token or two)
+            let path = i > 0 && (ts[i - 1] == b"::" || ts[i - 1] == b":" && i > 1 && ts[i - 2] == b":");
+            let call = ts.get(i + 1).is_some_and(|n| *n == b"(" || *n == b"::" || *n == b":");
+            path || i > 0 && ts[i - 1] == b"." && call
+        }
+        NameReach::Path => i == 0 || ts[i - 1] != b".",
+    }))
+}
+
 /// item_mentions, where an impl's item also names what its impl's header names: its `Self`
-/// (a method's match on `Self` sees its enum's new variants).
-fn item_or_impl_mentions(prog: &crate::program::Program, d: DefId, names: &[&[u8]]) -> bool {
-    if item_mentions(prog, d, names) { return true; }
+/// (a method's match on `Self` sees its enum's new variants). Each name counts where it can
+/// reach (NameReach).
+fn item_or_impl_mentions(prog: &crate::program::Program, d: DefId, names: &[(&[u8], NameReach)]) -> bool {
+    if item_mentions_at(prog, d, names) { return true; }
     let p = prog.def(d).parent;
     if p == crate::program::NO_DEF || prog.def(p).kind != DefKind::Impl { return false; }
     let pf = &prog.files[prog.def(p).file as usize];
     let it = pf.ast.item(prog.def(p).item);
     let hi = pf.src.get(it.lo as usize..it.hi as usize).and_then(|t| t.iter().position(|b| *b == b'{')).map_or(it.hi, |at| it.lo + at as u32);
-    toks(pf, it.lo, hi, &[]).iter().any(|t| names.contains(t))
+    mentions_at(&toks(pf, it.lo, hi, &[]), names)
+}
+
+/// item_mentions, each name counting where it can reach (NameReach).
+fn item_mentions_at(prog: &crate::program::Program, d: DefId, names: &[(&[u8], NameReach)]) -> bool {
+    let def = prog.def(d);
+    let pf = &prog.files[def.file as usize];
+    let it = pf.ast.item(def.item);
+    mentions_at(&toks(pf, it.lo, it.hi, &[]), names)
+}
+
+/// Whether inherent impl `r` (added to a file version at `at`) is of a struct, enum or union the
+/// same edit adds beside it: its self type is a one-segment path naming one of them.
+fn impl_of_added_type(pf: &crate::parser::ParsedFile, r: crate::ast::Row<crate::ast::ImplItem>, at: Result<u32, DefId>, added: &[(u32, Result<u32, DefId>)]) -> bool {
+    let na = &pf.ast;
+    let crate::ast::Ty::Path(p) = na.ty(na.row(r).self_ty) else { return false };
+    let segs = na.segs(p.segs);
+    if !p.no_qself() || segs.len() != 1 || at.is_err() { return false; }
+    let name = &pf.src[segs[0].name.lo as usize..segs[0].name.hi as usize];
+    added.iter().any(|&(k, where_)| {
+        let it = &na.items[k as usize];
+        where_ == at && matches!(it.kind, crate::ast::ItemKind::Struct(_) | crate::ast::ItemKind::Enum(_) | crate::ast::ItemKind::Union(_))
+            && &pf.src[it.name.lo as usize..it.name.hi as usize] == name
+    })
 }
 
 fn def_name(prog: &crate::program::Program, d: DefId) -> String {
@@ -5508,6 +5559,10 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
     // new inherent method shadowing a trait method, a removed fn): every running fn whose text
     // names one of them is type-checked and rebuilt with the edit (conservative, by name)
     let mut set_names: Vec<Vec<u8>> = Vec::new();
+    // ... and the names of the items an edit adds that a mention reaches only in some places
+    // (NameReach: a method added to an inherent impl after a `.` or a `::`, an item of a module in
+    // a path). Common words (`push`, `new`, `walk`) otherwise reach most of an app's code.
+    let mut placed_names: Vec<(Vec<u8>, NameReach)> = Vec::new();
     // (scoreboard: fns naming a removed/renamed field, of which this many use it)
     let (mut field_named, mut field_deps) = (0usize, 0usize);
     // a changed macro: the fns invoking it are rebuilt from their new expansions
@@ -5695,15 +5750,33 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
                 continue;
             }
             let it = &na.items[j as usize];
-            set_names.push(v.pf.src[it.name.lo as usize..it.name.hi as usize].to_vec());
+            let name = v.pf.src[it.name.lo as usize..it.name.hi as usize].to_vec();
+            match at {
+                // an item of a module is named in a path, never after a `.`
+                Ok(_) => placed_names.push((name, NameReach::Path)),
+                // one of an existing inherent impl: a method call or a path through its type
+                Err(imp) if u.prog.def(imp).kind == DefKind::Impl => placed_names.push((name, NameReach::Member)),
+                Err(_) => set_names.push(name),
+            }
             // a trait impl's methods shadow nothing (the trait's own methods resolve as before
             // for every other type); an inherent impl's may hide a trait method of its type
             if matches!(&it.kind, crate::ast::ItemKind::Impl(r) if na.row(*r).trait_.is_some()) {
                 continue;
             }
+            // ... unless its type is one this edit adds: no running code has a value of it, and
+            // what names the type names one of the edit's names
+            if matches!(&it.kind, crate::ast::ItemKind::Impl(r) if impl_of_added_type(&v.pf, *r, at, &plan.added)) {
+                continue;
+            }
             for c in child_items(na, &it.kind) {
                 let ci = na.item(c);
-                set_names.push(v.pf.src[ci.name.lo as usize..ci.name.hi as usize].to_vec());
+                let name = v.pf.src[ci.name.lo as usize..ci.name.hi as usize].to_vec();
+                match &it.kind {
+                    crate::ast::ItemKind::Impl(_) => placed_names.push((name, NameReach::Member)),
+                    crate::ast::ItemKind::Mod(_) | crate::ast::ItemKind::ForeignMod(_) => placed_names.push((name, NameReach::Path)),
+                    // (a trait's methods: anywhere)
+                    _ => set_names.push(name),
+                }
             }
         }
         for &d in &plan.removed {
@@ -5788,6 +5861,7 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
         }
     }
     set_names.retain(|n| !n.is_empty());
+    placed_names.retain(|(n, _)| !n.is_empty());
     // The fns the edit's names reach are type-checked and rebuilt. What a rebuilt fn's body makes
     // must then be new too (rustc builds it from the new types; here the running values of the
     // old ones live on):
@@ -5922,11 +5996,18 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
         trace_count("impl_callers", impl_over.len());
     }
     let mut scanned = 0usize;
+    let mut placed_scanned = false;
     let mut moving: Vec<DefId> = Vec::new();
+    if reload_trace() && (!set_names.is_empty() || !placed_names.is_empty()) {
+        let s = |n: &[u8]| String::from_utf8_lossy(n).into_owned();
+        eprintln!("reload-trace: edit names {:?} {:?}", set_names.iter().map(|n| s(n)).collect::<Vec<_>>(), placed_names.iter().map(|(n, r)| (s(n), *r)).collect::<Vec<_>>());
+    }
     loop {
-        if set_names.len() > scanned {
-            let names: Vec<&[u8]> = set_names[scanned..].iter().map(|n| n.as_slice()).collect();
+        if set_names.len() > scanned || !placed_scanned {
+            let names: Vec<(&[u8], NameReach)> = set_names[scanned..].iter().map(|n| (n.as_slice(), NameReach::Any))
+                .chain(placed_names.iter().filter(|_| !placed_scanned).map(|(n, r)| (n.as_slice(), *r))).collect();
             scanned = set_names.len();
+            placed_scanned = true;
             let mut seen: std::collections::HashSet<DefId> = std::collections::HashSet::new();
             for f in u.fns.iter() {
                 trace_count("slot_visits", 1);
@@ -6231,7 +6312,7 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
     {
         let mut changed: Vec<DefId> = body_defs.iter().chain(&consts_hit).chain(&static_defs).chain(&layout_defs).copied().collect();
         for (_, plan) in &versions { changed.extend_from_slice(&plan.removed); }
-        let names: Vec<&[u8]> = set_names.iter().map(|n| n.as_slice()).collect();
+        let names: Vec<(&[u8], NameReach)> = set_names.iter().map(|n| (n.as_slice(), NameReach::Any)).chain(placed_names.iter().map(|(n, r)| (n.as_slice(), *r))).collect();
         let mut enums: Vec<DefId> = u.tcx.adts.iter().filter(|(d, a)| a.is_enum && visible_crates[u.prog.def(**d).krate as usize] && !layout_defs.contains(d) && !changed.contains(d)).map(|(d, _)| *d).collect();
         enums.sort_unstable_by_key(|d| d.0);
         for d in enums {
@@ -6244,7 +6325,7 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
                 }
             }
             if code.is_empty() { continue; }
-            if item_mentions(&u.prog, d, &names) {
+            if item_mentions_at(&u.prog, d, &names) {
                 discr_restart.push(format!("enum `{}`: a discriminant computed by code names an item this edit adds or removes -- restart the app", def_name(&u.prog, d)));
                 continue;
             }
@@ -8665,6 +8746,8 @@ pub(crate) struct PendingPatch {
     pub(crate) what: String,
     pub(crate) ids: Vec<u32>,
     pub(crate) event_seq: u64,
+    /// when it was installed (its verdict reports how long the program ran it unverified)
+    pub(crate) installed: Instant,
 }
 
 /// RELAX_SPECV_TRACE: the slots a patch group's verdict waits on, printed when they change
@@ -8732,6 +8815,10 @@ pub(crate) fn settle_verdicts(up: *mut Unit, pending: &mut Vec<PendingPatch>, un
                 UNVERIFIED_PATCHES.fetch_sub(1, Ordering::AcqRel);
                 let seqs = crate::inspect::events::unverified_seqs_since(p.event_seq);
                 let seqs: Vec<String> = seqs.iter().map(|s| s.to_string()).collect();
+                let ms = p.installed.elapsed().as_secs_f64() * 1e3;
+                eprintln!("relax live: {}: verified: the borrow checker passed its {} fn(s), {:.1} s after the install{}", p.what, p.ids.len().saturating_sub(unchecked.len()), ms / 1e3,
+                    if unchecked.is_empty() { String::new() } else { format!(" ({} not checked)", unchecked.len()) });
+                live_log(&format!("{{\"event\":\"patch_verified\",\"edit\":{},\"group\":{},\"fns\":{},\"unchecked\":{},\"ms\":{:.1}}}", json_str(&p.what), p.group, p.ids.len(), unchecked.len(), ms));
                 patch_verified_event(&p.what, p.group, &seqs);
             }
             Some(Some(events)) => {
@@ -10450,7 +10537,7 @@ unsafe fn test_edit(up: *mut Unit, paths: Vec<String>, o: &mut Outcome, undos: &
         let ids = crate::owner::call(crate::owner::Class::Program, || unverified_patch(up, o.group));
         if !ids.is_empty() {
             UNVERIFIED_PATCHES.fetch_add(1, Ordering::AcqRel);
-            pending.push(PendingPatch { group: o.group, what: what.clone(), ids, event_seq: crate::inspect::events::last_seq() });
+            pending.push(PendingPatch { group: o.group, what: what.clone(), ids, event_seq: crate::inspect::events::last_seq(), installed: Instant::now() });
         }
         undos.push(undo);
     }
@@ -11410,7 +11497,7 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
             let ids: Vec<u32> = crate::owner::call(crate::owner::Class::Program, || unverified_patch(up, group));
             if !ids.is_empty() {
                 UNVERIFIED_PATCHES.fetch_add(1, Ordering::AcqRel);
-                pending.push(PendingPatch { group, what: what.clone(), ids, event_seq: crate::inspect::events::last_seq() });
+                pending.push(PendingPatch { group, what: what.clone(), ids, event_seq: crate::inspect::events::last_seq(), installed: Instant::now() });
                 awaits_check = true;
             }
             undos.push(u);
