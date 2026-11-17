@@ -54,6 +54,15 @@ static DIGEST_N: AtomicU64 = AtomicU64::new(0);
 /// cpu ns of lowering while a patch is open
 static PATCH_LOWER_NS: AtomicU64 = AtomicU64::new(0);
 
+/// What this module holds of a run, as a fresh process has it (`run_end`).
+pub(crate) unsafe fn reset_statics() {
+    use relax_session::reset_static as reset;
+    reset(&DIGEST_NS, AtomicU64::new(0));
+    reset(&DIGEST_N, AtomicU64::new(0));
+    reset(&PATCH_LOWER_NS, AtomicU64::new(0));
+    reset(&PATCH, relax_session::sync::Mutex::new(None));
+}
+
 /// The digest of `f` as lowered (`Func::lowering_digest`), kept off the compile's scratch heap.
 pub(crate) fn take(f: &Func) -> Arc<BodyDigest> {
     let t = relax_session::clock::cpu_ns();

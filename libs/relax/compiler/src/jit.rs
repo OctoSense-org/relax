@@ -33459,6 +33459,7 @@ fn compile_checkpoint() {
 pub(crate) unsafe fn reset_statics() {
     use relax_session::reset_static as reset;
     bmemo::reset_statics();
+    crate::gate::reset_statics();
     busy::reset_statics();
     queue::reset_statics();
     settle_rebuild::reset_statics();

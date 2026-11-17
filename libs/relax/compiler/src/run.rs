@@ -5143,7 +5143,14 @@ impl CaptureLive {
 }
 impl Drop for CaptureLive {
     fn drop(&mut self) {
-        CAPTURES.fetch_sub(1, Ordering::AcqRel);
+        // (never below zero: a run that ends in place resets the count)
+        let mut n = CAPTURES.load(Ordering::Acquire);
+        while n > 0 {
+            match CAPTURES.compare_exchange_weak(n, n - 1, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => break,
+                Err(now) => n = now,
+            }
+        }
     }
 }
 
@@ -6059,6 +6066,7 @@ pub(crate) unsafe fn reset_statics() {
     reset(&DONE, AtomicBool::new(false));
     reset(&EXIT_MARKS, relax_session::sync::Mutex::new(Vec::new()));
     reset(&COLLECTED_CURRENT, AtomicBool::new(false));
+    reset(&CAPTURES, std::sync::atomic::AtomicUsize::new(0));
     reset(&COLLECTED_RESTORED, AtomicBool::new(false));
     reset(&COLLECTED_WRITTEN, relax_session::sync::Mutex::new(None));
     reset(&MID_COLLECTED_TRIED, AtomicBool::new(false));
