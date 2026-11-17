@@ -9547,6 +9547,15 @@ pub fn relaunch_pending(who: &str) -> Result<String, String> {
     restart_in_place(if why.is_empty() { "session relaunch".into() } else { why }).map(str::to_string)
 }
 
+/// `session relaunch process=1`, asked by `who`: the run starts again on the loader binary it
+/// runs, nothing rebuilt (host::relaunch_process), with the edits that wait.
+pub fn relaunch_process(who: &str) -> Result<String, String> {
+    RELAUNCH_ASKED.store(true, Ordering::SeqCst);
+    let why = restart_pending().join("; ");
+    eprintln!("{} (process=1: on the same binary, nothing rebuilt)", relaunch_line(who, &why, host::restart_asked()));
+    host::relaunch_process()
+}
+
 /// The log's line of a `session relaunch` that `who` asked for, `why` the edits it applies (a
 /// repeat while the restart is on its way changes nothing, and says so).
 fn relaunch_line(who: &str, why: &str, again: bool) -> String {

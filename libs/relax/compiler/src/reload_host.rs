@@ -364,6 +364,39 @@ pub(super) fn relaunch() -> Option<Result<String, String>> {
     }))
 }
 
+/// `session relaunch process=1`: the run starts again on the loader binary it runs, nothing
+/// rebuilt, as it restarts into a rebuilt one (macOS: a new process behind the run's parent; an
+/// exec elsewhere): an app that restarts with its state hands it over at its next safe point. A
+/// way into that restart that waits for no build (the tray example's restart_process test; an app
+/// whose process went bad). A rebuilt binary that waits is taken instead, and a build that runs is
+/// waited for.
+pub(super) fn relaunch_process() -> Result<String, String> {
+    #[cfg(unix)]
+    {
+        let loader = loader().ok_or_else(|| format!("the {tool} binary's path is unknown", tool = crate::tool_name()))?;
+        let why = "a restart as a new process (`session relaunch process=1`)".to_string();
+        {
+            let mut st = STATE.lock().unwrap_or_else(|e| e.into_inner());
+            match st.phase {
+                Phase::Building => {
+                    RESTART_AFTER_BUILD.store(true, std::sync::atomic::Ordering::SeqCst);
+                    end_low_cargo(&mut st);
+                    return Ok(format!("rebuild {tool}, then restart with the program's state", tool = crate::tool_name()));
+                }
+                Phase::Restarting => {}
+                Phase::Idle | Phase::Failed => {
+                    let stamps = stamps(&st.paths);
+                    *HANDOVER.lock().unwrap_or_else(|e| e.into_inner()) = Some(Handover { loader, stamps });
+                    st.phase = Phase::Restarting;
+                }
+            }
+        }
+        apply_ready(why)
+    }
+    #[cfg(not(unix))]
+    Err(format!("this platform restarts a run as a new process only into a rebuilt {tool}", tool = crate::tool_name()))
+}
+
 fn apply_ready(why: String) -> Result<String, String> {
     {
         let st = STATE.lock().unwrap_or_else(|e| e.into_inner());
