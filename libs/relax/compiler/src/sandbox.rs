@@ -2204,6 +2204,9 @@ fn c_policy(allow: Allow, name: &str) -> Option<Option<(&'static str, u64)>> {
         // std's default hook (install_core_hook): none, a module's std has no stdio; its panics
         // reach the host as their payload
         "relax_std_default_hook" => Some(("sb_no_symbol", sb_no_symbol as *const () as u64)),
+        // std::backtrace: no frames (a twin's walk would cross the host's frames; Unsupported, as
+        // real std's capture on a target without unwind info)
+        "relax_backtrace_capture" | "relax_backtrace_resolve" => Some(("sb_no_symbol", sb_no_symbol as *const () as u64)),
         // std's handle_alloc_error (the runtime's message and abort): a twin's call is the fault
         // an abort is, contained to the module's call
         "relax_alloc_error" => Some(("abort", 0)),

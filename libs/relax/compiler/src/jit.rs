@@ -1025,6 +1025,13 @@ impl CodeTables {
         self.entry_at(pc).map(|e| e.2)
     }
 
+    /// The start of the glue code (`Unit::emit_glue`: the runtime's entries and trampolines)
+    /// holding `pc`.
+    pub(crate) fn glue_at(&self, pc: u64) -> Option<u64> {
+        let k = self.glue.partition_point(|g| g.0 <= pc);
+        self.glue.get(k.wrapping_sub(1)).filter(|g| pc < g.0 + g.1 as u64).map(|g| g.0)
+    }
+
     /// The frame pointer of the JIT frame whose call returns to `ret`, from the stack pointer
     /// it will have there (`sp`: the walk of a thread blocked in a syscall knows its sp and pc
     /// only): the function's frame size and the call's staged arguments, or the glue's frame.
@@ -27061,6 +27068,9 @@ pub(crate) fn loader_symbol(name: &[u8]) -> Option<usize> {
         b"relax_allocator_swap" => Some(relax_allocator_swap as *const () as usize),
         b"relax_set_panic_hook" => Some(relax_set_panic_hook as *const () as usize),
         b"relax_std_default_hook" => Some(relax_std_default_hook as *const () as usize),
+        // std::backtrace (std/std/backtrace.rs): the thread's frames, and their names
+        b"relax_backtrace_capture" => Some(crate::inspect::backtrace::relax_backtrace_capture as *const () as usize),
+        b"relax_backtrace_resolve" => Some(crate::inspect::backtrace::relax_backtrace_resolve as *const () as usize),
         // what observers cost the program and what the runtime's own threads run and wait for: one count for the
         // host's endpoint and every copy of makepad-remote the program runs, whichever crates bind
         b"relax_served_ns" => Some(makepad_remote::served_count() as *const std::sync::atomic::AtomicU64 as usize),

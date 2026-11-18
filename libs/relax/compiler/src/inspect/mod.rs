@@ -10,6 +10,7 @@
 
 pub mod answer;
 pub mod asm;
+pub mod backtrace;
 pub(crate) use asm::plain_name as asm_plain;
 pub mod calltree;
 pub mod client;

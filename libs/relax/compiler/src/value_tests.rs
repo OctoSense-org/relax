@@ -426,6 +426,52 @@ pub fn values(out: &mut [usize; 5]) {{
     assert_eq!(values::<5>(&src, "vfs_dir"), [1, 1, 1, 1, 1]);
 }
 
+/// std::backtrace (it was a stub that printed "unsupported backtrace", so a lane learned who held a
+/// stale id only from a native run): a capture prints real std's frames from its caller on, each
+/// fn with the file and line it was at, innermost first. `mid` is `#[inline]`: where a tier
+/// inlines it into `outer`, it is still a frame of its own (the line table's inline stack).
+/// Debug is real std's list; a disabled backtrace prints as std's does.
+const BACKTRACE: &str = r#"
+use std::backtrace::{Backtrace, BacktraceStatus};
+#[inline(never)]
+fn inner() -> Backtrace { let b = Backtrace::force_capture(); std::hint::black_box(&b); b }
+#[inline]
+fn mid() -> Backtrace { let b = inner(); std::hint::black_box(&b); b }
+#[inline(never)]
+fn outer() -> Backtrace { let b = mid(); std::hint::black_box(&b); b }
+/// frame `k`'s fn (its name's last segment) and line
+fn frame(lines: &[&str], k: usize) -> (String, usize) {
+    let head = format!("{:4}: ", k);
+    let Some(i) = lines.iter().position(|l| l.starts_with(&head)) else { return (String::new(), 0) };
+    let name = lines[i][head.len()..].rsplit("::").next().unwrap_or("").to_string();
+    let line = lines.get(i + 1).and_then(|l| l.trim_start().strip_prefix("at ")).and_then(|a| a.rsplitn(3, ':').nth(1)).and_then(|l| l.parse().ok()).unwrap_or(0);
+    (name, line)
+}
+pub fn values(out: &mut [usize; 8]) {
+    let b = outer();
+    out[0] = (b.status() == BacktraceStatus::Captured) as usize;
+    let text = b.to_string();
+    let lines: Vec<&str> = text.lines().collect();
+    let fs: Vec<(String, usize)> = (0..4).map(|k| frame(&lines, k)).collect();
+    out[1] = (fs.iter().map(|f| f.0.as_str()).collect::<Vec<_>>() == ["inner", "mid", "outer", "values"]) as usize;
+    out[2] = fs[0].1;
+    out[3] = fs[1].1;
+    out[4] = fs[2].1;
+    out[5] = lines.get(1).is_some_and(|l| l.contains("lib.rs:4:")) as usize;
+    let dbg = format!("{:?}", b);
+    out[6] = (dbg.starts_with("Backtrace [{ fn: \"") && dbg.contains("::inner\", file: \"")) as usize;
+    out[7] = (Backtrace::disabled().to_string() == "disabled backtrace" && format!("{:?}", Backtrace::disabled()) == "<disabled>") as usize;
+}
+"#;
+
+#[test]
+fn a_backtrace_names_its_callers_with_their_lines() {
+    isolated_test!(a_backtrace_names_its_callers_with_their_lines);
+    let (first, o3, refused): ([usize; 8], [usize; 8], _) = values_at_o3(BACKTRACE, "backtrace", RELEASE);
+    assert_eq!(first, [1, 1, 4, 6, 8, 1, 1, 1], "captured; frames inner, mid, outer, values; their lines; the file; Debug; disabled (first tier)");
+    assert_eq!(o3, first, "the same at O3 (not built: {refused:?})");
+}
+
 /// A constant's initializer that runs as code (ctfe.rs off) runs constant-evaluation twins (ctfe_twin.rs), which count rustc's const-eval steps;
 /// the program's own code is untouched: `count` called at run time counts nothing.
 const CTFE_TWINS: &str = r#"
