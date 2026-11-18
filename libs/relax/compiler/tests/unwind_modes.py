@@ -3,7 +3,9 @@
 innermost first, on the way to the catch):
 
   plain            `makepad run`, the panic unwinds (panic and index-out-of-bounds)
-  park-panic       the panic parks for `makepad inspect`; `resume P1 panic` unwinds it
+  park-panic       a panic that leaves the program parks for `makepad inspect` (at the rethrow
+                   of the catch that restores; a caught one parks nothing); `resume P1 panic`
+                   unwinds it
   park-restart     `restartable work`; the parked panic is resumed `restart` (the fn runs again)
   park-return      `restartable work`; resumed `return 4242` (the call returns the value)
   (live sessions: live/unwind_guards, run by run_cases.py; `makepad test` recovery: unwind_nested_catch_restore.rs)
@@ -36,7 +38,7 @@ def unwound():
 EXPECT = {
     "panic": unwound(),
     "oob": unwound(),
-    "park-panic": unwound(),
+    "park-panic": ["out drop " + d for d in DROPS] + ["out restore", "out drop parked-guard", "out drop top", "out drop outer"],
     "park-restart": ["out work attempt 1", "out drop leaf", "out drop mid-box", "out drop mid-a", "out drop work-inner", "out drop work",
                      "out work attempt 2", "out drop work", "out work result Ok(1007)", "out drop outer", "out done"],
     "park-return": ["out work attempt 1", "out drop leaf", "out drop mid-box", "out drop mid-a", "out drop work-inner", "out drop work",
@@ -55,7 +57,7 @@ def run_parked(a, mode):
     tmp = tempfile.mkdtemp()
     ready, go = os.path.join(tmp, "ready"), os.path.join(tmp, "go")
     env = dict(os.environ, UNWIND_PROBE_READY=ready, UNWIND_PROBE_GO=go, RELAX_PANIC_PARK="120")
-    probe_mode = {"park-panic": "panic", "park-restart": "restart", "park-return": "return"}[mode]
+    probe_mode = {"park-panic": "uncaught", "park-restart": "restart", "park-return": "return"}[mode]
     p = subprocess.Popen([a["relax"], "run", "--agent", *PKG, "--", probe_mode], cwd=a["ws"], env=env,
                          stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     try:
@@ -68,8 +70,8 @@ def run_parked(a, mode):
             inspect(a["relax"], p.pid, "restartable", "work")
         open(go, "w").write("go")
         t0 = time.time()
-        while "P1" not in inspect(a["relax"], p.pid, "panics"):
-            if time.time() - t0 > 60: raise RuntimeError("no parked panic")
+        while "P1" not in (said := inspect(a["relax"], p.pid, "panics")):
+            if time.time() - t0 > 60: raise RuntimeError("no parked panic: " + said[-400:])
             time.sleep(0.3)
         how = {"park-panic": ["panic"], "park-restart": ["restart"], "park-return": ["return", "4242"]}[mode]
         inspect(a["relax"], p.pid, "resume", "P1", *how)

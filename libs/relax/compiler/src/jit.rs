@@ -3779,8 +3779,20 @@ fn raise_with(kind: &str, message: String, site: u64, fault: u64, rbp: u64, ret:
     // proc-macro world: a macro's panic (a confined macro's refused call among them) is its
     // expansion's error, reported where it is expanded, and no live edit resumes it
     let in_macro_world = { let u = cur_unit(); !u.is_null() && unsafe { (*u).aux } };
-    if !RETHROW.with(|c| c.replace(false)) && !in_macro_world {
+    let rethrow = RETHROW.with(|c| c.replace(false));
+    if !in_macro_world && !rethrow {
         crate::inspect::events::on_panic(&info, regs);
+    } else if !in_macro_world {
+        // std's resume_unwind starts a fresh unwind, which searches for its catch anew: a panic the
+        // program caught without parking and now rethrows parks if this unwind leaves the program
+        // (said where it began; its frames are the rethrow's, the ones below unwound already)
+        if let Some(began) = crate::inspect::events::rethrow_of_caught(&info.message) {
+            let mut at = info.clone();
+            if !began.is_empty() {
+                at.location = began;
+            }
+            crate::inspect::events::on_panic(&at, regs);
+        }
     }
     PANIC.with(|p| *p.borrow_mut() = Some(info));
     FMT.with(|f| {
@@ -4798,6 +4810,50 @@ pub extern "C" fn relax_catch_caught() {
     let _ = CATCH_CAUGHT.try_with(|c| c.set(true));
 }
 
+/// What a recovery point (rt_catch_panic) does with a panic that unwinds to it.
+#[derive(Clone, Copy, PartialEq)]
+enum Catch {
+    /// std's own boundary (a thread's start, the test harness): the panic ends what runs there
+    Ends,
+    /// std's catch_unwind: the panic goes back to the program
+    Program,
+    /// the catch_unwind of a retry boundary (makepad's event dispatch, relax_retry_enter): it
+    /// catches only to run the unit again when the one deciding asks, and rethrows otherwise
+    Retry,
+}
+
+thread_local! {
+    /// The recovery points this thread runs inside (rt_catch_panic), innermost last.
+    static RECOVERY: std::cell::RefCell<Vec<Catch>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Whether a panic raised on this thread now goes back to the program, which handles it: the
+/// recovery point it unwinds to, the innermost, is a catch_unwind of the program's. Real std's
+/// unwinder decides the same in its search phase: the first frame above the panic with a catch
+/// takes it (here every catch is a recovery point, and cleanup pads on the way catch nothing),
+/// and a resume_unwind searches anew. A panic leaves the program when std's own boundary takes it
+/// (a thread's start, the test harness), none does (a program's main, a callback the host runs),
+/// or a retry boundary does (it rethrows unless asked to retry).
+pub(crate) fn panic_caught_here() -> bool {
+    RECOVERY.try_with(|r| r.borrow().last() == Some(&Catch::Program)).unwrap_or(false)
+}
+
+/// The thread is inside a recovery point (`RECOVERY`) until this drops.
+struct InRecovery;
+impl InRecovery {
+    fn enter(catch: Catch) -> InRecovery {
+        // (the thread's list outlives the program heap's resets)
+        let _k = crate::zone_alloc::kept();
+        let _ = RECOVERY.try_with(|r| r.borrow_mut().push(catch));
+        InRecovery
+    }
+}
+impl Drop for InRecovery {
+    fn drop(&mut self) {
+        let _ = RECOVERY.try_with(|r| r.borrow_mut().pop());
+    }
+}
+
 rt_fn! {
 /// core::intrinsics_rt::catch_panic: `f(data)` under a recovery point (std::panic::
 /// catch_unwind, std::thread's start routine). The panic message itself was printed by
@@ -4806,7 +4862,15 @@ pub(crate) fn rt_catch_panic(f: u64, data: u64) -> u64 {
     ensure_altstack();
     let caught = CATCH_CAUGHT.try_with(|c| c.replace(false)).unwrap_or(false);
     let u = cur_unit();
-    match unsafe { call_jit_nested(u, f, data) } {
+    let retry = crate::inspect::events::take_retry_next();
+    let recovery = InRecovery::enter(match (caught, retry) {
+        (false, _) => Catch::Ends,
+        (true, false) => Catch::Program,
+        (true, true) => Catch::Retry,
+    });
+    let r = unsafe { call_jit_nested(u, f, data) };
+    drop(recovery);
+    match r {
         Ok(_) => 0,
         // `process::exit` in an app domain (domain.rs exit_current) is no panic: catch_unwind
         // does not stop it, it leaves for the next recovery point out to the thread's start

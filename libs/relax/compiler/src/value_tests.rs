@@ -472,6 +472,70 @@ fn a_backtrace_names_its_callers_with_their_lines() {
     assert_eq!(o3, first, "the same at O3 (not built: {refused:?})");
 }
 
+/// A panic parks (inspect events.rs on_panic) only where it leaves the program: one the program's
+/// catch_unwind catches goes back to it, which handles it, and parks nothing (a backtrace sample's
+/// caught panic parked, and devhub ended the idle lease, 11-18); one that ends a thread parks, as
+/// does a caught one rethrown out of a thread (resume_unwind searches anew) and one at a retry
+/// boundary (makepad's event dispatch: it catches only to retry). The run's endpoint is up with
+/// nobody attached, so each parks once and is released as a quit releases it (it unwinds).
+const PANIC_PARK: &str = r#"
+extern "C" {
+    fn relax_retry_enter(name: *const u8, len: usize);
+    fn relax_retry_leave();
+}
+fn rethrown(f: impl FnOnce() + std::panic::UnwindSafe) {
+    if let Err(p) = std::panic::catch_unwind(f) {
+        std::panic::resume_unwind(p);
+    }
+}
+pub fn values(out: &mut [usize; 5]) {
+    out[0] = std::panic::catch_unwind(|| { let v: Vec<u32> = Vec::new(); std::hint::black_box(&v)[3] }).is_err() as usize;
+    out[1] = std::panic::catch_unwind(|| rethrown(|| panic!("caught after a rethrow"))).is_err() as usize;
+    out[2] = std::thread::spawn(|| { let x: Option<u32> = std::hint::black_box(None); x.unwrap() }).join().is_err() as usize;
+    out[3] = std::thread::spawn(|| rethrown(|| panic!("rethrown out of a thread"))).join().is_err() as usize;
+    let name = "Signal";
+    unsafe { relax_retry_enter(name.as_ptr(), name.len()) };
+    out[4] = std::panic::catch_unwind(|| panic!("at a retry boundary")).is_err() as usize;
+    unsafe { relax_retry_leave() };
+}
+"#;
+
+#[test]
+fn a_panic_parks_only_where_it_leaves_the_program() {
+    isolated_test!(a_panic_parks_only_where_it_leaves_the_program);
+    use std::sync::atomic::{AtomicBool, Ordering};
+    std::env::remove_var("RELAX_INSPECT");
+    std::env::set_var("RELAX_PANIC_PARK", "600");
+    crate::inspect::start("panic_park");
+    let stop = std::sync::Arc::new(AtomicBool::new(false));
+    let watcher = {
+        let stop = stop.clone();
+        std::thread::spawn(move || {
+            let mut seen: Vec<(String, String)> = Vec::new();
+            while !stop.load(Ordering::Relaxed) {
+                let now = crate::inspect::events::parked_now();
+                if !now.is_empty() {
+                    seen.extend(now.into_iter().map(|p| (p.3, p.4)));
+                    crate::inspect::events::quit_releases();
+                }
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            seen
+        })
+    };
+    let got: [usize; 5] = values(PANIC_PARK, "panic_park");
+    stop.store(true, Ordering::Relaxed);
+    let seen = watcher.join().unwrap();
+    let parked = |m: &str| seen.iter().filter(|p| p.0.contains(m)).count();
+    assert_eq!(got, [1; 5], "catch_unwind and join return each panic");
+    assert_eq!(parked("index out of bounds"), 0, "a panic catch_unwind catches parks nothing: {seen:?}");
+    assert_eq!(parked("caught after a rethrow"), 0, "nor one caught again after a rethrow: {seen:?}");
+    assert_eq!(parked("on a `None` value"), 1, "a panic that ends a thread parks: {seen:?}");
+    assert_eq!(parked("rethrown out of a thread"), 1, "a caught panic rethrown out of a thread parks once: {seen:?}");
+    assert!(seen.iter().any(|p| p.0.contains("rethrown out of a thread") && p.1.ends_with(":15:48")), "the rethrow's park says where the panic began: {seen:?}");
+    assert_eq!(parked("at a retry boundary"), 1, "a panic at a retry boundary parks: {seen:?}");
+}
+
 /// A constant's initializer that runs as code (ctfe.rs off) runs constant-evaluation twins (ctfe_twin.rs), which count rustc's const-eval steps;
 /// the program's own code is untouched: `count` called at run time counts nothing.
 const CTFE_TWINS: &str = r#"
