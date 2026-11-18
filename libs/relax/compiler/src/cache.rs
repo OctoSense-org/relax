@@ -2227,26 +2227,38 @@ impl Cache {
         self.closure_fps.get(&(file, expr)).copied()
     }
 
-    /// Item `item`'s closures in order, memoized per item and file version.
-    fn item_closures(&mut self, u: &Unit, item: DefId) -> std::sync::Arc<[u32]> {
-        let file = u.prog.def(item).file;
-        self.closure_ords.entry((item, file)).or_insert_with(|| crate::program::closure_exprs(&u.prog, item).into()).clone()
+    /// Item `item`'s closures in order in file version `file` (its current one, or an older one a
+    /// running closure names: program::item_in_version), memoized per item and file version.
+    /// None: the item has no item in that version.
+    fn item_closures(&mut self, u: &Unit, item: DefId, file: u32) -> Option<std::sync::Arc<[u32]>> {
+        if let Some(v) = self.closure_ords.get(&(item, file)) {
+            return Some(v.clone());
+        }
+        let at = crate::program::item_in_version(&u.prog, item, file)?;
+        let v: std::sync::Arc<[u32]> = crate::program::closure_exprs_at(&u.prog, file, at).into();
+        self.closure_ords.insert((item, file), v.clone());
+        Some(v)
     }
 
     /// Closure `expr` of `file` as its owner knows it, the way rustc's DefPath names a closure:
     /// its ordinal among the closures of the item that encloses it (`owner`, or the item a closure
     /// def `owner` is in) and its text, with no file version and no position -- a line added above
     /// it, or anywhere else in its file, leaves it the same closure (its code's entries still say
-    /// where it is: code keys hash the enclosing bodies' text and position). None: an async fn's
-    /// body, or an expression the item's closures do not hold (it keeps the file-keyed identity).
+    /// where it is: code keys hash the enclosing bodies' text and position). The ordinal is taken in
+    /// the file version the closure names: after a live edit commits its file, the owner's def is
+    /// the new version's while a running closure's type still names the old one, which the boot
+    /// parsed; counted there, it keeps the identity the boot gave it, whichever form an encode of it
+    /// came from (the startup image's, or a fresh one after the commit). None: an async fn's body,
+    /// an owner with no item in that version, or an expression the item's closures do not hold (it
+    /// keeps the file-keyed identity).
     fn closure_ordinal(&mut self, u: &Unit, owner: DefId, file: u32, expr: u32) -> Option<(u32, u64)> {
         if expr & crate::tcx::ASYNC_FN_BODY != 0 || (owner.0 as usize) >= u.prog.defs.len() { return None; }
         let item = closure_item(u, owner);
-        if u.prog.def(item).file != file {
+        let Some(closures) = self.item_closures(u, item, file) else {
             crate::gate::CLOSURE_ORDINAL_FILE_MISSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return None;
-        }
-        let ord = self.item_closures(u, item).iter().position(|&x| x == expr)? as u32;
+        };
+        let ord = closures.iter().position(|&x| x == expr)? as u32;
         Some((ord, closure_text_only_fp(u, file, expr)?))
     }
 
@@ -2256,7 +2268,7 @@ impl Cache {
         if (owner.0 as usize) >= u.prog.defs.len() { return None; }
         let item = closure_item(u, owner);
         let file = u.prog.def(item).file;
-        let expr = *self.item_closures(u, item).get(ord as usize)?;
+        let expr = *self.item_closures(u, item, file)?.get(ord as usize)?;
         (closure_text_only_fp(u, file, expr)? == fp).then_some((file, expr))
     }
 
@@ -9533,7 +9545,7 @@ mod data_tests {
         let method_slot = u.fn_id(FnKey::Inst(method, vec![]));
         keys.extend([FnKey::Inst(method, vec![]), FnKey::Plain(method_slot)]);
         let owner_file = u.prog.def(owner).file;
-        let owner_closures = cache.item_closures(&u, owner);
+        let owner_closures = cache.item_closures(&u, owner, owner_file).expect("the owner's closures");
         assert_eq!(owner_closures.len(), 2);
         keys.extend(owner_closures.iter().map(|&expr| FnKey::Closure(owner_file, expr, owner_slot)));
         // glue kinds: one byte below 0xFF, else the 0xFF escape and a u32 (constructors of variant

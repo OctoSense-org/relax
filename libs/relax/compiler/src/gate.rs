@@ -77,7 +77,7 @@ static DIGEST_NS: AtomicU64 = AtomicU64::new(0);
 static DIGEST_N: AtomicU64 = AtomicU64::new(0);
 /// cpu ns of lowering while a patch is open
 static PATCH_LOWER_NS: AtomicU64 = AtomicU64::new(0);
-/// Closure ordinals whose enclosing item belongs to a different file version.
+/// Closure ordinals whose owner has no item in the file version the closure names.
 pub(crate) static CLOSURE_ORDINAL_FILE_MISSES: AtomicU64 = AtomicU64::new(0);
 
 /// What this module holds of a run, as a fresh process has it (`run_end`).
