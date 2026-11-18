@@ -153,6 +153,19 @@ fn inlined_fn_versions_probes_and_pins() {
     });
     assert_eq!(unsafe { run(up, caller) }, 9984);
 
+    // ---- cache verify: caller's copy of leaf is one an edit of leaf rebuilds; with that edge
+    // gone (leaf no longer names caller a host: the bug class it looks for) it is the one
+    // untracked copy, named, unguarded (no live session) and among the recorded inputs
+    crate::owner::call(crate::owner::Class::Program, || {
+        let c = codever::check_copies(&u, &[caller], 8);
+        assert!(c.copies >= 1 && c.untracked == 0, "caller's copy of leaf is tracked: {} copies, {} untracked", c.copies, c.untracked);
+        let kept = std::mem::take(&mut u.fns[leaf as usize].history.get_or_insert_with(Default::default).inlined_into);
+        let c = codever::check_copies(&u, &[caller], 8);
+        u.fns[leaf as usize].history.get_or_insert_with(Default::default).inlined_into = kept;
+        assert_eq!((c.untracked, c.unguarded), (1, 1), "the copy whose edge is gone: {:?}", c.rows.iter().map(|r| r.0).collect::<Vec<_>>());
+        assert!(c.rows.iter().any(|r| r.0 == caller && r.1.contains(&leaf_d) && !r.2 && r.3), "named as leaf's copy in caller, recorded");
+    });
+
     // ---- count leaf: leaf's own code is instrumented; its inliners are rebuilt at their own tier
     // (caller at O3, caller2 at O1) without leaf inlined, so all calls count
     let (group, sites, inliners) = crate::inspect::instrument::count_for_test("inspect_tiers::leaf").unwrap();
