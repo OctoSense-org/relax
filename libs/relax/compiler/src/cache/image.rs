@@ -588,7 +588,7 @@ impl ImageTables {
     fn sym(&mut self, d: &mut D) -> Option<u32> {
         let s = d.p;
         match d.u8()? {
-            1 | 5 | 9 | 19 => {
+            1 | 5 | 9 => {
                 d.str()?;
             }
             2 | 10 => {
@@ -1917,6 +1917,7 @@ impl Linker {
         // what each slot's code references, as linked
         let mut refs: Vec<crate::jit::RefList> = (0..layout.len()).map(|_| Default::default()).collect();
         {
+            let env = &u.env;
             let syms = &u.syms;
             let im = &*im;
             unsafe {
@@ -1932,27 +1933,27 @@ impl Linker {
                                 ok = false;
                                 break;
                             };
-                            let target = match t {
+                            let v = match t {
                                 IMG_SLOT | IMG_THUNK | IMG_CALL => im.slot_of(ix).map(|x| {
                                     refs[k].slot(x, t == IMG_THUNK);
-                                    match t { IMG_SLOT => Reloc::Slot(x), IMG_CALL => Reloc::Call(x), _ => Reloc::Thunk(x) }
+                                    env.reloc_value(match t { IMG_SLOT => Reloc::Slot(x), IMG_CALL => Reloc::Call(x), _ => Reloc::Thunk(x) })
                                 }),
                                 IMG_SYM => im.fresh.get(&ri).copied().or_else(|| im.sym_sym.get(ix as usize).copied().flatten().flatten()).map(|s| {
                                     if live && (s.off == crate::jit::PATCH_FLAG_OFF || s.off == crate::jit::COPY_VER_OFF) {
                                         guards[k].push(s);
                                     }
-                                    refs[k].sym(s.id, syms.kind(s.id));
+                                    refs[k].sym(syms.kind(s.id));
                                     if is_vt.get(ix as usize).copied().unwrap_or(false) && !im.fresh.contains_key(&ri) {
                                         makes[k].push(syms.value(s));
                                     }
-                                    Reloc::Sym(s)
+                                    syms.value(s)
                                 }),
-                                IMG_TLS_KEY => Some(Reloc::TlsKey),
-                                IMG_TLS_SLOW => Some(Reloc::TlsSlow),
-                                _ => Some(Reloc::Resume),
+                                IMG_TLS_KEY => Some(env.reloc_value(Reloc::TlsKey)),
+                                IMG_TLS_SLOW => Some(env.reloc_value(Reloc::TlsSlow)),
+                                _ => Some(env.reloc_value(Reloc::Resume)),
                             };
-                            match target {
-                                Some(target) if (r_at as usize) < n => rl.push(RelocAt { at: r_at, kind, target }),
+                            match v {
+                                Some(v) if (r_at as usize) < n => rl.push(RelocAt { at: r_at, kind, target: Reloc::Value(v) }),
                                 _ => {
                                     ok = false;
                                     break;

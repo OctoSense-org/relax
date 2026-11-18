@@ -341,10 +341,6 @@ impl<'a, I: Ids + ?Sized> Resolver<'a, I> {
                 h.u8(17);
                 h.str(&n);
             }
-            SymKind::Note(n) => {
-                h.u8(18);
-                h.str(&n);
-            }
         }
         Some(h.finish128())
     }
@@ -736,7 +732,6 @@ fn sym_name(u: &Unit, y: u32) -> String {
         Some(SymKind::SbTls(s)) => format!("SbTls symbol #{s}"),
         Some(SymKind::SbTable) => "SbTable".to_string(),
         Some(SymKind::SbHost(n)) => format!("SbHost {n}"),
-        Some(SymKind::Note(n)) => format!("Note {n}"),
         None => "no kind recorded".to_string(),
     };
     format!("symbol #{y} {name}")
