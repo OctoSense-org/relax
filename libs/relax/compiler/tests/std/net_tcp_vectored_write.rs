@@ -1,10 +1,11 @@
 //! A TcpStream's vectored write sends its buffers in one call, as real std's writev(2) does: the
 //! bytes of every buffer in order, empty ones skipped, and at most the OS's limit of buffers in
-//! one call (1024 on Linux and Apple targets), through the stream and through `&TcpStream`. Relax's
-//! std had the trait's default, which writes the first non-empty buffer alone, so a caller that
-//! trusts one vectored write to take a whole small message lost the rest (relax PR 233).
+//! one call (1024 on Linux and Apple targets), through the stream, through `&TcpStream` and from
+//! the accepted side. Relax's std had the trait's default, which writes the first non-empty buffer
+//! alone, so a caller that trusts one vectored write to take a whole small message lost the rest
+//! (relax PR 233). A differential file of agree.sh's `named` list.
 #![cfg(unix)]
-use std::io::{IoSlice, Read, Write};
+use std::io::{ErrorKind, IoSlice, Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
 
 #[test]
@@ -34,7 +35,13 @@ fn a_vectored_write_sends_every_buffer() {
         IoSlice::advance_slices(&mut rest, n);
     }
     tx.shutdown(Shutdown::Write).unwrap();
-    assert!(tx.write_vectored(&parts).is_err(), "a write after the write half's shutdown fails");
+    let after = tx.write_vectored(&parts).unwrap_err();
+    assert_eq!(after.kind(), ErrorKind::BrokenPipe, "a write after the write half's shutdown is EPIPE: {after}");
+    // the accepted socket writes the same way (its read half is open on the other side)
+    assert_eq!(rx.write_vectored(&parts).unwrap(), 10, "a vectored write from the accepted socket");
+    let mut back = [0u8; 10];
+    tx.read_exact(&mut back).unwrap();
+    assert_eq!(&back, b"head:body;", "the connecting side reads the accepted side's buffers");
     let mut got = Vec::new();
     rx.read_to_end(&mut got).unwrap();
     let mut want = b"head:body;body;".to_vec();

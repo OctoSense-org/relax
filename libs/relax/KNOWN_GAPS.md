@@ -294,3 +294,30 @@ pub fn first(v: &[u8]) -> u8 {
 
 Start in types/src/lint_late2.rs (the unsafe block lint) and how lint::external and expansion_kind
 classify the tokens an attribute macro passes on from its input.
+
+## 15. A vectored write sends only its first non-empty buffer, outside TcpStream
+
+`write_vectored` with several non-empty buffers, on a writer whose Relax impl is `io::Write`'s
+default:
+
+```rust
+use std::io::{IoSlice, Write};
+fn main() {
+    let parts = [IoSlice::new(b"a"), IoSlice::new(b"b\n")];
+    let mut out: Box<dyn Write> = Box::new(std::io::stdout());
+    println!("{}", out.write_vectored(&parts).unwrap());
+}
+```
+
+- rustc: one call takes every buffer, so this prints `ab`, then `3`, on two lines. The unix fds
+  (File, Stdout, Stderr, UnixStream, PipeWriter, ChildStdin) do one writev(2), Windows' TcpStream
+  does one WSASend, and `&mut W` and `Box<W>` pass the call on to the writer.
+- Relax: only TcpStream on unix has its own (net/socket_unix.rs `write_vectored`). Every other
+  writer, and any writer behind `&mut W` or `Box<W>` (io/mod.rs), writes the first non-empty
+  buffer, so this prints `a1`: the first buffer, then the count 1. That is a short write, not an
+  error, so `write_all` loops still work; a caller that takes one vectored write for the whole
+  message loses the rest.
+
+Start in io/mod.rs: forward `write_vectored` in the `&mut W` and `Box<W>` impls. Then give the unix
+fds a writev, as net/socket_unix.rs does. Windows' File, Stdout and pipes keep the default, as in
+rustc's std.
