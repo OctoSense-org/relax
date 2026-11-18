@@ -114,6 +114,14 @@ if [ "$GOT" = "$(cat "$D/expect-fuel.out")" ]; then echo "modules fuel: PASS"; e
 OUT=$("$1" test --allow-module-fuel=1000000 "$D/fuel_cleanup.rs" 2>&1)
 GOT=$(echo "$OUT" | grep '^out ')
 if [ "$GOT" = "$(cat "$D/expect-fuel-cleanup.out")" ]; then echo "modules fuel cleanup: PASS"; else echo "modules fuel cleanup: FAIL"; echo "$GOT"; echo "$OUT" | grep -v '^  report' | tail -8; FAILS=$((FAILS + 1)); fi
+# Metering follows the grant: metered, a long call is charged and its Budget stops it; unmetered,
+# the module's code pays no fuel, so the same call is charged nothing and completes.
+for GRANT in "" --allow-unmetered-modules; do
+OUT=$("$1" test $GRANT "$D/unmetered.rs" 2>&1)
+GOT=$(echo "$OUT" | grep '^out ')
+if [ -z "$GRANT" ]; then WANT=$'out long call completes: false\nout stopped for fuel: true\nout fuel charged: true'; else WANT=$'out long call completes: true\nout stopped for fuel: false\nout fuel charged: false'; fi
+if [ "$GOT" = "$WANT" ]; then echo "modules metering (${GRANT:-metered}): PASS"; else echo "modules metering (${GRANT:-metered}): FAIL"; echo "$GOT"; echo "$OUT" | grep -v '^  report' | tail -8; FAILS=$((FAILS + 1)); fi
+done
 bash "$D/milk.sh" "$1" || FAILS=$((FAILS + 1))
 OUT=$("$1" test --allow-unmetered-modules "$D/deadline.rs" 2>&1)
 STATUS=$?

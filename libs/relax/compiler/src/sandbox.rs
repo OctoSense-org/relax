@@ -199,6 +199,11 @@ pub use relax_base::compile_time::{policy, set_policy, Policy};
 /// arena may set a per-call budget).
 pub const MODULES: Domain = Domain { name: "modules", allow: modules_allow, fuel: true, clean_up: false };
 
+/// The run-time modules' domain under `--allow-unmetered-modules` (`Options::sandbox_fuel` off):
+/// `MODULES`' policy, its twins without any fuel accounting. A name of its own, so a metered
+/// unit never links code made for this one.
+pub const MODULES_UNMETERED: Domain = Domain { name: "modules-unmetered", allow: modules_allow, fuel: false, clean_up: false };
+
 fn modules_allow(_: &str) -> Option<Option<(&'static str, u64)>> {
     None
 }
@@ -374,9 +379,10 @@ fn with_sb<R>(u: &Unit, f: impl FnOnce(&mut Sb) -> R) -> R {
 }
 
 /// Marks crates of unit `up` whose code runs only as twins (a module's crate; std's are added
-/// with the first), in the run-time modules' domain.
+/// with the first), in the run-time modules' domain: metered unless the run was granted
+/// unmetered modules.
 pub unsafe fn add_sandboxed_crate(up: *mut Unit, krate: u32) -> Result<(), String> {
-    sb_init(up, MODULES)?;
+    sb_init(up, if (&*up).prog.session.options.sandbox_fuel { MODULES } else { MODULES_UNMETERED })?;
     let u = &*up;
     let std_crates: Vec<u32> = (0..u.prog.crates.len() as u32).filter(|&c| matches!(u.prog.syms.str(u.prog.crates[c as usize].name), "core" | "alloc" | "std")).collect();
     with_sb(u, |s| {
