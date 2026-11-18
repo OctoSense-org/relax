@@ -40,11 +40,14 @@ STATUS=$?
 GOT=$(echo "$OUT" | grep '^out ')
 if [ "$STATUS" = 0 ] && [ "$GOT" = $'out concurrent guards: true\nout nested guards: true' ]; then echo "modules guard threads: PASS"; else echo "modules guard threads: FAIL"; echo "$OUT" | tail -30; FAILS=$((FAILS + 1)); fi
 # O3 keeps a twin's guarantees: fuel charges and stops, memory bounds and indirect calls are the
-# same with O3 off and with the twins' O3 code installed (tiers.rs waits for it).
+# same with O3 off and with the twins' O3 code installed (tiers.rs waits for it; each twin it
+# warms must have been installed).
 SE=$(mktemp); PROG=$(mktemp -u)
 LOW=$(RELAX_O3=0 "$1" test --allow-unchecked-modules "$D/tiers.rs" 2>/dev/null | grep '^out ')
 HIGH=$(RELAX_O3=1 RELAX_O3_CALLS=100 RELAX_O3_TRACE=1 RELAX_O3_PROGRESS="$PROG" "$1" test --allow-unchecked-modules "$D/tiers.rs" 2>"$SE" | grep '^out ')
-if [ -n "$LOW" ] && [ "$LOW" = "$HIGH" ] && grep -q '^tier1: sandbox:tiers::mix installed' "$SE"; then echo "modules tiers (O3 against O3 off): PASS"; else echo "modules tiers (O3 against O3 off): FAIL"; diff <(echo "$LOW") <(echo "$HIGH"); grep -c '^tier1: sandbox:tiers::' "$SE"; tail -8 "$SE"; FAILS=$((FAILS + 1)); fi
+MISSING=""
+for F in mix fill zero zero_const table read_at write_at call_at; do grep -q "^tier1: sandbox:tiers::$F installed" "$SE" || MISSING="$MISSING $F"; done
+if [ -n "$LOW" ] && [ "$LOW" = "$HIGH" ] && [ -z "$MISSING" ]; then echo "modules tiers (O3 against O3 off): PASS"; else echo "modules tiers (O3 against O3 off): FAIL"; echo "  twins without O3 code:${MISSING:- none}"; diff <(echo "$LOW") <(echo "$HIGH"); grep -c '^tier1: sandbox:tiers::' "$SE"; tail -8 "$SE"; FAILS=$((FAILS + 1)); fi
 rm -f "$SE" "$PROG" "$PROG.tmp"
 # Exercise the sandbox wrappers/twins and the trusted host-code inlining path.
 for TRUSTED in 0 1; do
