@@ -1739,6 +1739,9 @@ pub fn hold_build(dir: &Path) {
         }
         // a prune that retired this build meanwhile removed the file it held: lock the new one
         if still_at(&f, &p) {
+            // stamped when taken: a tool that holds a timed series' builds between its runs
+            // (devhub exec.rs hold_series) tells by it which builds a run took
+            let _ = f.set_modified(std::time::SystemTime::now());
             held.insert(dir.to_path_buf(), f);
             return;
         }
