@@ -536,6 +536,93 @@ fn a_panic_parks_only_where_it_leaves_the_program() {
     assert_eq!(parked("at a retry boundary"), 1, "a panic at a retry boundary parks: {seen:?}");
 }
 
+/// A panic through a restartable fn (`restartable <fn>`) parks even where the program catches it
+/// (the one deciding asked), and each decision does what it says: `restart` runs the fn again
+/// from its entry, `return <v>` makes the call return v, `panic` unwinds on to the catch. Every
+/// frame's drops run on the way, innermost first, as rustc's unwinder runs them (digits of the
+/// log: leaf 1, mid's box 2, mid 3, the fn's inner block 4, the fn 5).
+const RESTARTABLE: &str = r#"
+use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+static LOG: AtomicUsize = AtomicUsize::new(0);
+static ATTEMPT: AtomicUsize = AtomicUsize::new(0);
+struct G(usize);
+impl Drop for G {
+    fn drop(&mut self) { LOG.store(LOG.load(SeqCst) * 10 + self.0, SeqCst); }
+}
+#[inline(never)]
+fn leaf(n: usize) -> u64 { let _g = G(1); if std::hint::black_box(n) > 0 { panic!("attempt {n}") } 0 }
+#[inline(never)]
+fn mid(n: usize) -> u64 { let _a = G(3); let _b = Box::new(G(2)); let r = leaf(n); let _c = G(9); r }
+#[inline(never)]
+pub fn restartable_work(x: u64) -> u64 {
+    if x == 0 { return 0; }
+    let _w = G(5);
+    let n = ATTEMPT.fetch_add(1, SeqCst) + 1;
+    if n != 2 { let _i = G(4); mid(n); }
+    x + 1000
+}
+pub fn values(out: &mut [usize; 7]) {
+    restartable_work(0);
+    let (ready, go) = (std::env::var("RESTART_READY").unwrap(), std::env::var("RESTART_GO").unwrap());
+    std::fs::write(&ready, "").unwrap();
+    while !std::path::Path::new(&go).exists() { std::thread::sleep(std::time::Duration::from_millis(2)); }
+    out[0] = std::panic::catch_unwind(|| restartable_work(7)).unwrap_or(0) as usize;
+    out[1] = LOG.swap(0, SeqCst);
+    out[2] = std::panic::catch_unwind(|| restartable_work(7)).unwrap_or(0) as usize;
+    out[3] = LOG.swap(0, SeqCst);
+    out[4] = std::panic::catch_unwind(|| restartable_work(7)).is_err() as usize;
+    out[5] = LOG.swap(0, SeqCst);
+    out[6] = ATTEMPT.load(SeqCst);
+}
+"#;
+
+#[test]
+fn a_panic_through_a_restartable_fn_restarts_returns_or_unwinds_as_decided() {
+    isolated_test!(a_panic_through_a_restartable_fn_restarts_returns_or_unwinds_as_decided);
+    use std::sync::atomic::{AtomicBool, Ordering};
+    std::env::remove_var("RELAX_INSPECT");
+    std::env::set_var("RELAX_PANIC_PARK", "600");
+    crate::inspect::start("restartable");
+    let dir = std::env::temp_dir().join(format!("relax-restartable-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let (ready, go) = (dir.join("ready"), dir.join("go"));
+    std::env::set_var("RESTART_READY", &ready);
+    std::env::set_var("RESTART_GO", &go);
+    let stop = std::sync::Arc::new(AtomicBool::new(false));
+    let decider = {
+        let (stop, go) = (stop.clone(), go.clone());
+        std::thread::spawn(move || {
+            let say = |f: fn(&crate::inspect::Req, &mut crate::inspect::Out), line: &str| String::from_utf8_lossy(&makepad_remote::cmd::answer(f, line)).into_owned();
+            let wait = |until: &mut dyn FnMut() -> bool| {
+                while !until() && !stop.load(Ordering::Relaxed) {
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+            };
+            // armed once the program's first call compiled the fn
+            wait(&mut || ready.exists());
+            let armed = say(crate::inspect::instrument::cmd, "restartable restartable_work");
+            std::fs::write(&go, "").unwrap();
+            let mut decided = Vec::new();
+            for how in ["restart", "return 4242", "panic"] {
+                let mut id = None;
+                wait(&mut || { id = crate::inspect::events::parked_now().first().map(|p| p.0); id.is_some() });
+                let Some(id) = id else { break };
+                decided.push((how, say(crate::inspect::events::cmd_resume, &format!("resume P{id} {how}"))));
+                wait(&mut || !crate::inspect::events::parked_now().iter().any(|p| p.0 == id));
+            }
+            (armed, decided)
+        })
+    };
+    let got: [usize; 7] = values(RESTARTABLE, "restartable");
+    stop.store(true, Ordering::Relaxed);
+    let (armed, decided) = decider.join().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(got[6], 4, "four attempts: one restarted, then a return, then an unwind (armed: {armed}; decided: {decided:?})");
+    assert_eq!((got[0], got[1]), (1007, 123455), "restart: the fn ran again and returned, its frames' drops ran first ({decided:?})");
+    assert_eq!((got[2], got[3]), (4242, 12345), "return 4242: the call returned it ({decided:?})");
+    assert_eq!((got[4], got[5]), (1, 12345), "panic: it unwound on to the catch ({decided:?})");
+}
+
 /// A constant's initializer that runs as code (ctfe.rs off) runs constant-evaluation twins (ctfe_twin.rs), which count rustc's const-eval steps;
 /// the program's own code is untouched: `count` called at run time counts nothing.
 const CTFE_TWINS: &str = r#"
