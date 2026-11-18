@@ -107,6 +107,13 @@ pub struct Env {
 }
 
 impl Env {
+    /// The environment of standalone code (code outside Relax's Rust JIT): no function slots, no
+    /// thread-local block, no resume trampoline, no symbol table; host calls go through pool words, so
+    /// the code is position independent. `opt_regs`: thorough register allocation.
+    pub fn standalone(opt_regs: bool) -> Env {
+        Env { slots: SlotsPtr::NONE, tls_key: 0, tls_slow: 0, resume: 0, opt_regs, syms: 0, sym_class: 0, near: false }
+    }
+
     /// The current value of a relocated word.
     pub fn reloc_value(&self, r: Reloc) -> u64 {
         match r {
@@ -7392,7 +7399,7 @@ mod tests {
         push(&mut f, b4, Inst::Iconst(one, 1));
         f.blocks[b4 as usize].term = Term::Ret(vec![one]);
         f.blocks[b5 as usize].term = Term::Ret(vec![x]);
-        let env = Env { slots: SlotsPtr::NONE, tls_key: 0, tls_slow: 0, resume: 0, opt_regs: true, syms: 0, sym_class: 0, near: false };
+        let env = Env::standalone(true);
         let r = compile(options, &f, &env).expect("compiles");
         let code = &r.code[..r.text_len as usize];
         // add r64, 12: REX.W(+B) 83 /0 ib
@@ -7428,7 +7435,7 @@ mod tests {
             f.blocks[b0 as usize].insts.push(Inst::IBinI(op, u64t, p, p, k));
             f.blocks[b0 as usize].pos.push(0);
             f.blocks[b0 as usize].term = Term::Ret(vec![p]);
-            let env = Env { slots: SlotsPtr::NONE, tls_key: 0, tls_slow: 0, resume: 0, opt_regs: true, syms: 0, sym_class: 0, near: false };
+            let env = Env::standalone(true);
             let r = compile(options, &f, &env).expect("compiles");
             let code = &r.code[..r.text_len as usize];
             // no REX.W 81 /n with an imm32 that is not k (the truncated constant)

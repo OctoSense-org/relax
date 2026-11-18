@@ -333,6 +333,13 @@ pub struct Env {
 }
 
 impl Env {
+    /// The environment of standalone code (code outside Relax's Rust JIT): no function slots, no
+    /// thread-local block, no resume trampoline, no symbol table; host calls go through pool words, so
+    /// the code is position independent. `opt_regs`: thorough register allocation.
+    pub fn standalone(opt_regs: bool) -> Env {
+        Env { slots: SlotsPtr::NONE, tls_key: 0, tls_slow: 0, resume: 0, opt_regs, syms: 0, sym_class: 0, near: false }
+    }
+
     /// The current value of a relocated word.
     pub fn reloc_value(&self, r: Reloc) -> u64 {
         match r {
@@ -6207,7 +6214,7 @@ mod tests {
         }
         f.blocks[b1 as usize].term = Term::Ret(vec![acc]);
         f.blocks[b2 as usize].term = Term::Ret(vec![p]);
-        let env = Env { slots: SlotsPtr::NONE, tls_key: 0, tls_slow: 0, resume: 0, opt_regs: true, syms: 0, sym_class: 0, near: false };
+        let env = Env::standalone(true);
         let r = compile(options, &f, &env).expect("relaxed");
         let w: Vec<u32> = r.code[..r.text_len as usize].chunks(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
         // the entry block's branch on p: cbz/cbnz skipping one word, then `b` beyond 1 MB
@@ -6250,7 +6257,7 @@ mod tests {
     #[cfg(target_arch = "aarch64")]
     fn single_bit_branches_use_tbz_and_fall_back_past_its_range() {
         let options = &relax_session::Options::default();
-        let env = Env { slots: SlotsPtr::NONE, tls_key: 0, tls_slow: 0, resume: 0, opt_regs: true, syms: 0, sym_class: 0, near: false };
+        let env = Env::standalone(true);
         for (bit, filler) in [(0u32, 0usize), (13, 0), (31, 0), (32, 0), (63, 0), (5, 12_000), (40, 12_000)] {
             let mut f = Func::new("tbz".to_string(), 0);
             let p = f.vreg(Cls::I);
@@ -6318,7 +6325,7 @@ mod tests {
         f.blocks[b2 as usize].insts.push(Inst::IBinI(IOp::Add, it, s2, s, 1));
         f.blocks[b2 as usize].pos.push(0);
         f.blocks[b2 as usize].term = Term::Ret(vec![s2]);
-        let env = Env { slots: SlotsPtr::NONE, tls_key: 0, tls_slow: 0, resume: 0, opt_regs: true, syms: 0, sym_class: 0, near: false };
+        let env = Env::standalone(true);
         let r = compile(options, &f, &env).expect("compiles");
         let w: Vec<u32> = r.code[..r.text_len as usize].chunks(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
         let csel = |x: u32| x & 0x7FE0_0C00 == 0x1A80_0000;
@@ -6362,7 +6369,7 @@ mod tests {
             }
             f.blocks[b1 as usize].term = Term::Ret(vec![acc]);
             f.blocks[b2 as usize].term = Term::Ret(vec![p]);
-            let env = Env { slots: SlotsPtr::NONE, tls_key: 0, tls_slow: 0, resume: 0, opt_regs: true, syms: 0, sym_class: 0, near: false };
+            let env = Env::standalone(true);
             let r = compile(options, &f, &env).expect("relaxed");
             let w: Vec<u32> = r.code[..r.text_len as usize].chunks(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
             // the first conditional branch skips one word; a `b` beyond 1 MB follows
