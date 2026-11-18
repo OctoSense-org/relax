@@ -45,6 +45,7 @@ pub(crate) enum DigestOrigin {
     Linked,
     O3First,
     O3,
+    PatchBuild,
 }
 
 impl DigestOrigin {
@@ -56,6 +57,7 @@ impl DigestOrigin {
             Self::Linked => "linked",
             Self::O3First => "O3 first",
             Self::O3 => "O3",
+            Self::PatchBuild => "patch build",
         }
     }
 }

@@ -7463,6 +7463,8 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
     let mut pre: Vec<(u32, Result<Code, String>)> = Vec::new();
     let mut pending_ahead: Vec<u32> = Vec::new();
     let mut pre_n = 0usize;
+    // (what an earlier patch built and did not install is not this one's)
+    crate::zone_alloc::kept_with(|| u.built_digests.clear());
     if errs.is_empty() {
         for &id in slots.iter().chain(fresh.iter()) {
             // SPEC-V: the edited bodies have no verdict for their new text yet: flagged before any
@@ -7511,7 +7513,10 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
         }
         for id in twins {
             match compile_guarded(up, id) {
-                Ok(c) => staged.push((id, c)),
+                Ok(c) => {
+                    jit::keep_built_digest(up, id);
+                    staged.push((id, c));
+                }
                 Err(e) => {
                     let u = &*up;
                     errs.push(format!("{}: {}", u.fns[id as usize].name, e));
@@ -7867,7 +7872,10 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
         }
         for id in twins {
             match compile_guarded(up, id) {
-                Ok(c) => staged.push((id, c)),
+                Ok(c) => {
+                    jit::keep_built_digest(up, id);
+                    staged.push((id, c));
+                }
                 Err(e) => errs.push(format!("{}: {}", (&*up).fns[id as usize].name, e)),
             }
         }
@@ -8168,6 +8176,7 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
             Err(e) => out.lines.push(format!("link error in {}: {}", (&*up).fns[id as usize].name, e)),
         }
     }
+    crate::zone_alloc::kept_with(|| (&mut *up).built_digests.clear());
     // (the slots outside the real-time set are its walk's to take from here: their new code is in)
     drop(rt);
     for (id, target, cell) in forwards {

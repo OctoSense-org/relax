@@ -434,6 +434,11 @@ pub struct Unit {
     /// first query (a reload), kept current from then on; a run without a reload never builds it
     reload_slots: relax_session::sync::Mutex<Option<ReloadSlots>>,
     pub(crate) reload_rir: Option<std::collections::HashSet<u32>>,
+    /// A patch's builds (live sessions, gate.rs): per slot, the digest of the RIR its new code was
+    /// built from, noted at that code's install. The slot's own RIR may be gone by then (the RIR
+    /// sweep drops a compiled slot's between the build and the install), and a digest read from it
+    /// would name another build's anyway.
+    pub(crate) built_digests: std::collections::HashMap<u32, std::sync::Arc<crate::gate::CodeDigest>>,
     pub(crate) reload_errors: std::collections::HashSet<u32>,
     pub(crate) reload_specs: std::collections::HashSet<u32>,
     /// the slots in flight (Fn::inflight)
@@ -5782,6 +5787,7 @@ impl Unit {
             fns: crate::conc::AppendVec::new_slots(u32::MAX as usize + 1),
             reload_slots: Default::default(),
             reload_rir: None,
+            built_digests: Default::default(),
             reload_errors: Default::default(),
             reload_specs: Default::default(),
             flights: Default::default(),
@@ -11444,12 +11450,33 @@ unsafe fn note_linked_digest(up: *mut Unit, id: u32, d: Option<std::sync::Arc<cr
     code.note_digest(at, d, crate::gate::DigestOrigin::Linked);
 }
 
+/// A patch's code for slot `id`, installed at `at`: the digest of the RIR it was built from
+/// (Unit::built_digests), in place of what the install read from the slot.
+fn note_built_digest(u: &mut Unit, id: u32, at: u64) {
+    let Some(d) = crate::zone_alloc::kept_with(|| u.built_digests.remove(&id)) else { return };
+    u.code.write().unwrap_or_else(|e| e.into_inner()).note_digest(at, Some(d), crate::gate::DigestOrigin::PatchBuild);
+}
+
+/// A patch built slot `id`'s code from the RIR it holds now (compile_fn under the lock): that RIR's
+/// digest goes with the code to its install (Unit::built_digests).
+pub(crate) unsafe fn keep_built_digest(up: *mut Unit, id: u32) {
+    if !crate::gate::keeping() {
+        return;
+    }
+    let u = &mut *up;
+    if let Some(r) = &u.fns[id as usize].rir {
+        let d = crate::gate::of_func(r);
+        crate::zone_alloc::kept_with(|| u.built_digests.insert(id, d));
+    }
+}
+
 pub(crate) unsafe fn install_patched(up: *mut Unit, id: u32, code: &[u8], map: Vec<(u32, u64)>, relocs: &[relax_backend::rir::RelocAt], gen: u32) -> Result<u64, String> {
     let u = &mut *up;
     let t = if u.fns[id as usize].rir.as_ref().is_some_and(|r| r.baseline) { tier::BASELINE } else { tier::O1 };
     let _as = code_as(CodeKind::new(t, origin::PATCH));
     let old = crate::gate::before_install(u, id);
     let a = u.install(id, code, relocs, map, gen)?;
+    note_built_digest(u, id, a);
     crate::gate::installed(u, id, old, a);
     if matches!(u.fns[id as usize].key, FnKey::Sandbox(_)) {
         u.rearm_sandbox_counter(id, a);
@@ -11468,6 +11495,7 @@ pub(crate) unsafe fn install_unforwarded(up: *mut Unit, id: u32, code: &[u8], ma
     let _as = code_as(CodeKind::new(t, origin::PATCH));
     let old = crate::gate::before_install(u, id);
     let a = u.install_code(id, code, relocs, map, gen)?;
+    note_built_digest(u, id, a);
     crate::gate::installed(u, id, old, a);
     u.arm_after_patch(id, a);
     Ok(a)
@@ -27404,7 +27432,8 @@ pub(crate) unsafe fn compile_batch_off_lock(up: *mut Unit, ids: &[u32], threads:
         (x64::Env { slots: e.slots, tls_key: e.tls_key, tls_slow: e.tls_slow, resume: e.resume, opt_regs: !TIER1_ENABLED.load(Ordering::Relaxed), syms: e.syms, sym_class: e.sym_class, near: e.near }, u.opt.fold, u.opt.layout)
     };
     // back ends, off the unit (on helper threads; the owner serves requests meanwhile)
-    type Built = (u32, Result<(Option<(std::sync::Arc<relax_backend::rir::Func>, Vec<(u32, usize)>, u64)>, Vec<u8>, Vec<(u32, u64)>, Vec<relax_backend::rir::RelocAt>), String>, Vec<Deferred>);
+    type Digest = Option<std::sync::Arc<crate::gate::CodeDigest>>;
+    type Built = (u32, Result<(Option<(std::sync::Arc<relax_backend::rir::Func>, Vec<(u32, usize)>, u64)>, Vec<u8>, Vec<(u32, u64)>, Vec<relax_backend::rir::RelocAt>, Digest), String>, Vec<Deferred>);
     let next = std::sync::atomic::AtomicUsize::new(0);
     let results: relax_session::sync::Mutex<Vec<Built>> = relax_session::sync::Mutex::new(Vec::new());
     let work_cells: Vec<relax_session::sync::Mutex<Option<(u32, Front, String, Lc)>>> = work.into_iter().map(|w| relax_session::sync::Mutex::new(Some(w))).collect();
@@ -27454,7 +27483,9 @@ pub(crate) unsafe fn compile_batch_off_lock(up: *mut Unit, ids: &[u32], threads:
                         };
                         note_frame(id, c.frame_size, slot_bytes(&cg), false);
                         dump_o1(&cg, &c);
-                        Ok((opt, c.code, c.pc_map, c.relocs))
+                        // (live sessions: the digest of what this code was built from goes with it)
+                        let digest = crate::gate::keeping().then(|| crate::gate::of_func(&rir));
+                        Ok((opt, c.code, c.pc_map, c.relocs, digest))
                     }));
                     let r = match r {
                         Ok(r) => r,
@@ -27488,12 +27519,16 @@ pub(crate) unsafe fn compile_batch_off_lock(up: *mut Unit, ids: &[u32], threads:
             }
         }
         match r {
-            Ok((opt, code, map, relocs)) => {
+            Ok((opt, code, map, relocs, digest)) => {
                 if let Some((f, inl, ns)) = opt {
                     if (&*up).fns[id as usize].rir.is_none() {
                         let f = std::sync::Arc::try_unwrap(f).unwrap_or_else(|a| (*a).clone());
                         store_rir(up, id, f, inl, ns, RIR_OWN);
                     }
+                }
+                if let Some(d) = digest {
+                    let u = &mut *up;
+                    crate::zone_alloc::kept_with(|| u.built_digests.insert(id, d));
                 }
                 out.push((id, Ok((code, map, relocs))));
             }
