@@ -212,6 +212,14 @@ pub fn point_of(key: &[u8; X963_KEY_LEN]) -> [u8; 65] {
     p
 }
 
+/// P-256 ECDH, then HMAC over the context and the two public points in canonical order.
+pub fn shared_key(key: &[u8; X963_KEY_LEN], peer: &[u8; 65], context: &str) -> io::Result<[u8; 32]> {
+    let raw = tls::ecdh_p256(key, peer)?;
+    let mine = point_of(key);
+    let (a, b) = if mine <= *peer { (mine, *peer) } else { (*peer, mine) };
+    Ok(crate::tunnel::hmac_sha256(&raw, format!("{TAG} shared|{context}|{}|{}", to_hex(&a), to_hex(&b)).as_bytes()))
+}
+
 // --- credentials --------------------------------------------------------------------
 
 /// A machine's credential: public; useful only with the machine's key.
@@ -659,10 +667,7 @@ impl Me {
     /// A key only this machine and the holder of `peer`'s key can compute
     /// (P-256 ECDH, then HMAC over `context` and both public points).
     pub fn shared_key(&self, peer: &[u8; 65], context: &str) -> io::Result<[u8; 32]> {
-        let raw = tls::ecdh_p256(&self.key, peer)?;
-        let mine = point_of(&self.key);
-        let (a, b) = if mine <= *peer { (mine, *peer) } else { (*peer, mine) };
-        Ok(crate::tunnel::hmac_sha256(&raw, format!("{TAG} shared|{context}|{}|{}", to_hex(&a), to_hex(&b)).as_bytes()))
+        shared_key(&self.key, peer, context)
     }
 }
 
