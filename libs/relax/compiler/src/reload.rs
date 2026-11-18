@@ -11310,6 +11310,17 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
         let settled_stamps = last;
         // (what settled may be a held landing's: it waits, the rest applies)
         changed.retain(|&k| !held_back(&files[k].0, true));
+        // The lockfile as the run's own native build left it is no edit (cargo brought it up to
+        // date, or made it in a tree without one: native.rs OWN_LOCKS): taken as it is. While that
+        // cargo still runs, a later round looks at it again.
+        changed.retain(|&k| match inputs.is_manifest(&files[k].0).then(|| crate::native::own_lock(&files[k].0)).flatten() {
+            Some(crate::native::OwnLockState::Building) => false,
+            Some(crate::native::OwnLockState::Left(left)) if left == settled_stamps[k] => {
+                files[k].2 = left;
+                false
+            }
+            _ => true,
+        });
         if changed.is_empty() && !quiet_retry {
             continue;
         }
