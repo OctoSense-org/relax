@@ -1074,6 +1074,11 @@ pub struct Cache {
     slot_keys: HashMap<u32, Option<u128>>,
     /// An unnamed image slot must not cache a failed key before its identity is decoded.
     key_waits: bool,
+    /// The re-key's comparison (linked_readers): a closure of a file version a live edit committed
+    /// takes its ordinal form, as the boot's text names the same closure (its owner, its ordinal
+    /// among the owner's closures, its text), so a slot over a closure the edit left alone keeps
+    /// its key. Such a key is only compared: it is never remembered (key_waits) nor stored.
+    ordinal_in_edits: bool,
     /// a slot's encoded key (None: not encodable), and encoded keys already decoded to slots
     fnkey_bytes: HashMap<u32, Option<Vec<u8>>>,
     /// borrow-check verdicts recorded by this run (not flushed yet)
@@ -1467,6 +1472,7 @@ impl Cache {
             linked_key: HashMap::new(),
             slot_keys: HashMap::new(),
             key_waits: false,
+            ordinal_in_edits: false,
             last_callees: Vec::new(),
             last_tier1: None,
             last_kept: Vec::new(),
@@ -2490,7 +2496,10 @@ impl Cache {
                     let item = closure_item(u, d);
                     if !v.contains(&item) { v.push(item); }
                 }
-                if let Some((ord, fp)) = def.filter(|_| !u.prog.is_edit_version(file)).and_then(|d| self.closure_ordinal(u, d, file, expr)) {
+                let edit = u.prog.is_edit_version(file);
+                if let Some((ord, fp)) = def.filter(|_| !edit || self.ordinal_in_edits).and_then(|d| self.closure_ordinal(u, d, file, expr)) {
+                    // (an edit version's closure, named for the re-key's comparison: not remembered)
+                    if edit { self.key_waits = true; }
                     e.u8(if coroutine { 30 } else { 28 });
                     crates.push(u.prog.file_crate.get(file as usize).copied().unwrap_or(0));
                     self.enc_ty(u, owner, e, crates, depth + 1)?;
@@ -2903,7 +2912,10 @@ impl Cache {
                 }
                 // its owner's closure ordinal, as rustc names it (closure_ordinal)
                 let owner = key_defs(u, &u.fns[parent as usize].key).first().copied();
-                if let Some((ord, fp)) = owner.filter(|_| !u.prog.is_edit_version(file)).and_then(|o| self.closure_ordinal(u, o, file, expr)) {
+                let edit = u.prog.is_edit_version(file);
+                if let Some((ord, fp)) = owner.filter(|_| !edit || self.ordinal_in_edits).and_then(|o| self.closure_ordinal(u, o, file, expr)) {
+                    // (an edit version's closure, named for the re-key's comparison: not remembered)
+                    if edit { self.key_waits = true; }
                     e.u8(KeyKind::Closure as u8);
                     crates.push(u.prog.file_crate.get(file as usize).copied().unwrap_or(0));
                     e.u32(ord);
@@ -12447,6 +12459,10 @@ impl Cache {
         let (n, mut by_key, mut by_cert) = (ids.len(), 0usize, 0usize);
         let mut keys: HashMap<Vec<u8>, Option<u128>> = HashMap::new();
         let mut readers = Vec::new();
+        // a certificate's slot decodes to the closures of the text now: an edit version's, named
+        // as the boot named them (ordinal_in_edits)
+        self.ordinal_in_edits = true;
+        let waits = self.key_waits;
         for id in ids {
             let Some(&entry) = self.linked_key.get(&id) else { readers.push(id); continue };
             let same = self.slot_key(u, id) == Some(entry) || {
@@ -12461,6 +12477,8 @@ impl Cache {
                 readers.push(id);
             }
         }
+        self.ordinal_in_edits = false;
+        self.key_waits = waits;
         if self.verbose {
             eprintln!("relax cache: re-key: {} of {} linked slots read the edit ({} by key, {} by what their code took in; {} keys of those) in {:.1} ms", readers.len(), n, by_key, by_cert, keys.len(), t0.elapsed().as_secs_f64() * 1e3);
         }
