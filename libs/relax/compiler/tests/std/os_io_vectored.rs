@@ -17,7 +17,7 @@ impl Rec {
     fn note(&self, what: String) {
         self.0.borrow_mut().push(what);
     }
-    fn take(&self) -> Vec<String> {
+    fn log(&self) -> Vec<String> {
         std::mem::take(&mut *self.0.borrow_mut())
     }
 }
@@ -130,26 +130,26 @@ fn a01_references_and_boxes_pass_every_method_on() {
     let rec = Rec::default();
     let mut own = rec.clone();
     let n = drive_write(&mut &mut own);
-    println!("| &mut W writes: {n} {:?}", rec.take());
+    println!("| &mut W writes: {n} {:?}", rec.log());
     let n = drive_write(&mut Box::new(rec.clone()));
-    println!("| Box<W> writes: {n} {:?}", rec.take());
+    println!("| Box<W> writes: {n} {:?}", rec.log());
     let mut d: Box<dyn Write> = Box::new(rec.clone());
     let n = drive_write(&mut d);
-    println!("| Box<dyn Write> writes: {n} {:?}", rec.take());
+    println!("| Box<dyn Write> writes: {n} {:?}", rec.log());
     let mut own = rec.clone();
     let mut d: &mut dyn Write = &mut own;
     let n = drive_write(&mut d);
-    println!("| &mut dyn Write writes: {n} {:?}", rec.take());
+    println!("| &mut dyn Write writes: {n} {:?}", rec.log());
     let got = drive_read(&mut &mut own);
-    println!("| &mut R reads: {got} {:?}", rec.take());
+    println!("| &mut R reads: {got} {:?}", rec.log());
     let mut d: Box<dyn Read> = Box::new(rec.clone());
     let got = drive_read(&mut d);
-    println!("| Box<dyn Read> reads: {got} {:?}", rec.take());
+    println!("| Box<dyn Read> reads: {got} {:?}", rec.log());
     let got = drive_buf(&mut &mut own);
-    println!("| &mut B buffers: {got} {:?}", rec.take());
+    println!("| &mut B buffers: {got} {:?}", rec.log());
     let mut d: Box<dyn BufRead> = Box::new(rec.clone());
     let got = drive_buf(&mut d);
-    println!("| Box<dyn BufRead> buffers: {got} {:?}", rec.take());
+    println!("| Box<dyn BufRead> buffers: {got} {:?}", rec.log());
 }
 
 fn parts() -> [IoSlice<'static>; 3] {
@@ -193,17 +193,18 @@ fn a03_buffered_writers() {
     let mut w = BufWriter::with_capacity(4, Vec::new());
     let a = w.write_vectored(&two).unwrap();
     let b = w.write_vectored(&[IoSlice::new(b"g"), IoSlice::new(b"h")]).unwrap();
-    println!("| BufWriter over Vec: {a} {b} {:?} {:?}", w.buffer(), String::from_utf8_lossy(&w.into_inner().unwrap()));
+    let buffered = w.buffer().to_vec();
+    println!("| BufWriter over Vec: {a} {b} {buffered:?} {:?}", String::from_utf8_lossy(&w.into_inner().unwrap()));
     // over any other writer: buffer after buffer while it fits
     let rec = Rec::default();
     let mut w = BufWriter::with_capacity(4, rec.clone());
     let a = w.write_vectored(&two).unwrap();
     let b = w.write_vectored(&two[2..]).unwrap();
     w.flush().unwrap();
-    println!("| BufWriter over a plain writer: {a} {b} {:?}", rec.take());
+    println!("| BufWriter over a plain writer: {a} {b} {:?}", rec.log());
     let mut w = BufWriter::with_capacity(4, rec.clone());
     let a = w.write_vectored(&[IoSlice::new(b""), IoSlice::new(b"abcdef")]).unwrap();
-    println!("| BufWriter, a first buffer as large as it: {a} {:?}", rec.take());
+    println!("| BufWriter, a first buffer as large as it: {a} {:?}", rec.log());
     // a LineWriter writes the complete lines in one vectored write and buffers the rest
     let mut w = LineWriter::new(Vec::new());
     let a = w.write_vectored(&[IoSlice::new(b"a"), IoSlice::new(b"b\n"), IoSlice::new(b"c")]).unwrap();
@@ -214,7 +215,7 @@ fn a03_buffered_writers() {
     let mut w = LineWriter::new(rec.clone());
     let a = w.write_vectored(&[IoSlice::new(b""), IoSlice::new(b"a\nb"), IoSlice::new(b"c\n")]).unwrap();
     w.flush().unwrap();
-    println!("| LineWriter over a plain writer: {a} {:?}", rec.take());
+    println!("| LineWriter over a plain writer: {a} {:?}", rec.log());
 }
 
 #[test]
