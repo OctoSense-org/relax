@@ -189,9 +189,11 @@ const KIND_TIER: u32 = 20;
 /// check_test_subjects): the warnings it printed, under the key of their check keys together
 /// (test_warnings_key). The crates' clean verdicts are not stored then: a rerun prints these.
 const KIND_TEST_WARNINGS: u32 = 21;
-/// A program's real-time set (rt_set_load): one entry in its own store, under the key of the
-/// root crate and the cache configuration, which holds the codegen identity (compiler and std).
+/// The head of a program's real-time set holds its part count under the key of the root crate
+/// and the cache configuration, which includes the codegen identity (compiler and std).
 const KIND_RT_SET: u32 = 22;
+/// Each part holds the slot keys and trait-object types added to the real-time set.
+const KIND_RT_SET_PART: u32 = 23;
 const TIER_PARKED_SALT: u128 = 0x7469_6572_2d76_6572_6469_6374_2d70_6b64;
 const TIER_QUEUED_SALT: u128 = 0x7469_6572_2d71_7565_7565_642d_7261_7465;
 /// stores a front image was mapped from: kept for the rest of the process (the arrays point
@@ -2961,23 +2963,32 @@ impl Cache {
         let key = self.rt_set_key(u, root);
         let Some(store) = Store::open(&self.rt_set_path(key)) else { return Default::default() };
         let Some((KIND_RT_SET, b)) = store.get(key) else { return Default::default() };
-        let mut d = D { b, p: 0 };
+        let Ok(head) = b.try_into() else { return Default::default() };
         let (mut keys, mut dyns) = (Vec::new(), Vec::new());
-        for _ in 0..d.u32().unwrap_or(0) {
-            let Some(k) = d.bytes() else { break };
-            keys.push(k.to_vec());
-        }
-        for _ in 0..d.u32().unwrap_or(0) {
-            let Some(t) = d.bytes() else { break };
-            dyns.extend(self.dec_ty(u, &mut D { b: t, p: 0 }, 0));
+        for part in 0..u32::from_le_bytes(head) {
+            let Some((KIND_RT_SET_PART, b)) = store.get(Self::rt_set_part_key(key, part)) else { break };
+            let mut d = D { b, p: 0 };
+            for _ in 0..d.u32().unwrap_or(0) {
+                let Some(k) = d.bytes() else { break };
+                keys.push(k.to_vec());
+            }
+            for _ in 0..d.u32().unwrap_or(0) {
+                let Some(t) = d.bytes() else { break };
+                dyns.extend(self.dec_ty(u, &mut D { b: t, p: 0 }, 0));
+            }
         }
         (keys, dyns)
     }
 
-    /// Writes the real-time set (see rt_set_load): slots `ids`, trait-object types `dyns`.
-    pub fn rt_set_store(&mut self, u: &Unit, root: u32, ids: &[u32], dyns: &[TyId]) {
+    /// Writes the new slots and trait-object types in one part and publishes the part count in
+    /// the same append. A failed write leaves this part for the next completion that adds slots or types.
+    /// (Part 0 starts the run's record over. The whole set encoded and its file rewritten at every
+    /// completion cost the owner 46.7 s over 180 completions of a cold run of a large app's test
+    /// binary, 11-18. Two processes of one program writing at once can leave a record of both
+    /// runs' parts: the set is only what to compile ahead.)
+    pub fn rt_set_store(&mut self, u: &Unit, root: u32, ids: &[u32], dyns: &[TyId], part: u32) -> bool {
         if self.mode == Mode::ReadOnly {
-            return;
+            return false;
         }
         let mut keys = E::default();
         let mut n = 0;
@@ -3002,23 +3013,37 @@ impl Cache {
         e.0.extend_from_slice(&keys.0);
         e.u32(nd);
         e.0.extend_from_slice(&types.0);
-        if crate::jit::rt_trace() {
-            eprintln!("relax rt: recorded {} of {} slots, {} of {} trait-object types", n, ids.len(), nd, dyns.len());
-        }
         let key = self.rt_set_key(u, root);
-        let _ = crate::store::append(&self.rt_set_path(key), vec![NewEntry { key, kind: KIND_RT_SET, payload: e.0 }], true);
+        let entries = vec![
+            NewEntry { key: Self::rt_set_part_key(key, part), kind: KIND_RT_SET_PART, payload: e.0 },
+            NewEntry { key, kind: KIND_RT_SET, payload: (part + 1).to_le_bytes().to_vec() },
+        ];
+        let stored = crate::store::append(&self.rt_set_path(key), entries, part == 0).is_ok();
+        if stored && crate::jit::rt_trace() {
+            eprintln!("relax rt: recorded part {}: {} of {} slots, {} of {} trait-object types", part, n, ids.len(), nd, dyns.len());
+        }
+        stored
     }
 
     /// The real-time set's key: the root crate's name under this cache configuration (the codegen
     /// identity: compiler stamps and std digest, the format and the code options) and worktree.
     fn rt_set_key(&self, u: &Unit, root: u32) -> u128 {
         let mut h = Sip128::new();
-        h.str("rt-set");
+        h.str("rt-set-parts");
         // the worktree: payloads still hold its absolute paths (Target B removes this per payload)
         h.u128(crate::dirs::anchors_key());
         h.u128(self.cfg);
         h.str(&crate::codegen_id::target_tag());
         h.str(u.prog.crates.get(root as usize).map_or("program", |c| u.prog.syms.str(c.name)));
+        h.finish128()
+    }
+
+    /// Each numbered part belongs to the real-time set under `key`.
+    fn rt_set_part_key(key: u128, part: u32) -> u128 {
+        let mut h = Sip128::new();
+        h.str("rt-set-part");
+        h.u128(key);
+        h.u32(part);
         h.finish128()
     }
 
@@ -9656,7 +9681,8 @@ mod data_tests {
         let u = load("#![no_std] pub struct S<T>(T); pub struct R<T>(T);");
         let mut cache = open_test_cache(&u, &root.join("cache"));
         let types = [held(&u, "S"), held(&u, "R")];
-        cache.rt_set_store(&u, 0, &[], &types);
+        cache.rt_set_store(&u, 0, &[], &types[..1], 0);
+        cache.rt_set_store(&u, 0, &[], &types[1..], 1);
         assert_eq!(cache.rt_set_load(&u, 0).1, types, "the configuration that wrote the set reads it");
         let cfg = cache.cfg;
         cache.cfg ^= 1;

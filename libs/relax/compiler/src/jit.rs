@@ -9897,6 +9897,9 @@ impl Unit {
             // (a version a layout patch invalidated never runs again: built anew)
             if crate::stale::lookup(at).is_none() {
                 SlotWord::of(&self.slots, id).store(at, Ordering::SeqCst);
+                if f.compiled {
+                    realtime_seen(id, true);
+                }
             } else {
                 self.stub_if_invalidated(id);
             }
@@ -9934,6 +9937,9 @@ impl Unit {
             // (a version a layout patch invalidated never runs again: built anew)
             if crate::stale::lookup(prev.0).is_none() {
                 SlotWord::of(&self.slots, id as u32).store(prev.0, Ordering::SeqCst);
+                if f.compiled {
+                    realtime_seen(id as u32, true);
+                }
             } else {
                 self.stub_if_invalidated(id as u32);
             }
@@ -31959,14 +31965,22 @@ struct RealTime {
     /// slots reached, in order (what the disk cache records)
     set: Vec<u32>,
     seen: crate::fxhash::HashSet<u32>,
+    /// These reached slots had code installed or restored since the top tier last ran.
+    dirty: Vec<u32>,
     /// trait-object types real-time code is handed (TyId) and their names (stable_ty: a vtable
     /// linked from the disk cache or placed from the startup image names its types only so), and
     /// the vtables already followed
     dyns: crate::fxhash::HashSet<u32>,
+    /// The disk record takes each new trait-object type in reach order.
+    dyn_order: Vec<u32>,
     dyn_names: crate::fxhash::HashSet<String>,
     vtables: crate::fxhash::HashSet<u64>,
     /// the earlier runs' set was taken (into `link`)
     loaded: bool,
+    /// This run has recorded these prefixes of `set` and `dyn_order` in `parts` parts.
+    stored: usize,
+    dyns_stored: usize,
+    parts: u32,
     /// the slots of the set whose code the audit found whole, and that code's start
     /// (realtime_audit checks each code once)
     audited: crate::fxhash::HashMap<u32, u64>,
@@ -32016,6 +32030,9 @@ static RT_SIGS: AtomicBool = AtomicBool::new(false);
 static RT_PENDING: relax_session::sync::Mutex<Vec<u64>> = relax_session::sync::Mutex::new(Vec::new());
 /// slots compiled ahead for real-time code, and the owner's wall ns spent on it
 pub static RT_AHEAD: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+/// RT_TAIL counts completions and measures ns in the audit, collecting new slots, the top tier
+/// and the disk cache record.
+static RT_TAIL: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
 /// the last ticket std::relax::realtime handed out, and the newest whose reach is compiled
 static RT_TICKET: AtomicU64 = AtomicU64::new(0);
 static RT_DONE: AtomicU64 = AtomicU64::new(0);
@@ -32121,7 +32138,7 @@ pub(crate) extern "C" fn __relax_realtime_arm(on: bool) {
             if !up.is_null() && RT_ANY.load(Ordering::Acquire) {
                 let upn = up as usize;
                 owner::call(owner::Class::Program, move || unsafe {
-                    if !with_rt(|rt| rt.scheduled) && realtime_audit(upn as *mut Unit, "arm") {
+                    if !with_rt(|rt| rt.scheduled) && realtime_audit(upn as *mut Unit, "arm", true) {
                         realtime_reach_queued(upn as *mut Unit, Vec::new(), "hole");
                     }
                 });
@@ -32407,6 +32424,7 @@ unsafe fn realtime_step_for(up: *mut Unit, budget: u64) {
                     let mut any = false;
                     for (d, n) in names {
                         if rt.dyns.insert(d) {
+                            rt.dyn_order.push(d);
                             rt.dyn_names.insert(n);
                             any = true;
                         }
@@ -32462,34 +32480,61 @@ unsafe fn realtime_step_for(up: *mut Unit, budget: u64) {
         return;
     }
     // (the invariant, before the tickets are done: a hole the audit finds is walked first)
-    if !done || realtime_audit(up, "reach") {
+    let tail0 = wall_ns();
+    if !done || realtime_audit(up, "reach", false) {
+        if done {
+            rt_tail(&[wall_ns() - tail0, 0, 0, 0]);
+        }
         // the program's requests that queued meanwhile go first
         let upn = up as usize;
         owner::post_queued(owner::Class::Program, move || unsafe { realtime_step(upn as *mut Unit) });
         return;
     }
-    let (set, dyns) = with_rt(|rt| (rt.set.clone(), rt.dyns.iter().map(|&d| TyId(d)).collect::<Vec<TyId>>()));
-    let grew = set.len() > n0 || dyns.len() > d0;
+    let tail1 = wall_ns();
+    let (set_len, grew) = with_rt(|rt| (rt.set.len(), rt.set.len() > n0 || rt.dyns.len() > d0));
     if !grew && total_compiled == 0 {
+        let tail2 = wall_ns();
+        let t = rt_tail(&[tail1 - tail0, tail2 - tail1, 0, 0]);
+        if rt_trace() && tail2 - tail0 >= 10_000_000 {
+            eprintln!("relax rt: {}: nothing new, tail {}", why, t);
+        }
         realtime_done();
         return;
     }
-    // the top tier for all of it: an O2 build replaces whatever code it has (baseline or O1 code
-    // made before it was known to be real-time; the sampler never sees a device's thread, so
-    // nothing else would) and is the slot's disk cache entry, so later runs link O2 code at the
-    // mark; the O3 tier follows its call counts as anywhere
-    realtime_top_tier(up, &set);
+    // the top tier for what is new since the last completion: the set's new slots and the slots
+    // whose code changed since (installed, rolled back, restored: `dirty`). An O2 build replaces
+    // whatever code a slot has (baseline or O1 code made before it was known to be real-time; the
+    // sampler never sees a device's thread, so nothing else would) and is the slot's disk cache
+    // entry, so later runs link O2 code at the mark; the O3 tier follows its call counts as
+    // anywhere. (The whole set at every completion cost the owner 9.2 s over 180 completions of
+    // a cold run of a large app's test binary, 11-18.)
+    let (mut slots, dirty) = with_rt(|rt| (rt.set[n0..].to_vec(), std::mem::take(&mut rt.dirty)));
+    let new = slots.len();
+    realtime_add_dirty(&mut slots, dirty);
+    let tail2 = wall_ns();
+    realtime_top_tier(up, &slots);
+    let tail3 = wall_ns();
     let u = &mut *up;
-    if grew {
-        if let Some(mut c) = u.cache.take() {
-            c.rt_set_store(u, crate::layout::root_crate(), &set, &dyns);
-            u.cache = Some(c);
+    if let Some(mut c) = u.cache.take_if(|c| grew && c.mode != crate::cache::Mode::ReadOnly) {
+        let (ids, dyns, part) = with_rt(|rt| {
+            let ids = rt.set[rt.stored..].to_vec();
+            let dyns: Vec<TyId> = rt.dyn_order[rt.dyns_stored..].iter().copied().map(TyId).collect();
+            (ids, dyns, rt.parts)
+        });
+        if (!ids.is_empty() || !dyns.is_empty()) && c.rt_set_store(u, crate::layout::root_crate(), &ids, &dyns, part) {
+            with_rt(|rt| {
+                rt.stored += ids.len();
+                rt.dyns_stored += dyns.len();
+                rt.parts += 1;
+            });
         }
+        u.cache = Some(c);
     }
-    if rt_trace() && set.len() > n0 {
+    let tail = rt_tail(&[tail1 - tail0, tail2 - tail1, tail3 - tail2, wall_ns() - tail3]);
+    if rt_trace() && new > 0 {
         // what the new part of the set is, by crate (an unexpectedly large reach shows here)
         let mut by: crate::fxhash::HashMap<u32, usize> = Default::default();
-        for &id in &set[n0..] {
+        for &id in &slots[..new] {
             if let Some(k) = slot_crate(&u.prog, &u.fns, id) {
                 *by.entry(k).or_default() += 1;
             }
@@ -32500,9 +32545,39 @@ unsafe fn realtime_step_for(up: *mut Unit, budget: u64) {
         eprintln!("relax rt: {}: the new slots by crate: {}", why, top.join(", "));
     }
     if crate::run::VERBOSE.load(Ordering::Relaxed) || rt_trace() {
-        eprintln!("relax rt: {}: real-time code reaches {} slots ({} new), {} compiled now, {:.1} ms on the owner", why, set.len(), set.len() - n0, total_compiled, ns as f64 / 1e6);
+        eprintln!("relax rt: {}: real-time code reaches {} slots ({} new), {} compiled now, {:.1} ms on the owner; tail {}", why, set_len, new, total_compiled, ns as f64 / 1e6, tail);
     }
     realtime_done();
+}
+
+/// Adds the audit, new slots, top tier and disk record times to RT_TAIL after a reach's walk.
+/// The trace shows the times for this completion and for the run so far.
+fn rt_tail(parts: &[u64; 4]) -> String {
+    let n = RT_TAIL[0].fetch_add(1, Ordering::Relaxed) + 1;
+    let mut all = [0u64; 4];
+    for (i, &p) in parts.iter().enumerate() {
+        all[i] = RT_TAIL[1 + i].fetch_add(p, Ordering::Relaxed) + p;
+    }
+    let ms = |v: u64| v as f64 / 1e6;
+    format!(
+        "{:.1} ms (audit {:.1}, new slots {:.1}, top tier {:.1}, record {:.1}); {} tails so far {:.1} ms (audit {:.1}, new slots {:.1}, top tier {:.1}, record {:.1})",
+        ms(parts.iter().sum()), ms(parts[0]), ms(parts[1]), ms(parts[2]), ms(parts[3]),
+        n, ms(all.iter().sum()), ms(all[0]), ms(all[1]), ms(all[2]), ms(all[3])
+    )
+}
+
+/// Adds the dirty slots in slot order. The new range is already unique and keeps its reach order.
+fn realtime_add_dirty(new: &mut Vec<u32>, dirty: Vec<u32>) {
+    if dirty.is_empty() {
+        return;
+    }
+    let mut older: crate::fxhash::HashSet<u32> = dirty.into_iter().collect();
+    for id in new.iter() {
+        older.remove(id);
+    }
+    let n = new.len();
+    new.extend(older);
+    new[n..].sort_unstable();
 }
 
 /// The real-time set's invariant, checked when a reach is done and at an arm: the code of every
@@ -32510,9 +32585,22 @@ unsafe fn realtime_step_for(up: *mut Unit, budget: u64) {
 /// walk stops there) -- compiled ahead, or counted among the failed. A hole is said (the slot, its
 /// code's tier and origin, the reference), counted (std::relax::realtime_holes) and queued for the walk;
 /// true: some were. Each code body of a slot is checked once (`audited`). Owner only.
-unsafe fn realtime_audit(up: *mut Unit, why: &str) -> bool {
+unsafe fn realtime_audit(up: *mut Unit, why: &str, full: bool) -> bool {
     let u = &*up;
-    let check: Vec<u32> = with_rt(|rt| rt.set.iter().copied().filter(|&s| (s as usize) < u.fns.len() && u.fns[s as usize].compiled && rt.audited.get(&s) != Some(&u.fns[s as usize].code)).collect());
+    let (mut check, dirty) = with_rt(|rt| {
+        let candidates = |ids: &[u32]| -> Vec<u32> {
+            ids.iter().copied().filter(|&s| {
+                let i = s as usize;
+                i < u.fns.len() && u.fns[i].compiled && rt.audited.get(&s) != Some(&u.fns[i].code)
+            }).collect()
+        };
+        if full {
+            (candidates(&rt.set), Vec::new())
+        } else {
+            (candidates(&rt.set[rt.n0..]), candidates(&rt.dirty))
+        }
+    });
+    realtime_add_dirty(&mut check, dirty);
     if check.is_empty() {
         return false;
     }
@@ -32815,12 +32903,24 @@ fn realtime_ref_slots(u: &Unit, refs: &CodeRefs) -> Vec<u32> {
     out
 }
 
+/// A reached slot whose code was installed or restored needs the next audit and top tier.
+/// A patch can roll back to code from before the slot entered the reach.
+fn realtime_seen(id: u32, dirty: bool) -> bool {
+    let mut g = REALTIME.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(rt) = g.as_mut() else { return false };
+    let seen = rt.seen.contains(&id);
+    if seen && dirty {
+        crate::zone_alloc::kept_with(|| rt.dirty.push(id));
+    }
+    seen
+}
+
 /// The slots new code of slot `id` references (`refs`, realtime_ref_slots) that the reach has not
 /// walked; none when `id` is not real-time code. A diverging slot stays out (the walk stops
 /// there). An O2/O3 build or a verdict's rebuild can call slots the code it replaces did not
 /// (SPEC-V twins and their verified bodies are separate slots).
-fn realtime_new_refs(u: &Unit, id: u32, refs: &CodeRefs, held_covered: bool) -> Vec<u32> {
-    if !REALTIME.lock().unwrap_or_else(|e| e.into_inner()).as_ref().is_some_and(|rt| rt.seen.contains(&id)) {
+fn realtime_new_refs(u: &Unit, id: u32, refs: &CodeRefs, held_covered: bool, dirty: bool) -> Vec<u32> {
+    if !realtime_seen(id, dirty) {
         return Vec::new();
     }
     let mut refs = realtime_ref_slots(u, refs);
@@ -32871,7 +32971,7 @@ unsafe fn realtime_installed(up: *mut Unit, id: u32, refs: &CodeRefs, site: &'st
     }
     // (a slot held for its own build in flight is walked when that is installed: the reach is not
     // done until then; a static queued is taken before it is)
-    let new = realtime_new_refs(u, id, refs, true);
+    let new = realtime_new_refs(u, id, refs, true, true);
     let statics = realtime_new_statics(id, refs, true);
     if new.is_empty() && statics.is_empty() {
         return;
@@ -32923,7 +33023,7 @@ pub(crate) unsafe fn realtime_before_install(up: *mut Unit, id: u32, relocs: &[r
         let u = &*up;
         // (a slot held for its own build in flight is not walked yet: this install waits for it)
         let refs = CodeRefs::of_relocs(u, relocs);
-        let new = realtime_new_refs(u, id, &refs, false);
+        let new = realtime_new_refs(u, id, &refs, false, false);
         let statics = realtime_new_statics(id, &refs, false);
         if new.is_empty() && statics.is_empty() {
             return 0;
@@ -33792,6 +33892,7 @@ pub(crate) unsafe fn reset_statics() {
     reset(&RT_SIGS, AtomicBool::new(false));
     reset(&RT_PENDING, relax_session::sync::Mutex::new(Vec::new()));
     reset(&RT_AHEAD, [AtomicU64::new(0), AtomicU64::new(0)]);
+    reset(&RT_TAIL, [const { AtomicU64::new(0) }; 5]);
     reset(&RT_TICKET, AtomicU64::new(0));
     reset(&RT_DONE, AtomicU64::new(0));
     reset(&RT_ARMED, std::sync::atomic::AtomicU32::new(0));
