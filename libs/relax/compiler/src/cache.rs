@@ -2954,19 +2954,14 @@ impl Cache {
         }
     }
 
-    /// What real-time threads of the program rooted at crate `root` reached in earlier runs (jit.rs
-    /// realtime), compiled ahead when the program marks its real-time code: the key encodings of
-    /// the slots (resolve them with slot_for_bytes_unit) and the trait-object types whose vtables
-    /// it followed (a type that no longer decodes is left out). Only a set this configuration
-    /// recorded (rt_set_key): key bytes name definitions and types in the std and compiler that
-    /// wrote them, and decoded against another std they name other types (a `Box<T>` key of a
-    /// std before `Box<T, A>` decoded to a one-argument Box, which no impl matches).
-    pub fn rt_set_load(&mut self, u: &Unit, root: u32) -> (Vec<Vec<u8>>, Vec<TyId>) {
+    /// Slots and call-site notes from earlier runs under this program and cache configuration.
+    /// The slot keys resolve against the current unit. The note strings are stable across runs.
+    pub fn rt_set_load(&mut self, u: &Unit, root: u32) -> (Vec<Vec<u8>>, Vec<String>) {
         let key = self.rt_set_key(u, root);
         let Some(store) = Store::open(&self.rt_set_path(key)) else { return Default::default() };
         let Some((KIND_RT_SET, b)) = store.get(key) else { return Default::default() };
         let Ok(head) = b.try_into() else { return Default::default() };
-        let (mut keys, mut dyns) = (Vec::new(), Vec::new());
+        let (mut keys, mut notes) = (Vec::new(), Vec::new());
         for part in 0..u32::from_le_bytes(head) {
             let Some((KIND_RT_SET_PART, b)) = store.get(Self::rt_set_part_key(key, part)) else { break };
             let mut d = D { b, p: 0 };
@@ -2975,20 +2970,16 @@ impl Cache {
                 keys.push(k.to_vec());
             }
             for _ in 0..d.u32().unwrap_or(0) {
-                let Some(t) = d.bytes() else { break };
-                dyns.extend(self.dec_ty(u, &mut D { b: t, p: 0 }, 0));
+                let Some(note) = d.str() else { break };
+                notes.push(note.to_string());
             }
         }
-        (keys, dyns)
+        (keys, notes)
     }
 
-    /// Writes the new slots and trait-object types in one part and publishes the part count in
-    /// the same append. A failed write leaves this part for the next completion that adds slots or types.
-    /// (Part 0 starts the run's record over. The whole set encoded and its file rewritten at every
-    /// completion cost the owner 46.7 s over 180 completions of a cold run of a large app's test
-    /// binary, 11-18. Two processes of one program writing at once can leave a record of both
-    /// runs' parts: the set is only what to compile ahead.)
-    pub fn rt_set_store(&mut self, u: &Unit, root: u32, ids: &[u32], dyns: &[TyId], part: u32) -> bool {
+    /// Writes slots and notes in one part and publishes the part count in the same append.
+    /// Part zero starts the record. A failed write leaves its entries for the next append.
+    pub fn rt_set_store(&mut self, u: &Unit, root: u32, ids: &[u32], notes: &[String], part: u32) -> bool {
         if self.mode == Mode::ReadOnly {
             return false;
         }
@@ -3000,21 +2991,11 @@ impl Cache {
                 n += 1;
             }
         }
-        let mut types = E::default();
-        let mut nd = 0;
-        let mut crates = Vec::new();
-        for &t in dyns {
-            let mut one = E::default();
-            if self.enc_ty(u, t, &mut one, &mut crates, 0).is_some() {
-                types.bytes(&one.0);
-                nd += 1;
-            }
-        }
         let mut e = E::default();
         e.u32(n);
         e.0.extend_from_slice(&keys.0);
-        e.u32(nd);
-        e.0.extend_from_slice(&types.0);
+        e.u32(notes.len() as u32);
+        for note in notes { e.str(note); }
         let key = self.rt_set_key(u, root);
         let entries = vec![
             NewEntry { key: Self::rt_set_part_key(key, part), kind: KIND_RT_SET_PART, payload: e.0 },
@@ -3022,7 +3003,7 @@ impl Cache {
         ];
         let stored = crate::store::append(&self.rt_set_path(key), entries, part == 0).is_ok();
         if stored && crate::jit::rt_trace() {
-            eprintln!("relax rt: recorded part {}: {} of {} slots, {} of {} trait-object types", part, n, ids.len(), nd, dyns.len());
+            eprintln!("relax rt: recorded part {}: {} of {} slots, {} call-site notes", part, n, ids.len(), notes.len());
         }
         stored
     }
@@ -3031,7 +3012,7 @@ impl Cache {
     /// identity: compiler stamps and std digest, the format and the code options) and worktree.
     fn rt_set_key(&self, u: &Unit, root: u32) -> u128 {
         let mut h = Sip128::new();
-        h.str("rt-set-parts");
+        h.str("rt-set-notes");
         // the worktree: payloads still hold its absolute paths (Target B removes this per payload)
         h.u128(crate::dirs::anchors_key());
         h.u128(self.cfg);
@@ -9674,10 +9655,7 @@ mod data_tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
-    /// The real-time set crosses runs, so it is read only under the configuration that wrote it:
-    /// a set a std before `Box<T, A>` recorded decoded its `Box<T>` keys to a one-argument Box,
-    /// and the glue over it failed to compile (Sandbox's first frame, 11-14). A type key that a
-    /// program with other generics wrote (an edited type under one compiler) decodes to no type.
+    /// Parts preserve note order across edits and belong to the configuration that wrote them.
     #[test]
     fn rt_set_keyed_by_configuration_and_generic_counts() {
         isolated_test!(rt_set_keyed_by_configuration_and_generic_counts);
@@ -9694,25 +9672,21 @@ mod data_tests {
             tcx.collect(&prog);
             Unit::new(prog, tcx, 0)
         };
-        let held = |u: &Unit, name: &str| {
-            let def = (0..u.prog.defs.len() as u32).map(DefId).find(|&d| u.prog.name(d) == name).unwrap();
-            u.tcx.tys.intern(TyKind::Adt(def, u.tcx.tys.mk_list(&[u.tcx.tys.i32_]), crate::types::RegionArgsId::EMPTY))
-        };
         let u = load("#![no_std] pub struct S<T>(T); pub struct R<T>(T);");
         let mut cache = open_test_cache(&u, &root.join("cache"));
-        let types = [held(&u, "S"), held(&u, "R")];
-        cache.rt_set_store(&u, 0, &[], &types[..1], 0);
-        cache.rt_set_store(&u, 0, &[], &types[1..], 1);
-        assert_eq!(cache.rt_set_load(&u, 0).1, types, "the configuration that wrote the set reads it");
+        let notes = ["v:3:app::Route#12345678".to_string(), "hs:0123456789abcdef:fn(u32)".to_string()];
+        assert!(cache.rt_set_store(&u, 0, &[], &notes[..1], 0));
+        assert!(cache.rt_set_store(&u, 0, &[], &notes[1..], 1));
+        assert_eq!(cache.rt_set_load(&u, 0).1, notes, "both parts read back in order");
         let cfg = cache.cfg;
         cache.cfg ^= 1;
-        assert!(cache.rt_set_load(&u, 0).1.is_empty(), "another configuration (another compiler or std) reads no set");
+        let (keys, other_notes) = cache.rt_set_load(&u, 0);
+        assert!(keys.is_empty() && other_notes.is_empty(), "another configuration (another compiler or std) reads no set");
         drop(cache);
-        // the program edited: S takes two arguments now, R is as it was
         let v = load("#![no_std] pub struct S<T, U = u8>(T, U); pub struct R<T>(T);");
         let mut cache = open_test_cache(&v, &root.join("cache"));
         assert_eq!(cache.cfg, cfg, "an edit keeps the configuration");
-        assert_eq!(cache.rt_set_load(&v, 0).1, [held(&v, "R")], "S<i32> names no type of the edited program; R<i32> still does");
+        assert_eq!(cache.rt_set_load(&v, 0).1, notes, "notes survive a generic parameter edit");
         drop(cache);
         std::fs::remove_dir_all(root).unwrap();
     }

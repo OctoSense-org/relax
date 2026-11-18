@@ -19,7 +19,7 @@ use crate::program::DefId;
 use relax_backend::rir::{Mem, Sym, SymClass};
 use crate::types::{TyId, TyKind};
 use std::collections::{BTreeMap, HashMap};
-use std::sync::atomic::{AtomicPtr, Ordering};
+use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 use std::sync::OnceLock;
 use relax_session::sync::Mutex;
 
@@ -111,6 +111,11 @@ pub struct Syms {
     kinds: crate::conc::AppendVec<SymKind>,
     inner: Mutex<SymsInner>,
     data: Mutex<DataIndex>,
+    /// Published length of the vtable index for the real-time walk.
+    vtable_count: AtomicUsize,
+    /// How many `SymKind::Thunk` symbols exist: the real-time walk scans the table for new ones
+    /// only when this grew (fn pointers held in data, matched against called signatures).
+    thunk_count: AtomicUsize,
     /// (size, align) of each `SymKind::Rw` block
     pub rw_blocks: Mutex<Vec<(u64, u64)>>,
     /// the writable blocks lowering made, by address: start -> (size, the value's type)
@@ -186,7 +191,7 @@ pub fn vtable_name_keys(name: &str) -> impl Iterator<Item = &str> {
 
 impl Syms {
     pub fn new(vals: u64, dom0: u64) -> Syms {
-        Syms { dom0, vals, classes: crate::jit::alloc_rw(SYM_CAP), kinds: crate::conc::AppendVec::new_kept(SYM_CAP), inner: Mutex::new(SymsInner::default()), data: Mutex::new(DataIndex::default()), rw_blocks: Mutex::new(Vec::new()), rw_starts: Mutex::new(BTreeMap::new()), rw_syms: Mutex::new(BTreeMap::new()), const_copies: Mutex::new(HashMap::new()), initial_data: Mutex::new(HashMap::new()), foreign_defs: Mutex::new(HashMap::new()), rt_by_addr: OnceLock::new(), foreign_by_addr: Mutex::new(ForeignIndex::default()) }
+        Syms { dom0, vals, classes: crate::jit::alloc_rw(SYM_CAP), kinds: crate::conc::AppendVec::new_kept(SYM_CAP), inner: Mutex::new(SymsInner::default()), data: Mutex::new(DataIndex::default()), vtable_count: AtomicUsize::new(0), thunk_count: AtomicUsize::new(0), rw_blocks: Mutex::new(Vec::new()), rw_starts: Mutex::new(BTreeMap::new()), rw_syms: Mutex::new(BTreeMap::new()), const_copies: Mutex::new(HashMap::new()), initial_data: Mutex::new(HashMap::new()), foreign_defs: Mutex::new(HashMap::new()), rt_by_addr: OnceLock::new(), foreign_by_addr: Mutex::new(ForeignIndex::default()) }
     }
 
 
@@ -215,6 +220,7 @@ impl Syms {
     fn push(&self, kind: SymKind, value: u64) -> Sym {
         // a domain symbol's table value is its offset in the domain static block (0: no storage)
         let value = if class_of(&kind) == relax_backend::rir::SymClass::Domain && value != 0 { value - self.dom0 } else { value };
+        let thunk = matches!(kind, SymKind::Thunk(_));
         let id = self.kinds.push(kind) as u32;
         if id as usize >= SYM_CAP {
             panic!("symbol table full");
@@ -222,7 +228,15 @@ impl Syms {
         unsafe { std::ptr::write((self.vals as *mut u64).add(id as usize), value) };
         let class = class_of(&self.kinds[id as usize]);
         unsafe { std::ptr::write((self.classes as *mut u8).add(id as usize), class as u8) };
+        if thunk {
+            self.thunk_count.fetch_add(1, Ordering::Release);
+        }
         Sym::new(id)
+    }
+
+    /// How many thunk symbols exist (see `thunk_count`).
+    pub fn thunk_count(&self) -> usize {
+        self.thunk_count.load(Ordering::Acquire)
     }
 
     /// The slot of a tier record symbol (`SymKind::TierRec`), without copying the kind.
@@ -269,6 +283,11 @@ impl Syms {
         self.kinds.len()
     }
 
+    /// Published symbol kinds starting at the cursor. Each index can resume a bounded scan.
+    pub fn kinds_from(&self, cursor: usize) -> impl Iterator<Item = (usize, &SymKind)> {
+        (cursor..self.len()).map(move |i| (i, &self.kinds[i]))
+    }
+
     /// Registers the data object at `start..start+len` (Unit::data); returns its symbol.
     pub fn add_data(&self, start: u64, len: u64, align: u64, kind: DataKind, mutable: bool) -> Sym {
         // one critical section: the object's index and its symbol must agree (lock order:
@@ -302,6 +321,7 @@ impl Syms {
             d.by_start.insert(*start, first + i as u32);
         }
         let vtables = d.vtables.len() > vtables;
+        if vtables { self.vtable_count.store(d.vtables.len(), Ordering::Release); }
         drop(d);
         // (the data lock released: the real-time reach's lock goes first)
         if vtables {
@@ -372,6 +392,7 @@ impl Syms {
             let Some(&i) = d.by_start.get(&start) else { return };
             if vtable && !d.objs[i as usize].name.as_deref().is_some_and(|n| n.starts_with(VTABLE_NAME)) {
                 d.vtables.push(i);
+                self.vtable_count.store(d.vtables.len(), Ordering::Release);
             }
             d.objs[i as usize].name = Some(if vtable { name.clone() } else { std::mem::take(&mut name) });
         }
@@ -384,8 +405,18 @@ impl Syms {
     /// Every vtable of this run (lowered, linked from the disk cache, placed from the startup
     /// image -- only a lowered one is in Unit::vtables): (start, name).
     pub fn vtable_objs(&self) -> Vec<(u64, String)> {
+        self.vtables_from(0).0
+    }
+
+    pub fn vtable_count(&self) -> usize {
+        self.vtable_count.load(Ordering::Acquire)
+    }
+
+    /// Vtables registered since the last scan, in registration order, and the next cursor.
+    pub fn vtables_from(&self, cursor: usize) -> (Vec<(u64, String)>, usize) {
         let d = self.data.lock().unwrap_or_else(|e| e.into_inner());
-        d.vtables.iter().filter_map(|&i| d.objs.get(i as usize)).filter_map(|o| Some((o.start, o.name.clone()?))).collect()
+        let objs = d.vtables[cursor..].iter().map(|&i| &d.objs[i as usize]);
+        (objs.filter_map(|o| Some((o.start, o.name.clone()?))).collect(), d.vtables.len())
     }
 
     /// The vtables of this run (see vtable_objs) whose dyn type `of(start, dyn type)` takes, by its
@@ -401,6 +432,12 @@ impl Syms {
             }
         }
         out
+    }
+
+    /// Whether a code reference names a vtable object.
+    pub fn is_vtable_obj(&self, idx: u32) -> bool {
+        let d = self.data.lock().unwrap_or_else(|e| e.into_inner());
+        d.objs.get(idx as usize).is_some_and(|o| o.name.as_deref().is_some_and(|n| n.starts_with(VTABLE_NAME)))
     }
 
     /// Whether a vtable's data object starts at `addr`.
@@ -562,26 +599,23 @@ pub fn read_leaf(u: &Unit, s: Sym, m: Mem) -> relax_backend::passes::RoRead {
     read_obj(u, s, n)
 }
 
-/// The functions a constant data object at `addr` points at, directly or through the data
-/// objects it points at (vtables and their supertrait vtables, fn tables, constants holding fn
-/// pointers): what code reading it can call (real-time reach, jit.rs realtime).
+/// Thunks under a data address, including supertrait vtables of an explicit real-time root.
 pub(crate) fn data_thunks(u: &Unit, addr: u64, out: &mut Vec<u32>) {
-    let objs: Vec<u32> = u.syms.data_at(addr).into_iter().filter_map(|s| match u.syms.kind(s.id) { Some(SymKind::Data(i)) => Some(i), _ => None }).collect();
-    obj_thunks(u, objs, out);
+    if let Some(idx) = u.syms.data_at(addr).and_then(|s| u.syms.obj_of(s)) {
+        obj_thunks(u, vec![idx], out, true);
+    }
 }
 
-/// data_thunks for the data object of index `idx` (a code body's reference record names it so).
+/// The thunks reachable through non-vtable data. A vtable's callers name its words in notes.
 pub(crate) fn data_obj_thunks(u: &Unit, idx: u32, out: &mut Vec<u32>) {
-    obj_thunks(u, vec![idx], out);
+    obj_thunks(u, vec![idx], out, false);
 }
 
-fn obj_thunks(u: &Unit, mut todo: Vec<u32>, out: &mut Vec<u32>) {
-    let mut seen = Vec::new();
+fn obj_thunks(u: &Unit, mut todo: Vec<u32>, out: &mut Vec<u32>, include_vtables: bool) {
+    let mut seen = crate::fxhash::HashSet::default();
     while let Some(idx) = todo.pop() {
-        if seen.contains(&idx) || seen.len() > 4096 {
-            continue;
-        }
-        seen.push(idx);
+        if include_vtables && seen.len() > 4096 { break; }
+        if !seen.insert(idx) || (!include_vtables && u.syms.is_vtable_obj(idx)) { continue; }
         let Some((_, _, ptrs, _)) = obj_ptrs(u, idx) else { continue };
         for (_, s) in ptrs.iter() {
             match s.and_then(|s| u.syms.kind(s.id)) {
@@ -591,6 +625,64 @@ fn obj_thunks(u: &Unit, mut todo: Vec<u32>, out: &mut Vec<u32>) {
             }
         }
     }
+}
+
+/// Indexes thunk words in the immutable initializer object or the captured initial bytes.
+/// Vtables have their own keys. Mutable storage is read from its declared initial image.
+pub(crate) fn static_initial_thunks(u: &Unit, d: DefId, initial: Option<u64>) -> Vec<u32> {
+    let root = initial.and_then(|a| u.syms.data_at(a)).or_else(|| {
+        u.statics.get(&d).and_then(|&a| u.static_sym_at(a))
+    });
+    let mut todo: Vec<_> = root.into_iter().collect();
+    let mut seen = crate::fxhash::HashSet::default();
+    let mut slots = Vec::new();
+    while let Some(sym) = todo.pop() {
+        if !seen.insert(sym.id) { continue; }
+        match u.syms.kind(sym.id) {
+            Some(SymKind::Thunk(id)) => { slots.push(id); continue; }
+            Some(SymKind::Data(i)) => {
+                if u.syms.is_vtable_obj(i) { continue; }
+                if let Some((_, _, ptrs, _)) = obj_ptrs(u, i) {
+                    todo.extend(ptrs.iter().filter_map(|(_, s)| *s));
+                    continue;
+                }
+            }
+            Some(SymKind::Static(_) | SymKind::Rw(_)) => {}
+            _ => continue,
+        }
+        let bytes = u.syms.initial_data.lock().unwrap_or_else(|e| e.into_inner()).get(&sym.id).cloned();
+        let Some(bytes) = bytes else { continue };
+        let Some(offsets) = pointer_offsets(u, u.syms.addr(Sym::new(sym.id)), &bytes) else { continue };
+        for off in offsets {
+            if off as usize + u.ptr_bytes() as usize > bytes.len() { continue; }
+            let v = word_in(u, &bytes, off as usize);
+            if let Some(id) = u.thunk_slot(v) {
+                slots.push(id);
+            } else if let Some(child) = u.syms.containing(v).or_else(|| u.static_sym_at(v)).or_else(|| u.syms.rw_sym_at(v)) {
+                todo.push(child);
+            }
+        }
+    }
+    slots
+}
+
+/// Thunk at one pointer-sized vtable word, if that word names a function.
+pub(crate) fn vtable_word_thunk(u: &Unit, addr: u64, word: u32) -> Option<u32> {
+    let idx = u.syms.obj_of(u.syms.data_at(addr)?)?;
+    let (_, _, ptrs, _) = obj_ptrs(u, idx)?;
+    let offset = word.checked_mul(u.ptr_bytes())?;
+    let sym = ptrs.iter().find(|(off, _)| *off == offset)?.1?;
+    match u.syms.kind(sym.id)? { SymKind::Thunk(id) => Some(id), _ => None }
+}
+
+/// Thunks in the vtable itself. Stored supertrait pointers have their own vtable keys.
+pub(crate) fn vtable_thunks(u: &Unit, addr: u64) -> Vec<u32> {
+    let Some(idx) = u.syms.data_at(addr).and_then(|s| u.syms.obj_of(s)) else { return Vec::new() };
+    let Some((_, _, ptrs, _)) = obj_ptrs(u, idx) else { return Vec::new() };
+    ptrs.iter().filter_map(|(_, s)| match u.syms.kind(s.as_ref()?.id)? {
+        SymKind::Thunk(id) => Some(id),
+        _ => None,
+    }).collect()
 }
 
 /// The data objects the constant data object at `addr` points at itself (a vtable's supertrait
