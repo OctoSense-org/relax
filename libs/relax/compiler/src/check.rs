@@ -1040,29 +1040,55 @@ fn body_errors(prog: &crate::program::Program, tcx: &crate::tcx::Tcx, options: &
 /// type and MIR lints, the borrow check's `unused_mut` -- in the check's order. Not the lints that
 /// rest on every body of the crate (dead_code, unused imports): the next test check reports them.
 /// A body with type errors reports none (the save is refused).
-pub(crate) fn live_lints(prog: &crate::program::Program, tcx: &crate::tcx::Tcx, defs: &[crate::program::DefId]) -> Vec<String> {
+///
+/// With them, the borrow check's errors of those bodies, by body owner (`LiveCheck::borrows`): the
+/// save runs (as a lazy build does), and the test session's verdict is red while one is left
+/// (harness_live `note_borrows`). Before, they were checked and dropped: a save rustc rejects went
+/// green under `--live` (E0502 in a sim crate, 11-18).
+pub(crate) struct LiveCheck {
+    pub lints: Vec<String>,
+    /// every body owner the save's bodies have (typeck roots): what `borrows` speaks for
+    pub owners: Vec<u32>,
+    /// (owner, rendered error): each body's borrow check errors, and the bodies it could not check
+    pub borrows: Vec<(u32, String)>,
+}
+
+pub(crate) fn live_lints(prog: &crate::program::Program, tcx: &crate::tcx::Tcx, defs: &[crate::program::DefId]) -> LiveCheck {
     use crate::check_order::{Entry, Out};
-    if !relax_types::lint::enabled() { return Vec::new(); }
+    let lints = relax_types::lint::enabled();
     let mut roots: Vec<crate::program::DefId> = defs.iter().map(|&d| relax_types::type_queries::typeck_root_def_id(prog, d)).collect();
     roots.sort_unstable_by_key(|d| d.0);
     roots.dedup();
+    let mut borrows: Vec<(u32, String)> = Vec::new();
     let ((), reported) = relax_types::lint::capture(|| {
         for &d in &roots {
             if crate::borrowck::body::CheckedBody::item(prog, d).is_none() { continue; }
-            // (an internal failure of a lint reports nothing, as in a check)
-            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                relax_types::lint_early::check_def(prog, tcx, d);
+            // (an internal failure of a lint reports nothing, as in a check; one of the borrow
+            // check leaves its body unchecked, which is no pass)
+            let checked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                if lints { relax_types::lint_early::check_def(prog, tcx, d); }
                 // (typed again: the save's build typed it with no lints)
                 let body = tcx.typeck_unstored(prog, d);
-                if !body.errors.is_empty() { return; }
-                relax_types::lint::check_literals(prog, tcx, &body);
-                relax_types::lint_pass::check_body(prog, tcx, &body);
-                let _ = relax_types::unsafety::check_body(prog, tcx, &body);
+                if !body.errors.is_empty() { return Vec::new(); }
+                if lints {
+                    relax_types::lint::check_literals(prog, tcx, &body);
+                    relax_types::lint_pass::check_body(prog, tcx, &body);
+                    let _ = relax_types::unsafety::check_body(prog, tcx, &body);
+                }
                 let state = crate::tcx::EvalState::new();
-                let _ = crate::borrowck::check_body(&crate::tcx::EvalCx::new(prog, tcx, crate::tcx::TypingEnv::fully_monomorphized(prog), &state), prog, tcx, &body);
+                let v = crate::borrowck::check_body(&crate::tcx::EvalCx::new(prog, tcx, crate::tcx::TypingEnv::fully_monomorphized(prog), &state), prog, tcx, &body);
+                let mut out: Vec<String> = v.errors.iter().map(|e| e.render()).collect();
+                out.extend(v.unchecked.iter().map(|x| format!("error: internal compiler error while checking the borrows of {}: {} -- Relax bug, report it", prog.def_path(d), x)));
+                out
             }));
+            match checked {
+                Ok(errors) => borrows.extend(errors.into_iter().map(|e| (d.0, e))),
+                Err(_) => borrows.push((d.0, format!("error: internal compiler error while checking the borrows of {} -- Relax bug, report it", prog.def_path(d)))),
+            }
         }
     });
+    let owners: Vec<u32> = roots.iter().map(|d| d.0).collect();
+    if !lints { return LiveCheck { lints: Vec::new(), owners, borrows }; }
     let entries: Vec<Entry> = reported.into_iter().filter(|r| !r.lint.is_empty() && roots.contains(&relax_types::type_queries::typeck_root_def_id(prog, r.def)))
         .map(|r| {
             let stage = crate::check_order::stage_of_lint(r.lint, r.def);
@@ -1071,7 +1097,8 @@ pub(crate) fn live_lints(prog: &crate::program::Program, tcx: &crate::tcx::Tcx, 
             Entry::new(stage, seq, if r.level >= relax_types::lint::Level::Deny { Out::Error(r.line) } else { Out::Warning(r.line) })
         })
         .collect();
-    crate::check_order::sort(prog, entries).into_iter().filter_map(|e| match e.out { Out::Warning(s) | Out::Error(s) => Some(s), Out::Borrow(_) => None }).collect()
+    let lints = crate::check_order::sort(prog, entries).into_iter().filter_map(|e| match e.out { Out::Warning(s) | Out::Error(s) => Some(s), Out::Borrow(_) => None }).collect();
+    LiveCheck { lints, owners, borrows }
 }
 
 fn check_crate_impl(u: &mut Unit, root: u32, crates: &[u32], front: Vec<String>, emit: bool, compile: bool, mut reuse: Option<&mut crate::check_reuse::Reuse>) -> (i32, Vec<crate::diag::Diagnostic>, Vec<(String, usize)>) {

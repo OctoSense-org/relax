@@ -10752,9 +10752,11 @@ unsafe fn test_edit(up: *mut Unit, paths: Vec<String>, o: &mut Outcome, undos: &
     // rest on every body -- dead code, unused imports -- wait for the next test check)
     let mut bodies = o.bodies.clone();
     if let Some(u) = &o.undo { bodies.extend(u.added.iter().copied()); }
-    for l in crate::owner::call(crate::owner::Class::Program, || crate::check::live_lints(&(*up).prog, &(*up).tcx, &bodies)) {
+    let check = crate::owner::call(crate::owner::Class::Program, || crate::check::live_lints(&(*up).prog, &(*up).tcx, &bodies));
+    for l in check.lints.iter().chain(check.borrows.iter().map(|(_, e)| e)) {
         eprintln!("relax live:   {l}");
     }
+    live::note_borrows(&check.owners, check.borrows);
     patch_landed(edit.paths.iter().cloned(), changed_items(up, o));
     let mut pending = Vec::new();
     if let Some(undo) = o.undo.take() {
