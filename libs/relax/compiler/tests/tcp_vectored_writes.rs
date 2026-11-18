@@ -15,7 +15,14 @@ fn a_vectored_write_sends_every_buffer() {
     let parts = [IoSlice::new(b"head:"), IoSlice::new(b""), IoSlice::new(b"body"), IoSlice::new(b";")];
     assert_eq!(tx.write_vectored(&parts).unwrap(), 10, "every buffer's bytes, the empty one skipped");
     assert_eq!((&tx).write_vectored(&parts[2..]).unwrap(), 5, "the same through &TcpStream");
-    assert_eq!(tx.write_vectored(&[]).unwrap(), 0, "no buffers write nothing");
+    // no buffers: writev(2) with none, as real std calls it, which Linux answers with 0 and
+    // Apple's kernel refuses (EINVAL: its man page's "iovcnt ... less than or equal to 0")
+    let none = tx.write_vectored(&[]);
+    if cfg!(target_vendor = "apple") {
+        assert_eq!(none.unwrap_err().kind(), std::io::ErrorKind::InvalidInput, "no buffers on an Apple target");
+    } else {
+        assert_eq!(none.unwrap(), 0, "no buffers write nothing");
+    }
     // one byte per buffer: a call takes the OS's limit of them, the rest is the next write's
     let bytes: Vec<u8> = (0..1100u32).map(|i| (i % 251) as u8).collect();
     let many: Vec<IoSlice> = bytes.chunks(1).map(IoSlice::new).collect();
