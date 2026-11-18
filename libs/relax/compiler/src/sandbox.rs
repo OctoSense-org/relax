@@ -1163,6 +1163,39 @@ fn cur_arena() -> Option<&'static Arena> {
     }
 }
 
+/// Reads one byte of each page of [pm, pm + len) of the current window as fault-safe code, before
+/// host code reads the range: an unmapped page faults here, where the module's own read would
+/// have, and is contained like it (the module's call ends with the fault) instead of ending the
+/// process in host code. A live window's mapped memory only grows until it is unloaded (an
+/// access after that is stale: stale.rs parks the thread), so a range this read stays readable
+/// for the host code after it. One read per 4 KB page; no lock, no allocation.
+fn touch_in(pm: u64, len: u64) {
+    if len == 0 {
+        return;
+    }
+    let _safe = crate::jit::FaultSafe::enter();
+    let end = pm.saturating_add(len);
+    let mut p = pm;
+    while p < end {
+        unsafe { std::ptr::read_volatile(p as *const u8) };
+        p = (p | 4095) + 1;
+    }
+}
+
+/// `touch_in` for text a runtime entry was handed (rt_panic_impl's): a range in the current
+/// arena's window is the module's, and faults as its own read would; any other range is the
+/// host's own memory, which the host reads as before.
+pub(crate) fn touch_module_text(p: u64, len: u64) {
+    if !sb_ready() {
+        return;
+    }
+    let Some(a) = cur_arena() else { return };
+    if p & !(WINDOW - 1) != a.base {
+        return;
+    }
+    touch_in(p, len.min(WINDOW - (p & (WINDOW - 1))));
+}
+
 /// Masks a module pointer into the current window.
 fn m(p: u64) -> u64 {
     match cur_arena() {
@@ -1840,6 +1873,9 @@ fn fill_random(p: u64, len: u64) -> bool {
     }
     let out = unsafe { std::slice::from_raw_parts_mut(pm as *mut u8, len as usize) };
     let seed = std::collections::hash_map::RandomState::new();
+    // the writes into the module's memory: an unmapped or read-only page faults as the module's
+    // own write would (contained, its call ends), not in host code (the seed is made above)
+    let _safe = crate::jit::FaultSafe::enter();
     for (k, c) in out.chunks_mut(8).enumerate() {
         let mut h = seed.build_hasher();
         h.write_usize(k);
@@ -2028,6 +2064,8 @@ rt_fn! {
 fn sb_fmt_str(p: u64, len: u64, spec: u64) {
     let pm = m(p);
     let len = if fits(pm, len) { len } else { 0 };
+    // an unmapped page of the text faults here, as the module's own read (rt_fmt_str allocates)
+    touch_in(pm, len);
     let f: rt_fn_ty!(fn(u64, u64, u64)) = unsafe { std::mem::transmute(jit::rt_entry("fmt_str") as usize) };
     f(pm, len, spec)
 }
@@ -2039,6 +2077,8 @@ fn sb_str_eq(p1: u64, l1: u64, p2: u64, l2: u64) -> u64 {
     if l1 != l2 || !fits(a, l1) || !fits(b, l2) {
         return 0;
     }
+    // reads of the module's memory: a fault is the module's (no lock, no allocation here)
+    let _safe = crate::jit::FaultSafe::enter();
     let (x, y) = unsafe { (std::slice::from_raw_parts(a as *const u8, l1 as usize), std::slice::from_raw_parts(b as *const u8, l2 as usize)) };
     (x == y) as u64
 }

@@ -81,6 +81,12 @@ if [ "$GOT" = "$(cat "$D/expect-scale.out")" ]; then echo "modules scale: PASS (
 OUT=$("$1" test --allow-unchecked-modules "$D/contain.rs" 2>&1)
 GOT=$(echo "$OUT" | grep '^out ')
 if [ "$GOT" = "$(cat "$D/expect-contain.out")" ]; then echo "modules contain: PASS"; else echo "modules contain: FAIL"; echo "$GOT"; echo "$OUT" | grep -v '^  report' | tail -8; FAILS=$((FAILS + 1)); fi
+# A fault contained in fault-safe host code leaves the thread as it was: a later host-code fault on
+# it still ends the process (contain_leak.rs ends by it, after its first line).
+OUT=$("$1" test --allow-unchecked-modules "$D/contain_leak.rs" 2>&1)
+STATUS=$?
+GOT=$(echo "$OUT" | grep '^out ')
+if [ "$STATUS" != 0 ] && [ "$GOT" = "out module fault contained: true" ] && echo "$OUT" | grep -q 'fault in host code (not JIT code), not contained'; then echo "modules contain leak: PASS"; else echo "modules contain leak: FAIL (status $STATUS)"; echo "$GOT"; echo "$OUT" | grep -v '^  report' | tail -8; FAILS=$((FAILS + 1)); fi
 # Append-only module code (MEMRECLAIM): 400 load/edit/unload cycles keep a live module stable;
 # prints the twin code growth per hot patch. Its harness deadline includes compilation.
 OUT=$(RELAX_WATCHDOG_MS=120000 "$1" test "$D/growth.rs" 2>&1)

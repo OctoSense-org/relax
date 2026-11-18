@@ -2,7 +2,14 @@
 // is off, so modules may use unsafe): whatever address a module writes or reads, the host's
 // memory is untouched and a bad access ends the call with an error. A module's panic message
 // reaches the host as the call's error, read from the module's memory alone and at most 4096
-// bytes of it, whatever pointer and length the module hands the runtime.
+// bytes of it, whatever pointer and length the module hands the runtime. Text a module hands the
+// runtime at an unmapped part of its window (offset 0, the window's last bytes, past the heap's
+// mapped top, a range from its statics into its first segment's guard) ends that call as the
+// module's own read would, never the host process: panic text and file name (rt_panic_impl), a
+// str compared through the runtime's str_eq, a buffer filled with random bytes. (At the window's
+// last bytes the last two are refused unread: the range leaves the window. A str formatted with
+// panic! is formatted in the module's own code, a contained read of JIT code; no module code
+// reaches the runtime's fmt_str.)
 // Run: makepad test --allow-unchecked-modules tests/modules/contain.rs
 static mut SECRET: u64 = 0x1234_5678;
 static TEXT: &str = "HOST-ONLY-BYTES";
@@ -57,6 +64,38 @@ pub fn panic_long() -> u64 {
     let s = "long";
     unsafe { core::intrinsics_rt::panic_impl(s.as_ptr(), 1 << 40, "evil.rs".as_ptr(), 7, 1, 1) }
 }
+pub fn panic_file(a: u64) -> u64 {
+    unsafe { core::intrinsics_rt::panic_impl("x".as_ptr(), 1, a as *const u8, 16, 1, 1) }
+}
+// (a str made without std's checks: a forged one. panic! formats it in the twin's own code; a
+// match against a literal longer than 16 bytes compares it through the runtime's str_eq)
+fn forged_str(a: u64, n: u64) -> &'static str {
+    unsafe { core::mem::transmute(core::ptr::slice_from_raw_parts(a as *const u8, n as usize)) }
+}
+pub fn fmt_at(a: u64, n: u64) -> u64 {
+    panic!("text {}", forged_str(a, n))
+}
+pub fn eq_at(a: u64, _n: u64) -> u64 {
+    match forged_str(a, 64) {
+        "yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy" => 1,
+        _ => 0,
+    }
+}
+#[cfg(target_vendor = "apple")]
+pub fn random_into(a: u64, n: u64) -> u64 {
+    unsafe extern "C" {
+        fn arc4random_buf(buf: *mut u8, len: usize);
+    }
+    unsafe { arc4random_buf(a as *mut u8, n as usize) }
+    n
+}
+#[cfg(not(target_vendor = "apple"))]
+pub fn random_into(a: u64, n: u64) -> u64 {
+    unsafe extern "C" {
+        fn getrandom(buf: *mut u8, len: usize, flags: u32) -> isize;
+    }
+    unsafe { getrandom(a as *mut u8, n as usize, 0) as u64 }
+}
 "#,
         &[],
     )
@@ -71,6 +110,10 @@ pub fn panic_long() -> u64 {
     let po: fn(u64) -> u64 = m.get("panic_own").unwrap();
     let pt: fn(u64, u64) -> u64 = m.get("panic_text").unwrap();
     let pl: fn() -> u64 = m.get("panic_long").unwrap();
+    let pf: fn(u64) -> u64 = m.get("panic_file").unwrap();
+    let fa: fn(u64, u64) -> u64 = m.get("fmt_at").unwrap();
+    let eq: fn(u64, u64) -> u64 = m.get("eq_at").unwrap();
+    let rnd: fn(u64, u64) -> u64 = m.get("random_into").unwrap();
     let local = own();
     // Exercise confinement after the twins have become hot, not only in O1.
     for _ in 0..10000 {
@@ -100,5 +143,18 @@ pub fn panic_long() -> u64 {
     println!("out host bytes never a panic message: {}", g7.as_ref().is_err_and(|e| !e.contains(TEXT)));
     let g8 = std::relax::guard(1000, || pl());
     println!("out panic message bounded: {}", g8.as_ref().is_err_and(|e| e.len() <= 4096 * 3));
+    // fixed unmapped offsets of the window: its first page, its last bytes, past the heap's
+    // mapped top, and text that starts in the module's mapped statics and runs into the guard of
+    // its first thread segment
+    let mut panics_end = true;
+    for (at, n) in [(0u64, 32u64), (0xffff_fff0, 64), (0xfffe_fff8, 4096), (0x07ff_fff8, 4096)] {
+        panics_end &= std::relax::guard(1000, || pt(at, n)).is_err();
+        panics_end &= std::relax::guard(1000, || pf(at)).is_err();
+        // (a call that returns is as good: the property is that the host goes on)
+        let _ = std::relax::guard(1000, || fa(at, n));
+        let _ = std::relax::guard(1000, || eq(at, n));
+        let _ = std::relax::guard(1000, || rnd(at, n));
+    }
+    println!("out unmapped module text ends the call: {}", panics_end);
     println!("out host still fine: {}", unsafe { SECRET } == 0x1234_5678);
 }

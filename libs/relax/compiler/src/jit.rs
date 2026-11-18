@@ -3082,8 +3082,13 @@ unsafe fn recovered_call(enter: u64, thunk: unsafe extern "C" fn(*mut u8), data:
     let place = app_caller();
     let was = if place.is_null() { 0 } else { (*place).in_call.swap(*(tls_block() as *const u64) + 1, Ordering::AcqRel) };
     let mut call = (thunk, data);
+    // the thread's fault-safe depth, as call_jit_inner keeps it: a fault this recovery point
+    // takes (end_on_fault: the run ending, a stale window) resumes here past any guard's drop,
+    // and the native frames below go on (a leaked depth would contain their host faults)
+    let safe_depth = FAULT_SAFE.try_with(|c| c.get()).unwrap_or(0);
     let enter: rt_fn_ty!(fn(u64, u64, *mut u64) -> u64) = std::mem::transmute(enter as usize);
     let r = enter(app_call_body as *const () as usize as u64, &mut call as *mut _ as u64, e);
+    let _ = FAULT_SAFE.try_with(|c| c.set(safe_depth));
     if !place.is_null() {
         (*place).in_call.store(was, Ordering::Release);
     }
@@ -3144,6 +3149,9 @@ pub(crate) fn run_thread_body(enter: u64, f: u64, arg: u64) {
         let r = enter(f, arg, e);
         *e = 0;
         *e.add(1) = 0;
+        // the body's frames are gone: no fault-safe guard of theirs is open (a fault this point
+        // took resumed here past its drop)
+        let _ = FAULT_SAFE.try_with(|c| c.set(0));
         r
     };
     if r == LEAVE_RUN_ENDED {
@@ -4105,6 +4113,11 @@ fn site_file(path: &str) -> &'static [u8] {
 rt_fn! {
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn rt_panic_impl(msg: *const u8, len: u64, file: *const u8, file_len: u64, line: u64, col: u64, regs: *const u64, _a7: u64) {
+    // a module's text (its twin's call: the pointers masked into its window, the lengths cut to
+    // 4096 bytes and the window's end) is read first as fault-safe code, so an unmapped page
+    // ends the module's call as its own read would, not the process in the decoding below
+    crate::sandbox::touch_module_text(msg as u64, len);
+    crate::sandbox::touch_module_text(file as u64, file_len);
     let m = unsafe { String::from_utf8_lossy(std::slice::from_raw_parts(msg, len as usize)).into_owned() };
     let f = unsafe { String::from_utf8_lossy(std::slice::from_raw_parts(file, file_len as usize)).into_owned() };
     PANIC_LOC.with(|l| *l.borrow_mut() = format!("{}:{}:{}", f, line as u32, col as u32));
@@ -10033,6 +10046,11 @@ pub unsafe fn call_jit_in(u: *mut Unit, domain: u64, entry: u64, arg: u64) -> Re
 unsafe fn call_jit_inner(u: *mut Unit, entry: u64, arg: u64) -> Result<u64, PanicInfo> {
     let ctx = ctx_ptr();
     let saved_ctx = [*ctx, *ctx.add(1)];
+    // the thread's fault-safe depth at this recovery point: a fault contained inside FaultSafe
+    // code (or a panic or hang that leaves through it) resumes here past the guard's drop, so the
+    // depth is put back below; left raised, every later host-code fault on the thread would be
+    // contained (JITSAFE fix 7)
+    let safe_depth = FAULT_SAFE.try_with(|c| c.get()).unwrap_or(0);
     let enter: rt_fn_ty!(fn(u64, u64, *mut u64) -> u64) = std::mem::transmute((&*u).enter as usize);
     // Hosted under the JIT, `catch_unwind` is the outer runtime's recovery point: only its return
     // puts the thread's outer recovery context back. A panic of the code `enter` runs leaves
@@ -10045,6 +10063,7 @@ unsafe fn call_jit_inner(u: *mut Unit, entry: u64, arg: u64) -> Result<u64, Pani
     let r = enter(entry, arg, ctx);
     *ctx = saved_ctx[0];
     *ctx.add(1) = saved_ctx[1];
+    let _ = FAULT_SAFE.try_with(|c| c.set(safe_depth));
     if r == LEAVE_RUN_ENDED {
         note_abandoned_frames(false);
         return Err(PanicInfo { kind: RUN_ENDED_KIND.to_string(), message: String::new(), site: u64::MAX, frames: Vec::new(), fault_addr: 0, location: String::new() });
