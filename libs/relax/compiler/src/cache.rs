@@ -6099,12 +6099,10 @@ pub fn app_store_files(dir: &std::path::Path, krate: &str) -> Vec<PathBuf> {
     files
 }
 
-/// Relax keeps a tenth of the store folder's volume free, at most FREE_MAX (prune): room for every
-/// other program's writes between two runs (swap growth, a few builds). Under it, stores go, least
-/// recently used first. A tenth alone kept 190 GB free on a 2 TB disk: with 185 GB free, every
-/// launch there evicted every store not in use, and warm runs started cold.
-const FREE_SHARE: u64 = 10;
-const FREE_MAX: u64 = 20 << 30;
+// Relax keeps a tenth of the store folder's volume free, at most FREE_MAX (prune): room for every
+// other program's writes between two runs (swap growth, a few builds). Under it, stores go, least
+// recently used first. The rule is relax-session's, where devhub's disk guard reads it too.
+use relax_session::store_floor::{free_floor, FREE_MAX, FREE_SHARE};
 /// Under the floor, Relax holds back when all it could free is under 1/FUTILE_SHARE of what the
 /// volume lacks: other programs' files fill it, and deleting the cache would cost warm starts and
 /// leave the volume as short (said once per process).
@@ -6181,7 +6179,7 @@ fn prune_shared_with(root: &std::path::Path, live: &HashSet<PathBuf>, open: &Has
 fn below_floor(dir: &std::path::Path) -> (u64, u64, u64) {
     match crate::dirs::volume_space(dir) {
         Some((free, size)) => {
-            let floor = (size / FREE_SHARE).min(FREE_MAX);
+            let floor = free_floor(size);
             (floor.saturating_sub(free), free, floor)
         }
         None => (0, 0, 0),
