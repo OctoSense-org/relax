@@ -48,16 +48,17 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 
-pub const MAGIC: &[u8; 4] = b"RCS1";
-pub(crate) const FORMAT: u32 = 3;
-const HEADER: usize = 128;
+// (relax-session store_file: what tools that share the store read of a header)
+pub const MAGIC: &[u8; 4] = relax_session::store_file::MAGIC;
+pub(crate) const FORMAT: u32 = relax_session::store_file::FORMAT;
+const HEADER: usize = relax_session::store_file::HEADER;
 const INDEX_ENTRY: usize = 40;
 const MIN_CAP: u32 = 256;
 /// Where the header's two slots begin, and the bytes of each.
 const SLOTS_AT: usize = 16;
 const SLOT: usize = 48;
 /// Where the header names the Relax build that wrote the store.
-const BUILD_AT: usize = 112;
+const BUILD_AT: usize = relax_session::store_file::BUILD_AT;
 
 /// This Relax build's codegen identity (codegen_id.rs) as store headers carry it. Every store name hashes it
 /// (cache.rs front_store_name, code_store_name, front_graph_key; run stores are one process's),
