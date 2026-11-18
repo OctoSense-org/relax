@@ -65,6 +65,9 @@ pub enum SymKind {
     /// sandboxed code: the version of host entry `.0` (`c:<C name>`, `rt:<runtime entry>`) the
     /// domain's policy gives its code
     SbHost(String),
+    /// What code calls through, named by a stable string (jit.rs `RtNote`). `Func::notes`
+    /// carries it to a `RelocKind::Note`. Its value is zero and no code reads it.
+    Note(String),
 }
 
 /// What the bytes of a data object hold.
@@ -158,15 +161,27 @@ struct DataIndex {
 
 /// The name prefix of a vtable's data object (jit.rs Unit::vtable).
 pub const VTABLE_NAME: &str = "vtable:";
+/// Separates a vtable's dyn type and each principal key it serves.
+pub const VTABLE_KEY_SEP: char = '\u{1f}';
 
-/// The two types a vtable's data name gives (`vtable:<type>#<hash>:<dyn type>#<hash>`, stable_ty
-/// each), with their hashes.
-pub fn vtable_name_parts(name: &str) -> Option<(&str, &str)> {
+/// The concrete type, followed by the dyn type and the keys sharing its vtable.
+fn vtable_name_fields(name: &str) -> Option<(&str, std::str::Split<'_, char>)> {
     let rest = name.strip_prefix(VTABLE_NAME)?;
     let b = rest.as_bytes();
-    // (the last `#<hash>:`: the concrete type's end; the dyn type ends in its own hash)
+    // The last `#<hash>:` ends the concrete type. The dyn type and keys end in a hash or '-'.
     let cut = (0..b.len()).rev().find(|&i| b[i] == b'#' && i + 9 < b.len() && b[i + 9] == b':' && b[i + 1..i + 9].iter().all(u8::is_ascii_hexdigit))?;
-    Some((&rest[..cut + 9], &rest[cut + 10..]))
+    Some((&rest[..cut + 9], rest[cut + 10..].split(VTABLE_KEY_SEP)))
+}
+
+/// The concrete and dyn types of a vtable, with their stable_ty hashes.
+pub fn vtable_name_parts(name: &str) -> Option<(&str, &str)> {
+    let (ty, mut fields) = vtable_name_fields(name)?;
+    Some((ty, fields.next()?))
+}
+
+/// The principal keys this vtable serves, in segment order.
+pub fn vtable_name_keys(name: &str) -> impl Iterator<Item = &str> {
+    vtable_name_fields(name).into_iter().flat_map(|(_, fields)| fields.skip(1))
 }
 
 impl Syms {
@@ -190,6 +205,11 @@ impl Syms {
         let s = self.push(own.clone(), value);
         g.map.insert(own, s.id);
         s
+    }
+
+    /// The symbol for a real-time call-site note.
+    pub fn note(&self, name: String) -> Sym {
+        self.intern(SymKind::Note(name), 0)
     }
 
     fn push(&self, kind: SymKind, value: u64) -> Sym {
@@ -1012,6 +1032,7 @@ pub fn describe(u: &Unit, s: Sym) -> String {
         Some(SymKind::SbTls(id)) => format!("sandbox-tls:{}", describe(u, Sym::new(id))),
         Some(SymKind::SbTable) => "sandbox-table".to_string(),
         Some(SymKind::SbHost(n)) => format!("sandbox-host:{}", n),
+        Some(SymKind::Note(n)) => format!("note:{n}"),
         Some(SymKind::Rw(k)) => {
             let b = u.syms.rw_blocks.lock().unwrap_or_else(|e| e.into_inner());
             let (sz, al) = b.get(k as usize).copied().unwrap_or((0, 0));
@@ -1112,7 +1133,11 @@ pub fn reloc_sig(u: &Unit, name: impl FnOnce() -> String, code: &[u8], relocs: &
     for rl in relocs {
         let (off, r) = (&rl.at, &rl.target);
         let o = *off as usize;
-        let w = if rl.kind == relax_backend::rir::RelocKind::Pool64 { 8 } else { 4 };
+        let w = match rl.kind {
+            relax_backend::rir::RelocKind::Note => 0,
+            relax_backend::rir::RelocKind::Pool64 => 8,
+            _ => 4,
+        };
         if o + w <= c.len() {
             c[o..o + w].fill(0);
         }
@@ -1141,7 +1166,7 @@ pub fn reloc_sig(u: &Unit, name: impl FnOnce() -> String, code: &[u8], relocs: &
         if want == "*" || name.contains(want) {
             let hex: String = c.iter().map(|b| format!("{:02x}", b)).collect();
             // the pool as compiled (values), for debugging relocations
-            let vals: Vec<String> = relocs.iter().map(|rl| {
+            let vals: Vec<String> = relocs.iter().filter(|rl| rl.kind != relax_backend::rir::RelocKind::Note).map(|rl| {
                 let (o, r) = (&rl.at, &rl.target);
                 let o = *o as usize;
                 let v = if o + 8 <= code.len() { u64::from_le_bytes(code[o..o + 8].try_into().unwrap()) } else { 0 };
@@ -1292,7 +1317,7 @@ pub fn class_of(k: &SymKind) -> relax_backend::rir::SymClass {
         SymKind::Foreign(_) | SymKind::Provided(_) | SymKind::StaticAddr(_) | SymKind::TierRec(_) => SymClass::Far,
         // (an offset of the sandbox's own, or an address outside the unit's code area)
         SymKind::SbThunk(_) | SymKind::SbPlace(_) | SymKind::SbTls(_) | SymKind::SbTable | SymKind::SbHost(_) => SymClass::Far,
-        SymKind::Site(_) | SymKind::ThreadLocal(_) => SymClass::Imm,
+        SymKind::Site(_) | SymKind::ThreadLocal(_) | SymKind::Note(_) => SymClass::Imm,
     }
 }
 

@@ -252,7 +252,9 @@ const LEDGER_KEY: u128 = 0;
 // 36: a coroutine's closure type has tags of its own (enc_ty 29 for 17's form, 30 for 28's).
 // 37: a type its tree has written before is a back-reference (TY_BACKREF) when that is shorter,
 // and a callee key the entry's relocation list has written before is one (RELOC_KEY_REF).
-const ENTRY_VERSION: u32 = 38;
+// 39: code entries carry call-site notes (relocation kind 9, symbol tag 19 and a stable string).
+// A vtable's data name carries its principal keys (syms::vtable_name_keys).
+const ENTRY_VERSION: u32 = 39;
 /// enc_ty's tag for "the n-th type this tree wrote in full" (a u32 n follows): written for a type
 /// whose first write was longer than this back-reference.
 const TY_BACKREF: u8 = 63;
@@ -3880,6 +3882,10 @@ impl Cache {
                 e.u8(18);
                 e.str(&n);
             }
+            SymKind::Note(n) => {
+                e.u8(19);
+                e.str(&n);
+            }
         }
         e.u64(s.off as u64);
         Some(())
@@ -6924,13 +6930,16 @@ impl Cache {
             }
             return Some(false);
         }
-        let n = d.u32().unwrap_or(0) as usize;
-        let start = d.p;
-        let _ = start;
+        let Some(n) = d.u32() else { return Some(false) };
+        if n as usize != relocs.len() {
+            eprintln!("relax cache: VERIFY relocation count differs: {} ({} cached, {} fresh, {})", name, n, relocs.len(), inputs_word);
+            if same_inputs { self.stats.verify_diff_reloc += 1 } else { self.stats.verify_diff_inputs += 1 }
+            return Some(false);
+        }
         let mut rw = Vec::new();
         // the callee keys written so far, as the entry's writer counts them (write_callee)
         let mut keyed = HashMap::new();
-        for rl in relocs.iter().take(n) {
+        for rl in relocs {
             let (o, r) = (&rl.at, &rl.target);
             let co = d.u32().unwrap_or(u32::MAX);
             let ck = d.u8().and_then(kind_of);
@@ -6979,6 +6988,7 @@ fn kind_code(k: RelocKind) -> u8 {
         RelocKind::A64CoverageBit { .. } => unreachable!("coverage disables the code cache"),
         RelocKind::X64Branch32 => 7,
         RelocKind::A64Branch26 => 8,
+        RelocKind::Note => 9,
     }
 }
 
@@ -6993,6 +7003,7 @@ fn kind_of(c: u8) -> Option<RelocKind> {
         6 => RelocKind::A64MovzMovk,
         7 => RelocKind::X64Branch32,
         8 => RelocKind::A64Branch26,
+        9 => RelocKind::Note,
         _ => return None,
     })
 }
@@ -11953,6 +11964,7 @@ impl Linker {
                 let name = d.str()?;
                 crate::sandbox::host_sym(u, name)?
             }
+            19 => u.syms.note(d.str()?.to_string()),
             _ => return None,
         };
         s.off = d.u64()? as i64;
@@ -12260,9 +12272,11 @@ impl Linker {
                 }
                 _ => {
                     let s = self.link_symbol(u, &mut d, &mut rw)?;
-                    let v = u.syms.value(s);
-                    if u.syms.data_at(v).is_some() {
-                        data.push(v);
+                    if kind != RelocKind::Note {
+                        let v = u.syms.value(s);
+                        if u.syms.data_at(v).is_some() {
+                            data.push(v);
+                        }
                     }
                     Reloc::Sym(s)
                 }
@@ -12272,7 +12286,11 @@ impl Linker {
             }
             if let Some(w) = dump_filter().filter(|_| self.cache().verbose) {
                 if _name.contains(w) {
-                    eprintln!("relax cache: link {} at {} {:?} tag {} = {:#x}", _name, o, kind, tag, u.env.reloc_value(target));
+                    if let (RelocKind::Note, Reloc::Sym(s)) = (kind, target) {
+                        eprintln!("relax cache: link {} {}", _name, crate::syms::describe(u, s));
+                    } else {
+                        eprintln!("relax cache: link {} at {} {:?} tag {} = {:#x}", _name, o, kind, tag, u.env.reloc_value(target));
+                    }
                 }
             }
             relocs.push(RelocAt { at: o as u32, kind, target });

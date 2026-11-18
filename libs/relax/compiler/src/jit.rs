@@ -781,12 +781,12 @@ fn code_as_now() -> Option<CodeKind> {
 /// What one code body references, read off the relocations that linked those exact bytes: the
 /// slots it calls or names (a call, a callable address, a table word), of those the ones whose
 /// callable address it takes (a fn pointer it makes), the data objects it names (their `syms`
-/// index: vtables, fn tables), and the statics and thread-locals it names (their DefId). Sorted,
-/// each once.
+/// index: vtables, fn tables), the statics and thread-locals it names (their DefId), and its
+/// call-site notes (symbol ids). Each part is sorted and holds each id once.
 pub(crate) struct CodeRefs {
     ids: Box<[u32]>,
-    /// where `taken`, `data` and `statics` start in `ids`
-    ends: [u32; 3],
+    /// where `taken`, `data`, `statics` and `notes` start in `ids`
+    ends: [u32; 4],
 }
 
 /// The parts of a CodeRefs as they are collected (CodeRefs::new sorts them).
@@ -796,6 +796,8 @@ pub(crate) struct RefList {
     pub taken: Vec<u32>,
     pub data: Vec<u32>,
     pub statics: Vec<u32>,
+    /// Symbol ids of the body's call-site notes.
+    pub notes: Vec<u32>,
 }
 
 impl RefList {
@@ -808,12 +810,13 @@ impl RefList {
     }
 
     /// A relocation naming a symbol of kind `k`.
-    pub(crate) fn sym(&mut self, k: Option<crate::syms::SymKind>) {
+    pub(crate) fn sym(&mut self, id: u32, k: Option<crate::syms::SymKind>) {
         use crate::syms::SymKind;
         match k {
             Some(SymKind::Thunk(c)) => self.slot(c, true),
             Some(SymKind::Data(i)) => self.data.push(i),
             Some(SymKind::Static(d) | SymKind::StaticAddr(d) | SymKind::ThreadLocal(d)) => self.statics.push(d.0),
+            Some(SymKind::Note(_)) => self.notes.push(id),
             _ => {}
         }
     }
@@ -827,7 +830,7 @@ impl CodeRefs {
             match r.target {
                 Reloc::Call(c) | Reloc::Slot(c) => l.slot(c, false),
                 Reloc::Thunk(c) => l.slot(c, true),
-                Reloc::Sym(s) => l.sym(u.syms.kind(s.id)),
+                Reloc::Sym(s) => l.sym(s.id, u.syms.kind(s.id)),
                 _ => {}
             }
         }
@@ -835,9 +838,9 @@ impl CodeRefs {
     }
 
     pub(crate) fn new(l: RefList) -> CodeRefs {
-        let mut ids = Vec::with_capacity(l.slots.len() + l.taken.len() + l.data.len() + l.statics.len());
-        let mut ends = [0u32; 3];
-        for (k, mut part) in [l.slots, l.taken, l.data, l.statics].into_iter().enumerate() {
+        let mut ids = Vec::with_capacity(l.slots.len() + l.taken.len() + l.data.len() + l.statics.len() + l.notes.len());
+        let mut ends = [0u32; 4];
+        for (k, mut part) in [l.slots, l.taken, l.data, l.statics, l.notes].into_iter().enumerate() {
             if k > 0 {
                 ends[k - 1] = ids.len() as u32;
             }
@@ -865,7 +868,12 @@ impl CodeRefs {
 
     /// The statics and thread-locals the code names (DefId).
     pub(crate) fn statics(&self) -> &[u32] {
-        &self.ids[self.ends[2] as usize..]
+        &self.ids[self.ends[2] as usize..self.ends[3] as usize]
+    }
+
+    /// The note symbols the code names.
+    pub(crate) fn notes(&self) -> &[u32] {
+        &self.ids[self.ends[3] as usize..]
     }
 }
 
@@ -6297,7 +6305,7 @@ impl Unit {
 
     /// Code at a fresh address with its relocated fields linked for that address.
     /// no-codegen mode: the address a slot takes for `code` (which must be a plain jump with no
-    /// relocations: an interpreter entry or a foreign function); other machine code is an error.
+    /// code fixups: an interpreter entry or a foreign function); other machine code is an error.
     fn no_codegen_target(&self, code: &[u8], relocs: &[relax_backend::rir::RelocAt], what: &str) -> Result<u64, String> {
         if relax_codegen::interp::blob::is_blob(code) {
             let mut c = code.to_vec();
@@ -6305,7 +6313,7 @@ impl Unit {
             return relax_codegen::interp::install_linked(&c, self.env.tls_slow, self.env.resume, self.slots.table_stride() - 8);
         }
         match relax_codegen::interp::redirect_target(code) {
-            Some(t) if relocs.is_empty() => Ok(t),
+            Some(t) if relocs.iter().all(|r| r.kind == relax_backend::rir::RelocKind::Note) => Ok(t),
             _ => Err(format!("relax run: no-codegen mode: `{}` would need machine code ({} bytes)", what, code.len())),
         }
     }
@@ -7575,12 +7583,20 @@ impl Unit {
         wsyms.push(None);
         // rustc_trait_selection/src/traits/vtable.rs:199-298.
         use relax_types::next_solver::vtable::VtblSegment;
-        let mut compact = vec![src]; compact.extend_from_slice(self.tcx.tys.list(targs));
-        let regions = self.tcx.tys.intern_region_args(&vec![crate::types::RegionId::ERASED; self.tcx.generic_indices_of(&self.prog, td).lifetimes.len()]);
-        // rustc_middle/src/ty/fold.rs:321-326 @8d1a764: the object's
-        // principal binder is instantiated before requesting vtable entries.
-        let tr = self.tcx.instantiate_bound_regions_with_erased(relax_types::next_solver::TraitRef { def_id: td, args: self.tcx.complete_args(&self.prog, td, &compact, regions) });
-        for segment in self.tcx.prepare_vtable_segments(&self.prog, tr) {
+        let mut keys = Vec::new();
+        let segments = if rt_has_principal(self, td) {
+            let mut compact = vec![src];
+            compact.extend_from_slice(self.tcx.tys.list(targs));
+            let regions = self.tcx.tys.intern_region_args(&vec![crate::types::RegionId::ERASED; self.tcx.generic_indices_of(&self.prog, td).lifetimes.len()]);
+            // rustc_middle/src/ty/fold.rs:321-326 @8d1a764: the object's
+            // principal binder is instantiated before requesting vtable entries.
+            let tr = self.tcx.instantiate_bound_regions_with_erased(TraitRef { def_id: td, args: self.tcx.complete_args(&self.prog, td, &compact, regions) });
+            self.tcx.prepare_vtable_segments(&self.prog, tr)
+        } else {
+            keys.push("-".to_string());
+            Vec::new()
+        };
+        for segment in segments {
             let VtblSegment::TraitOwnEntries { trait_ref, emit_vptr } = segment else { continue };
             for method in self.tcx.own_existential_vtable_entries(&self.prog, trait_ref.def_id) {
                 let indices = self.tcx.generic_indices_of(&self.prog, method);
@@ -7600,12 +7616,17 @@ impl Unit {
                 words.push(self.entry(id));
                 wsyms.push(Some(self.syms.intern(crate::syms::SymKind::Thunk(id), self.entry(id))));
             }
+            let args = Instance::new_raw(trait_ref.def_id, trait_ref.args).compact_args(&self.tcx);
             if emit_vptr {
-                let args = Instance::new_raw(trait_ref.def_id, trait_ref.args).compact_args(&self.tcx);
-                let super_dyn = self.tcx.tys.intern(TyKind::Dyn(trait_ref.def_id, self.tcx.tys.mk_list(&args[1..]), crate::types::List::EMPTY, crate::types::RegionArgsId::EMPTY, crate::types::RegionId::ERASED, 0, crate::types::List::EMPTY)
-);
+                let super_dyn = self.tcx.tys.intern(TyKind::Dyn(trait_ref.def_id, self.tcx.tys.mk_list(&args[1..]), crate::types::List::EMPTY, crate::types::RegionArgsId::EMPTY, crate::types::RegionId::ERASED, 0, crate::types::List::EMPTY));
                 let address = self.vtable(src, super_dyn)?;
                 words.push(address); wsyms.push(Some(self.data_sym(address)));
+            } else {
+                // An upcast to this segment keeps the vtable pointer.
+                let key = rt_trait_ref_key(self, trait_ref.def_id, &args[1..]);
+                if !keys.contains(&key) {
+                    keys.push(key);
+                }
             }
         }
         let pb = self.ptr_bytes();
@@ -7621,7 +7642,12 @@ impl Unit {
         }
         // (named: one of a trait-object type real-time code calls through is compiled after the
         // current request, realtime_vtable)
-        self.syms.set_data_name(a, format!("{}{}:{}", crate::syms::VTABLE_NAME, crate::syms::stable_ty(self, src), crate::syms::stable_ty(self, dy)));
+        let mut name = format!("{}{}:{}", crate::syms::VTABLE_NAME, crate::syms::stable_ty(self, src), crate::syms::stable_ty(self, dy));
+        for key in keys {
+            name.push(crate::syms::VTABLE_KEY_SEP);
+            name.push_str(&key);
+        }
+        self.syms.set_data_name(a, name);
         // a racing builder of the same vtable: everyone uses the first (one symbol per vtable)
         Ok(self.vtables.insert_first((src, dy), a))
     }
@@ -32070,10 +32096,10 @@ struct RealTime {
     /// through as the roots' are
     statics: crate::fxhash::HashSet<u32>,
     new_statics: Vec<u32>,
-    /// the fn-pointer signatures real-time values hold (realtime_sig_key), and the fn-pointer types
+    /// the fn-pointer signatures real-time values hold (rt_sig_hash), and the fn-pointer types
     /// still to take: every slot code takes the address of under one of them is real-time code
     /// too, now and as more code takes one (realtime_installed)
-    sigs: crate::fxhash::HashSet<Box<[u32]>>,
+    sigs: crate::fxhash::HashSet<u64>,
     new_sigs: Vec<u32>,
     /// slots outside the set with a tier-up build between its walk check and its install
     /// (realtime_before_install: how many), and the ones of them the walk met meanwhile: it takes
@@ -32475,8 +32501,8 @@ unsafe fn realtime_step_for(up: *mut Unit, budget: u64) {
             // took under one of them so far (the code records); later ones at their install
             Next::Sigs(ts) => {
                 let u = &*up;
-                let keys: Vec<Box<[u32]>> = ts.into_iter().filter_map(|t| realtime_fn_ptr_key(u, TyId(t))).collect();
-                let new: Vec<Box<[u32]>> = with_rt(|rt| keys.into_iter().filter(|k| rt.sigs.insert(k.clone())).collect());
+                let keys: Vec<u64> = ts.into_iter().filter_map(|t| realtime_fn_ptr_key(u, TyId(t))).collect();
+                let new: Vec<u64> = with_rt(|rt| keys.into_iter().filter(|&k| rt.sigs.insert(k)).collect());
                 if !new.is_empty() {
                     RT_SIGS.store(true, Ordering::Release);
                     let taken = u.code.read().unwrap_or_else(|e| e.into_inner()).taken_slots();
@@ -32874,28 +32900,133 @@ fn realtime_value_calls(u: &Unit, types: &[TyId]) -> ValueCalls {
     out
 }
 
-/// A fn signature as a key: its parameter types then its return type, every region erased (bound
-/// ones too: `for<'a> fn(&'a T)` and `fn(&T)` are one key). ABI and safety are not part of it.
-fn realtime_sig_key(u: &Unit, params: &[TyId], ret: TyId) -> Box<[u32]> {
-    let erased = |t: TyId| u.tcx.tys.map_regions(t, &|_, _| crate::types::RegionId::ERASED, 0).0;
-    params.iter().map(|&p| erased(p)).chain(std::iter::once(erased(ret))).collect()
+/// Whether a dyn type has a principal, as in supertrait_vtable_slot.
+fn rt_has_principal(u: &Unit, def: DefId) -> bool {
+    if def == crate::program::NO_DEF {
+        return false;
+    }
+    let d = u.prog.def(def);
+    let ast = &u.prog.files[d.file as usize].ast;
+    !ast.as_trait(&ast.item(d.item).kind).is_some_and(|t| t.auto)
+}
+
+/// Erases every region, including bound regions, for a real-time call-site key.
+fn rt_erased(u: &Unit, t: TyId) -> TyId {
+    u.tcx.tys.map_regions(t, &|_, _| crate::types::RegionId::ERASED, 0)
+}
+
+/// The key of a principal trait reference. Its arguments exclude Self.
+pub(crate) fn rt_trait_ref_key(u: &Unit, def: DefId, args: &[TyId]) -> String {
+    use crate::types::{List, RegionArgsId, RegionId};
+    if !rt_has_principal(u, def) {
+        return "-".to_string();
+    }
+    let args: Vec<_> = args.iter().map(|&t| rt_erased(u, t)).collect();
+    let dy = u.tcx.tys.intern(TyKind::Dyn(def, u.tcx.tys.mk_list(&args), List::EMPTY, RegionArgsId::EMPTY, RegionId::ERASED, 0, List::EMPTY));
+    crate::syms::stable_ty(u, dy)
+}
+
+/// The principal key of a trait object, shared across its auto traits and associated bindings.
+pub(crate) fn rt_trait_key(u: &Unit, dy: TyId) -> String {
+    match u.tcx.tys.kind(dy) {
+        TyKind::Dyn(def, args, ..) => rt_trait_ref_key(u, *def, u.tcx.tys.list(*args)),
+        _ => "-".to_string(),
+    }
+}
+
+/// A stable hash of the ABI class, parameter types and return type of a fn pointer.
+pub(crate) fn rt_sig_hash(u: &Unit, params: &[TyId], ret: TyId, c_like: bool) -> u64 {
+    let mut h = crate::sip::Sip128::new();
+    h.u8(c_like as u8);
+    for &t in params.iter().chain(std::iter::once(&ret)) {
+        h.u128(crate::stable::type_hash(&u.prog, &u.tcx, rt_erased(u, t)));
+    }
+    h.finish128() as u64
+}
+
+/// What an indirect call or a trait-object conversion contributes to the real-time reach.
+pub(crate) enum RtNote<'a> {
+    /// Calls this word of a vtable registered under the key. Word zero is drop.
+    Virtual(&'a str, u32),
+    /// Hands an object to native code that can call any word.
+    All(&'a str),
+    /// Calls a fn pointer. The hash matches its signature and the text describes it in traces.
+    Sig(u64, &'a str),
+    /// Upcasts an object of this key to an object without a principal.
+    Share(&'a str),
+}
+
+impl<'a> RtNote<'a> {
+    /// Reads a note's stable name, keeping paths and other colons in its text.
+    pub(crate) fn parse(s: &'a str) -> Option<Self> {
+        let (kind, rest) = s.split_once(':')?;
+        match kind {
+            "v" => {
+                let (word, key) = rest.split_once(':')?;
+                if key.is_empty() || !word.bytes().all(|b| b.is_ascii_digit()) { return None; }
+                Some(Self::Virtual(key, word.parse().ok()?))
+            }
+            "a" if !rest.is_empty() => Some(Self::All(rest)),
+            "s" => {
+                let (hash, readable) = rest.split_once(':')?;
+                if hash.len() != 16 || !hash.bytes().all(|b| b.is_ascii_hexdigit()) || readable.is_empty() { return None; }
+                Some(Self::Sig(u64::from_str_radix(hash, 16).ok()?, readable))
+            }
+            "x" if !rest.is_empty() => Some(Self::Share(rest)),
+            _ => None,
+        }
+    }
+
+    /// The stable string carried by the note symbol.
+    pub(crate) fn name(&self) -> String {
+        match self {
+            Self::Virtual(key, word) => format!("v:{word}:{key}"),
+            Self::All(key) => format!("a:{key}"),
+            Self::Sig(hash, readable) => format!("s:{hash:016x}:{readable}"),
+            Self::Share(key) => format!("x:{key}"),
+        }
+    }
+}
+
+/// Names a call through one vtable word.
+pub(crate) fn rt_virtual_note(u: &Unit, dy: TyId, word: u32) -> String {
+    RtNote::Virtual(&rt_trait_key(u, dy), word).name()
+}
+
+/// Names a trait object handed to native code.
+pub(crate) fn rt_all_note(u: &Unit, dy: TyId) -> String {
+    RtNote::All(&rt_trait_key(u, dy)).name()
+}
+
+/// Names a fn-pointer call by signature and includes its type for traces.
+pub(crate) fn rt_sig_note(u: &Unit, params: &[TyId], ret: TyId, c_like: bool) -> String {
+    use crate::types::{Abi, FnHeader};
+    let header = FnHeader { abi: if c_like { Abi::C } else { Abi::Rust }, ..FnHeader::RUST };
+    let fp = u.tcx.tys.intern(TyKind::FnPtr(u.tcx.tys.mk_list(params), ret, header, 0));
+    let readable = crate::typeck::ty_to_string(true, &u.prog, &u.tcx, fp);
+    RtNote::Sig(rt_sig_hash(u, params, ret, c_like), &readable).name()
+}
+
+/// Names a vtable shared with an object without a principal after an upcast.
+pub(crate) fn rt_share_note(u: &Unit, dy: TyId) -> String {
+    RtNote::Share(&rt_trait_key(u, dy)).name()
 }
 
 /// The signature key of fn-pointer type `t`.
-fn realtime_fn_ptr_key(u: &Unit, t: TyId) -> Option<Box<[u32]>> {
+fn realtime_fn_ptr_key(u: &Unit, t: TyId) -> Option<u64> {
     match u.tcx.tys.kind(t) {
-        TyKind::FnPtr(ps, r, _, _) => Some(realtime_sig_key(u, u.tcx.tys.list(*ps), *r)),
+        TyKind::FnPtr(ps, r, header, _) => Some(rt_sig_hash(u, u.tcx.tys.list(*ps), *r, header.abi.is_c_like())),
         _ => None,
     }
 }
 
 /// The signature key a fn pointer to slot `c` has: a fn item's (or its reify shim's) signature, a
 /// capture-free closure's as a fn pointer. None for other slots (glue, vtable shims).
-fn realtime_slot_key(u: &Unit, c: u32) -> Option<Box<[u32]>> {
+fn realtime_slot_key(u: &Unit, c: u32) -> Option<u64> {
     let item = |d: DefId, args: &[TyId]| {
         let sig = u.tcx.fn_sig(&u.prog, d)?;
         let params: Vec<TyId> = sig.params.iter().map(|&p| u.tcx.tys.subst_erasing_regions(p, args)).collect();
-        Some(realtime_sig_key(u, &params, u.tcx.tys.subst_erasing_regions(sig.ret, args)))
+        Some(rt_sig_hash(u, &params, u.tcx.tys.subst_erasing_regions(sig.ret, args), sig.header.abi.is_c_like()))
     };
     if (c as usize) >= u.fns.len() {
         return None;
@@ -32917,7 +33048,7 @@ fn realtime_slot_key(u: &Unit, c: u32) -> Option<Box<[u32]>> {
 /// The slots of `taken` (addresses new code takes) whose signature real-time values hold, not
 /// walked yet.
 fn realtime_sig_hits(u: &Unit, taken: &[u32]) -> Vec<u32> {
-    let keyed: Vec<(u32, Box<[u32]>)> = taken.iter().filter_map(|&c| Some((c, realtime_slot_key(u, c)?))).collect();
+    let keyed: Vec<(u32, u64)> = taken.iter().filter_map(|&c| Some((c, realtime_slot_key(u, c)?))).collect();
     with_rt(|rt| keyed.into_iter().filter(|(c, k)| rt.sigs.contains(k) && !rt.seen.contains(c)).map(|(c, _)| c).collect())
 }
 
