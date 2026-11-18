@@ -21887,9 +21887,18 @@ fn tier_explain_at(u: &Unit, id: u32, place: Option<(queue::TierEntry, usize, us
         let key = u as *const Unit as usize;
         let left: Vec<u32> = UNVERIFIED_LEFT.lock().unwrap_or_else(|e| e.into_inner()).iter().filter(|x| x.0 == key && x.2 == id).map(|x| x.1).collect();
         let kept = u.kept_users.values().filter(|v| v.contains(&id)).count();
-        let vstate = |c: u32| match u.verdict_state(c) { Verdict::Clean => "clean", Verdict::Failed(_) => "failed", Verdict::Pending => "pending", Verdict::Unverifiable(_) => "unverifiable" };
+        // (a twin's state: unverified code for good, whatever its base's verdict, unless that failed)
+        let vstate = |c: u32| match u.verdict_state(c) {
+            Verdict::Clean => "clean", Verdict::Failed(_) => "failed", Verdict::Pending => "pending",
+            Verdict::Unverifiable(_) if matches!(u.fns[c as usize].key, FnKey::Plain(_)) => "twin",
+            Verdict::Unverifiable(_) => "unverifiable",
+        };
         rows.push(("SPEC-V".into(), format!("flagged unverified {}; verdict {}; waits to be built again for: {} unverified callee(s) [{}], {} kept callee(s) turning hot",
-            f.unverified.load(Ordering::Relaxed), match u.verdict_state(id) { Verdict::Unverifiable(w) => format!("unverifiable ({})", w), _ => vstate(id).to_string() }, left.len(),
+            f.unverified.load(Ordering::Relaxed), match (u.verdict_state(id), &f.key) {
+                (Verdict::Unverifiable(_), FnKey::Plain(b)) => format!("twin of #{b} (its code stays unverified)"),
+                (Verdict::Unverifiable(w), _) => format!("unverifiable ({})", w),
+                _ => vstate(id).to_string(),
+            }, left.len(),
             left.iter().take(6).map(|&c| format!("#{} {} {}{}", c, short_name(&u.fns[c as usize].name), vstate(c), if u.fns[c as usize].unverified.load(Ordering::Relaxed) { " flagged" } else { "" })).collect::<Vec<_>>().join(", "), kept)));
     }
     if !allowed || awaiting {
@@ -24282,7 +24291,8 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
                         if f.unverified.load(Ordering::Relaxed) {
                             incomplete = true;
                             if !kept_calls.contains(&c) { kept_calls.push(c); }
-                            notes.push((c, if unverified_left.contains(&c) { "unverified: again at its verdict" } else { "unverified: again only with the root's verdict" }));
+                            notes.push((c, if matches!(f.key, FnKey::Plain(_)) { "twin: a call (a body lowered before its verdict names it)" }
+                                else if unverified_left.contains(&c) { "unverified: again at its verdict" } else { "unverified: again only with the root's verdict" }));
                             continue;
                         }
                         if f.build_err.is_some() {
@@ -26008,7 +26018,9 @@ unsafe fn o3_assemble(up: *mut Unit, (prog, tcx): (&Program, &Tcx), id: u32, rir
             Ok(a) => a,
             Err(why) => {
                 if trace { eprintln!("inline-trace-snap {}: out fn#{} {} ({})", fns[id as usize].name, c, fns[c as usize].name, why); }
-                if fns[c as usize].unverified.load(Ordering::Relaxed) { unverified_left.push(c); }
+                // (a twin is unverified code for good: its flag never clears, so a wait for it would
+                // never end, and o3_settled with it)
+                if fns[c as usize].unverified.load(Ordering::Relaxed) && !matches!(fns[c as usize].key, FnKey::Plain(_)) { unverified_left.push(c); }
                 continue;
             }
         };

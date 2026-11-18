@@ -1959,6 +1959,90 @@ fn a_settle_sweep_lets_main_through_between_steps() {
     drop(u);
 }
 
+/// SPEC-V: an O3 build of verified code that meets a twin among its candidates keeps the call and
+/// waits for nothing. The twin comes in with a callee whose body was lowered before its verdict and
+/// still names it. A twin's flag never clears, so the wait the build took for it never ended:
+/// `makepad live`'s settle (o3_settled) never came, and why-tier said the root waited for an
+/// "unverifiable" callee (an app's live simulation, 11-18: its stepper waited for 3 all session).
+#[test]
+fn a_twin_left_out_of_a_verified_build_holds_no_settle() {
+    const CHILD: &str = "RELAX_TWIN_SETTLE_TEST";
+    if std::env::var_os(CHILD).is_none() {
+        let output = crate::test_child::output(std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "jit::settle_tests::a_twin_left_out_of_a_verified_build_holds_no_settle", "--nocapture", "--test-threads=1"])
+            .env(CHILD, "1").env("RELAX_GANDALF_ALL", "0"));
+        assert!(output.status.success(), "{}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+        return;
+    }
+    CHECK_FIRST.store(false, Ordering::Relaxed);
+    SPECV_HOLD.store(1, Ordering::Relaxed);
+    std::env::set_var("RELAX_STD", concat!(env!("CARGO_MANIFEST_DIR"), "/std"));
+    let dir = std::env::temp_dir().join(format!("relax-twin-settle-{}", std::process::id()));
+    std::fs::create_dir_all(dir.join("app/src")).unwrap();
+    std::fs::write(dir.join("Cargo.toml"), "[workspace]\nmembers = [\"app\"]\n").unwrap();
+    std::fs::write(dir.join("app/Cargo.toml"), "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n").unwrap();
+    std::fs::write(dir.join("app/src/lib.rs"), "#[inline(never)] pub fn leaf(a: &mut u32, b: &u32) -> u32 { *a += *b; *a }\n\
+        pub fn inner(out: &mut u32) { let mut x = 1u32; let y = 2u32; *out = leaf(&mut x, &y); }\n\
+        pub fn outer(out: &mut u32) { inner(out); *out += 1; }\n").unwrap();
+    let app = dir.join("app/src/lib.rs").to_string_lossy().into_owned();
+    let session = std::sync::Arc::new(crate::Session::default());
+    let (prog, core, app_crate) = crate::load_with_std(&session, &app, "twin_settle", false).unwrap();
+    let graph = format!(r#"{{"units":[{{"pkg_id":"path+file://{}/app#app@0.1.0","target":{{"name":"app","src_path":{}}}}}]}}"#, dir.display().to_string().replace('\\', "\\\\"), crate::diag::quote(&app));
+    let roots = crate::reload::gandalf_app_roots(&crate::unitgraph::Units::from_json(graph.as_bytes()).unwrap(), dir.join("app").to_str().unwrap());
+    let find = |name: &str| prog.defs.iter().enumerate().find_map(|(i, d)| {
+        let id = DefId(i as u32);
+        (d.krate == app_crate && prog.name(id) == name).then_some(id)
+    }).unwrap();
+    let (leaf_def, inner_def, outer_def) = (find("leaf"), find("inner"), find("outer"));
+    let mut tcx = Tcx::new();
+    tcx.collect(&prog);
+    crate::borrowck::event::set_app_scope(roots);
+    let mut u = Unit::new(prog, tcx, core);
+    let up = &mut *u as *mut Unit;
+    crate::syms::set_unit(up);
+    let (leaf, inner, outer, inner_entry) = crate::owner::call(crate::owner::Class::Program, || {
+        let (l, i, o) = (u.fn_id(FnKey::Inst(leaf_def, vec![])), u.fn_id(FnKey::Inst(inner_def, vec![])), u.fn_id(FnKey::Inst(outer_def, vec![])));
+        (l, i, o, u.entry(i))
+    });
+    let call = |entry: u64, want: u32, label: &str| {
+        let mut result = 0u32;
+        unsafe { call_jit(up, entry, &mut result as *mut u32 as u64) }.unwrap_or_else(|p| panic!("JIT call panicked: {}", p.message));
+        assert_eq!(result, want, "{label}");
+    };
+    // held verdicts: `inner` is lowered as unverified code, its call going to leaf's twin
+    call(inner_entry, 3, "inner, unverified");
+    let twin = u.plain_twin_of(leaf).expect("inner's call made leaf's twin");
+    assert!(u.fns[inner as usize].rir.as_ref().is_some_and(|r| r.plain_calls), "inner's lowering calls the twin");
+    // every verdict comes clean (outer never ran: its check is asked for); inner's flag clears, its
+    // lowering still names the twin
+    specv_release();
+    crate::owner::call(crate::owner::Class::Program, || unsafe { prioritize_verdicts(up, &[outer]) });
+    let t0 = std::time::Instant::now();
+    while ![leaf, inner, outer].iter().all(|&i| u.verdict_clean(i)) {
+        crate::borrowck::settle().recv().unwrap();
+        assert!(t0.elapsed().as_secs() < 20, "no clean verdicts");
+    }
+    assert!(u.refresh_verified(inner));
+    assert!(u.fns[inner as usize].rir.as_ref().is_some_and(|r| r.plain_calls), "the test needs inner's lowering from before its verdict");
+    assert!(u.fns[twin as usize].unverified.load(Ordering::Relaxed), "a twin stays flagged");
+    // outer runs as verified code. Its O3 snapshot meets the twin among its candidates (in an app, a
+    // callee whose body was lowered before its verdict still names it): the twin stays a call, and
+    // the build waits for no verdict
+    let outer_entry = crate::owner::call(crate::owner::Class::Program, || u.entry(outer));
+    call(outer_entry, 4, "outer, verified");
+    assert!(!u.fns[outer as usize].unverified.load(Ordering::Relaxed), "outer is verified code");
+    let rir = u.fns[outer as usize].rir.clone().expect("outer's RIR");
+    let views: std::collections::HashMap<u32, O3View> = [(twin, o3_view(&u, twin))].into_iter().collect();
+    let mut a = crate::owner::call(crate::owner::Class::Program, || unsafe { o3_assemble(up, owner_front(up), outer, &rir, &[twin], &views, false) });
+    assert!(!a.snap.iter().any(|x| x.0 == twin), "verified code never inlines a twin");
+    crate::owner::call(crate::owner::Class::Program, || unsafe { o3_assemble_owner(up, &unit_session(up).options, &mut a) });
+    assert!(a.unverified_left.is_empty(), "the build waits for no verdict: {:?}", a.unverified_left);
+    let left: Vec<u32> = UNVERIFIED_LEFT.lock().unwrap_or_else(|e| e.into_inner()).iter().filter(|x| x.0 == up as usize && x.2 == outer).map(|x| x.1).collect();
+    assert!(left.is_empty(), "outer waits for no verdict (o3_settled reads this): {left:?}, twin #{twin}");
+    std::mem::forget(u);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
 /// SPEC-V: a twin that turns hot asks for its base's verdict then: the base's check is the next one
 /// the background checker runs (RANK_HOT, no check ahead of it), from the pool worker's pick after
 /// its inbox drain (prioritize_hot_verdicts). A twin has no owner of its own, so it asked for
