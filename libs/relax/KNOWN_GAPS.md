@@ -254,3 +254,43 @@ again. That check is the type checker's: names, types, traits.
 
 Start in compiler/src/typeck_bg.rs (the background check and its stored verdicts) and jit.rs
 install_error (the report when a body's build fails).
+
+## 13. A lint in a local `macro_rules!` expansion is reported at the call, rustc in the macro
+
+```rust
+#![warn(unsafe_code)]
+pub unsafe trait Plain {}  // (in a dependency, so the trait itself is not linted)
+macro_rules! plain {
+    ($t:ident) => {
+        unsafe impl Plain for $t {}
+    };
+}
+pub struct S(pub u8);
+plain!(S);
+```
+
+- rustc: the `unsafe_code` warning points at `unsafe impl` inside the macro's body, with the
+  expansion as a note.
+- Relax: the same warning, at `plain!(S);`.
+
+Diagnostics of expanded code take the call site's position. Start where lints map a position in a
+local rules expansion back to the file (types/src/lint.rs, front/src/parser.rs expansion_kind and
+the origin tables).
+
+## 14. `unsafe_code` misses an unsafe block in a function an attribute macro passes on
+
+A proc-macro crate with `#[proc_macro_attribute] pub fn pass(_: TokenStream, item: TokenStream)
+-> TokenStream { item }`, and in a crate with `#![warn(unsafe_code)]`:
+
+```rust
+#[mac::pass]
+pub fn first(v: &[u8]) -> u8 {
+    unsafe { *v.get_unchecked(0) }
+}
+```
+
+- rustc: warns "usage of an `unsafe` block" (the tokens are the input's, written by the crate).
+- Relax: nothing; the same function without the attribute is reported.
+
+Start in types/src/lint_late2.rs (the unsafe block lint) and how lint::external and expansion_kind
+classify the tokens an attribute macro passes on from its input.
