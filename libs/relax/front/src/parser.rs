@@ -129,8 +129,8 @@ pub struct Parser<'a> {
     /// definition position, length), ascending
     pub body_origin: OSeg<'a, Maps>,
     /// proc-macro output tokens the macro made (spanned at its call site): (text lo, text hi,
-    /// the macro crate's edition), ascending; only where that edition is not the one the call
-    /// site gives (edition_of)
+    /// the macro crate's edition), ascending; every such range (edition_of reads the edition,
+    /// ParsedFile::made_by_proc_macro that the macro made them)
     pub pm_editions: OSeg<'a, Regions>,
     /// compound tokens split by the grammar, with their old value
     pub tok_undo: Vec<(u32, Tok)>,
@@ -6303,14 +6303,11 @@ impl Parser<'_> {
 
     fn append_origins(&mut self, expansion: &crate::builtins::Expansion, call: u32) {
         let base = (self.src.len() + self.ext.len()) as u32;
-        // the tokens a proc macro made have its crate's edition; a row only where the call
-        // site would not give that edition already (a call in this file's own text gives the
-        // file's)
-        let at_source = (call as usize) < self.src.len();
+        // the tokens a proc macro made have its crate's edition, and are the macro's own code
+        // (lints are not reported in them): a row for each run of them, also where the call
+        // site gives the same edition
         for &(lo, hi, edition) in &expansion.editions {
-            if !(at_source && edition == self.edition) {
-                self.pm_editions.push((base + lo, base + hi, edition as u32));
-            }
+            self.pm_editions.push((base + lo, base + hi, edition as u32));
         }
         if expansion.origins.is_empty() {
             let source = self.source_span(call);
@@ -6880,6 +6877,31 @@ impl ParsedFile {
             if pos < r.1 { return r.0.max(2); }
         }
         1
+    }
+
+    /// Whether the token at `pos` is one a proc macro made (spanned at its call: rustc's
+    /// `Span::call_site()`, `mixed_site()` and `def_site()`), or comes from one through a
+    /// substitution. rustc gives such a token the macro's expansion as its context, and
+    /// `Span::in_external_macro` holds for every proc macro's expansion (a derive, an attribute
+    /// or a function-like one): lints are not reported there. The token may still map to the
+    /// call site for its hygiene (append_origins), which expansion_kind follows.
+    pub fn made_by_proc_macro(&self, mut pos: u32) -> bool {
+        for _ in 0..4096 {
+            if pos < self.src_len {
+                return false;
+            }
+            let made = self.part_at(pos).map_or(&self.pm_editions, |p| &p.pm_editions);
+            if let Some((_, r)) = OSegRef::from(made).floor(pos) {
+                if pos < r.1 {
+                    return true;
+                }
+            }
+            match origin_of(self.tables(pos).0, pos) {
+                Some(o) => pos = o,
+                None => return false,
+            }
+        }
+        false
     }
 
     /// Which kind of expansion's text holds position `pos` (not following the origin of a token
