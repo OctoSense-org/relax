@@ -1104,6 +1104,21 @@ impl<'a> Fcx<'a> {
         match kind { 0 => self.infcx.next_ty_var(), 1 => self.infcx.next_int_var(), 2 => self.infcx.next_float_var(), _ => unreachable!() }
     }
 
+    /// fn_ctxt/_impl.rs structurally_resolve_type: whether `t`'s outer type is known, the pending goals
+    /// settled first. A type variable still open there (a closure's parameter only a later call
+    /// names) is E0282, unless the body has an error already, and becomes `{error}`: false.
+    fn structurally_resolve(&mut self, t: TyId, lo: u32) -> bool {
+        if !matches!(self.tcx.tys.kind(self.shallow(t)), TyKind::Infer(_)) { return true; }
+        self.retry_goals(false);
+        if !matches!(self.tcx.tys.kind(self.shallow(t)), TyKind::Infer(_)) { return true; }
+        if self.b.errors.is_empty() && !self.infcx.tainted_by_errors() {
+            self.err(lo, "E0282: type annotations needed".to_string());
+        }
+        let error = self.tcx.tys.error;
+        self.eq(t, error);
+        false
+    }
+
     fn shallow(&mut self, t: TyId) -> TyId {
         let t = self.infcx.shallow_resolve(t);
         if matches!(self.tcx.tys.kind(t), TyKind::Alias(_, _)) { self.normalize_body_type(t) } else { t }
@@ -5235,6 +5250,8 @@ impl<'a> Fcx<'a> {
                 // rustc_hir_typeck/src/expr.rs check_expr_unary and op.rs:960-1080.
                 UnOp::Neg | UnOp::Not => {
                     let t = self.check_expr(*x, expected);
+                    // the operand's type is resolved structurally first (E0282 while still open)
+                    if !self.structurally_resolve(t, lo) { return error; }
                     let st = self.shallow(t);
                     let builtin = match (op, self.tcx.tys.kind(st)) {
                         (UnOp::Neg, TyKind::Int(_) | TyKind::Float(_) | TyKind::IntVar(_) | TyKind::FloatVar(_)) => true,
@@ -5251,6 +5268,7 @@ impl<'a> Fcx<'a> {
                 }
                 UnOp::Deref => {
                     let t = self.check_expr(*x, None);
+                    if !self.structurally_resolve(t, lo) { return error; }
                     // (a built-in `*` is no adjustment; an overloaded one is the operand's Deref::deref)
                     match self.deref_step_raw(t) {
                         Some((i, overloaded)) => {
