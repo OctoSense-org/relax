@@ -120,7 +120,7 @@ GOT=$(echo "$OUT" | grep '^out ')
 if [ "$GOT" = $'out distinct fn values: 9000\nout calls land: true' ]; then echo "modules fn values (no codegen): PASS"; else echo "modules fn values (no codegen): FAIL"; echo "$GOT"; echo "$OUT" | grep -v '^  report' | tail -12; FAILS=$((FAILS + 1)); fi
 OUT=$(RELAX_NO_CODEGEN=1 "$1" test --allow-unchecked-modules "$D/nc_fn_values.rs" 2>&1)
 GOT=$(echo "$OUT" | grep '^out ')
-if [ "$GOT" = "$(cat "$D/expect-nc-fn-values.out")" ]; then echo "modules fn value kinds (no codegen): PASS"; else echo "modules fn value kinds (no codegen): FAIL"; echo "$GOT"; echo "$OUT" | grep -v '^  report' | tail -12; FAILS=$((FAILS + 1)); fi
+if [ "$GOT" = "$(cat "$D/expect-nc-fn-values.out")" ]; then echo "modules fn value kinds (no codegen): PASS ($(echo "$OUT" | grep -o 'fn value cost: .*'))"; else echo "modules fn value kinds (no codegen): FAIL"; echo "$GOT"; echo "$OUT" | grep -v '^  report' | tail -12; FAILS=$((FAILS + 1)); fi
 fi
 # More threads than segments: the rest wait for one, every call returns.
 OUT=$("$1" test --allow-unchecked-modules --allow-unmetered-modules "$D/segment_wait.rs" 2>&1)

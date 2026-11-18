@@ -40,6 +40,7 @@ use crate::program::DefKind;
 use relax_backend::rir::{Callee, Cls, Cond, Conv, Func, IOp, Inst, Sym, Term, VReg, U32, U64};
 use crate::syms::SymKind;
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use relax_session::sync::Mutex;
 
@@ -176,7 +177,76 @@ impl State {
 pub type Allow = fn(&str) -> Option<Option<(&'static str, u64)>>;
 
 /// No-codegen mode's thunk table targets (`Sb::nc_fns`), shared with the unit's arenas.
-type NcFns = Arc<Mutex<Vec<u64>>>;
+type NcFns = Arc<NcTable>;
+
+/// Entries per chunk of an NcTable (32 KB).
+const NC_CHUNK: usize = 1 << 12;
+
+/// No-codegen mode: the target of each thunk table entry, read by every indirect call of a twin
+/// (sb_nc_fn) without a lock: the chunks, made zero when an entry of theirs is first given out, are
+/// published once with a release store and never move or go before the table; an entry is written
+/// once, by sbthunk under the unit's sandbox lock (the only writer). An entry not given out (0, or
+/// its chunk not made) is the trap's. The chunk pointers cover the whole table (its span over a
+/// thunk's size), allocated zero: untouched pages of them cost no memory.
+pub(crate) struct NcTable {
+    trap: u64,
+    chunks: Box<[std::sync::atomic::AtomicPtr<[AtomicU64; NC_CHUNK]>]>,
+}
+
+impl NcTable {
+    fn new(entries: u64, trap: u64) -> NcTable {
+        let n = (entries as usize).div_ceil(NC_CHUNK).max(1);
+        NcTable { trap, chunks: zeroed_box(n) }
+    }
+
+    /// The owner (sbthunk, under the sandbox lock): entry `k` goes to `target`.
+    fn set(&self, k: usize, target: u64) {
+        use std::sync::atomic::Ordering::{Acquire, Release};
+        let slot = &self.chunks[k / NC_CHUNK];
+        let mut c = slot.load(Acquire);
+        if c.is_null() {
+            c = Box::into_raw(zeroed_box::<AtomicU64>(NC_CHUNK)) as *mut [AtomicU64; NC_CHUNK];
+            slot.store(c, Release);
+        }
+        unsafe { (*c)[k % NC_CHUNK].store(target, Release) };
+    }
+
+    /// Entry `k`'s target, the trap's when none was given out. No lock, no allocation.
+    fn get(&self, k: u64) -> u64 {
+        let k = k as usize;
+        let Some(slot) = self.chunks.get(k / NC_CHUNK) else { return self.trap };
+        let c = slot.load(std::sync::atomic::Ordering::Acquire);
+        if c.is_null() {
+            return self.trap;
+        }
+        match unsafe { (*c)[k % NC_CHUNK].load(std::sync::atomic::Ordering::Acquire) } {
+            0 => self.trap,
+            t => t,
+        }
+    }
+}
+
+impl Drop for NcTable {
+    fn drop(&mut self) {
+        for slot in self.chunks.iter() {
+            let c = slot.load(std::sync::atomic::Ordering::Acquire);
+            if !c.is_null() {
+                drop(unsafe { Box::from_raw(c as *mut [AtomicU64]) });
+            }
+        }
+    }
+}
+
+/// `n` atomics of zero bits (a null AtomicPtr, a zero AtomicU64), allocated zero: no page of it
+/// is written here.
+fn zeroed_box<T>(n: usize) -> Box<[T]> {
+    let layout = std::alloc::Layout::array::<T>(n).expect("table size");
+    let p = unsafe { std::alloc::alloc_zeroed(layout) } as *mut T;
+    if p.is_null() {
+        std::alloc::handle_alloc_error(layout);
+    }
+    unsafe { Box::from_raw(std::ptr::slice_from_raw_parts_mut(p, n)) }
+}
 
 /// A confinement domain: its name, what its code may call beyond what every domain may, whether
 /// its code meters fuel and whether its twins always get the clean-up. The name is part of its
@@ -350,7 +420,7 @@ unsafe fn sb_init(up: *mut Unit, domain: Domain) -> Result<(), String> {
     // the slot every unused sandbox thunk jumps through: its code panics with the reason
     let trap_slot = u.fn_id(FnKey::Sandbox(u32::MAX));
     let trap = tgt::thunk(u.slots.table(trap_slot));
-    let nc_fns = u.prog.session.options.no_codegen.then(|| Arc::new(Mutex::new(vec![u.slots.callable(trap_slot)])));
+    let nc_fns = u.prog.session.options.no_codegen.then(|| Arc::new(NcTable::new(sbt_span / ts, u.slots.callable(trap_slot))));
     *u.sandbox.sb.lock().unwrap_or_else(|e| e.into_inner()) = Some(Box::new(Sb {
         tls_sym,
         domain: domain.name,
@@ -535,12 +605,7 @@ unsafe fn sbthunk(up: *mut Unit, t: u32) -> Result<u64, String> {
         }
         if let Some(nc) = &s.nc_fns {
             // no-codegen mode: the index's target, the twin's slot thunk (`Sb::nc_fns`)
-            let mut fns = nc.lock().unwrap_or_else(|e| e.into_inner());
-            if fns.len() <= k as usize {
-                fns.resize(k as usize + 1, 0);
-            }
-            fns[k as usize] = target;
-            drop(fns);
+            nc.set(k as usize, target);
             s.sbt_n += 1;
             s.sbt_of.insert(t, k);
             return Ok(s.sbt_base + k as u64 * ts);
@@ -2019,13 +2084,13 @@ fn arena_fn(f: u64) -> u64 {
 
 /// No-codegen mode: the target of thunk table index `k` (the trap's when none was given out).
 fn nc_target(nc: &NcFns, k: u64) -> u64 {
-    let fns = nc.lock().unwrap_or_else(|e| e.into_inner());
-    fns.get(k as usize).copied().filter(|&t| t != 0).unwrap_or(fns[0])
+    nc.get(k)
 }
 
 rt_fn! {
-/// No-codegen mode: where a twin's indirect call through masked table address `at` goes (`mask_fn`).
-fn sb_nc_fn(at: u64) -> u64 {
+/// No-codegen mode: where a twin's indirect call through masked table address `at` goes
+/// (`mask_fn`): every indirect call of a twin, so a leaf (no lock, no allocation, cannot panic).
+leaf fn sb_nc_fn(at: u64) -> u64 {
     let Some(a) = cur_arena() else { return 0 };
     match &a.nc_fns {
         Some(nc) => nc_target(nc, at.wrapping_sub(a.sbt_base) / jit::thunk_size() as u64),
