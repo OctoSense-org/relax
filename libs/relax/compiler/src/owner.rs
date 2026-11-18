@@ -28,8 +28,13 @@ pub enum Class {
     /// a bounded, guarded step (OWNERARCH.DESIGN.md rule I-PUB, `publish`): a back end's finish,
     /// background bookkeeping, the take of a background build. It runs
     /// no front, no initializer, no JIT code, no wait and no request, so it is never refused and is
-    /// served inside every pump. Served after the program's requests: a program thread waits for at
-    /// most the one publish running when it asks
+    /// served inside every pump. Served after the program's requests, except that a program request
+    /// the owner posted to itself (the next step of its own work, a real-time reach's) waits behind
+    /// the publishes queued when it was posted (`Req::own_ahead`). So a program thread waits for the
+    /// one publish running when it asks, plus those counted ahead of an owner step queued before
+    /// it; the main thread is exempt (main's requests go first). A publish in turn may wait for one
+    /// such step, and a step is not held to its budget: one compile can overrun it, and the step
+    /// that completes a reach also runs the reach's tail, up to about 3 s in all (11-18)
     Publish = 1,
     /// the program's threads (its main thread among them, in one FIFO: OWNERARCH.DESIGN.md step 6),
     /// patches, structural steps (loads, adopts), inspect
@@ -153,6 +158,13 @@ struct Req {
     t_main: u64,
     t_serve: AtomicU64,
     t_done: AtomicU64,
+    /// a program request the owner posted to itself (post_queued on the owner: the next step of
+    /// its own work, a real-time reach's): the publishes queued when it was posted, which pick
+    /// serves before it. Program requests go before publishes (SERVICE_ORDER), so a walk that
+    /// posts its next step after every step kept the publish lane waiting for the walk's whole
+    /// length: a cold test binary's compile workers and test threads waited 76 s for their
+    /// publishes behind a 190k-slot reach, and two tests ran out of their own deadlines (11-18)
+    own_ahead: Cell<u32>,
     /// the requester sleeps on these until Done (no thread handle: a thread's TLS destructors
     /// compile too, after std::thread::current() is gone)
     done: Mutex<bool>,
@@ -1114,6 +1126,7 @@ fn request_dyn(site: &'static std::panic::Location<'static>, class: Class, deadl
         t_main: if main_after { crate::jit::wall_ns().max(1) } else { 0 },
         t_serve: AtomicU64::new(0),
         t_done: AtomicU64::new(0),
+        own_ahead: Cell::new(0),
         done: Mutex::new(false),
         wake: Condvar::new(),
     };
@@ -1256,6 +1269,7 @@ pub fn post_queued(class: Class, f: impl FnOnce() + Send + 'static) {
         t_main: 0,
         t_serve: AtomicU64::new(0),
         t_done: AtomicU64::new(0),
+        own_ahead: Cell::new(0),
         done: Mutex::new(false),
         wake: Condvar::new(),
     });
@@ -1264,6 +1278,10 @@ pub fn post_queued(class: Class, f: impl FnOnce() + Send + 'static) {
 
 fn push(r: usize, class: Class) {
     let mut q = Q.lock().unwrap_or_else(|e| e.into_inner());
+    if class == Class::Program && is_owner() {
+        let ahead = q.lanes[Class::Publish as usize].len().min(u32::MAX as usize) as u32;
+        unsafe { (*(r as *const Req)).own_ahead.set(ahead) };
+    }
     // a lane grows in the kept heap, whichever phase the requester is in
     crate::zone_alloc::kept_with(|| q.lanes[class as usize].push_back(r));
     if class == Class::Program {
@@ -1406,6 +1424,19 @@ fn pick(q: &mut Queue, mode: Mode) -> Option<usize> {
                 if i > 0 || q.lanes.iter().enumerate().any(|(k, l)| k != c && !l.is_empty()) {
                     MAIN_AHEAD.fetch_add(1, Ordering::Relaxed);
                 }
+                return Some(r);
+            }
+        }
+    }
+    // the owner's own next step (Req::own_ahead) at the head of the program lane: the publishes
+    // that were queued when it was posted go first, one per pick (a job's request still first)
+    if only == 0 && mode == Mode::Top && q.lanes[Class::Job as usize].is_empty() && !q.lanes[Class::Publish as usize].is_empty() {
+        if let Some(&h) = q.lanes[Class::Program as usize].front() {
+            let ahead = unsafe { &(*(h as *const Req)).own_ahead };
+            if ahead.get() > 0 {
+                ahead.set(ahead.get() - 1);
+                let r = q.lanes[Class::Publish as usize].pop_front().unwrap();
+                dequeued(Class::Publish as usize, r);
                 return Some(r);
             }
         }
