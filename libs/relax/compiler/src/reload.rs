@@ -10758,6 +10758,12 @@ unsafe fn test_edit(up: *mut Unit, paths: Vec<String>, o: &mut Outcome, undos: &
     }
     let mut back = Vec::new();
     loop {
+        // each run starts from the program's initial statics, as a fresh run does; when they
+        // cannot go back in this process, the tests restart into a fresh one (a failed restart
+        // runs them here, and the verdict says the statics were carried)
+        if let Err(why) = live::fresh_statics(up) {
+            live::restart(edit.clone(), &why);
+        }
         let faults = live::rerun(&edit);
         // A later group may depend on the faulting one: unwind newest first, as SPEC-V does.
         let Some(first) = undos.iter().position(|u| faults.contains(&u.group)) else { break };
