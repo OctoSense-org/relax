@@ -1834,6 +1834,11 @@ pub(crate) fn note_progress(k: usize) {
     TEST_PROGRESS[k].fetch_add(1, Ordering::Relaxed);
 }
 
+/// How often `k` progressed in this process (`note_progress`): a first frame's watch reads it too.
+pub(crate) fn progress_count(k: usize) -> u64 {
+    TEST_PROGRESS[k].load(Ordering::Relaxed)
+}
+
 /// A test's watch: it expires `window` after the last progress the watchdog's worker saw, however
 /// long the test runs while it progresses. Progress is the TEST_PROGRESS counts and, on Linux, the
 /// bytes the test's thread read or wrote (its /proc io rchar + wchar). A thread that only runs,
