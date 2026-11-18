@@ -49,7 +49,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 
 pub const MAGIC: &[u8; 4] = b"RCS1";
-const FORMAT: u32 = 3;
+pub(crate) const FORMAT: u32 = 3;
 const HEADER: usize = 128;
 const INDEX_ENTRY: usize = 40;
 const MIN_CAP: u32 = 256;
@@ -1634,6 +1634,16 @@ fn write_at(file: &std::fs::File, mut b: &[u8], mut off: u64) -> std::io::Result
 
 /// The Relax build that wrote the store file `p` (its header; 0: written before headers named
 /// the build). None: unreadable, not a store, or locked by a writer right now.
+/// The store format a file's header names (its magic checked): what a build of another format
+/// cannot read (Header::parse). Read without a lock: magic and format are the first bytes a store
+/// file is written with and never change; a file that has none yet says None.
+pub fn format_of(p: &Path) -> Option<u32> {
+    let mut f = std::fs::File::open(p).ok()?;
+    let mut b = [0u8; 8];
+    f.read_exact(&mut b).ok()?;
+    (&b[0..4] == MAGIC).then(|| u32_at(&b, 4))
+}
+
 pub fn build_of(p: &Path) -> Option<u64> {
     let mut f = std::fs::File::open(p).ok()?;
     f.try_lock_shared().ok()?;

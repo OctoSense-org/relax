@@ -6083,13 +6083,15 @@ const FREE_SHARE: u64 = 10;
 const UNUSED_FOR: std::time::Duration = std::time::Duration::from_secs(7 * 24 * 3600);
 /// A build script's output folder or a `--allow-c` build's that no root names stays this long
 /// after its last use (native.rs, unitgraph.rs prune_build: a run that started meanwhile may be
-/// about to name it).
+/// about to name it), as does a store of an older store format (prune: a run of a build from
+/// before the change may be using it).
 const UNNAMED_KEPT: std::time::Duration = std::time::Duration::from_secs(10 * 60);
 
 /// Keeps the cache: first every store's older generations go (store.rs: a rewrite leaves the
 /// generation it replaced for readers that still have it open), except one this process
 /// itself opened; a delete that fails (open elsewhere, on Windows) is retried by the next
-/// start. Other Relax builds' stores stay for when that build runs again: store names hash the
+/// start. A store of another store format goes once no run stamped it for UNNAMED_KEPT: no build
+/// of this format can read it. Other Relax builds' stores stay for when that build runs again: store names hash the
 /// codegen identity (codegen_id.rs), so no other build ever reads them, and a box whose lanes run
 /// several builds went cold each time one of them pruned (the Windows node lost a stopped app's
 /// 109 code stores to a test of another build, 11-04). Whole store files go, whichever build wrote
@@ -6229,6 +6231,23 @@ fn prune(root: &std::path::Path, live: &HashSet<PathBuf>, open: &HashSet<PathBuf
     // its current set no longer names goes once no set or demand part names it and no running
     // pass uses it (until then it stays on the retiring list)
     let name = |p: &PathBuf| crate::store::base_path(p).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    // stores of another store format: no build of this format reads them (store.rs Header::parse),
+    // only a build from before the format changed, whose runs stamp what they use. One no run
+    // stamped for UNNAMED_KEPT goes, a run store too: kept by use for UNUSED_FOR, as other builds'
+    // stores are, they outweighed the stores of every build since the change. (A store of
+    // this format names its build, so only a store with none is read for its format.)
+    let mut outdated: Vec<String> = Vec::new();
+    files.retain(|(t, p, len)| {
+        let age = now.duration_since(*t).unwrap_or_default();
+        let gone = builds[p].is_none() && age >= UNNAMED_KEPT && crate::store::format_of(p).is_some_and(|f| f != crate::store::FORMAT)
+            && !live.contains(&crate::store::base_path(p)) && !open.contains(p) && !in_pass(&name(p)) && crate::store::delete_checked(p);
+        if gone { outdated.push(format!("{} {} MB, last used {} h ago: an older store format", name(p), len >> 20, age.as_secs() / 3600)); }
+        !gone
+    });
+    if !outdated.is_empty() {
+        note_evicted(&dir, &outdated);
+        crate::progress::log(&format!("relax cache: {} store(s) of an older store format went ({}/evicted.log)", outdated.len(), dir.display()));
+    }
     let keep = |f: &(std::time::SystemTime, PathBuf, u64)| builds.get(&f.1).copied().flatten() != Some(me)
         || live.contains(&crate::store::base_path(&f.1)) || open.contains(&f.1) || in_pass(&name(&f.1));
     let (named, retiring) = write_sets(&sets, me, programs);
@@ -12976,6 +12995,18 @@ mod prune_tests {
         let unnamed = store("std-00000000000000a2.rcs", 4000, Some(0));
         let other_running = store("core-00000000000000b1.rcs", 5000, Some(alive));
         let other_stamped = store("core-00000000000000c1.rcs", 60, Some(me ^ 0x4444));
+        // stores of an older store format: no build of this one reads them, so with room too they
+        // go once no run stamped them for UNNAMED_KEPT, a run store as well
+        let older = |name: &str, age_s: u64| -> PathBuf {
+            let p = store(name, age_s, None);
+            let mut b = std::fs::read(&p).unwrap();
+            b[4..8].copy_from_slice(&(crate::store::FORMAT - 1).to_le_bytes());
+            std::fs::write(&p, b).unwrap();
+            std::fs::File::options().write(true).open(&p).unwrap().set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(age_s)).unwrap();
+            p
+        };
+        let (older_idle, older_run, older_stamped) = (older("serde-00000000000000d1.rcs", 1200), older("front_run-00000000000000d2.rcs", 1200), older("serde-00000000000000d3.rcs", 60));
+        assert_eq!((crate::store::build_of(&older_idle), crate::store::format_of(&older_idle)), (None, Some(crate::store::FORMAT - 1)));
         // a pass of that build runs and uses it
         let pass = other_pass(&dir, "4244", &["core-00000000000000c1.rcs"]);
         assert_eq!(crate::store::build_of(&mine_old), Some(me));
@@ -12995,6 +13026,9 @@ mod prune_tests {
         std::fs::write(&idle_set, "").unwrap();
         let live: HashSet<PathBuf> = [mine_used.clone()].into_iter().collect();
         prune(&root, &live, &HashSet::new(), &[], Some(0));
+        assert!(!older_idle.exists() && !older_run.exists(), "an older format's idle stores go, with room too");
+        assert!(older_stamped.exists(), "one a run stamped within UNNAMED_KEPT stays");
+        assert!(std::fs::read_to_string(dir.join("evicted.log")).unwrap().contains("serde-00000000000000d1.rcs 0 MB, last used 0 h ago: an older store format"));
         assert!(other_old.exists() && unnamed.exists() && other_running.exists() && other_stamped.exists(), "with room every build's stores stay");
         assert!(idle_set.exists(), "and what names them");
         assert!(mine_old.exists() && mine_used.exists());
