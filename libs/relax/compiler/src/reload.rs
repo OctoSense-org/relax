@@ -6511,7 +6511,7 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
     out.ms[0] = (t1 - t0).as_secs_f64() * 1e3;
     trace_sub("gp_ctfe_scan");
     jit::open_patch();
-    crate::gate::patch_opened();
+    crate::gate::patch_opened(up);
     // Record only RIR first materialized during this attempt, including concurrent
     // lazy compilation while the transaction releases the owner thread.
     let journal_start = u.fns.len();

@@ -6859,11 +6859,18 @@ pub fn closure_exprs(prog: &Program, owner: DefId) -> Vec<u32> {
         .filter(|&i| matches!(file.ast.expr(crate::ast::ExprId(i)).kind, crate::ast::ExprKind::Closure { .. } | crate::ast::ExprKind::Async(..))).collect()
 }
 
+/// Closure names whose owner belongs to a different file version.
+pub static STABLE_CLOSURE_NAME_FILE_MISSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// An owner-local closure ordinal; anonymous owners use a file-level fallback.
 pub fn stable_closure_name(prog: &Program, file: u32, e: u32, owner: Option<DefId>) -> String {
     let Some(f) = prog.files.get(file as usize) else { return format!("{{closure@{}}}", e) };
     let path = owner.map(|d| hint_path(&prog.defs, &prog.syms, &prog.files, d)).unwrap_or_default();
-    let n = owner.filter(|d| prog.def(*d).file == file)
+    let n = owner.filter(|d| {
+            let same = prog.def(*d).file == file;
+            if !same { STABLE_CLOSURE_NAME_FILE_MISSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
+            same
+        })
         .and_then(|d| closure_exprs(prog, d).iter().position(|&x| x == e))
         .unwrap_or_else(|| (0..e).filter(|&i| matches!(f.ast.exprs.get(i as usize).map(|x| &x.kind), Some(crate::ast::ExprKind::Closure { .. }))).count());
     if path.is_empty() {
@@ -7384,6 +7391,7 @@ pub(crate) unsafe fn reset_statics() {
     reset(&WORLD_WAITERS, std::sync::atomic::AtomicUsize::new(0));
     reset(&LOAD_STEPS, std::sync::atomic::AtomicU64::new(0));
     reset(&PARSE_AGAIN, std::sync::atomic::AtomicU64::new(0));
+    reset(&STABLE_CLOSURE_NAME_FILE_MISSES, std::sync::atomic::AtomicU64::new(0));
     reset(&COLLECTING, std::sync::atomic::AtomicBool::new(false));
     reset(&COLLECT_MISSES, relax_session::sync::Mutex::new(Vec::new()));
 }

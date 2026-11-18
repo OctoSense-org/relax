@@ -877,6 +877,8 @@ pub struct CodeTables {
     /// the digest gate (gate.rs): what each code body was built from, by code start -- its own
     /// lowering's digest and its inline contexts' (built, linked from the cache or the image)
     digests: HashMap<u64, std::sync::Arc<crate::gate::CodeDigest>>,
+    /// the install path, even when that path had no digest to keep
+    digest_origin: HashMap<u64, crate::gate::DigestOrigin>,
     /// what each code body references, by code start, recorded at its install whatever made it
     /// (a build, the disk cache, the startup image, a forwarder): the real-time walk reads these
     refs: HashMap<u64, CodeRefs>,
@@ -954,11 +956,16 @@ impl CodeTables {
         self.digests.get(&start).cloned()
     }
 
-    fn note_digest(&mut self, start: u64, d: Option<std::sync::Arc<crate::gate::CodeDigest>>) {
+    pub(crate) fn digest_origin_at(&self, start: u64) -> Option<crate::gate::DigestOrigin> {
+        self.digest_origin.get(&start).copied()
+    }
+
+    fn note_digest(&mut self, start: u64, d: Option<std::sync::Arc<crate::gate::CodeDigest>>, origin: crate::gate::DigestOrigin) {
         if !crate::gate::keeping() {
             return;
         }
         let _k = crate::zone_alloc::kept();
+        self.digest_origin.insert(start, origin);
         match d {
             Some(d) => self.digests.insert(start, d),
             None => self.digests.remove(&start),
@@ -2258,7 +2265,7 @@ unsafe fn install_prelinked_slot(up: *mut Unit, s: crate::cache::PrelinkedSlot, 
         if tier1 {
             code.note_inlined(s.at, &s.inlined);
         }
-        code.note_digest(s.at, s.digest.clone());
+        code.note_digest(s.at, s.digest.clone(), crate::gate::DigestOrigin::StartupImage);
     }
     // (perf maps and the cache trace name the slot: prelink_startup decoded the identities first)
     if perf_map_on() {
@@ -9406,7 +9413,7 @@ impl Unit {
                     if !inl_slots.is_empty() {
                         code.note_inlined(at, &inl_slots);
                     }
-                    code.note_digest(at, digest);
+                    code.note_digest(at, digest, crate::gate::DigestOrigin::Built);
                 }
             }
         }
@@ -10979,7 +10986,7 @@ unsafe fn ready_code_locked(up: *mut Unit, id: u32) -> Option<u64> {
             if let Some(inl) = &t1 {
                 c.note_inlined(at, inl);
             }
-            c.note_digest(at, digest);
+            c.note_digest(at, digest, crate::gate::DigestOrigin::CacheLink);
         }
         // an entry an earlier run made from an unverified lowering (it calls SPEC-V twins): its
         // verified O1 rebuild becomes the entry (o1v_begin checks the verdict)
@@ -11421,14 +11428,20 @@ pub(crate) unsafe fn install_failed(up: *mut Unit, id: u32, e: &str) -> u64 {
 /// Hot reload: installs a patched slot's code as part of patch group `gen` (kept for rollback),
 /// with a fresh O3 counter.
 /// Linked code's digests (its cache entry's: gate.rs), noted with the code slot `id` now runs.
-/// None leaves what the install noted.
+/// None leaves the digest and origin the install noted; code no path noted is marked linked.
 unsafe fn note_linked_digest(up: *mut Unit, id: u32, d: Option<std::sync::Arc<crate::gate::CodeDigest>>) {
-    if d.is_none() {
+    if !crate::gate::keeping() {
         return;
     }
     let u = &*up;
     let at = u.fns[id as usize].code;
-    u.code.write().unwrap_or_else(|e| e.into_inner()).note_digest(at, d);
+    let mut code = u.code.write().unwrap_or_else(|e| e.into_inner());
+    // (none: the install's own digest and origin stay; only code no path noted is marked linked)
+    if d.is_none() && code.digest_origin_at(at).is_some() {
+        return;
+    }
+    let d = d.or_else(|| code.digest_at(at));
+    code.note_digest(at, d, crate::gate::DigestOrigin::Linked);
 }
 
 pub(crate) unsafe fn install_patched(up: *mut Unit, id: u32, code: &[u8], map: Vec<(u32, u64)>, relocs: &[relax_backend::rir::RelocAt], gen: u32) -> Result<u64, String> {
@@ -16117,6 +16130,31 @@ pub(crate) unsafe fn source_rir(up: *mut Unit, id: u32) -> Result<relax_backend:
     build_rir_inner(up, id)
 }
 
+/// The gate's check and probes (gate.rs, under RELAX_RELOAD_TRACE): slot `id` lowered from the
+/// program's text now, as a build lowers it, and the digest of its body as lowered. Nothing is
+/// installed, and a lowering made ahead for a build is left for that build.
+pub(crate) unsafe fn gate_lower(up: *mut Unit, id: u32) -> Result<std::sync::Arc<relax_backend::rir::BodyDigest>, String> {
+    if id as usize >= (&*up).fns.len() {
+        return Err(format!("slot {id} is past the slot table"));
+    }
+    let prev = GATE_LOWER.with(|g| g.replace(true));
+    let r = build_rir_inner(up, id);
+    GATE_LOWER.with(|g| g.set(prev));
+    let mut f = r?;
+    // (as prepare_rir_from does before it takes the digest)
+    if let FnKey::Inst(d, _) = &(&*up).fns[id as usize].key {
+        if crate::sandbox::is_wrapper_crate(&*up, (&*up).prog.def(*d).krate) {
+            crate::sandbox::redirect_wrapper(up, &mut f);
+        }
+    }
+    Ok(crate::zone_alloc::kept_with(|| std::sync::Arc::new(f.lowering_digest())))
+}
+
+thread_local! {
+    /// gate_lower runs: a lowering made ahead stays for the build it was made for
+    static GATE_LOWER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// The skipped modules (Rust file selection) failed builds looked into: the post-boot loader
 /// loads them at the next outer compile (load_deferred).
 /// (outermost build on the failing thread, (skipped module, name)): misses of failed builds.
@@ -16743,8 +16781,10 @@ thread_local! {
 unsafe fn build_rir_lowered(up: *mut Unit, id: u32) -> Result<relax_backend::rir::Func, String> {
     if let FnKey::Plain(base) = (&*up).fns[id as usize].key {
         // lowered off the owner for a background build's take (prefront_twin)
-        if let Some(f) = take_lowered_ahead(&mut *up, id) {
-            return Ok(f);
+        if !GATE_LOWER.with(|g| g.get()) {
+            if let Some(f) = take_lowered_ahead(&mut *up, id) {
+                return Ok(f);
+            }
         }
         let prev = PLAIN_LOWER.with(|c| c.replace(Some((base, id))));
         let r = build_rir_lowered_as(up, base);
@@ -24373,7 +24413,7 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
                         let at = u.fns[id as usize].code;
                         let mut c = u.code.write().unwrap_or_else(|e| e.into_inner());
                         c.note_inlined(at, &inlined);
-                        c.note_digest(at, Some(o3_digest.clone()));
+                        c.note_digest(at, Some(o3_digest.clone()), crate::gate::DigestOrigin::O3First);
                     }
                     O3_FIRST_AT.with(|c| c.set(a));
                     true
@@ -24412,7 +24452,7 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
                     u.index_code(at, code.len() as u32, id, info);
                     let mut c = u.code.write().unwrap_or_else(|e| e.into_inner());
                     c.note_inlined(at, &inlined);
-                    c.note_digest(at, Some(o3_digest.clone()));
+                    c.note_digest(at, Some(o3_digest.clone()), crate::gate::DigestOrigin::O3);
                 }
                 if perf_map_on() {
                     perf_map(at, code.len(), &format!("{} [O3]", u.fns[id as usize].name));

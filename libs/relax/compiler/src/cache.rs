@@ -791,6 +791,15 @@ impl crate::gate::Ids for Cache {
         self.enc_defs = named;
         Some(relax_session::sip::hash_bytes(&e.0))
     }
+    fn slot_bytes_from(&mut self, u: &Unit, x: u32) -> (&'static str, Option<Vec<u8>>) {
+        if let Some(b) = self.fnkey_bytes.get(&x) {
+            return ("memo", b.clone());
+        }
+        if let Some(b) = self.image_ids.as_ref().and_then(|i| i.bytes_of(x)) {
+            return ("startup image", Some(b.to_vec()));
+        }
+        ("fresh encode", self.slot_bytes(u, x))
+    }
 }
 
 pub struct Cache {
@@ -2233,7 +2242,10 @@ impl Cache {
     fn closure_ordinal(&mut self, u: &Unit, owner: DefId, file: u32, expr: u32) -> Option<(u32, u64)> {
         if expr & crate::tcx::ASYNC_FN_BODY != 0 || (owner.0 as usize) >= u.prog.defs.len() { return None; }
         let item = closure_item(u, owner);
-        if u.prog.def(item).file != file { return None; }
+        if u.prog.def(item).file != file {
+            crate::gate::CLOSURE_ORDINAL_FILE_MISSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return None;
+        }
         let ord = self.item_closures(u, item).iter().position(|&x| x == expr)? as u32;
         Some((ord, closure_text_only_fp(u, file, expr)?))
     }
