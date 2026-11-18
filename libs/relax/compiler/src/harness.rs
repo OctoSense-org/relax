@@ -60,6 +60,18 @@ pub(crate) fn take_test_package() {
     }
 }
 
+/// TEST_PACKAGE_ENV for the next process of this run (a restart in place, a rebuilt loader): it
+/// goes on when this process is a target of `makepad test`, so that run's no-match exit is
+/// NO_TESTS_EXIT too, and is taken out otherwise.
+pub(crate) fn test_package_env() -> (&'static str, Option<std::ffi::OsString>) {
+    (makepad_remote::hot::TEST_PACKAGE_ENV, TEST_PACKAGE.load(std::sync::atomic::Ordering::Relaxed).then(|| "1".into()))
+}
+
+#[cfg(test)]
+pub(crate) fn set_test_package(on: bool) {
+    TEST_PACKAGE.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
 struct Found {
     def: DefId,
     name: String,

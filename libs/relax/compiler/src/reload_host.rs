@@ -314,6 +314,9 @@ pub(crate) fn apply_at_boot(change: &crate::provided::ProvidedChange) -> i32 {
     {
         let mut cmd = std::process::Command::new(&exe);
         cmd.args(std::env::args_os().skip(1)).env(REBUILT_ENV, restart_key().to_string());
+        // a test target of `makepad test` stays one on the rebuilt loader (the name was taken out
+        // of this process's environment at its start)
+        if let (name, Some(value)) = crate::harness::test_package_env() { cmd.env(name, value); }
         // the rebuilt loader builds the program's native packages as a restart does (NATIVE_RECEIPTS)
         for name in super::NATIVE_RECEIPTS { cmd.env_remove(name); }
         // fd 2 back to the terminal before the restart (the transcript tee is a thread of this process)

@@ -9416,7 +9416,22 @@ pub(crate) fn next_run_env(state: Option<&[u8]>) -> Result<Vec<(&'static str, Op
     let saved = RESTART_SAVED_MS.load(std::sync::atomic::Ordering::Relaxed).to_string();
     let mut next = vec![("RELAX_JIT_RECOVERY", recovery), ("RELAX_RESTORE", restore), ("RELAX_RESTART_T0", Some(saved.into()))];
     next.extend(NATIVE_RECEIPTS.map(|name| (name, None)));
+    next.push(crate::harness::test_package_env());
     Ok(next)
+}
+
+/// A test target of `makepad test` restarted in place stays one: its next process gets
+/// RELAX_TEST_PACKAGE (taken out of the environment at its start), so a filter that matches
+/// nothing still exits NO_TESTS_EXIT there; a run that is no such target hands none on.
+#[cfg(test)]
+#[test]
+fn a_restarted_test_target_stays_a_test_target() {
+    isolated_test!(a_restarted_test_target_stays_a_test_target);
+    let carried = |next: &[(&'static str, Option<std::ffi::OsString>)]| next.iter().find(|(k, _)| *k == makepad_remote::hot::TEST_PACKAGE_ENV).map(|(_, v)| v.clone());
+    crate::harness::set_test_package(true);
+    assert_eq!(carried(&next_run_env(None).unwrap()), Some(Some("1".into())), "a test target's restart carries the name");
+    crate::harness::set_test_package(false);
+    assert_eq!(carried(&next_run_env(None).unwrap()), Some(None), "any other run's restart takes it out");
 }
 
 /// A restart that waited out the run's boot (run_end::restart) and hands no state of its own: the
