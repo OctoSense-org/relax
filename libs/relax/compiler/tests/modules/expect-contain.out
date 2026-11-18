@@ -4,4 +4,7 @@ out host secret not readable: true
 out forged fn pointer contained: true
 out big copy contained: true
 out memory budget: true
+out module panic message carried: true
+out host bytes never a panic message: true
+out panic message bounded: true
 out host still fine: true

@@ -52,6 +52,10 @@ use relax_backend::x64 as tgt;
 pub const WINDOW: u64 = 1 << 32;
 /// unmapped bytes on both sides of a window, and the largest offset a masked access may add
 const GUARD: u64 = 1 << 16;
+
+/// The most bytes of a twin's panic message, and of its file name, the runtime reads (core's
+/// panic_at formats a message into 4096 bytes; longer text is cut there).
+const PANIC_TEXT_MAX: i64 = 4096;
 /// window layout (offsets): [0, 64K) never mapped (null and small dangling pointers fault)
 const RO_BASE: u32 = 64 << 10;
 const RO_END: u32 = 96 << 20;
@@ -2407,7 +2411,30 @@ pub unsafe fn transform(up: *mut Unit, f: &mut Func, twin_id: u32) -> Result<(),
                         emit(Inst::Copy(d2, s2, len), &mut insts, &mut pos);
                     }
                 }
-                Inst::Call(callee, args, rets) => {
+                Inst::Call(callee, mut args, rets) => {
+                    // the panic message and file name a twin hands the runtime (`panic_impl`:
+                    // pointer, length, pointer, length, line, column) are module memory the host
+                    // reads as text: each pointer masked into the window, each length cut to the
+                    // bytes from there to the window's end and to PANIC_TEXT_MAX
+                    if let Callee::Host(s) = &callee {
+                        if matches!(u.syms.kind(s.id), Some(SymKind::Rt("panic_impl"))) && args.len() >= 4 {
+                            for k in [0, 2] {
+                                let (text, len) = (args[k], args[k + 1]);
+                                let (masked, _) = mask(f, &mut insts, &mut pos, &mut cache, text, 0);
+                                let [lo, end, room, fits, cut, max, under, bounded] = std::array::from_fn(|_| f.vreg(Cls::I));
+                                emit(Inst::Conv(Conv::IntToInt(U32), lo, text), &mut insts, &mut pos);
+                                emit(Inst::Iconst(end, WINDOW as i64), &mut insts, &mut pos);
+                                emit(Inst::IBin(IOp::Sub, U64, room, end, lo), &mut insts, &mut pos);
+                                emit(Inst::ICmp(Cond::Lt, false, fits, len, room), &mut insts, &mut pos);
+                                emit(Inst::Sel(cut, fits, len, room), &mut insts, &mut pos);
+                                emit(Inst::Iconst(max, PANIC_TEXT_MAX), &mut insts, &mut pos);
+                                emit(Inst::ICmp(Cond::Lt, false, under, cut, max), &mut insts, &mut pos);
+                                emit(Inst::Sel(bounded, under, cut, max), &mut insts, &mut pos);
+                                args[k] = masked;
+                                args[k + 1] = bounded;
+                            }
+                        }
+                    }
                     let callee = match callee {
                         Callee::Asm(_) => return Err(format!("{}: inline assembly, which sandboxed code cannot run", f.name)),
                         Callee::Fn(id) => Callee::Fn(call_target(up, id, &sandboxed, allow)?),
