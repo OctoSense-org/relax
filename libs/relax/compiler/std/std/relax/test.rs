@@ -52,6 +52,10 @@ pub struct Tests {
     pub context: usize,
     pub revision: u64,
     pub verbose: u32,
+    /// main's fact for the host: name filters were given and no test passed (none matched, or
+    /// all it matched were ignored). The exit status stays libtest's (0); `makepad test` holds
+    /// such a run no pass (relax-compiler harness.rs `run`).
+    pub unmatched: u32,
 }
 
 struct Desc {
@@ -467,13 +471,9 @@ fn run(t: &mut Tests, opts: &Opts, descs: Arc<Vec<Desc>>, filtered_out: usize) -
     );
     println!();
     let _ = crate::io::stdout().flush();
-    // a filter that ran no test is no pass (makepad_remote::hot::NO_TESTS_EXIT); under
-    // `makepad test` (TEST_PACKAGE_ENV) it says so once for all its targets
-    if ok && passed == 0 && !opts.filters.is_empty() {
-        if crate::env::var("RELAX_TEST_PACKAGE").is_err() {
-            eprintln!("error: no test matched {}{}", opts.filters.join(" "), if ignored > 0 { format!(" ({} matched and ignored: --ignored runs them)", ignored) } else { String::new() });
-        }
-        return 87;
-    }
+    // libtest's exit status whatever the filters ran (console.rs run_tests_console: success is no
+    // failure). That a filter ran no test is the host's to judge (`makepad test`: no pass), so it
+    // goes to the host as a fact, never into what the program prints or returns.
+    t.unmatched = (ok && passed == 0 && !opts.filters.is_empty()) as u32;
     if ok { 0 } else { 101 }
 }

@@ -660,6 +660,7 @@ fn session_of(options: crate::options::Options, runtime: crate::options::Runtime
 pub fn session_from_env(args: &[String]) -> std::sync::Arc<crate::Session> {
     crate::pool::thread_start(crate::jit::ensure_altstack);
     keep_toolchain_homes();
+    crate::harness::take_test_package();
     if crate::sandbox::policy() == crate::sandbox::Policy::Sandboxed {
         drop_ambient_grants();
     }

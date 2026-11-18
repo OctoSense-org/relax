@@ -109,8 +109,16 @@ const HANDOVER: [&[u8]; 7] = [PROGRAM_ENV, BUILD_ENV, SCRIPT_ENV, b"RELAX_ARG0",
 /// process that started a parent of its own took itself for the outer one's run).
 pub const RESTART: [&[u8]; 3] = [b"RELAX_RESTART_FILE", b"RELAX_RESTART_PARENT", b"RELAX_RESTART_LIFELINE"];
 
-fn restart_var(name: &[u8]) -> bool {
-    RESTART.iter().any(|n| same_name(n, name))
+/// `makepad test`'s word to the run of each of its targets that it sums their verdicts
+/// (makepad-remote hot.rs TEST_PACKAGE_ENV; relax-compiler harness.rs takes it out at the run's
+/// start): that run's alone, as the restart parent's names are. Carried into a build
+/// environment, a test that ran its own binary again started another target of the package,
+/// whose filter that ran no test exited NO_TESTS_EXIT instead of libtest's 0.
+pub const TEST_PACKAGE: &[u8] = b"RELAX_TEST_PACKAGE";
+
+/// A name one process gives the run it starts, and that run alone (`RESTART`, `TEST_PACKAGE`).
+fn one_run_var(name: &[u8]) -> bool {
+    RESTART.iter().any(|n| same_name(n, name)) || same_name(TEST_PACKAGE, name)
 }
 
 pub fn run_fact(name: &[u8]) -> bool {
@@ -248,10 +256,10 @@ pub fn child_env(real: &[(Vec<u8>, Vec<u8>)], own: &[(Vec<u8>, Option<Vec<u8>>)]
     }
     let wrote = |k: &[u8]| own.iter().any(|(o, _)| same_name(o, k)) || spawn.edits.iter().any(|(e, _)| same_name(e, k));
     let host_value = |k: &[u8]| real.iter().find(|(r, _)| same_name(r, k)).map(|(_, v)| v.clone());
-    // the restart parent's names: only what the program or the spawn set (`RESTART`)
-    view.retain(|(k, _)| !restart_var(k) || wrote(k));
+    // the restart parent's names and makepad test's: only what the program or the spawn set
+    view.retain(|(k, _)| !one_run_var(k) || wrote(k));
     let mut env = if spawn.self_exec {
-        let host: Env = real.iter().filter(|(k, _)| reserved(k) && !same_name(k, PROGRAM_ENV) && !restart_var(k)).cloned().collect();
+        let host: Env = real.iter().filter(|(k, _)| reserved(k) && !same_name(k, PROGRAM_ENV) && !one_run_var(k)).cloned().collect();
         let mut differ: Own = Vec::new();
         for (k, v) in &view {
             if reserved(k) && !host.iter().any(|(h, hv)| same_name(h, k) && hv == v) {
@@ -859,7 +867,7 @@ static PROGRAM_START: std::sync::OnceLock<Env> = std::sync::OnceLock::new();
 /// hands it to.
 fn build_part(env: &[(Vec<u8>, Vec<u8>)]) -> Env {
     let grant = |k: &[u8]| crate::options::GRANTS.iter().any(|(_, name)| same_name(name.as_bytes(), k));
-    env.iter().filter(|(k, _)| !run_fact(k) && !grant(k) && !restart_var(k) && !HANDOVER.iter().any(|h| same_name(h, k))).cloned().collect()
+    env.iter().filter(|(k, _)| !run_fact(k) && !grant(k) && !one_run_var(k) && !HANDOVER.iter().any(|h| same_name(h, k))).cloned().collect()
 }
 
 /// A child run handed a build environment (`BUILD_ENV`): `start` is its environment as started,
@@ -1062,14 +1070,14 @@ mod tests {
         let again = child_env(&granted, &own, &Spawn { edits: &[], clear: false, self_exec: true, dir: ChildDir::Same, host: &[] });
         assert_eq!(get(&again, "RELAX_ALLOW_C"), Some(&b"1"[..]), "a self-exec child, this run again, keeps --allow-c");
 
-        // a run its restart parent started: no child takes the parent's names from this process
-        // (a self-exec child that did took itself for another run of that parent), a spawn that
-        // sets them gives them
+        // a run its restart parent (and makepad test) started: no child takes the parent's names
+        // from this process (a self-exec child that did took itself for another run of that
+        // parent, or another target of the package), a spawn that sets them gives them
         let mut ran_by: Env = real.clone();
-        ran_by.extend([(b("RELAX_RESTART_FILE"), b("/f")), (b("RELAX_RESTART_PARENT"), b("7")), (b("RELAX_RESTART_LIFELINE"), b("3"))]);
+        ran_by.extend([(b("RELAX_RESTART_FILE"), b("/f")), (b("RELAX_RESTART_PARENT"), b("7")), (b("RELAX_RESTART_LIFELINE"), b("3")), (b("RELAX_TEST_PACKAGE"), b("1"))]);
         let restart_names = |env: &Env| -> Own {
-            let mut all: Own = env.iter().filter(|(k, _)| restart_var(k)).map(|(k, v)| (k.clone(), Some(v.clone()))).collect();
-            all.extend(program_env(env).into_iter().filter(|(k, _)| restart_var(k)));
+            let mut all: Own = env.iter().filter(|(k, _)| one_run_var(k)).map(|(k, v)| (k.clone(), Some(v.clone()))).collect();
+            all.extend(program_env(env).into_iter().filter(|(k, _)| one_run_var(k)));
             all
         };
         let started = vec![(b("RELAX_RESTART_FILE"), Some(b("/mine")))];
