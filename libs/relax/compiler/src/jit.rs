@@ -520,6 +520,10 @@ pub struct Unit {
     pub spec_cached: crate::conc::MemoMap<u32, ()>,
     /// drop_may_unwind answers
     pub unwind_drop_cache: crate::conc::MemoMap<TyId, bool>,
+    /// Principal keys and fn-pointer note strings shared by lowering workers.
+    rt_note_names: crate::conc::MemoMap<RtNameKey, String>,
+    /// Slots whose lowered body contains an indirect call without a call-site note.
+    pub(crate) rt_unnoted: relax_session::sync::Mutex<crate::fxhash::HashSet<u32>>,
     /// (concrete type, dyn type) -> vtable address
     pub vtables: crate::conc::MemoMap<(TyId, TyId), u64>,
     /// vtable address -> the slots whose code makes trait objects with it: an unsizing coercion
@@ -5919,6 +5923,8 @@ impl Unit {
             coro_waiting: Default::default(),
             spec_cached: Default::default(),
             unwind_drop_cache: Default::default(),
+            rt_note_names: crate::conc::MemoMap::new_kept(16),
+            rt_unnoted: Default::default(),
             vtables: crate::conc::MemoMap::new_kept(16),
             vtable_makers: Default::default(),
             locations: Default::default(),
@@ -8154,6 +8160,10 @@ impl Unit {
 
     /// All O1 RIR installations, including sandbox twins, pass through here.
     fn set_rir(&mut self, id: u32, mut func: relax_backend::rir::Func) {
+        // These twins install their transformed source lowering directly under the twin's slot.
+        if matches!(self.fns[id as usize].key, FnKey::Sandbox(_) | FnKey::Ctfe(_)) {
+            crate::lower::rt_check_notes(self, id, &func);
+        }
         func.patch_flag = patch_flag(self, id);
         let lowering = func.lowering.take();
         // a normal body built while the RIR is an O2 build's full body (for callers below O2): kept
@@ -16780,7 +16790,7 @@ unsafe fn provided_fmt_hash(u: &mut Unit, d: DefId, args: &[TyId], id: u32) -> R
         let ret = u.tcx.tys.unit;
         let shim = u.syms.intern(crate::syms::SymKind::Provided(format!("shim:{}", key)), shim as usize as u64);
         let last = u.syms.intern(crate::syms::SymKind::Provided(format!("last_panic:{}", pc.name)), pc.last_panic as usize as u64);
-        return Ok(Some(crate::lower::bridge_func_sig(u, &ps, ret, format!("{} (provided)", key), shim, last)));
+        return Ok(Some(crate::lower::bridge_func_sig(u, krate, &ps, ret, format!("{} (provided)", key), shim, last)));
     }
     // the trait impls' methods of an opaque type
     let Some((ad, st, op)) = opaque_impl_op(u, d) else { return Ok(None) };
@@ -16795,7 +16805,7 @@ unsafe fn provided_fmt_hash(u: &mut Unit, d: DefId, args: &[TyId], id: u32) -> R
         let (ps, ret) = if op == OpaqueOp::Eq { (vec![r, r], u.tcx.tys.bool_) } else { (vec![r], st) };
         let shim = u.syms.intern(crate::syms::SymKind::Provided(format!("shim:{}", key)), shim as usize as u64);
         let last = u.syms.intern(crate::syms::SymKind::Provided(format!("last_panic:{}", pc.name)), pc.last_panic as usize as u64);
-        return Ok(Some(crate::lower::bridge_func_sig(u, &ps, ret, format!("{} (provided)", key), shim, last)));
+        return Ok(Some(crate::lower::bridge_func_sig(u, krate, &ps, ret, format!("{} (provided)", key), shim, last)));
     }
     let (helper, hargs) = match op {
         OpaqueOp::Hash => {
@@ -16934,7 +16944,7 @@ thread_local! {
 
 /// Lowers slot `id`. An unverified-mode twin is its base slot's body lowered again as unverified code.
 unsafe fn build_rir_lowered(up: *mut Unit, id: u32) -> Result<relax_backend::rir::Func, String> {
-    if let FnKey::Plain(base) = (&*up).fns[id as usize].key {
+    let f = if let FnKey::Plain(base) = (&*up).fns[id as usize].key {
         // lowered off the owner for a background build's take (prefront_twin)
         if !GATE_LOWER.with(|g| g.get()) {
             if let Some(f) = take_lowered_ahead(&mut *up, id) {
@@ -16944,9 +16954,12 @@ unsafe fn build_rir_lowered(up: *mut Unit, id: u32) -> Result<relax_backend::rir
         let prev = PLAIN_LOWER.with(|c| c.replace(Some((base, id))));
         let r = build_rir_lowered_as(up, base);
         PLAIN_LOWER.with(|c| c.set(prev));
-        return r;
-    }
-    build_rir_lowered_as(up, id)
+        r
+    } else {
+        build_rir_lowered_as(up, id)
+    }?;
+    crate::lower::rt_check_notes(&*up, id, &f);
+    Ok(f)
 }
 
 unsafe fn build_rir_lowered_as(up: *mut Unit, id: u32) -> Result<relax_backend::rir::Func, String> {
@@ -28432,6 +28445,7 @@ fn prefront_closure_as(front: &FrontShared, into: u32, id: u32, plain: Option<u3
         let _plain = PlainLower::enter(plain.map(|t| (id, t)));
         LOWER_AHEAD_IDS.with(|a| a.borrow_mut().body = Some(body.clone()));
         let (func, _) = lower_checked_body(u, id, &key, &body)?;
+        crate::lower::rt_check_notes(u, into, &func);
         let (callees, consts, tls) = LOWER_AHEAD_IDS.with(|a| { let mut a = a.borrow_mut(); (std::mem::take(&mut a.keys), std::mem::take(&mut a.consts), std::mem::take(&mut a.tls)) });
         Ok::<_, String>(LoweredAhead { epoch, file: u.fns[into as usize].file, func, body: plain.is_none().then(|| body.clone()), callees, consts, tls })
     }));
@@ -29642,6 +29656,7 @@ fn lower_ahead_as(u: &Unit, into: u32, base: u32, d: DefId, args: &[TyId], epoch
         if plain.is_some() && !lowers_ahead(u, d, &body) { return Err("not lowered ahead".to_string()) }
         LOWER_AHEAD_IDS.with(|a| a.borrow_mut().body = Some(body.clone()));
         let (func, closures) = lower_checked_body(u, base, &fn_key, &body)?;
+        crate::lower::rt_check_notes(u, into, &func);
         let (callees, consts, tls) = LOWER_AHEAD_IDS.with(|a| { let mut a = a.borrow_mut(); (std::mem::take(&mut a.keys), std::mem::take(&mut a.consts), std::mem::take(&mut a.tls)) });
         // a twin's closures are its base's (their bodies come with the base's own lowering)
         Ok::<_, String>(LoweredAhead { epoch, file: if plain.is_some() { u.fns[into as usize].file } else { body.file }, func, body: (closures && plain.is_none()).then_some(body), callees, consts, tls })
@@ -32864,10 +32879,34 @@ struct ValueCalls {
     sigs: Vec<u32>,
 }
 
+/// Which native code receives the arguments of a host call.
+#[derive(Clone, Copy)]
+pub(crate) enum RtBoundary {
+    Foreign,
+    Provided(u32),
+}
+
+/// Emits the notes for callbacks native code can reach through its arguments.
+pub(crate) fn rt_host_notes(u: &Unit, types: &[TyId], boundary: RtBoundary, mut note: impl FnMut(String)) {
+    let calls = rt_value_calls(u, types, Some(boundary));
+    for t in calls.dyns {
+        note(rt_all_note(u, TyId(t), true));
+    }
+    for t in calls.sigs {
+        let TyKind::FnPtr(ps, ret, header, _) = u.tcx.tys.kind(TyId(t)) else { unreachable!() };
+        note(rt_sig_note(u, u.tcx.tys.list(*ps), *ret, header.abi.is_c_like(), true));
+    }
+}
+
 /// The trait-object and fn-pointer types values of `types` can hold: through struct, enum, tuple,
 /// array and slice fields, closures' captures, and what pointers point at (Box, Vec, Arc behind
 /// their raw pointers and markers).
 fn realtime_value_calls(u: &Unit, types: &[TyId]) -> ValueCalls {
+    rt_value_calls(u, types, None)
+}
+
+fn rt_value_calls(u: &Unit, types: &[TyId], boundary: Option<RtBoundary>) -> ValueCalls {
+    let foreign = matches!(boundary, Some(RtBoundary::Foreign));
     let env = crate::tcx::TypingEnv::fully_monomorphized(&u.prog);
     let mut todo: Vec<TyId> = types.to_vec();
     let mut seen = crate::fxhash::HashSet::default();
@@ -32878,26 +32917,40 @@ fn realtime_value_calls(u: &Unit, types: &[TyId]) -> ValueCalls {
             continue;
         }
         match u.tcx.tys.kind(t) {
-            TyKind::Dyn(..) => out.dyns.push(t.0),
-            TyKind::FnPtr(..) => out.sigs.push(t.0),
+            TyKind::Dyn(..) if !foreign => out.dyns.push(t.0),
+            TyKind::FnPtr(_, _, header, _) if !foreign || header.abi.is_c_like() => out.sigs.push(t.0),
             TyKind::Adt(d, args, _) => {
+                if matches!(boundary, Some(RtBoundary::Provided(krate)) if u.prog.def(*d).krate == krate) { continue; }
+                let args = u.tcx.tys.list(*args);
+                if foreign && u.tcx.lang_items.get(LangItem::Option) == Some(*d) {
+                    todo.extend_from_slice(args);
+                    continue;
+                }
                 let adt = &u.tcx.adts[d];
+                if foreign && (!adt.repr_c || adt.is_enum) { continue; }
                 for (vi, v) in adt.variants.iter().enumerate() {
                     for fi in 0..v.fields.len() {
-                        todo.push(u.tcx.field_ty(&u.prog, env, *d, vi as u32, fi as u32, u.tcx.tys.list(*args)));
+                        todo.push(u.tcx.field_ty(&u.prog, env, *d, vi as u32, fi as u32, args));
                     }
                 }
-                // PhantomData<T> (Vec's element type): T's values are behind the raw pointer
-                todo.extend_from_slice(u.tcx.tys.list(*args));
+                // A boundary follows stored fields. A type argument alone may belong to an opaque field.
+                if boundary.is_none() { todo.extend_from_slice(args); }
             }
-            TyKind::Tuple(fields) => todo.extend_from_slice(u.tcx.tys.list(*fields)),
-            TyKind::Array(elem, _) | TyKind::Slice(elem) => todo.push(*elem),
-            TyKind::Closure(_, _, crate::types::ClosureArgs { tupled_upvars_ty, .. }) => todo.push(*tupled_upvars_ty),
+            TyKind::Tuple(fields) if !foreign => todo.extend_from_slice(u.tcx.tys.list(*fields)),
+            TyKind::Array(elem, _) => todo.push(*elem),
+            TyKind::Slice(elem) if !foreign => todo.push(*elem),
+            TyKind::Closure(_, _, crate::types::ClosureArgs { tupled_upvars_ty, .. }) if !foreign => todo.push(*tupled_upvars_ty),
             TyKind::Ref(_, p, _) | TyKind::Ptr(_, p) => todo.push(*p),
             _ => {}
         }
     }
     out
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum RtNameKey {
+    Trait(TyId),
+    Sig(TyId, bool),
 }
 
 /// Whether a dyn type has a principal, as in supertrait_vtable_slot.
@@ -32928,10 +32981,12 @@ pub(crate) fn rt_trait_ref_key(u: &Unit, def: DefId, args: &[TyId]) -> String {
 
 /// The principal key of a trait object, shared across its auto traits and associated bindings.
 pub(crate) fn rt_trait_key(u: &Unit, dy: TyId) -> String {
-    match u.tcx.tys.kind(dy) {
-        TyKind::Dyn(def, args, ..) => rt_trait_ref_key(u, *def, u.tcx.tys.list(*args)),
-        _ => "-".to_string(),
-    }
+    let dy = u.tcx.tys.erase_regions(dy);
+    let TyKind::Dyn(def, args, ..) = u.tcx.tys.kind(dy) else { return "-".to_string() };
+    let key = RtNameKey::Trait(dy);
+    u.rt_note_names.get(&key).unwrap_or_else(|| {
+        u.rt_note_names.insert_first(key, rt_trait_ref_key(u, *def, u.tcx.tys.list(*args)))
+    })
 }
 
 /// A stable hash of the ABI class, parameter types and return type of a fn pointer.
@@ -32949,9 +33004,9 @@ pub(crate) enum RtNote<'a> {
     /// Calls this word of a vtable registered under the key. Word zero is drop.
     Virtual(&'a str, u32),
     /// Hands an object to native code that can call any word.
-    All(&'a str),
+    All { key: &'a str, host: bool },
     /// Calls a fn pointer. The hash matches its signature and the text describes it in traces.
-    Sig(u64, &'a str),
+    Sig { hash: u64, readable: &'a str, host: bool },
     /// Upcasts an object of this key to an object without a principal.
     Share(&'a str),
 }
@@ -32966,11 +33021,11 @@ impl<'a> RtNote<'a> {
                 if key.is_empty() || !word.bytes().all(|b| b.is_ascii_digit()) { return None; }
                 Some(Self::Virtual(key, word.parse().ok()?))
             }
-            "a" if !rest.is_empty() => Some(Self::All(rest)),
-            "s" => {
+            "a" | "ha" if !rest.is_empty() => Some(Self::All { key: rest, host: kind == "ha" }),
+            "s" | "hs" => {
                 let (hash, readable) = rest.split_once(':')?;
                 if hash.len() != 16 || !hash.bytes().all(|b| b.is_ascii_hexdigit()) || readable.is_empty() { return None; }
-                Some(Self::Sig(u64::from_str_radix(hash, 16).ok()?, readable))
+                Some(Self::Sig { hash: u64::from_str_radix(hash, 16).ok()?, readable, host: kind == "hs" })
             }
             "x" if !rest.is_empty() => Some(Self::Share(rest)),
             _ => None,
@@ -32981,8 +33036,8 @@ impl<'a> RtNote<'a> {
     pub(crate) fn name(&self) -> String {
         match self {
             Self::Virtual(key, word) => format!("v:{word}:{key}"),
-            Self::All(key) => format!("a:{key}"),
-            Self::Sig(hash, readable) => format!("s:{hash:016x}:{readable}"),
+            Self::All { key, host } => format!("{}:{key}", if *host { "ha" } else { "a" }),
+            Self::Sig { hash, readable, host } => format!("{}:{hash:016x}:{readable}", if *host { "hs" } else { "s" }),
             Self::Share(key) => format!("x:{key}"),
         }
     }
@@ -32994,17 +33049,25 @@ pub(crate) fn rt_virtual_note(u: &Unit, dy: TyId, word: u32) -> String {
 }
 
 /// Names a trait object handed to native code.
-pub(crate) fn rt_all_note(u: &Unit, dy: TyId) -> String {
-    RtNote::All(&rt_trait_key(u, dy)).name()
+pub(crate) fn rt_all_note(u: &Unit, dy: TyId, host: bool) -> String {
+    RtNote::All { key: &rt_trait_key(u, dy), host }.name()
 }
 
 /// Names a fn-pointer call by signature and includes its type for traces.
-pub(crate) fn rt_sig_note(u: &Unit, params: &[TyId], ret: TyId, c_like: bool) -> String {
+pub(crate) fn rt_sig_note(u: &Unit, params: &[TyId], ret: TyId, c_like: bool, host: bool) -> String {
     use crate::types::{Abi, FnHeader};
     let header = FnHeader { abi: if c_like { Abi::C } else { Abi::Rust }, ..FnHeader::RUST };
     let fp = u.tcx.tys.intern(TyKind::FnPtr(u.tcx.tys.mk_list(params), ret, header, 0));
-    let readable = crate::typeck::ty_to_string(true, &u.prog, &u.tcx, fp);
-    RtNote::Sig(rt_sig_hash(u, params, ret, c_like), &readable).name()
+    let fp = u.tcx.tys.erase_regions(fp);
+    let key = RtNameKey::Sig(fp, c_like);
+    let mut name = u.rt_note_names.get(&key).unwrap_or_else(|| {
+        let readable = crate::typeck::ty_to_string(true, &u.prog, &u.tcx, fp);
+        let hash = rt_sig_hash(u, params, ret, c_like);
+        let name = RtNote::Sig { hash, readable: &readable, host: false }.name();
+        u.rt_note_names.insert_first(key, name)
+    });
+    if host { name.insert(0, 'h'); }
+    name
 }
 
 /// Names a vtable shared with an object without a principal after an upcast.

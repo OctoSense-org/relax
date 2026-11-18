@@ -13,7 +13,7 @@ use relax_types::consts::GenericArg;
 use crate::lang_items::LangItem;
 use crate::lit::{unescape_str, unescape_bytes, strip_paren, is_assignee_pattern, parse_fmt, FmtPiece, FmtSpec};
 use crate::ast::*;
-use crate::jit::{FnKey, Unit, ShimInstance};
+use crate::jit::{rt_host_notes, rt_share_note, rt_sig_note, rt_trait_key, rt_virtual_note, FnKey, RtBoundary, RtNote, ShimInstance, Unit};
 use relax_types::instance::{Instance, InstanceKind, ShimKind};
 use crate::layout::{Layout, Leaf};
 use crate::program::{DefId, DefKind, Prim};
@@ -31,6 +31,25 @@ pub const VT_DROP: u32 = 0;
 pub const VT_SIZE: u32 = 1;
 pub const VT_ALIGN: u32 = 2;
 pub const VT_METHODS: u32 = 3;
+
+/// Records a slot whose completed lowering calls indirectly without a call-site note.
+pub(crate) fn rt_check_notes(u: &Unit, id: u32, f: &Func) {
+    let indirect = f.blocks.iter().flat_map(|b| &b.insts).any(|i| {
+        matches!(i, Inst::Call(Callee::Indirect(_) | Callee::CIndirect(..), ..))
+    });
+    if !indirect { return; }
+    for sym in &f.notes {
+        let Some(crate::syms::SymKind::Note(name)) = u.syms.kind(sym.id) else { continue };
+        if matches!(RtNote::parse(&name),
+            Some(RtNote::Virtual(..) | RtNote::All { host: false, .. } | RtNote::Sig { host: false, .. })) {
+            return;
+        }
+    }
+    let first = crate::zone_alloc::kept_with(|| u.rt_unnoted.lock().unwrap_or_else(|e| e.into_inner()).insert(id));
+    if first && crate::jit::rt_trace() {
+        eprintln!("relax realtime: indirect call without a call-site note in #{} {}", id, f.name);
+    }
+}
 
 #[derive(Clone)]
 pub enum Val {
@@ -2816,15 +2835,23 @@ impl<'a> Lcx<'a> {
         next
     }
 
+    fn rt_note(&mut self, name: String) {
+        let sym = self.u.syms.note(name);
+        if !self.f.notes.contains(&sym) { self.f.notes.push(sym); }
+    }
+
     /// C-family pointers use the existing C ABI classifier, including the fixed
     /// parameter count of a variadic call (rustc_ty_utils/src/abi.rs:597).
-    fn fn_ptr_callee(&mut self, f: VReg, ps: &[TyId], ret: TyId, header: crate::types::FnHeader, args: &mut Vec<(Val, TyId)>) -> Callee {
+    fn fn_ptr_callee(&mut self, f: VReg, sig: &TyKind, call_ret: TyId, args: &mut Vec<(Val, TyId)>) -> Callee {
+        let TyKind::FnPtr(ps, ret, header, _) = sig else { unreachable!("fn pointer callee") };
+        let ps = self.u.tcx.tys.list(*ps);
+        self.rt_note(rt_sig_note(self.u, ps, *ret, header.abi.is_c_like(), false));
         if header.abi == crate::types::Abi::RustCall { self.spread_tuple_argument(args); }
         if header.abi.is_c_like() {
             let fixed = if header.c_variadic { Some(ps.len()) } else { None };
             let mut params = Vec::new();
             for (_, ty) in args { params.push(*ty); }
-            let cs = crate::cabi::c_sig(self.u, &params, ret, fixed, header.abi);
+            let cs = crate::cabi::c_sig(self.u, &params, call_ret, fixed, header.abi);
             Callee::CIndirect(f, Box::new(cs))
         } else {
             Callee::Indirect(f)
@@ -5374,6 +5401,7 @@ impl<'a> Lcx<'a> {
             }
             TyKind::Dyn(..) => {
                 // a `dyn` tail: through the vtable's drop entry (0 when nothing to drop)
+                self.rt_note(rt_virtual_note(self.u, t, VT_DROP));
                 let fp = self.f.vreg(Cls::I);
                 let pm = self.pmem();
                 self.emit(Inst::Load(pm, fp, len, (VT_DROP * self.pb()) as i32));
@@ -7198,7 +7226,12 @@ impl<'a> Lcx<'a> {
                 // The same principal trait (`dyn Any + 'static` to `dyn Any`, an auto trait
                 // dropped) keeps its vtable (rustc codegen unsized_info): the value is unchanged,
                 // whatever holds the pointer (`Ref<'_, dyn Any>` passed on as `Ref<'_, T>`).
-                let Some(slot) = self.u.tcx.supertrait_vtable_slot(&self.u.prog, sd, dd) else { return v };
+                let Some(slot) = self.u.tcx.supertrait_vtable_slot(&self.u.prog, sd, dd) else {
+                    if rt_trait_key(self.u, dd) == "-" && rt_trait_key(self.u, sd) != "-" {
+                        self.rt_note(rt_share_note(self.u, sd));
+                    }
+                    return v;
+                };
                 // (data, vtable of Sub) -> (data, Sub's stored vtable for Super); a smart
                 // pointer's other fields stay (a Box's allocator)
                 let st = from;
@@ -11205,6 +11238,7 @@ impl<'a> Lcx<'a> {
         let args = instance.compact_args(&self.u.tcx);
         match instance.def {
             InstanceKind::Virtual(d, index) => {
+                self.rt_note(rt_virtual_note(self.u, args[0], index as u32));
                 let receiver = self.to_leaves(vals[0].0.clone(), vals[0].1);
                 assert_eq!(receiver.len(), 2, "virtual receiver metadata");
                 let ptr = self.f.vreg(Cls::I);
@@ -11244,7 +11278,8 @@ impl<'a> Lcx<'a> {
                 self.read_place(&Place::Mem(p[0], 0), ret)
             }
             InstanceKind::Item(d) => {
-                let sig = self.u.tcx.fn_item_sig(&self.u.prog, d).expect("item signature");
+                let u = self.u;
+                let sig = u.tcx.fn_item_sig(&u.prog, d).expect("item signature");
                 let foreign = self.u.prog.def(d).kind == DefKind::ForeignFn;
                 let mut types = Vec::new();
                 for value in &vals { types.push(value.1); }
@@ -11261,6 +11296,7 @@ impl<'a> Lcx<'a> {
                         return self.dummy_val(ret);
                     };
                     let fixed = if sig.header.c_variadic { Some(sig.params.len()) } else { None };
+                    rt_host_notes(u, &types, RtBoundary::Foreign, |name| self.rt_note(name));
                     Callee::CHost(address, Box::new(crate::cabi::c_sig(self.u, &types, ret, fixed, sig.header.abi)))
                 } else if sig.header.abi.is_c_like() {
                     let cs = crate::cabi::c_sig(self.u, &types, ret, None, sig.header.abi);
@@ -11354,20 +11390,20 @@ impl<'a> Lcx<'a> {
             if let TyKind::FnDef(..) = self.kind(pt) {
                 ft = pt;
             } else {
-                return match self.kind(pt) {
-                    TyKind::FnPtr(ps, _, c, _) => {
+                return match self.kind_ref(pt) {
+                    sig @ TyKind::FnPtr(ps, ..) => {
                         let fv = self.read_place(&pl, pt);
                         let fv = self.to_leaves(fv, pt);
                         let mut vals = Vec::new();
                         let mut guards = Vec::new();
                         for (i, a) in args.iter().enumerate() {
-                            let p = self.u.tcx.tys.list(ps).get(i).copied().unwrap_or_else(|| self.body_ty(*a));
+                            let p = self.u.tcx.tys.list(*ps).get(i).copied().unwrap_or_else(|| self.body_ty(*a));
                             let v = self.lower_expr_coerced(*a, p);
                             let v = self.guard_operand(&args[i + 1..], v, p, &mut guards);
                             vals.push((v, p));
                         }
                         self.unguard(&guards);
-                        let callee = self.fn_ptr_callee(fv[0], self.u.tcx.tys.list(ps), t, c, &mut vals);
+                        let callee = self.fn_ptr_callee(fv[0], sig, t, &mut vals);
                         self.emit_call(callee, vals, t)
                     }
                     _ => {
@@ -11429,7 +11465,7 @@ impl<'a> Lcx<'a> {
                 self.emit_instance(instance, vals, t)
             }
 
-            TyKind::FnPtr(ps, _, c, _) => {
+            sig @ TyKind::FnPtr(ps, ..) => {
                 let fv = self.lower_expr(f);
                 let fv = self.to_leaves(fv, ft);
                 let mut vals = Vec::new();
@@ -11441,7 +11477,7 @@ impl<'a> Lcx<'a> {
                     vals.push((v, pt));
                 }
                 self.unguard(&guards);
-                let callee = self.fn_ptr_callee(fv[0], self.u.tcx.tys.list(*ps), t, *c, &mut vals);
+                let callee = self.fn_ptr_callee(fv[0], sig, t, &mut vals);
                 self.emit_call(callee, vals, t)
             }
             _ => {
@@ -11770,6 +11806,7 @@ impl<'a> Lcx<'a> {
                 if let Some(g) = g0 {
                     if let TyKind::Dyn(..) = self.kind(g) {
                         // through the vtable's drop entry (0 when the type has no drop)
+                        self.rt_note(rt_virtual_note(self.u, g, VT_DROP));
                         let fp = self.f.vreg(Cls::I);
                         let pm = self.pmem();
                         self.emit(Inst::Load(pm, fp, p[1], (VT_DROP * self.pb()) as i32));
@@ -13505,12 +13542,16 @@ pub fn bridge_func(u: &Unit, d: DefId, name: String, shim: relax_backend::rir::S
     let s = u.tcx.fn_sig(&u.prog, d).cloned()?;
     let ps: Vec<TyId> = s.params.iter().map(|p| u.tcx.normalize_erasing_late_bound_regions(&u.prog, crate::tcx::TypingEnv::fully_monomorphized(&u.prog), *p)).collect();
     let ret = u.tcx.normalize_erasing_late_bound_regions(&u.prog, crate::tcx::TypingEnv::fully_monomorphized(&u.prog), s.ret);
-    Some(bridge_func_sig(u, &ps, ret, name, shim, last_panic))
+    Some(bridge_func_sig(u, u.prog.def(d).krate, &ps, ret, name, shim, last_panic))
 }
 
 /// bridge_func for an explicit signature (a derived method of an opaque type).
-pub fn bridge_func_sig(u: &Unit, ps: &[TyId], ret: TyId, name: String, shim: relax_backend::rir::Sym, last_panic: relax_backend::rir::Sym) -> Func {
+pub fn bridge_func_sig(u: &Unit, krate: u32, ps: &[TyId], ret: TyId, name: String, shim: relax_backend::rir::Sym, last_panic: relax_backend::rir::Sym) -> Func {
     let mut f = Func::new(name, 0);
+    rt_host_notes(u, ps, RtBoundary::Provided(krate), |name| {
+        let sym = u.syms.note(name);
+        if !f.notes.contains(&sym) { f.notes.push(sym); }
+    });
     let b = f.block();
     let rl = u.lay.of(&crate::layout::LayoutCx::new(&u.prog), &u.tcx, ret);
     let mut rets = Vec::new();
@@ -16445,9 +16486,9 @@ pub fn shim_func(u: &Unit, shim: &ShimInstance, id: u32) -> Result<Func, String>
                 call_args.push((l.read_place(&place, ty), ty));
             }
             let callee = match l.kind(callable) {
-                TyKind::FnPtr(inputs, _, header, _) => {
+                ref sig @ TyKind::FnPtr(..) => {
                     let ptr = l.to_leaves(receiver, callable)[0];
-                    l.fn_ptr_callee(ptr, u.tcx.tys.list(inputs), ret, header, &mut call_args)
+                    l.fn_ptr_callee(ptr, sig, ret, &mut call_args)
                 }
                 TyKind::FnDef(d, args, _) => {
                     let instance = u.tcx.resolve_instance_raw(&u.prog, crate::tcx::TypingEnv::fully_monomorphized(&u.prog), d, u.tcx.tys.list(args)).map_err(|e| format!("shim callee: {e:?}"))?;
