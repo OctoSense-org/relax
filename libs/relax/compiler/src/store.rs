@@ -706,7 +706,11 @@ static LIVE: relax_session::sync::Mutex<Option<std::collections::HashSet<PathBuf
 
 /// Records the store `base` as used by this run, in this process and in its pass's record
 /// (note_in_pass: no running pass's store is evicted). The first time, an opened store's file also
-/// gets its modification time stamped: when a run last used it, the order prune evicts in.
+/// gets its modification time stamped: when a run last used it, the order prune evicts in. Only
+/// a store of this build is stamped (`stamp`: the callers pass whether it is): another build's
+/// store a cross-build lookup reads (a crate's front images, cache.rs candidate_of) ages as that
+/// build's use leaves it, so the stores of a build no run uses any more go (cache.rs prune,
+/// OTHER_UNUSED_FOR) however often later builds read them.
 fn mark_live(base: &Path, file: &Path, stamp: bool) {
     let _k = crate::zone_alloc::kept();
     OPEN_FILES.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(Default::default).insert(file.to_path_buf());
@@ -727,7 +731,7 @@ fn mark_live(base: &Path, file: &Path, stamp: bool) {
 pub fn stamp_used(path: &Path) {
     let base = base_path(path);
     let file = current(&base);
-    if file.exists() { mark_live(&base, &file, true); }
+    if file.exists() { mark_live(&base, &file, build_of(&file) == Some(this_build())); }
 }
 
 /// The generation files this process opened (a stale generation it still reads is not deleted).
@@ -882,6 +886,8 @@ pub struct Store {
     pub path: PathBuf,
     /// the generation file mapped
     file: PathBuf,
+    /// the Relax build that last committed it (its header: BUILD_AT)
+    build: u64,
     pub index: crate::arena::Arena<Ix>,
     pub(crate) generation: u64,
     data: Bytes,
@@ -904,9 +910,10 @@ impl Store {
     }
 
     /// Records this store as used by this run (mark_live): the cap and the replaced-variant
-    /// retirement keep it, other runs see it stamped.
+    /// retirement keep it, other runs see it stamped -- a store of this build; another build's
+    /// keeps its own build's stamp.
     pub fn mark_used(&self) {
-        mark_live(&self.path, &self.file, true);
+        mark_live(&self.path, &self.file, self.build == this_build());
     }
 
     /// When the current generation's file was last written or stamped used (mark_live)
@@ -935,7 +942,7 @@ impl Store {
             if k == h.active && suspect.0 < suspect.1 {
                 note_suspect(&file);
             }
-            Some(Store { path: base.clone(), file: file.clone(), index: ix.into(), generation: generation(&hb), data,
+            Some(Store { path: base.clone(), file: file.clone(), build: u64_at(&hb, BUILD_AT), index: ix.into(), generation: generation(&hb), data,
                 #[cfg(unix)] source: ReadSource::new(&file, &f),
                 data_end: s.end, suspect, checked: Default::default() })
         })();
@@ -961,7 +968,7 @@ impl Store {
             // an earlier epoch's payloads are checked at their first read (get_at), as an open's are
             let suspect = (s.tail, s.trusted_from(epoch(base.parent()?)));
             if suspect.0 < suspect.1 { note_suspect(&file); }
-            Some(Self { path: base.clone(), file: file.clone(), index: crate::arena::Arena::Mapped(index), generation, data,
+            Some(Self { path: base.clone(), file: file.clone(), build: u64_at(hb, BUILD_AT), index: crate::arena::Arena::Mapped(index), generation, data,
                 #[cfg(unix)] source: ReadSource::new(&file, &f),
                 data_end: s.end, suspect, checked: Default::default() })
         })();

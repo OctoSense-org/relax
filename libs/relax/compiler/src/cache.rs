@@ -21,7 +21,7 @@
 //! RELAX_CACHE=on (default) | off | verify | readonly;
 //! Stores live in `<cargo target dir>/relax/cache` (dirs.rs); RELAX_CACHE_DIR replaces
 //! the run dir for tests and measurement. No size caps them: a store goes when no run used it
-//! for a week, or while its volume has less than a tenth free, least recently used first, never
+//! for a week (another Relax build's store: a day), or while its volume has less than a tenth free, least recently used first, never
 //! one a running pass uses (prune_root). The `--allow-c` builds beside them (`relax/native`) are
 //! kept by reachability: what the last build of each slot uses stays, the rest goes (native.rs,
 //! roots).
@@ -6140,6 +6140,11 @@ fn floor_rule() -> String {
 /// A store no run used for this long goes (prune): what a cache holds is what its runs used in
 /// the last week, not every build and crate version it ever saw. A run uses one again cold.
 const UNUSED_FOR: std::time::Duration = std::time::Duration::from_secs(7 * 24 * 3600);
+/// A store another Relax build last committed goes once no run used it for this long: a lane's
+/// JIT build writes a full set of stores per box it runs on, and none is read once the lane is
+/// gone (a build box held 49 builds' stores, 205 GB, all from the last three days, 11-18). A
+/// build still in use stamps its own stores (store::mark_live); other builds' reads do not.
+const OTHER_UNUSED_FOR: std::time::Duration = std::time::Duration::from_secs(24 * 3600);
 /// A build script's output folder or a `--allow-c` build's that no root names stays this long
 /// after its last use (native.rs, unitgraph.rs prune_build: a run that started meanwhile may be
 /// about to name it), as does a store of an older store format (prune: a run of a build from
@@ -6151,10 +6156,12 @@ const UNNAMED_KEPT: std::time::Duration = std::time::Duration::from_secs(10 * 60
 /// itself opened; a delete that fails (open elsewhere, on Windows) is retried by the next
 /// start. A store of another store format goes once no run stamped it for UNNAMED_KEPT: no build
 /// of this format can read it. Other Relax builds' stores stay for when that build runs again: store names hash the
-/// codegen identity (codegen_id.rs), so no other build ever reads them, and a box whose lanes run
-/// several builds went cold each time one of them pruned (the Windows node lost a stopped app's
-/// 109 code stores to a test of another build, 11-04). Whole store files go, whichever build wrote
-/// them (a run stamps the files it uses: store::mark_live), when no run used them for UNUSED_FOR,
+/// codegen identity (codegen_id.rs), so no other build reads them as its own (a crate's front
+/// images are looked for in every store of the crate, which stamps none of another build's), and a
+/// box whose lanes run several builds went cold each time one of them pruned (the Windows node
+/// lost a stopped app's 109 code stores to a test of another build, 11-04). Whole store files go
+/// when no run used them for UNUSED_FOR, another build's after OTHER_UNUSED_FOR (a run stamps the
+/// files of its own build it uses: store::mark_live),
 /// and, while the volume holding `<root>/cache` has less than its floor free (1/FREE_SHARE of it, at
 /// most FREE_MAX), least recently used first until it has -- unless all it could free is under
 /// 1/FUTILE_SHARE of the shortfall -- never one a running pass touched (store::running_passes: a
@@ -6348,7 +6355,8 @@ fn prune(root: &std::path::Path, live: &HashSet<PathBuf>, open: &HashSet<PathBuf
         }); }
     }
     let mut total: u64 = files.iter().map(|f| f.2).sum();
-    // whole stores: the ones no run used for UNUSED_FOR (run stores go by reference, above), and
+    // whole stores: the ones no run used for UNUSED_FOR, another build's for OTHER_UNUSED_FOR
+    // (run stores go by reference, above), and
     // while the volume lacks room the least recently used -- never one in use
     let (lack, free, floor) = match need {
         Some(n) => (n, 0, 0),
@@ -6375,9 +6383,10 @@ fn prune(root: &std::path::Path, live: &HashSet<PathBuf>, open: &HashSet<PathBuf
     let mut lines: Vec<String> = Vec::new();
     for (t, p, len) in &files {
         let age = now.duration_since(*t).unwrap_or_default();
-        let old = age >= UNUSED_FOR;
-        // stamps ascend: once neither rule applies, none applies to a later store
-        if !old && freed >= lack {
+        let other = builds.get(p).copied().flatten().is_some_and(|b| b != me);
+        let old = age >= if other { OTHER_UNUSED_FOR } else { UNUSED_FOR };
+        // stamps ascend: once neither rule applies to any build's store, none applies to a later one
+        if age < OTHER_UNUSED_FOR && freed >= lack {
             break;
         }
         let n = name(p);
@@ -6394,7 +6403,7 @@ fn prune(root: &std::path::Path, live: &HashSet<PathBuf>, open: &HashSet<PathBuf
         let why = if aged {
             unused.0 += 1;
             unused.1 += len;
-            format!("no run used it for {} days", age.as_secs() / 86400)
+            if other { format!("another build's, no run used it for {} h", age.as_secs() / 3600) } else { format!("no run used it for {} days", age.as_secs() / 86400) }
         } else {
             pressed.0 += 1;
             pressed.1 += len;
@@ -6409,7 +6418,7 @@ fn prune(root: &std::path::Path, live: &HashSet<PathBuf>, open: &HashSet<PathBuf
         note_evicted(&dir, &lines);
         let what = |(n, b): (usize, u64)| format!("{n} store(s), {} MB", b >> 20);
         if unused.0 > 0 {
-            crate::progress::log(&format!("relax cache: {} no run used for {} days went ({}/evicted.log)", what(unused), UNUSED_FOR.as_secs() / 86400, dir.display()));
+            crate::progress::log(&format!("relax cache: {} no run used for {} days (another build's: {} h) went ({}/evicted.log)", what(unused), UNUSED_FOR.as_secs() / 86400, OTHER_UNUSED_FOR.as_secs() / 3600, dir.display()));
         }
         if pressed.0 > 0 {
             // a person may want to make room: said, not only logged
@@ -13048,13 +13057,15 @@ mod prune_tests {
         std::fs::remove_dir_all(&root).unwrap();
     }
 
-    /// Another build's stores stay until the volume needs their room, as this build's do: least
-    /// recently used first, never while a process of that build runs (it holds that build's live
-    /// lock, store::hold_build) nor while a running pass uses them. A build with no store left
-    /// loses its sets and lock file.
+    /// Another build's stores stay until no run of it used them for OTHER_UNUSED_FOR -- a read of
+    /// this build (a crate's front images are looked for in every store of the crate) stamps none
+    /// of them, so they age out however often later builds read them -- or until the volume needs
+    /// their room, as this build's do: least recently used first, never while a process of that
+    /// build runs (it holds that build's live lock, store::hold_build) nor while a running pass
+    /// uses them. A build with no store left loses its sets and lock file.
     #[test]
-    fn other_builds_stores_stay_until_the_volume_needs_their_room() {
-        isolated_test!(other_builds_stores_stay_until_the_volume_needs_their_room);
+    fn other_builds_stores_stay_until_unused_for_a_day_or_their_room_is_needed() {
+        isolated_test!(other_builds_stores_stay_until_unused_for_a_day_or_their_room_is_needed);
         let root = std::env::temp_dir().join(format!("relax-retire-{}-{}", std::process::id(), crate::clock::wall_ns()));
         let dir = root.join("cache");
         std::fs::create_dir_all(&dir).unwrap();
@@ -13106,8 +13117,33 @@ mod prune_tests {
         let (ended_set, idle_set) = (sets.join(format!("{:016x}-{:016x}", me ^ 0x3333, 1)), sets.join(format!("{idle:016x}-{:016x}", 1)));
         std::fs::write(&ended_set, "").unwrap();
         std::fs::write(&idle_set, "").unwrap();
+        // unused for two days: another build's store this build reads (a cross-build front lookup
+        // opens it and marks it used), this build's own, and a running build's
+        // (copied to a name this process never wrote: a store it wrote is its own already, and
+        // only a store's first use in a process stamps it)
+        let day = 24 * 3600;
+        let unseen = |name: &str, build: Option<u64>| -> PathBuf {
+            let made = store(&format!("{name}-ffffffffffffffff.rcs"), 0, build);
+            let p = dir.join(format!("{name}-00000000000000e1.rcs"));
+            std::fs::write(&p, std::fs::read(&made).unwrap()).unwrap();
+            std::fs::remove_file(&made).unwrap();
+            std::fs::File::options().write(true).open(&p).unwrap().set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(2 * day)).unwrap();
+            p
+        };
+        let (other_read, mine_read) = (unseen("core", Some(idle)), unseen("alloc", None));
+        let other_aged_running = store("core-00000000000000e3.rcs", 2 * day, Some(alive));
+        let age = |p: &PathBuf| std::fs::metadata(p).unwrap().modified().unwrap().elapsed().unwrap_or_default().as_secs();
+        for p in [&other_read, &mine_read] {
+            let st = crate::store::Store::open_unmarked(p).expect("the store opens");
+            st.mark_used();
+        }
+        assert!(age(&other_read) >= 2 * day - 60, "a read of this build leaves another build's stamp as it was");
+        assert!(age(&mine_read) < 60, "a store of this build is stamped used");
         let live: HashSet<PathBuf> = [mine_used.clone()].into_iter().collect();
         prune(&root, &live, &HashSet::new(), &[], Some(0));
+        assert!(!other_read.exists(), "another build's store no run of it used for a day goes, with room too, though this build read it");
+        assert!(mine_read.exists() && other_aged_running.exists(), "this build's stays for UNUSED_FOR; a running build's always");
+        assert!(std::fs::read_to_string(dir.join("evicted.log")).unwrap().contains("core-00000000000000e1.rcs 0 MB, last used 48 h ago: another build's, no run used it for 48 h"));
         assert!(!older_idle.exists() && !older_run.exists(), "an older format's idle stores go, with room too");
         assert!(older_stamped.exists(), "one a run stamped within UNNAMED_KEPT stays");
         assert!(std::fs::read_to_string(dir.join("evicted.log")).unwrap().contains("serde-00000000000000d1.rcs 0 MB, last used 0 h ago: an older store format"));
@@ -13131,7 +13167,7 @@ mod prune_tests {
         // that build's process and the pass end: prune may take their stores now
         drop((lock, pass));
         prune(&root, &live, &HashSet::new(), &[], Some(u64::MAX));
-        assert!(!other_running.exists() && !other_stamped.exists());
+        assert!(!other_running.exists() && !other_stamped.exists() && !other_aged_running.exists());
         #[cfg(unix)]
         assert!(!dir.join("live").join(format!("{alive:016x}")).exists());
         std::fs::remove_dir_all(&root).unwrap();
