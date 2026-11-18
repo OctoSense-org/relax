@@ -666,6 +666,13 @@ fn global() -> &'static Budget {
 /// side): every pool and the JIT's workers then size from that share, not the box. A tests shard
 /// ran three units at once, each unit's pools and JIT workers sized from the whole box, and its
 /// box ran well over its cores (11-08).
+///
+/// Which variable sizes what:
+/// - `MAKEPAD_CPU_CORES`: the budget itself ([`cores`], [`limit`]): every admission through it, the
+///   app's and the JIT's compile jobs alike, and the long-lived pools when no `MAKEPAD_POOL_CORES` is set.
+/// - `MAKEPAD_POOL_CORES`: the long-lived pools alone ([`pool_cores`]): the platform's app pool,
+///   the CSG pool and the script compute pool. Nothing else reads it.
+/// - `RELAX_JOBS`: the JIT's parse jobs (relax/session options), not this budget.
 fn granted_cores(machine: usize, jobs: Option<&str>) -> usize {
     jobs.and_then(|v| v.parse::<usize>().ok()).filter(|n| *n > 0).map_or(machine, |n| n.min(machine))
 }
@@ -721,6 +728,17 @@ fn physical_cores() -> usize { 0 }
 pub fn cores() -> u32 { global().cores as u32 }
 #[relax_api]
 pub fn limit() -> u32 { global().limit as u32 }
+/// The cores a long-lived pool sizes its threads from: `MAKEPAD_POOL_CORES` where the run was given
+/// that share for its steady work, at most [`cores`]; else [`cores`] ([`granted_cores`] says which
+/// variable sizes what). A pool's threads stay for the whole run, while a compile burst (the JIT's,
+/// at a launch) is short and is what an interactive launch waits on: devhub gives a live test
+/// session's pools its call's charge and leaves the budget, and so the JIT, the box. A live Fab
+/// test's app pool and CSG pool each took the box's 16 cores beside the JIT's workers while the
+/// budget counted it a small ask, and its box stood at load 57 (11-18). Read on each call: a
+/// pool reads it once, at its start.
+pub fn pool_cores() -> u32 {
+    granted_cores(cores() as usize, std::env::var("MAKEPAD_POOL_CORES").ok().as_deref()) as u32
+}
 /// How many Background jobs run at once.
 #[relax_api]
 pub fn background_limit() -> u32 { global().background_limit as u32 }
