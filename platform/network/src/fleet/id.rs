@@ -167,12 +167,14 @@ pub fn normalize(ip: IpAddr) -> IpAddr {
     }
 }
 
-fn sign(key: &[u8; X963_KEY_LEN], msg: &[u8]) -> io::Result<[u8; 64]> {
+/// Signs a message with P-256/SHA-256 and returns the raw 64-byte signature.
+pub fn sign(key: &[u8; X963_KEY_LEN], msg: &[u8]) -> io::Result<[u8; 64]> {
     let der = tls::sign_p256_sha256(key, msg)?;
     tls::ecdsa_raw_from_der(&der).ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "ECDSA signature is not DER"))
 }
 
-fn verify(point: &[u8; 65], msg: &[u8], sig: &[u8; 64]) -> bool {
+/// Verifies a raw P-256/SHA-256 signature with an uncompressed public point.
+pub fn verify(point: &[u8; 65], msg: &[u8], sig: &[u8; 64]) -> bool {
     tls::verify_p256_sha256(point, msg, &tls::x509::ecdsa_sig_from_raw(sig))
 }
 
