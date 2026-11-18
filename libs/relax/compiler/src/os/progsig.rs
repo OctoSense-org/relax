@@ -1029,7 +1029,8 @@ pub(crate) unsafe fn test_send(sig: i32, to: &str, block: bool, name: &str) {
                 sys::syscall(SYS_RT_TGSIGQUEUEINFO, sys::getpid() as i64, tid, sig as i64, p);
             }
         }
-        // a fault the kernel raises at an instruction, inside the compile (`sig` unused: SIGSEGV):
+        // a fault the kernel raises at an instruction, inside the compile (`sig` unused: SIGSEGV,
+        // SIGBUS on macOS, whose kernel raises that for a mapped page without access):
         // a write into an inaccessible page, made by the C library's code (under the JIT this
         // code is JIT code, whose own faults the host contains)
         "fault" => {
