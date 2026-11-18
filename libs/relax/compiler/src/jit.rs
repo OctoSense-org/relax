@@ -32114,9 +32114,18 @@ struct RealTime {
     link: Vec<u32>,
     todo: Vec<u32>,
     new_notes: Vec<u32>,
-    /// The first reason for each queued or held slot, and counts of slots that joined this reach.
-    queued: crate::fxhash::HashMap<u32, RtWay>,
+    /// The first reason for each queued or held slot and its origin (`origins`), and counts of
+    /// slots that joined this reach by way and by origin.
+    queued: crate::fxhash::HashMap<u32, (RtWay, u32)>,
     joined: [usize; 5],
+    by_origin: crate::fxhash::HashMap<u32, usize>,
+    /// What first brought a slot's walk in: the reach's reason for roots, a note's call (the key
+    /// and word, the signature) for what it took, inherited by everything the slot's code calls.
+    /// The trace's per-completion "by origin" line names the calls a large reach came through.
+    origins: Vec<String>,
+    origin_ids: crate::fxhash::HashMap<String, u32>,
+    /// The origin of each called signature (the note that called it first).
+    sig_origin: crate::fxhash::HashMap<u64, u32>,
     /// Statics whose initial fn pointers are indexed, and statics still to index.
     statics: crate::fxhash::HashSet<u32>,
     new_statics: Vec<u32>,
@@ -32152,9 +32161,11 @@ struct RealTime {
 #[derive(Default)]
 struct Called {
     all: bool,
-    words: Vec<u32>,
-    /// Whether a host boundary first requested all words.
+    /// The words called and each one's origin.
+    words: Vec<(u32, u32)>,
+    /// Whether a host boundary first requested all words, and that call's origin.
     host: bool,
+    all_origin: u32,
 }
 
 #[derive(Clone, Copy)]
@@ -32162,31 +32173,40 @@ enum RtWay { Direct, Word, Host, Signature, Share }
 
 impl RealTime {
     /// Keeps the first reason a slot joined the queue, including while an install holds it.
-    fn queue(&mut self, id: u32, way: RtWay) -> bool {
+    fn queue(&mut self, id: u32, way: RtWay, origin: u32) -> bool {
         if self.seen.contains(&id) || self.queued.contains_key(&id) { return false; }
-        self.queued.insert(id, way);
+        self.queued.insert(id, (way, origin));
         self.todo.push(id);
         true
     }
 
+    /// The id of an origin's name (see `origins`).
+    fn origin(&mut self, name: &str) -> u32 {
+        if let Some(&i) = self.origin_ids.get(name) { return i; }
+        let i = self.origins.len() as u32;
+        self.origins.push(name.to_string());
+        self.origin_ids.insert(name.to_string(), i);
+        i
+    }
+
     /// Queues one word of this vtable, or all its thunk words for u32::MAX.
-    fn vtable_word(&mut self, u: &Unit, addr: u64, word: u32, way: RtWay) -> usize {
+    fn vtable_word(&mut self, u: &Unit, addr: u64, word: u32, way: RtWay, origin: u32) -> usize {
         if self.vt_taken.contains(&(addr, u32::MAX)) || !self.vt_taken.insert((addr, word)) { return 0; }
         if word == u32::MAX {
-            crate::syms::vtable_thunks(u, addr).into_iter().filter(|&id| self.queue(id, way)).count()
+            crate::syms::vtable_thunks(u, addr).into_iter().filter(|&id| self.queue(id, way, origin)).count()
         } else {
-            crate::syms::vtable_word_thunk(u, addr, word).is_some_and(|id| self.queue(id, way)) as usize
+            crate::syms::vtable_word_thunk(u, addr, word).is_some_and(|id| self.queue(id, way, origin)) as usize
         }
     }
 
     /// Applies the calls known for a key to one vtable, including calls inherited by an upcast.
     fn called_words(&mut self, u: &Unit, addr: u64, key: &str, shared: bool) -> usize {
         let Some(c) = self.called.get(key) else { return 0 };
-        let (words, all, host) = (c.words.clone(), c.all, c.host);
+        let (words, all, host, all_origin) = (c.words.clone(), c.all, c.host, c.all_origin);
         let way = if shared { RtWay::Share } else { RtWay::Word };
         let mut n = 0;
-        for w in words { n += self.vtable_word(u, addr, w, way); }
-        if all { n += self.vtable_word(u, addr, u32::MAX, if host && !shared { RtWay::Host } else { way }); }
+        for (w, o) in words { n += self.vtable_word(u, addr, w, way, o); }
+        if all { n += self.vtable_word(u, addr, u32::MAX, if host && !shared { RtWay::Host } else { way }, all_origin); }
         n
     }
 
@@ -32422,7 +32442,8 @@ pub(crate) unsafe fn realtime_reach_queued(up: *mut Unit, roots: Vec<u32>, why: 
             rt.ns = 0;
             rt.why = why;
         }
-        for id in roots { rt.queue(id, RtWay::Direct); }
+        let origin = rt.origin(why);
+        for id in roots { rt.queue(id, RtWay::Direct, origin); }
         let post = !rt.scheduled;
         rt.scheduled = true;
         post
@@ -32517,7 +32538,7 @@ unsafe fn realtime_step_for(up: *mut Unit, budget: u64) {
                     with_rt(|rt| rt.queued.remove(&id));
                     continue;
                 }
-                let Some(way) = realtime_take(id) else { continue };
+                let Some((way, origin)) = realtime_take(id) else { continue };
                 let was = (&*up).fns[id as usize].compiled;
                 let (slots, statics, notes) = realtime_refs(up, id);
                 let partner = realtime_partner(&*up, id);
@@ -32527,8 +32548,8 @@ unsafe fn realtime_step_for(up: *mut Unit, budget: u64) {
                 }
                 with_rt(|rt| {
                     if now { rt.failed.remove(&id); } else { rt.failed.insert(id); }
-                    for slot in slots { rt.queue(slot, RtWay::Direct); }
-                    if let Some(id) = partner { rt.queue(id, way); }
+                    for slot in slots { rt.queue(slot, RtWay::Direct, origin); }
+                    if let Some(id) = partner { rt.queue(id, way, origin); }
                     rt.new_notes.extend(notes.into_iter().filter(|id| !rt.notes.contains(id)));
                     rt.new_statics.extend(statics.into_iter().filter(|d| !rt.statics.contains(d)));
                 });
@@ -32770,7 +32791,10 @@ unsafe fn realtime_audit(up: *mut Unit, why: &str, full: bool) -> bool {
         let mut walk = false;
         for (_, h) in holes {
             match h {
-                Hole::Slot(c) => { rt.queue(c, RtWay::Direct); }
+                Hole::Slot(c) => {
+                    let origin = rt.origin("audit");
+                    rt.queue(c, RtWay::Direct, origin);
+                }
                 Hole::Note(n) => rt.new_notes.push(n),
                 Hole::NoRecord | Hole::Unnoted => continue,
             }
@@ -32785,8 +32809,15 @@ unsafe fn realtime_audit(up: *mut Unit, why: &str, full: bool) -> bool {
 fn realtime_done() {
     let wakes = with_rt(|rt| {
         let [direct, word, host, sig, share] = std::mem::take(&mut rt.joined);
+        let by_origin = std::mem::take(&mut rt.by_origin);
         if rt_trace() {
             eprintln!("relax rt: {}: new slots: direct {direct}, vtable word {word}, host note {host}, signature {sig}, share {share}", rt.why);
+            if by_origin.len() > 1 {
+                let mut top: Vec<_> = by_origin.into_iter().collect();
+                top.sort_unstable_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+                let line: Vec<String> = top.iter().take(12).map(|&(o, n)| format!("{n} {}", rt.origins[o as usize])).collect();
+                eprintln!("relax rt: {}: new slots by origin ({} origins): {}", rt.why, top.len(), line.join("; "));
+            }
         }
         rt.scheduled = false;
         // (a step posted before a whole reach ran on the owner finds nothing new: no top tier again)
@@ -33090,7 +33121,8 @@ fn realtime_index_candidates(u: &Unit, slots: &[u32]) -> usize {
         let Some(hash) = realtime_slot_key(u, id) else { continue };
         added += with_rt(|rt| {
             rt.sig_slots.entry(hash).or_default().push(id);
-            rt.sigs.contains(&hash) && rt.queue(id, rt.sig_way(hash))
+            let origin = rt.sig_origin.get(&hash).copied().unwrap_or(0);
+            rt.sigs.contains(&hash) && rt.queue(id, rt.sig_way(hash), origin)
         }) as usize;
     }
     added
@@ -33128,15 +33160,21 @@ fn realtime_index_vtables(u: &Unit) -> usize {
 /// Records a call through one key and applies it to the vtables already indexed under that key.
 fn realtime_called(u: &Unit, key: &str, word: u32, host: bool) -> (usize, usize) {
     let mut tables = with_rt(|rt| {
+        if rt.called.get(key).is_some_and(|c| c.all || word != u32::MAX && c.words.iter().any(|&(w, _)| w == word)) {
+            return Vec::new();
+        }
+        let origin = if word == u32::MAX {
+            rt.origin(&format!("{}a:{key}", if host { "h" } else { "" }))
+        } else {
+            rt.origin(&format!("v:{word}:{key}"))
+        };
         let c = rt.called.entry(key.to_string()).or_default();
-        if c.all { return Vec::new(); }
         if word == u32::MAX {
             c.all = true;
             c.host = host;
-        } else if !c.words.contains(&word) {
-            c.words.push(word);
+            c.all_origin = origin;
         } else {
-            return Vec::new();
+            c.words.push((word, origin));
         }
         let mut tables = rt.vt_keys.get(key).cloned().unwrap_or_default();
         if key == "-" {
@@ -33151,7 +33189,11 @@ fn realtime_called(u: &Unit, key: &str, word: u32, host: bool) -> (usize, usize)
         tables.dedup();
     }
     let way = if host { RtWay::Host } else { RtWay::Word };
-    let n = tables.iter().map(|&a| with_rt(|rt| rt.vtable_word(u, a, word, way))).sum();
+    let n = tables.iter().map(|&a| with_rt(|rt| {
+        let c = &rt.called[key];
+        let origin = if word == u32::MAX { c.all_origin } else { c.words.iter().find(|&&(w, _)| w == word).map_or(0, |&(_, o)| o) };
+        rt.vtable_word(u, a, word, way, origin)
+    })).sum();
     (tables.len(), n)
 }
 
@@ -33185,9 +33227,11 @@ fn realtime_note(u: &Unit, id: u32) {
             let n = with_rt(|rt| {
                 if !rt.sigs.insert(hash) { return 0; }
                 if host { rt.host_sigs.insert(hash); }
+                let origin = rt.origin(&name);
+                rt.sig_origin.insert(hash, origin);
                 let way = rt.sig_way(hash);
                 let slots = rt.sig_slots.get(&hash).cloned().unwrap_or_default();
-                slots.into_iter().filter(|&id| rt.queue(id, way)).count()
+                slots.into_iter().filter(|&id| rt.queue(id, way, origin)).count()
             });
             (0, n)
         }
@@ -33220,17 +33264,18 @@ fn realtime_cut(u: &Unit, id: u32) -> bool {
 }
 
 /// Takes a queued slot, or holds it until its pending install completes.
-fn realtime_take(id: u32) -> Option<RtWay> {
+fn realtime_take(id: u32) -> Option<(RtWay, u32)> {
     with_rt(|rt| {
         if rt.building.contains_key(&id) {
             if !rt.held.contains(&id) { rt.held.push(id); }
             return None;
         }
-        let way = rt.queued.remove(&id)?;
+        let (way, origin) = rt.queued.remove(&id)?;
         rt.seen.insert(id);
         rt.set.push(id);
         rt.joined[way as usize] += 1;
-        Some(way)
+        *rt.by_origin.entry(origin).or_default() += 1;
+        Some((way, origin))
     })
 }
 
