@@ -3831,7 +3831,7 @@ impl<'a> Fcx<'a> {
                     explicit2.push(e);
                 }
             }
-            let targs = self.tcx.fill_trait_defaults(&self.cx.with_infcx(&self.infcx), prog, td, self_t, explicit2);
+            let targs = self.tcx.fill_trait_defaults(&self.cx.with_infcx(&self.infcx), prog, td, self_t, explicit2, crate::types::RegionArgsId::EMPTY);
             let mut args = vec![self_t];
             args.extend(targs);
             // the item's own args from the path (`<S as T<123>>::l::<true>()`)
