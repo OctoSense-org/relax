@@ -2476,6 +2476,8 @@ pub unsafe fn transform(up: *mut Unit, f: &mut Func, twin_id: u32) -> Result<(),
                         }
                     }
                     let callee = match callee {
+                        // (black_box's block runs no instruction)
+                        Callee::Asm(b) if b.is_empty() => Callee::Asm(b),
                         Callee::Asm(_) => return Err(format!("{}: inline assembly, which sandboxed code cannot run", f.name)),
                         Callee::Fn(id) => Callee::Fn(call_target(up, id, &sandboxed, allow)?),
                         Callee::CFn(id, sig) => Callee::CFn(call_target(up, id, &sandboxed, allow)?, sig),

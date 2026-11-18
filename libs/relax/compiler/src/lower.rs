@@ -12150,7 +12150,23 @@ impl<'a> Lcx<'a> {
                 self.emit(Inst::Call(Callee::Host(rt), vec![slot, z, n], Vec::new()));
                 self.load_val(slot, 0, g)
             }
-            "black_box" => vals[0].0.clone(),
+            // rustc_codegen_llvm (intrinsic black_box): the value goes to the result's place and
+            // an empty asm block takes its address with a memory clobber (a ZST: the clobber
+            // alone), so no pass sees through it: the value is made, kept and read back. (As an
+            // identity it was dead after a call, which then became a sibling call: the frame
+            // that held the value was gone from the stack a live edit's landing check reads.)
+            "black_box" => {
+                let g = g0?;
+                if self.layout(g).size == 0 {
+                    self.emit(Inst::Call(Callee::Asm(Box::new(AsmBlock::opaque(Vec::new()))), Vec::new(), Vec::new()));
+                    vals[0].0.clone()
+                } else {
+                    let slot = self.new_slot_for(g);
+                    self.store_val(slot, 0, g, vals[0].0.clone());
+                    self.emit(Inst::Call(Callee::Asm(Box::new(AsmBlock::opaque(vec![relax_backend::asm::PReg::int(0)]))), vec![slot], Vec::new()));
+                    self.load_val(slot, 0, g)
+                }
+            }
             "type_name" => {
                 let s = match g0 {
                     Some(g) => crate::typeck::type_name(&self.u.prog, &self.u.tcx, g),

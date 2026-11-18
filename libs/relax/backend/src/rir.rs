@@ -899,6 +899,23 @@ pub struct AsmBlock {
     pub opts: u32,
 }
 
+impl AsmBlock {
+    /// The empty block rustc makes `black_box` of (rustc_codegen_llvm intrinsic.rs: an empty
+    /// `asm!` with the value's address as its input and a memory clobber; for a ZST the clobber
+    /// alone): it runs no instruction, but every pass sees a call that may read and write any
+    /// memory, the input's included, so none sees through it.
+    pub fn opaque(ins: Vec<crate::asm::PReg>) -> AsmBlock {
+        let regs = ins.iter().fold(0u64, |m, r| m | 1 << r.bit());
+        AsmBlock { code: Vec::new(), fixups: Vec::new(), ins, outs: Vec::new(), regs, writes: 0, opts: ASM_NOSTACK | ASM_PRESERVES_FLAGS }
+    }
+
+    /// A block of no instructions (`opaque`): code that cannot run inline assembly (wasm,
+    /// sandboxed code) keeps it as the barrier it is to the passes and emits nothing for it.
+    pub fn is_empty(&self) -> bool {
+        self.code.is_empty() && self.fixups.is_empty() && self.outs.is_empty()
+    }
+}
+
 /// An aggregate passed or returned by value under the C ABI.
 #[derive(Clone, PartialEq, Hash, Debug)]
 pub struct CAgg {
