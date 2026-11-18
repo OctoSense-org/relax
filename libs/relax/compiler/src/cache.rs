@@ -6099,9 +6099,21 @@ pub fn app_store_files(dir: &std::path::Path, krate: &str) -> Vec<PathBuf> {
     files
 }
 
-/// Relax keeps a tenth of the store folder's volume free (prune): room for every other program's
-/// writes between two runs. Under it, stores go, least recently used first.
+/// Relax keeps a tenth of the store folder's volume free, at most FREE_MAX (prune): room for every
+/// other program's writes between two runs (swap growth, a few builds). Under it, stores go, least
+/// recently used first. A tenth alone kept 190 GB free on a 2 TB disk: with 185 GB free, every
+/// launch there evicted every store not in use, and warm runs started cold.
 const FREE_SHARE: u64 = 10;
+const FREE_MAX: u64 = 20 << 30;
+/// Under the floor, Relax holds back when all it could free is under 1/FUTILE_SHARE of what the
+/// volume lacks: other programs' files fill it, and deleting the cache would cost warm starts and
+/// leave the volume as short (said once per process).
+const FUTILE_SHARE: u64 = 10;
+
+/// The floor's rule, as the messages say it.
+fn floor_rule() -> String {
+    format!("1/{FREE_SHARE} of it, at most {} GB", FREE_MAX >> 30)
+}
 /// A store no run used for this long goes (prune): what a cache holds is what its runs used in
 /// the last week, not every build and crate version it ever saw. A run uses one again cold.
 const UNUSED_FOR: std::time::Duration = std::time::Duration::from_secs(7 * 24 * 3600);
@@ -6120,8 +6132,9 @@ const UNNAMED_KEPT: std::time::Duration = std::time::Duration::from_secs(10 * 60
 /// several builds went cold each time one of them pruned (the Windows node lost a stopped app's
 /// 109 code stores to a test of another build, 11-04). Whole store files go, whichever build wrote
 /// them (a run stamps the files it uses: store::mark_live), when no run used them for UNUSED_FOR,
-/// and, while the volume holding `<root>/cache` has less than FREE_SHARE of it free, least
-/// recently used first until it has -- never one a running pass touched (store::running_passes: a
+/// and, while the volume holding `<root>/cache` has less than its floor free (1/FREE_SHARE of it, at
+/// most FREE_MAX), least recently used first until it has -- unless all it could free is under
+/// 1/FUTILE_SHARE of the shortfall -- never one a running pass touched (store::running_passes: a
 /// `check -p` command's stores stay from its first package to its last), nor one this process
 /// opened or wrote, nor one of a build running right now (every running process holds its
 /// build's live lock). No size of the cache is a reason: a fixed or run-derived cap evicted what
@@ -6163,12 +6176,12 @@ fn prune_shared_with(root: &std::path::Path, live: &HashSet<PathBuf>, open: &Has
     prune(root, live, open, &[], need)
 }
 
-/// What the volume holding store folder `dir` lacks of its floor (FREE_SHARE of it free), in
-/// bytes, with what it has free and its floor; 0 where the system does not say.
+/// What the volume holding store folder `dir` lacks of its floor (1/FREE_SHARE of it free, at most
+/// FREE_MAX), in bytes, with what it has free and its floor; 0 where the system does not say.
 fn below_floor(dir: &std::path::Path) -> (u64, u64, u64) {
     match crate::dirs::volume_space(dir) {
         Some((free, size)) => {
-            let floor = size / FREE_SHARE;
+            let floor = (size / FREE_SHARE).min(FREE_MAX);
             (floor.saturating_sub(free), free, floor)
         }
         None => (0, 0, 0),
@@ -6318,6 +6331,21 @@ fn prune(root: &std::path::Path, live: &HashSet<PathBuf>, open: &HashSet<PathBuf
         Some(n) => (n, 0, 0),
         None => below_floor(&dir),
     };
+    // under the floor: what this rule could free at most (every store not in use). Far below what
+    // the volume lacks, it frees nothing: the cache is not what fills the volume
+    let futile = need.is_none() && lack > 0 && {
+        let evictable: u64 = files.iter()
+            .filter(|(_, p, _)| !(live.contains(&crate::store::base_path(p)) || running.contains(p) || in_pass(&name(p))))
+            .map(|f| f.2).sum();
+        let futile = evictable < lack / FUTILE_SHARE;
+        static HELD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if futile && !HELD.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            crate::progress::say(&format!("relax cache: the volume holding {} has {} MB free, under the {} MB ({}) Relax keeps free, but the cache could free only {} MB of the {} MB it lacks: it keeps its stores (other files fill the volume)",
+                dir.display(), free >> 20, floor >> 20, floor_rule(), evictable >> 20, lack >> 20));
+        }
+        futile
+    };
+    let lack = if futile { 0 } else { lack };
     files.sort();
     let mut evicted: HashSet<&PathBuf> = HashSet::new();
     let (mut freed, mut unused, mut pressed) = (0u64, (0usize, 0u64), (0usize, 0u64));
@@ -6349,7 +6377,7 @@ fn prune(root: &std::path::Path, live: &HashSet<PathBuf>, open: &HashSet<PathBuf
             pressed.1 += len;
             match need {
                 Some(_) => format!("asked to free {lack} bytes"),
-                None => format!("the volume has {} MB free, under the {} MB (1/{FREE_SHARE} of it) kept free", free >> 20, floor >> 20),
+                None => format!("the volume has {} MB free, under the {} MB ({}) kept free", free >> 20, floor >> 20, floor_rule()),
             }
         };
         lines.push(format!("{n} {} MB, last used {} h ago: {why}", len >> 20, age.as_secs() / 3600));
@@ -6362,8 +6390,8 @@ fn prune(root: &std::path::Path, live: &HashSet<PathBuf>, open: &HashSet<PathBuf
         }
         if pressed.0 > 0 {
             // a person may want to make room: said, not only logged
-            crate::progress::say(&format!("relax cache: the volume holding {} has {} MB free, under the {} MB (1/{FREE_SHARE} of it) Relax keeps free: {} went, least recently used first (evicted.log there)",
-                dir.display(), free >> 20, floor >> 20, what(pressed)));
+            crate::progress::say(&format!("relax cache: the volume holding {} has {} MB free, under the {} MB ({}) Relax keeps free: {} went, least recently used first (evicted.log there)",
+                dir.display(), free >> 20, floor >> 20, floor_rule(), what(pressed)));
         }
         if std::env::var_os("RELAX_CACHE_TRACE").is_some() {
             for l in &lines {
@@ -6374,8 +6402,8 @@ fn prune(root: &std::path::Path, live: &HashSet<PathBuf>, open: &HashSet<PathBuf
     static SHORT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     if need.is_none() && freed < lack && !SHORT.swap(true, std::sync::atomic::Ordering::Relaxed) {
         // what is left is in use: the run goes on, its writes may fail (a miss, never a failure)
-        crate::progress::say(&format!("relax cache: the volume holding {} has {} MB free, under the {} MB (1/{FREE_SHARE} of it) Relax keeps free; the {} MB left in the cache is in use",
-            dir.display(), (free + freed) >> 20, floor >> 20, total >> 20));
+        crate::progress::say(&format!("relax cache: the volume holding {} has {} MB free, under the {} MB ({}) Relax keeps free; the {} MB left in the cache is in use",
+            dir.display(), (free + freed) >> 20, floor >> 20, floor_rule(), total >> 20));
     }
     // a build prune took the last store of (or that left only its lock file)
     let holding: HashSet<u64> = files.iter().filter(|f| !evicted.contains(&f.1)).filter_map(|f| builds[&f.1]).collect();
