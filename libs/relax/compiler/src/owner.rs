@@ -1134,6 +1134,9 @@ fn request_dyn(site: &'static std::panic::Location<'static>, class: Class, deadl
     let behind_from = NOW_FROM.load(Ordering::Relaxed);
     // SAFETY: only &'static Locations are stored
     let behind_site = unsafe { NOW_SITE.load(Ordering::Relaxed).as_ref() };
+    // a main-thread request asked while a real-time reach step runs (its queue delay is the
+    // reach's cost to main: the trace's line per reach)
+    let behind_rt = req.t_push != 0 && crate::jit::RT_STEPS_ON.load(Ordering::Relaxed) > 0;
     let t_req = std::time::Instant::now();
     let t0 = if main_wait { crate::jit::wall_ns() } else { 0 };
     if req.t_push != 0 {
@@ -1161,6 +1164,9 @@ fn request_dyn(site: &'static std::panic::Location<'static>, class: Class, deadl
         if served != 0 {
             let q = served.saturating_sub(req.t_push);
             crate::jit::main_rec_behind(q, behind, behind_from, behind_site);
+            if behind_rt {
+                crate::jit::rt_main_waited(q);
+            }
         }
         crate::postframe::main_owner_wait(req.t_push, w);
     }

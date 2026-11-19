@@ -32287,6 +32287,46 @@ static RT_PENDING: relax_session::sync::Mutex<Vec<u64>> = relax_session::sync::M
 pub static RT_AHEAD: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
 /// Reach completions that found nothing new (the trace counts them).
 static RT_QUIET: AtomicU64 = AtomicU64::new(0);
+/// Reach steps running on the owner now (a count: realtime_before_install runs a whole reach on
+/// the owner, inside a step or not).
+pub(crate) static RT_STEPS_ON: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+/// The main thread's queue delay for its requests asked while a reach step ran: [count, sum ns,
+/// max ns] since the last completion, and the run's max (the trace's line per reach).
+static RT_MAIN_WAIT: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+/// A main-thread request to the owner was asked while a reach step ran and queued `ns`.
+pub(crate) fn rt_main_waited(ns: u64) {
+    RT_MAIN_WAIT[0].fetch_add(1, Ordering::Relaxed);
+    RT_MAIN_WAIT[1].fetch_add(ns, Ordering::Relaxed);
+    RT_MAIN_WAIT[2].fetch_max(ns, Ordering::Relaxed);
+    RT_MAIN_WAIT[3].fetch_max(ns, Ordering::Relaxed);
+}
+
+/// The main thread's waits behind the steps since the last completion, from 0 again: the max (ns)
+/// and the trace's words.
+fn rt_main_wait_take() -> (u64, String) {
+    let n = RT_MAIN_WAIT[0].swap(0, Ordering::Relaxed);
+    let sum = RT_MAIN_WAIT[1].swap(0, Ordering::Relaxed);
+    let max = RT_MAIN_WAIT[2].swap(0, Ordering::Relaxed);
+    let ms = |v: u64| v as f64 / 1e6;
+    (max, format!("main waited behind its steps {n}x, max {:.2} ms, sum {:.1} ms (run max {:.2} ms)", ms(max), ms(sum), ms(RT_MAIN_WAIT[3].load(Ordering::Relaxed))))
+}
+
+/// Counts a reach step on the owner while it lives (RT_STEPS_ON).
+struct RtStepOn;
+
+impl RtStepOn {
+    fn enter() -> RtStepOn {
+        RT_STEPS_ON.fetch_add(1, Ordering::Relaxed);
+        RtStepOn
+    }
+}
+
+impl Drop for RtStepOn {
+    fn drop(&mut self) {
+        RT_STEPS_ON.fetch_sub(1, Ordering::Relaxed);
+    }
+}
 /// RT_TAIL counts completions and measures ns in the audit, collecting new slots, the top tier
 /// and the disk cache record.
 static RT_TAIL: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
@@ -32536,6 +32576,7 @@ unsafe fn realtime_step(up: *mut Unit) {
 /// realtime_step with `budget` wall ns (u64::MAX: the whole reach now, realtime_before_install on
 /// the owner).
 unsafe fn realtime_step_for(up: *mut Unit, budget: u64) {
+    let _on = RtStepOn::enter();
     let t0 = wall_ns();
     // the earlier runs' set, once, first: on a warm run most of it links from the disk cache. It is
     // only what to compile ahead: the reach is what the walk from the roots takes. A slot's key names
@@ -32722,8 +32763,9 @@ unsafe fn realtime_step_for(up: *mut Unit, budget: u64) {
         let tail2 = wall_ns();
         let t = rt_tail(&[tail1 - tail0, tail2 - tail1, 0, 0]);
         let quiet = RT_QUIET.fetch_add(1, Ordering::Relaxed) + 1;
-        if rt_trace() && (tail2 - tail0 >= 10_000_000 || quiet % 64 == 0) {
-            eprintln!("relax rt: {}: nothing new ({} such completions), tail {}; {:.1} ms on the owner in all", why, quiet, t, RT_AHEAD[1].load(Ordering::Relaxed) as f64 / 1e6);
+        let (wait_max, waits) = rt_main_wait_take();
+        if rt_trace() && (tail2 - tail0 >= 10_000_000 || quiet % 64 == 0 || wait_max >= 2_000_000) {
+            eprintln!("relax rt: {}: nothing new ({} such completions), tail {}; {:.1} ms on the owner in all; {}", why, quiet, t, RT_AHEAD[1].load(Ordering::Relaxed) as f64 / 1e6, waits);
         }
         realtime_done();
         return;
@@ -32774,8 +32816,9 @@ unsafe fn realtime_step_for(up: *mut Unit, budget: u64) {
         let top: Vec<String> = v.iter().take(12).map(|(k, n)| format!("{} {}", u.prog.syms.str(u.prog.crates[*k as usize].name), n)).collect();
         eprintln!("relax rt: {}: the new slots by crate: {}", why, top.join(", "));
     }
+    let (_, waits) = rt_main_wait_take();
     if crate::run::VERBOSE.load(Ordering::Relaxed) || rt_trace() {
-        eprintln!("relax rt: {}: real-time code reaches {} slots ({} new), {} compiled now, {:.1} ms on the owner ({:.1} ms in all); tail {}", why, set_len, new, total_compiled, ns as f64 / 1e6, RT_AHEAD[1].load(Ordering::Relaxed) as f64 / 1e6, tail);
+        eprintln!("relax rt: {}: real-time code reaches {} slots ({} new), {} compiled now, {:.1} ms on the owner ({:.1} ms in all); tail {}; {}", why, set_len, new, total_compiled, ns as f64 / 1e6, RT_AHEAD[1].load(Ordering::Relaxed) as f64 / 1e6, tail, waits);
     }
     realtime_done();
 }
@@ -34559,6 +34602,8 @@ pub(crate) unsafe fn reset_statics() {
     reset(&RT_AHEAD, [AtomicU64::new(0), AtomicU64::new(0)]);
     reset(&RT_TAIL, [const { AtomicU64::new(0) }; 5]);
     reset(&RT_QUIET, AtomicU64::new(0));
+    reset(&RT_STEPS_ON, std::sync::atomic::AtomicU32::new(0));
+    reset(&RT_MAIN_WAIT, [const { AtomicU64::new(0) }; 4]);
     reset(&RT_TICKET, AtomicU64::new(0));
     reset(&RT_DONE, AtomicU64::new(0));
     reset(&RT_ARMED, std::sync::atomic::AtomicU32::new(0));
