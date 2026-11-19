@@ -33,6 +33,8 @@
 //! child in this process's folder or in the mount. A shared workspace's run (vfs.rs SHARE) has a
 //! real folder, its checkout: a child in this process's folder runs there with no mount, as it does
 //! under cargo, and only a child started in a folder of the mount gets it, with the share's name.
+//! A child that gets no mount gets no path into it either (`outside_mount`): a folder mount's path
+//! is spelled as the disk file it is, and a std chosen in a store mount stays behind.
 //!
 //! A run of a package binary the run prepared (its test's CARGO_BIN_EXE_<name>, std's spawn asks
 //! `prepared_bin`) or of this program again is built by the run that prepared it, as cargo builds
@@ -242,6 +244,41 @@ fn set(env: &mut Env, name: &[u8], value: Option<&[u8]>) {
 /// `BUILD_FD`): std's plumbing's alone, never the program's.
 fn handed_build(k: &[u8]) -> bool {
     same_name(k, BUILD_ENV) || same_name(k, BUILD_FD)
+}
+
+/// Where a value of a child's environment lies, for a child that gets none of this process's mount
+/// (`outside_mount`).
+#[derive(Clone, Debug, PartialEq)]
+pub enum Place {
+    /// no path in a mount (a disk path, or no path at all)
+    Disk,
+    /// a path in a folder mount (a shared workspace's, vfs.rs SHARE): the disk path it is
+    Folder(Vec<u8>),
+    /// a path in a store mount (a git run's, devhub's overlay): on no disk
+    Store,
+}
+
+/// The std a run took (relax-compiler std_source.rs), and the mark of an automatic choice.
+const STD: [&[u8]; 2] = [b"RELAX_STD", b"RELAX_STD_AUTO"];
+
+/// A child that starts without this process's mount (a real folder's, or any child of a shared
+/// workspace's run: `child_env`) cannot read a path in it, so its environment names none. A value
+/// in a folder mount is spelled as the disk path it is, as a host hands its own paths to other
+/// programs (vfs.rs `on_disk`). The std a run took in a store mount (RELAX_STD, a repository's own
+/// std, and its automatic mark) does not cross: the child takes its own, as a run given none does
+/// (std_source.rs `select`); before, a relax run that a shell in a real folder started refused
+/// that RELAX_STD as no folder. Any other value in a store mount has no spelling on disk and stays
+/// as the program gave it, as a path in its arguments does: a program that hands one on starts its
+/// child in the mount.
+pub fn outside_mount(env: &mut Env, place: impl Fn(&[u8]) -> Place) {
+    env.retain_mut(|(k, v)| match place(v) {
+        Place::Disk => true,
+        Place::Folder(disk) => {
+            *v = disk;
+            true
+        }
+        Place::Store => !STD.iter().any(|n| same_name(k, n)),
+    });
 }
 
 /// What the program reads: `real` (this process's environment) with its own values applied.
@@ -996,7 +1033,20 @@ pub extern "C" fn spawn_env(edits: *const u8, edits_len: usize, host: *const u8,
         }
     }
     let spawn = Spawn { edits: &edits, clear: flags & 1 != 0, self_exec: flags & 2 != 0, dir, host: &host };
-    let env: Own = child_env(&real(), &own(), &spawn).into_iter().map(|(k, v)| (k, Some(v))).collect();
+    let mut env = child_env(&real(), &own(), &spawn);
+    if !env.iter().any(|(k, v)| same_name(k, VFS) && !v.is_empty()) {
+        outside_mount(&mut env, |v| {
+            let Ok(path) = std::str::from_utf8(v) else { return Place::Disk };
+            if !crate::vfs::is_virtual(path) {
+                Place::Disk
+            } else if crate::vfs::in_store(path) {
+                Place::Store
+            } else {
+                Place::Folder(crate::vfs::on_disk(path).into_owned().into_bytes())
+            }
+        });
+    }
+    let env: Own = env.into_iter().map(|(k, v)| (k, Some(v))).collect();
     SNAPSHOT.with(|b| {
         let mut b = b.borrow_mut();
         *b = encode(&env);
@@ -1225,6 +1275,24 @@ mod tests {
             buf.truncate(got);
             Some(buf)
         }
+    }
+
+    /// A child that gets no mount (`outside_mount`): every path its environment names is one it can
+    /// read, each assert naming its property.
+    #[test]
+    fn a_child_without_the_mount_gets_no_path_into_it() {
+        let mut env: Env = vec![(b("RELAX_STD"), b("/m/repo/std")), (b("RELAX_STD_AUTO"), b("/m/repo/std")), (b("CARGO_MANIFEST_DIR"), b("/m/share/pkg")),
+            (b("SRC"), b("/m/repo/pkg")), (b("HOME"), b("/h")), (b("LANG"), b("C"))];
+        outside_mount(&mut env, |v| match v {
+            _ if v.starts_with(b"/m/repo") => Place::Store,
+            _ if v.starts_with(b"/m/share") => Place::Folder([&b"/disk/checkout"[..], &v[b"/m/share".len()..]].concat()),
+            _ => Place::Disk,
+        });
+        assert_eq!((get(&env, "RELAX_STD"), get(&env, "RELAX_STD_AUTO")), (None, None), "a std a run took in a store mount stays behind: the child takes its own");
+        assert_eq!(get(&env, "CARGO_MANIFEST_DIR"), Some(&b"/disk/checkout/pkg"[..]), "a folder mount's path is spelled as the disk path it is");
+        assert_eq!(get(&env, "SRC"), Some(&b"/m/repo/pkg"[..]), "a program's value in a store mount has no disk spelling: it stays as given");
+        assert_eq!((get(&env, "HOME"), get(&env, "LANG")), (Some(&b"/h"[..]), Some(&b"C"[..])), "what names no mount is untouched");
+        assert_eq!(env.len(), 4, "only the std's names left: {env:?}");
     }
 
     /// A program's writes of reserved names, read back the three ways a program reads: std's
