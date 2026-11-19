@@ -70,7 +70,7 @@ fn stream_timing() -> bool {
     *ON.get_or_init(|| std::env::var_os("RELAX_STREAM_TIMING").is_some())
 }
 
-fn live_trace() -> bool {
+pub(crate) fn live_trace() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("RELAX_LIVE_TRACE").is_some())
 }
@@ -10827,6 +10827,17 @@ unsafe fn test_edit(up: *mut Unit, paths: Vec<String>, o: &mut Outcome, undos: &
 }
 
 unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
+    if live_trace() {
+        eprintln!("relax live: watcher up at t={:.0} ms (recovering {}, replacement {})", crate::clock::ms_since_start(), crate::hot_failure::recovering(), crate::hot_failure::replacement_running());
+    }
+    // (hot_fail.py's late-watcher case: a restart's replacement whose watcher comes up after the
+    // next save, as one on a loaded box did, 11-19; the save is this run's to patch, from the
+    // stamps its resolve took)
+    if crate::hot_failure::replacement() {
+        if let Some(ms) = std::env::var("RELAX_TEST_LATE_WATCHER").ok().and_then(|v| v.parse::<u64>().ok()) {
+            std::thread::sleep(std::time::Duration::from_millis(ms));
+        }
+    }
     // a body that includes a file for the first time: the watcher watches it from now on
     crate::sip::on_late_new(watch_events::kick);
     inputs.add_runner();
@@ -10882,6 +10893,9 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
     // the readiness signal for tools and tests, whatever the log verbosity: RELAX_LIVE_READY=<file>
     // gets the watched file count once the watcher runs (edits saved from now on are seen)
     if let Some(ready) = std::env::var_os("RELAX_LIVE_READY") { let _ = std::fs::write(ready, format!("{}\n", files.len())); }
+    if live_trace() {
+        eprintln!("relax live: watching {} files at t={:.0} ms (recovering {})", files.len(), crate::clock::ms_since_start(), crate::hot_failure::recovering());
+    }
     let mut undos: Vec<Undo> = Vec::new();
     // SPEC-V: patches that ran before their verdict
     let mut pending: Vec<PendingPatch> = Vec::new();
