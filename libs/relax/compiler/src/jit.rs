@@ -13964,6 +13964,14 @@ unsafe fn wait_inflight(up: *mut Unit, id: u32) {
         return;
     }
     owner::busy_if_nested();
+    // a back end the owner's own step split off for the reach and no reach build took yet: run here
+    // (realtime_back_for_wait). (In a publish the wait bails or is a bug, as below.)
+    if owner::is_owner() {
+        owner::forbid_in_publish("a wait", u32::MAX);
+        if realtime_back_for_wait(up, id) && !(&*up).fns[id as usize].inflight {
+            return;
+        }
+    }
     let end = flight_end(up, id);
     let flight = &(&*up).flights[&id];
     let (root, holder) = (flight.root, flight.holder);
@@ -32505,8 +32513,10 @@ impl Drop for RtKeepOn {
 /// build is the owner's own, a given-back one, a whole reach run on the owner).
 static RT_OFF: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 /// Given-back slots whose take bailed: fronts made on the owner and back ends sent off it again
-/// (realtime_split), the owner's thread CPU ns for those fronts, back ends finished off it.
-static RT_SPLIT: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+/// (realtime_split), the owner's thread CPU ns for those fronts, back ends finished off it, and
+/// back ends the owner ran itself because a front of its own waited for their flight
+/// (realtime_back_for_wait).
+static RT_SPLIT: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 /// the longest owner step of the reach so far (wall ns)
 static RT_STEP_MAX: AtomicU64 = AtomicU64::new(0);
 /// Why reach builds went back to the owner (RT_GIVE_NAMES), and how many gave way to a front
@@ -32821,6 +32831,36 @@ pub(crate) fn realtime_reached(id: u32) -> bool {
 #[cfg(test)]
 pub(crate) fn realtime_out(id: u32) -> bool {
     with_rt(|rt| rt.out.contains_key(&id))
+}
+
+/// (unit tests) Reach builds held out of the queue (hold_reach_builds): (unit, slot).
+#[cfg(test)]
+static REACH_HELD: std::sync::Mutex<Option<Vec<(usize, u32)>>> = std::sync::Mutex::new(None);
+
+/// (unit tests) On: the reach builds queued from now stay out of the queue, as the pool's reserve
+/// holds them; off: the held ones are queued.
+#[cfg(test)]
+pub(crate) fn hold_reach_builds(on: bool) {
+    let held = std::mem::replace(&mut *REACH_HELD.lock().unwrap_or_else(|e| e.into_inner()), on.then(Vec::new));
+    for (up, id) in held.unwrap_or_default() {
+        unsafe { reach_queue(up as *mut Unit, id) };
+    }
+}
+
+/// (unit tests, owner) realtime_split of slot `id`, as the owner's step splits a given-back slot
+/// (whose reach build was sent first: realtime_send named the unit the reach builds run for).
+#[cfg(test)]
+pub(crate) unsafe fn realtime_split_now(up: *mut Unit, id: u32) -> bool {
+    SPEC_UNIT.store(up, Ordering::Release);
+    let origin = with_rt(|rt| rt.origin("test"));
+    realtime_split(up, id, RtWay::Direct, origin)
+}
+
+/// (unit tests) RT_SPLIT's counts: slots split, back ends run by their reach builds, back ends run
+/// by a wait of the owner.
+#[cfg(test)]
+pub(crate) fn realtime_split_counts() -> [u64; 3] {
+    [0, 2, 3].map(|i| RT_SPLIT[i].load(Ordering::Relaxed))
 }
 
 /// (unit tests) No build is queued or running: the next back end is the one a test starts.
@@ -34399,6 +34439,15 @@ unsafe fn realtime_split(up: *mut Unit, id: u32, way: RtWay, origin: u32) -> boo
     RT_SPLIT[1].fetch_add(cpu_ns() - t0, Ordering::Relaxed);
     match b {
         Ok(Begin::Back(w)) => {
+            // no thread runs it until a reach build or a wait of the owner takes it (the flight
+            // named the owner, whose step made the fronts: a wait for it then read as the owner's
+            // wait for itself)
+            let u = &mut *up;
+            for s in &w.slots {
+                if let Some(f) = u.flights.get_mut(s) {
+                    f.holder = 0;
+                }
+            }
             with_rt(|rt| {
                 rt.out.insert(id, (way, origin));
                 rt.backs.insert(id, RtBack(w));
@@ -34410,6 +34459,25 @@ unsafe fn realtime_split(up: *mut Unit, id: u32, way: RtWay, origin: u32) -> boo
         // installed, or failed (the walk compiles it as before)
         _ => false,
     }
+}
+
+/// (owner, a front's wait for slot `id` in flight) A back end the owner's step split off for the
+/// reach (realtime_split) that no reach build has taken yet: the owner runs it here and installs it
+/// (split_finish ends the flight), its walk left to that reach build (it finds the slot compiled).
+/// Waiting instead waits for the owner itself: the reach build stays queued while the pool holds it
+/// back (a reserve, parked jobs that wait for this owner). A Fab run's owner waited 2,300 s so on
+/// an inline candidate its own split had put in flight, main waiting on the owner (11-19). False:
+/// no such back end (another thread's build holds the flight).
+unsafe fn realtime_back_for_wait(up: *mut Unit, id: u32) -> bool {
+    let Some(root) = (&*up).flights.get(&id).map(|f| f.root) else { return false };
+    let back = crate::zone_alloc::kept_with(|| REALTIME.lock().unwrap_or_else(|e| e.into_inner()).as_mut().and_then(|rt| rt.backs.remove(&root)));
+    let Some(RtBack(w)) = back else { return false };
+    RT_SPLIT[3].fetch_add(1, Ordering::Relaxed);
+    let _keep = RtKeepOn::on();
+    let d = w.run();
+    let _ = split_finish(up, d);
+    COMPILE_LAST.store(wall_ns(), Ordering::Relaxed);
+    true
 }
 
 /// The O3 build of reached `#[relax(O3, always)]` slot `id` on this thread, off the owner, its RIR
@@ -34483,6 +34551,11 @@ fn run_reach(unit: usize, id: u32) -> bool {
 /// Queues the reach build of slot `id` (queue::reach) and wakes the threads waiting for the reach
 /// (they run reach builds while they wait).
 unsafe fn reach_queue(up: *mut Unit, id: u32) {
+    #[cfg(test)]
+    if let Some(held) = REACH_HELD.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+        held.push((up as usize, id));
+        return;
+    }
     // (a ticket not done waits for this reach: a device's start, a tier-up's install)
     let waited = with_rt(|rt| RT_DONE.load(Ordering::Acquire) < rt.added);
     queue::reach(up as usize, id, waited);
@@ -34511,10 +34584,10 @@ fn rt_off_summary(u: &Unit) -> String {
         v.iter().take(6).map(|(n, w)| format!("{w} {n}")).collect::<Vec<_>>().join(", ")
     };
     let kinds: Vec<String> = RT_KIND_NAMES.iter().enumerate().filter(|(i, _)| RT_KIND_MAX[*i].load(Ordering::Relaxed) != 0).map(|(i, n)| format!("{} {:.1}", n, ms(RT_KIND_MAX[i].load(Ordering::Relaxed)))).collect();
-    format!("builds off the owner {} of {} sent ({} given back: {}; {} queued again; {} split: fronts on the owner {:.1} ms cpu, {} back ends off it), {} compiled on the owner; publishes {} (longest {:.1} ms); \
+    format!("builds off the owner {} of {} sent ({} given back: {}; {} queued again; {} split: fronts on the owner {:.1} ms cpu, {} back ends off it, {} run by an owner's wait), {} compiled on the owner; publishes {} (longest {:.1} ms); \
         takes {}; take bails by why: {}; publish phases (ms) {}; longest publish {:.1} ms (cpu {:.1}): {} of `{}`, round {}{}, phases {}; \
         longest owner step {:.1} ms (main asked {}x: given {}, kept for a due {}), longest item by kind (ms): {}; longest item {:.1} ms: {} of `{}` ({})",
-        built, sent, given, why.join(", "), RT_REQUEUED.load(Ordering::Relaxed), RT_SPLIT[0].load(Ordering::Relaxed), ms(RT_SPLIT[1].load(Ordering::Relaxed)), RT_SPLIT[2].load(Ordering::Relaxed), owner, pubs.join(", "), ms(RT_PUB_MAX.load(Ordering::Relaxed)),
+        built, sent, given, why.join(", "), RT_REQUEUED.load(Ordering::Relaxed), RT_SPLIT[0].load(Ordering::Relaxed), ms(RT_SPLIT[1].load(Ordering::Relaxed)), RT_SPLIT[2].load(Ordering::Relaxed), RT_SPLIT[3].load(Ordering::Relaxed), owner, pubs.join(", "), ms(RT_PUB_MAX.load(Ordering::Relaxed)),
         takes.join(", "), bails, phases(&sum), ms(top.wall), ms(top.cpu), ["look", "take", "install"][top.kind], name(top.id), top.round, if top.bailed { ", bailed" } else { "" }, phases(&top.ph),
         ms(RT_STEP_MAX.load(Ordering::Relaxed)), RT_MAIN_ASKED[0].load(Ordering::Relaxed) + RT_MAIN_ASKED[1].load(Ordering::Relaxed), RT_MAIN_ASKED[1].load(Ordering::Relaxed), RT_MAIN_ASKED[0].load(Ordering::Relaxed), kinds.join(", "), ms(item.0), RT_KIND_NAMES[item.1], name(item.2), RT_WHY_NAMES.get(item.3 as usize).copied().unwrap_or("-"))
 }
@@ -35548,7 +35621,7 @@ pub(crate) unsafe fn reset_statics() {
     reset(&RT_ARMED, std::sync::atomic::AtomicU32::new(0));
     reset(&RT_HOLES, AtomicU64::new(0));
     reset(&RT_OFF, [const { AtomicU64::new(0) }; 4]);
-    reset(&RT_SPLIT, [const { AtomicU64::new(0) }; 3]);
+    reset(&RT_SPLIT, [const { AtomicU64::new(0) }; 4]);
     reset(&RT_STEP_MAX, AtomicU64::new(0));
     reset(&RT_GIVE, [const { AtomicU64::new(0) }; 6]);
     reset(&RT_REQUEUED, AtomicU64::new(0));
