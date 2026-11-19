@@ -32409,6 +32409,9 @@ static RT_REQUEUED: AtomicU64 = AtomicU64::new(0);
 /// the take and the install, and the longest one (wall ns).
 static RT_PUB: [[AtomicU64; 3]; 3] = [const { [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)] }; 3];
 static RT_PUB_MAX: AtomicU64 = AtomicU64::new(0);
+/// (trace) The reach builds' bailed takes by the drop's cause (TD_NAMES), the front's failure
+/// (PREFRONT_FAIL_NAMES), whose front (the root's own or a candidate's) and its slot's kind.
+static RT_BAILS: std::sync::Mutex<std::collections::BTreeMap<(u8, u8, &'static str, &'static str), u64>> = std::sync::Mutex::new(std::collections::BTreeMap::new());
 /// Steps that gave the owner back to a main-thread request before their budget.
 static RT_MAIN_YIELDS: AtomicU64 = AtomicU64::new(0);
 /// The takes by outcome (completed, bailed) and round (the first, a later one): [count, wall ns].
@@ -34009,7 +34012,20 @@ unsafe fn reach_build(up: *mut Unit, id: u32) -> Result<(), usize> {
                     post
                 }
                 // a front the take bails for, a failed front, a slot in flight elsewhere meanwhile
-                None => return Err(0),
+                None => {
+                    // (trace) why the take bailed: the drop's cause, the front's failure, whose front
+                    if rt_trace() {
+                        let (td, af, s) = TAKE_DROP.try_with(|d| d.get()).unwrap_or((TD_ROUNDS, AF_OK, u32::MAX));
+                        let fns = &(&*up).fns;
+                        let kind = match ((s as usize) < fns.len()).then(|| &fns[s as usize].key) {
+                            None => "-", Some(FnKey::Inst(..)) => "inst", Some(FnKey::Closure(..)) => "closure", Some(FnKey::Plain(_)) => "twin",
+                            Some(FnKey::Ctfe(_)) => "ctfe", Some(FnKey::Glue(..)) => "glue", Some(FnKey::Shim(..)) => "shim", Some(_) => "other",
+                        };
+                        let whose = if s == id { "own" } else if s == u32::MAX { "-" } else { "candidate" };
+                        *RT_BAILS.lock().unwrap_or_else(|e| e.into_inner()).entry((td, af, whose, kind)).or_default() += 1;
+                    }
+                    return Err(0);
+                }
                 Some(Take::Begin(_)) => return Err(2),
                 Some(Take::Owner | Take::Build) => return Err(1),
             }
@@ -34086,12 +34102,18 @@ fn rt_off_summary(u: &Unit) -> String {
     let sum: [u64; 8] = std::array::from_fn(|i| RT_PH_SUM[i].load(Ordering::Relaxed));
     let top = *RT_PUB_TOP.lock().unwrap_or_else(|e| e.into_inner());
     let item = *RT_ITEM_TOP.lock().unwrap_or_else(|e| e.into_inner());
+    let bails = {
+        let mut v: Vec<(u64, String)> = RT_BAILS.lock().unwrap_or_else(|e| e.into_inner()).iter()
+            .map(|(&(td, af, whose, kind), &n)| (n, format!("{}{} ({} {})", TD_NAMES[td as usize], if af == AF_OK { String::new() } else { format!("/{}", PREFRONT_FAIL_NAMES[af as usize]) }, whose, kind))).collect();
+        v.sort_by(|a, b| b.0.cmp(&a.0));
+        v.iter().take(6).map(|(n, w)| format!("{w} {n}")).collect::<Vec<_>>().join(", ")
+    };
     let kinds: Vec<String> = RT_KIND_NAMES.iter().enumerate().filter(|(i, _)| RT_KIND_MAX[*i].load(Ordering::Relaxed) != 0).map(|(i, n)| format!("{} {:.1}", n, ms(RT_KIND_MAX[i].load(Ordering::Relaxed)))).collect();
     format!("builds off the owner {} of {} sent ({} given back: {}; {} queued again), {} compiled on the owner; publishes {} (longest {:.1} ms); \
-        takes {}; publish phases (ms) {}; longest publish {:.1} ms (cpu {:.1}): {} of `{}`, round {}{}, phases {}; \
+        takes {}; take bails by why: {}; publish phases (ms) {}; longest publish {:.1} ms (cpu {:.1}): {} of `{}`, round {}{}, phases {}; \
         longest owner step {:.1} ms ({} gave the owner to main), longest item by kind (ms): {}; longest item {:.1} ms: {} of `{}` ({})",
         built, sent, given, why.join(", "), RT_REQUEUED.load(Ordering::Relaxed), owner, pubs.join(", "), ms(RT_PUB_MAX.load(Ordering::Relaxed)),
-        takes.join(", "), phases(&sum), ms(top.wall), ms(top.cpu), ["look", "take", "install"][top.kind], name(top.id), top.round, if top.bailed { ", bailed" } else { "" }, phases(&top.ph),
+        takes.join(", "), bails, phases(&sum), ms(top.wall), ms(top.cpu), ["look", "take", "install"][top.kind], name(top.id), top.round, if top.bailed { ", bailed" } else { "" }, phases(&top.ph),
         ms(RT_STEP_MAX.load(Ordering::Relaxed)), RT_MAIN_YIELDS.load(Ordering::Relaxed), kinds.join(", "), ms(item.0), RT_KIND_NAMES[item.1], name(item.2), RT_WHY_NAMES.get(item.3 as usize).copied().unwrap_or("-"))
 }
 
@@ -35130,6 +35152,7 @@ pub(crate) unsafe fn reset_statics() {
     reset(&RT_PUB, [const { [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)] }; 3]);
     reset(&RT_PUB_MAX, AtomicU64::new(0));
     reset(&RT_MAIN_YIELDS, AtomicU64::new(0));
+    RT_BAILS.lock().unwrap_or_else(|e| e.into_inner()).clear();
     reset(&RT_KIND_MAX, [const { AtomicU64::new(0) }; 11]);
     *RT_ITEM_TOP.lock().unwrap_or_else(|e| e.into_inner()) = (0, 0, u32::MAX, u8::MAX);
     reset(&RT_TAKE, [const { [const { [AtomicU64::new(0), AtomicU64::new(0)] }; 2] }; 2]);
