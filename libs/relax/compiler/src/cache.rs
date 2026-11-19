@@ -741,6 +741,8 @@ pub(crate) struct PendingRecord {
     digest: Option<std::sync::Arc<crate::gate::CodeDigest>>,
     /// the code's place among the slot's entries: a first record, O2 code, verified O1 code
     kind: RecKind,
+    /// its pc map section, when its back end made it (pc_section)
+    pc: Option<PcSection>,
 }
 
 /// Is a deferred record still describing the sources its code was built from?
@@ -4103,13 +4105,13 @@ impl Cache {
     /// the backend's unrelocated output, which installing patches in place; the nounwind inputs,
     /// the tier and the dependency slots can change or be reclaimed before the encoding runs.
     /// None: `record` would store nothing.
-    pub(crate) fn defer_record(&self, u: &Unit, id: u32, code: &[u8], relocs: &[RelocAt], pc_map: &[(u32, u64)]) -> Option<PendingRecord> {
-        self.defer_record_as(u, id, code, relocs, pc_map, RecKind::First)
+    pub(crate) fn defer_record(&self, u: &Unit, id: u32, code: &[u8], relocs: &[RelocAt], pc_map: &[(u32, u64)], pc: Option<PcSection>) -> Option<PendingRecord> {
+        self.defer_record_as(u, id, code, relocs, pc_map, RecKind::First, pc)
     }
 
     /// `defer_record` for O2 code (`record_o2`'s) or verified O1 code (`record_o1_verified`'s):
     /// they replace the slot's entry, so a slot whose code came from the cache gets them too.
-    pub(crate) fn defer_record_as(&self, u: &Unit, id: u32, code: &[u8], relocs: &[RelocAt], pc_map: &[(u32, u64)], kind: RecKind) -> Option<PendingRecord> {
+    pub(crate) fn defer_record_as(&self, u: &Unit, id: u32, code: &[u8], relocs: &[RelocAt], pc_map: &[(u32, u64)], kind: RecKind, pc: Option<PcSection>) -> Option<PendingRecord> {
         if self.mode == Mode::ReadOnly || u.fns[id as usize].patch_gen != 0 || kind == RecKind::First && self.linked.contains(&id) {
             return None;
         }
@@ -4130,6 +4132,7 @@ impl Cache {
             o3: None,
             digest: rir.map(|r| crate::gate::of_func(r)),
             kind,
+            pc,
         })
     }
 
@@ -4156,6 +4159,7 @@ impl Cache {
             o3: Some((inlined.to_vec(), nounwind.to_vec())),
             digest: Some(digest),
             kind: RecKind::First,
+            pc: None,
         })
     }
 
@@ -4684,45 +4688,19 @@ impl Cache {
             }
         }
         // the pc map as the jit keeps it (PcMap: varint offset and position deltas), its
-        // positions naming this entry's file table by index
-        let mut files: Vec<u32> = Vec::new();
-        let mut local = Vec::with_capacity(pc_map.len());
-        // (the variable table's entries after its length entry are raw bytes, four per entry, as
-        // PcMap::encode_to writes them: no position, nothing to map. A large body's table is
-        // hundreds of thousands of them.)
-        let mut raw = 0usize;
-        // (the last entry's file, and its index: consecutive positions are mostly in one file)
-        let mut last = (u32::MAX, 0usize);
-        for (o, pos) in pc_map {
-            if raw > 0 && *o == relax_backend::dbgloc::PC_VARS {
-                local.push((*o, *pos));
-                raw -= raw.min(4);
-                continue;
+        // positions naming this entry's file table by index: the back end's, made off the owner
+        // (BackWork::run), else made here
+        let own;
+        let sec = match pending.and_then(|p| p.pc.as_ref()) {
+            Some(sec) => sec,
+            None => {
+                own = pc_section(pc_map);
+                &own
             }
-            raw = 0;
-            let f = relax_backend::rir::pos_file(*pos);
-            let fi = if f == last.0 { last.1 } else {
-                let fi = match files.iter().position(|x| *x == f) {
-                    Some(i) => i,
-                    None => {
-                        files.push(f);
-                        files.len() - 1
-                    }
-                };
-                last = (f, fi);
-                fi
-            };
-            // (the inline context in the top bits stays)
-            local.push((*o, (fi as u64) << 32 | (*pos & 0xffff_ffff) | (*pos & !relax_backend::rir::pos_plain(u64::MAX))));
-            if *o == relax_backend::dbgloc::PC_VARS {
-                raw = *pos as u32 as usize;
-            }
-        }
-        let mut pcb = Vec::new();
-        crate::jit::PcMap::encode_to(&mut pcb, local.into_iter());
-        e.bytes(&pcb);
-        e.u32(files.len() as u32);
-        for f in files {
+        };
+        e.bytes(&sec.bytes);
+        e.u32(sec.files.len() as u32);
+        for &f in &sec.files {
             // a live edit's version: positions unknown to the next run (enc_file)
             if self.enc_file(u, f, &mut e).is_none() {
                 e.str("");
@@ -7197,6 +7175,54 @@ pub(crate) fn closure_identity_ok(u: &Unit, file: u32, expr: u32) -> bool {
     }
 }
 
+
+/// A record's pc map section (Cache::encode_entry): the map's bytes, its positions naming the
+/// record's own file table by index, and that table's session files, whose idents the record
+/// writes after them. A function of the pc map alone: a back end makes it off the owner
+/// (BackWork::run) and the record's encoding takes it as it is.
+pub(crate) struct PcSection {
+    bytes: Vec<u8>,
+    files: Vec<u32>,
+}
+
+/// The pc map section of code whose pc map is `pc_map` (PcSection).
+pub(crate) fn pc_section(pc_map: &[(u32, u64)]) -> PcSection {
+    let mut files: Vec<u32> = Vec::new();
+    let mut local = Vec::with_capacity(pc_map.len());
+    // (the variable table's entries after its length entry are raw bytes, four per entry, as
+    // PcMap::encode_to writes them: no position, nothing to map)
+    let mut raw = 0usize;
+    // (the last entry's file, and its index: consecutive positions are mostly in one file)
+    let mut last = (u32::MAX, 0usize);
+    for (o, pos) in pc_map {
+        if raw > 0 && *o == relax_backend::dbgloc::PC_VARS {
+            local.push((*o, *pos));
+            raw -= raw.min(4);
+            continue;
+        }
+        raw = 0;
+        let f = relax_backend::rir::pos_file(*pos);
+        let fi = if f == last.0 { last.1 } else {
+            let fi = match files.iter().position(|x| *x == f) {
+                Some(i) => i,
+                None => {
+                    files.push(f);
+                    files.len() - 1
+                }
+            };
+            last = (f, fi);
+            fi
+        };
+        // (the inline context in the top bits stays)
+        local.push((*o, (fi as u64) << 32 | (*pos & 0xffff_ffff) | (*pos & !relax_backend::rir::pos_plain(u64::MAX))));
+        if *o == relax_backend::dbgloc::PC_VARS {
+            raw = *pos as u32 as usize;
+        }
+    }
+    let mut bytes = Vec::new();
+    crate::jit::PcMap::encode_to(&mut bytes, local.into_iter());
+    PcSection { bytes, files }
+}
 
 /// A file's ident and what it was hashed from (Cache::enc_file).
 struct FileIdent {

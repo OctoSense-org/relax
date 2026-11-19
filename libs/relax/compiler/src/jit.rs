@@ -11087,7 +11087,7 @@ unsafe fn ready_code_locked(up: *mut Unit, id: u32) -> Option<u64> {
             u.reload_specs.remove(&id);
             u.fns[id as usize].spec_state = 2;
             main_how(1);
-            let a = install_compiled(up, id, &code, map, &relocs, false);
+            let a = install_compiled(up, id, &code, map, &relocs, false, None);
             note_linked_digest(up, id, digest);
             return Some(a);
         }
@@ -11118,7 +11118,7 @@ unsafe fn ready_code_locked(up: *mut Unit, id: u32) -> Option<u64> {
                         None => {}
                     }
                 }
-                return Some(install_compiled(up, id, &fresh, fmap, &relocs, true));
+                return Some(install_compiled(up, id, &fresh, fmap, &relocs, true, None));
             }
         }
         // linked from the cache: nothing to record; its cached callees get linked ahead
@@ -11132,7 +11132,7 @@ unsafe fn ready_code_locked(up: *mut Unit, id: u32) -> Option<u64> {
             o2_cached(up, id);
         }
         let digest = (&mut *up).cache.as_mut().and_then(|c| c.last_digest.take());
-        let a = install_compiled(up, id, &code, map, &crelocs, false);
+        let a = install_compiled(up, id, &code, map, &crelocs, false, None);
         {
             let u = &*up;
             let at = u.fns[id as usize].code;
@@ -11167,7 +11167,7 @@ unsafe fn ready_code_locked(up: *mut Unit, id: u32) -> Option<u64> {
         u.reload_specs.remove(&id);
         u.fns[id as usize].spec_state = 2;
         main_how(2);
-        let a = install_compiled(up, id, &code, map, &relocs, record);
+        let a = install_compiled(up, id, &code, map, &relocs, record, None);
         note_linked_digest(up, id, digest);
         return Some(a);
     }
@@ -11284,7 +11284,7 @@ unsafe fn compile_slot_locked(up: *mut Unit, id: u32, outer: bool) -> Compiled {
             let u = &mut *up;
             u.emit_or_redirect(&code, &relocs, "code from a layout so far").unwrap_or(0)
         }
-        Ok((code, map, relocs)) => install_compiled(up, id, &code, map, &relocs, true),
+        Ok((code, map, relocs)) => install_compiled(up, id, &code, map, &relocs, true, None),
         // it looked into a module the selection skipped: load it, build again
         Err(e) if outer && e.starts_with(DEFERRED_RETRY) && load_deferred(up, id) => return compile_slot_locked(up, id, outer),
         // nested (a constant's initializer run inside another build): nothing is installed;
@@ -11385,7 +11385,8 @@ pub(crate) fn drain_records_bounded() {
 /// speculative builds of its callees.
 /// Links and installs a slot's code (`relocs` are the code's own; `record`: the disk cache
 /// stores it -- false for code that came from the cache).
-unsafe fn install_compiled(up: *mut Unit, id: u32, code: &[u8], map: Vec<(u32, u64)>, relocs: &[relax_backend::rir::RelocAt], record: bool) -> u64 {
+/// `pc`: the record's pc map section when the back end made it (else the record makes it).
+unsafe fn install_compiled(up: *mut Unit, id: u32, code: &[u8], map: Vec<(u32, u64)>, relocs: &[relax_backend::rir::RelocAt], record: bool, pc: Option<crate::cache::PcSection>) -> u64 {
     note_progress(PROGRESS_JIT);
     let _cost_install = relax_codegen::fncost::phase(6);
     // made in this run (recorded or not) vs linked from the disk cache
@@ -11431,7 +11432,7 @@ unsafe fn install_compiled(up: *mut Unit, id: u32, code: &[u8], map: Vec<(u32, u
                         startup_phase() && owner::for_main()
                     };
                     if foreground { crate::cache::trace_lookup(u, id, "fg-compile"); }
-                    let deferred = c.defer_record(u, id, code, relocs, &map);
+                    let deferred = c.defer_record(u, id, code, relocs, &map, pc);
                     u.cache = Some(c);
                     if let Some(p) = deferred {
                         u.defer_cache_record(p);
@@ -11589,7 +11590,7 @@ fn note_const_reader(u: &Unit, d: DefId, slot: u32) {
 /// Hot reload (reload.rs): installs the first code of a slot as a lazy compile would (cache
 /// record, O3 counter, speculation of its callees).
 pub(crate) unsafe fn install_first(up: *mut Unit, id: u32, code: &[u8], map: Vec<(u32, u64)>, relocs: &[relax_backend::rir::RelocAt]) -> u64 {
-    install_compiled(up, id, code, map, relocs, true)
+    install_compiled(up, id, code, map, relocs, true, None)
 }
 
 /// Hot reload: a slot whose build failed panics when called (as a lazy compile's would).
@@ -13769,7 +13770,7 @@ unsafe fn o2_finish(up: *mut Unit, d: O2Done, cut: bool) {
         // (O3 code installed meanwhile: its own entry; record_o1_verified never goes below it)
         // (encoded in the record batches, as every install's record is)
         if let Some(cache) = u.cache.take() {
-            let p = cache.defer_record_as(u, id, &c.code, &c.relocs, &c.pc_map, crate::cache::RecKind::O1Up);
+            let p = cache.defer_record_as(u, id, &c.code, &c.relocs, &c.pc_map, crate::cache::RecKind::O1Up, None);
             u.cache = Some(cache);
             if let Some(p) = p {
                 u.defer_cache_record(p);
@@ -13786,7 +13787,7 @@ unsafe fn o2_finish(up: *mut Unit, d: O2Done, cut: bool) {
         crate::zone_alloc::kept_with(|| O2_LATER.lock().unwrap_or_else(|e| e.into_inner()).push((up as usize, id)));
     } else if let Some(mut cache) = u.cache.take() {
         cache.note_retier_over(u, id, crate::cache::warm_count::RETIER_O2_OVER);
-        let p = cache.defer_record_as(u, id, &c.code, &c.relocs, &c.pc_map, crate::cache::RecKind::O2);
+        let p = cache.defer_record_as(u, id, &c.code, &c.relocs, &c.pc_map, crate::cache::RecKind::O2, None);
         u.cache = Some(cache);
         if let Some(p) = p {
             u.defer_cache_record(p);
@@ -24649,7 +24650,7 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
                     note_body_deps(u, id, inlined.iter().copied());
                     let a = {
                         let _as = code_as(CodeKind::new(tier::O3, origin::FRESH));
-                        install_compiled(up, id, &code, map, &relocs, false)
+                        install_compiled(up, id, &code, map, &relocs, false, None)
                     };
                     {
                         let u = &*up;
@@ -27932,7 +27933,8 @@ pub(crate) struct BackDone {
     spec: bool,
     slots: Vec<u32>,
     epoch: u64,
-    built: Result<(Option<(std::sync::Arc<relax_backend::rir::Func>, Vec<(u32, usize)>, u64)>, Vec<u8>, Vec<(u32, u64)>, Vec<relax_backend::rir::RelocAt>, u64), String>,
+    /// (its record's pc map section is made here too: crate::cache::pc_section)
+    built: Result<(Option<(std::sync::Arc<relax_backend::rir::Func>, Vec<(u32, usize)>, u64)>, Vec<u8>, Vec<(u32, u64)>, Vec<relax_backend::rir::RelocAt>, u64, crate::cache::PcSection), String>,
     done: Vec<Deferred>,
 }
 
@@ -27984,7 +27986,7 @@ unsafe fn split_begin(up: *mut Unit, id: u32, spec: bool) -> Begin {
                 // ~24k staged links there, 1.2 s of UI blocks)
                 if u.fns[id as usize].baseline_hint.load(Ordering::Relaxed) {
                     u.exec_note(id, crate::exec_profile::SPEC);
-                    install_compiled(up, id, &code, map, &crelocs, false);
+                    install_compiled(up, id, &code, map, &crelocs, false, None);
                     note_linked_digest(up, id, digest);
                     let u = &mut *up;
                     let d = u.fns[id as usize].spec_depth;
@@ -28108,7 +28110,8 @@ impl BackWork {
                         if !spec {
                             main_rec(|r| if r.how == 4 { r.how = 6 });
                         }
-                        return Ok((opt, code, map, relocs, cg_ns));
+                        let pc = crate::cache::pc_section(&map);
+                        return Ok((opt, code, map, relocs, cg_ns, pc));
                     }
                     memo = Some((k, bmemo::SPrep::of(p)));
                 }
@@ -28165,7 +28168,8 @@ impl BackWork {
             if let Some((k, prep)) = memo {
                 bmemo::store(k, prep, &opt, &c.code, &c.pc_map, &c.relocs, t2 - t1, &done_out.lock().unwrap(), frame, t2 - t0, lc.map(|x| x.0));
             }
-            Ok((opt, c.code, c.pc_map, c.relocs, t2 - t1))
+            let pc = crate::cache::pc_section(&c.pc_map);
+            Ok((opt, c.code, c.pc_map, c.relocs, t2 - t1, pc))
         }));
         let w2 = wall_ns();
         SPLIT_NS[if spec { 5 } else { 1 }].fetch_add(w2 - w1, Ordering::Relaxed);
@@ -28218,7 +28222,7 @@ unsafe fn split_finish(up: *mut Unit, d: BackDone) -> Split {
         return if spec { Split::Spec } else { Split::Restart };
     }
     match built {
-        Ok((opt, code, map, relocs, cg_ns)) => {
+        Ok((opt, code, map, relocs, cg_ns, pc)) => {
             let u = &mut *up;
             if let Some((f, inl, ns)) = opt {
                 if u.fns[id as usize].rir.is_none() {
@@ -28245,7 +28249,7 @@ unsafe fn split_finish(up: *mut Unit, d: BackDone) -> Split {
                 // encoded in the record batches as every install's is (a marked slot's too: its
                 // O2 build replaces the entry, install_compiled)
                 if let Some(c) = u.cache.take() {
-                    let p = c.defer_record(u, id, &code, &relocs, &map);
+                    let p = c.defer_record(u, id, &code, &relocs, &map, Some(pc));
                     u.cache = Some(c);
                     if let Some(p) = p {
                         u.defer_cache_record(p);
@@ -28263,7 +28267,7 @@ unsafe fn split_finish(up: *mut Unit, d: BackDone) -> Split {
                 }
                 Split::Spec
             } else {
-                Split::Installed(install_compiled(up, id, &code, map, &relocs, true))
+                Split::Installed(install_compiled(up, id, &code, map, &relocs, true, Some(pc)))
             }
         }
         // a speculative build's error is reported when (if) the program calls it; a lazy
