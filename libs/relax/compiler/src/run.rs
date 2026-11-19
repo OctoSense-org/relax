@@ -2077,9 +2077,16 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
     // `makepad test`: the crates under test are checked as `cargo test` compiles them before any
     // test runs (test_subjects); marked before declaration collection, as a check marks its crates
     let test_subjects: Vec<u32> = if (harness || plain_test) && !check { vec![root] } else { Vec::new() };
+    // and their path dependencies, which it checks whole beside the tests (check.rs
+    // start_test_deps), with the validation-only checks a run gives the app's own crates: without
+    // them a private field a dependency's struct update names (E0451) ran under `makepad test`
+    // while `run` and `check` refused it
+    let path_crates: Vec<u32> = g.crates.iter().enumerate().filter(|(ci, c)| !c.registry && crate_of[*ci] != u32::MAX).map(|(ci, _)| crate_of[ci]).collect();
+    let test_deps: Vec<u32> = if test_subjects.is_empty() { Vec::new() } else { test_dep_crates(&prog, &path_crates, &test_subjects) };
     if !test_subjects.is_empty() {
         let mut own = vec![false; prog.crates.len()];
         for &k in &test_subjects { prog.crates[k as usize].validate = true; own[k as usize] = true; }
+        for &k in &test_deps { prog.crates[k as usize].validate = true; }
         prog.own_crates = own.clone();
         relax_types::lint::enable();
         prog.run_import_sim(&own);
@@ -2497,23 +2504,9 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
             return 101;
         }
         if !self_exec {
-            let candidates: Vec<u32> = g.crates.iter().enumerate().filter(|(ci, c)| !c.registry && crate_of[*ci] != u32::MAX).map(|(ci, _)| crate_of[ci]).collect();
             let names = g.crates.iter().enumerate().filter(|(ci, c)| !c.registry && crate_of[*ci] != u32::MAX).map(|(ci, _)| (crate_of[ci], g.pkg[ci].1.clone())).collect();
-            let subjects = test_subjects.clone();
-            crate::check::start_test_deps(&mut *u, move |prog| {
-                use crate::vfs::canonical as canon;
-                let std_dir = format!("{}/", canon(&crate::std_dir()).trim_end_matches('/'));
-                // the subject's dependencies (a test graph's other targets are not its)
-                let mut crates: Vec<u32> = candidates.into_iter().filter(|k| {
-                    let c = &prog.crates[*k as usize];
-                    !subjects.contains(k) && subjects.iter().any(|&s| prog.crate_sees(s, *k)) && !c.proc_macro
-                        && !matches!(prog.syms.str(c.name), "core" | "alloc" | "std" | "proc_macro")
-                        && !canon(c.root_path()).starts_with(&std_dir)
-                }).collect();
-                crates.sort_unstable();
-                crates.dedup();
-                crates
-            }, names, runtime);
+            let deps = test_deps.clone();
+            crate::check::start_test_deps(&mut *u, move |_| deps, names, runtime);
         }
         // a `harness = false` target is a program: a compile error it reaches ends it (rustc rejects it)
         if plain_test {
@@ -3339,6 +3332,25 @@ static HOST_THREAD: AtomicU64 = AtomicU64::new(0);
 pub(crate) fn host_thread() -> u64 {
     HOST_THREAD.load(Ordering::Acquire)
 }
+/// The path dependencies of `makepad test`'s crates under test (`subjects`), of `path_crates` (the
+/// graph's crates that are no registry package's): what its run checks whole beside the tests
+/// (check.rs start_test_deps) and validates as a run validates the app's own crates. Not the
+/// subjects, a proc macro or Relax's std; a test graph's other targets are not a subject's.
+fn test_dep_crates(prog: &crate::program::Program, path_crates: &[u32], subjects: &[u32]) -> Vec<u32> {
+    use crate::vfs::canonical as canon;
+    let std_dir = format!("{}/", canon(&crate::std_dir()).trim_end_matches('/'));
+    let seen: Vec<u32> = subjects.iter().flat_map(|&s| crate::check::dependency_closure(prog, s)).collect();
+    let mut crates: Vec<u32> = path_crates.iter().copied().filter(|k| {
+        let c = &prog.crates[*k as usize];
+        !subjects.contains(k) && seen.contains(k) && !c.proc_macro
+            && !matches!(prog.syms.str(c.name), "core" | "alloc" | "std" | "proc_macro")
+            && !canon(c.root_path()).starts_with(&std_dir)
+    }).collect();
+    crates.sort_unstable();
+    crates.dedup();
+    crates
+}
+
 /// `makepad run --harness` (`makepad test`): the program is a test harness.
 static HARNESS_RUN: AtomicBool = AtomicBool::new(false);
 
