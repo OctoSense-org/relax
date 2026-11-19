@@ -818,6 +818,7 @@ pub fn init_handed(beside: Option<Vec<u8>>) {
     // (what it hands on: without what `take_build` did not take)
     let _ = BUILD.set(build_part(&build));
     let _ = PROGRAM_START.set(program);
+    let _ = HIDDEN.set(hidden);
 }
 
 /// This run's build environment (`init`): the one it was handed, else its own as it started.
@@ -860,6 +861,26 @@ pub fn build_wire() -> Vec<u8> {
 }
 /// The program's environment as this process was started, when its host builds with a handed one.
 static PROGRAM_START: std::sync::OnceLock<Env> = std::sync::OnceLock::new();
+/// The reserved names only the handed build environment set (`take_build`'s hidden ones): in the
+/// host's environment, never the program's.
+static HIDDEN: std::sync::OnceLock<Vec<Vec<u8>>> = std::sync::OnceLock::new();
+
+/// The environment a run that was handed a build environment gives the same run of itself started
+/// again as a new process (restart_parent.rs: behind a parent on macOS and Windows): the
+/// program's environment as this process started, its host's own settings, and the build
+/// environment it was handed (`BUILD_ENV`), so the new process takes them as this one did. None:
+/// none was handed, and this process's environment is the run's. (Its host's environment alone
+/// would make the build environment the program's, and the program would read what the build
+/// set: cargo's `[env]`, a build script's `rustc-env`.)
+pub fn restart_env() -> Option<Vec<(std::ffi::OsString, std::ffi::OsString)>> {
+    let program = PROGRAM_START.get()?;
+    let hidden = HIDDEN.get().map_or(&[][..], Vec::as_slice);
+    let os = |b: &[u8]| unsafe { std::ffi::OsStr::from_encoded_bytes_unchecked(b) }.to_os_string();
+    let mut env: Vec<_> = program.iter().map(|(k, v)| (os(k), os(v))).collect();
+    env.extend(real().iter().filter(|(k, _)| reserved(k) && !same_name(k, BUILD_ENV) && !hidden.iter().any(|h| same_name(h, k))).map(|(k, v)| (os(k), os(v))));
+    env.push((os(BUILD_ENV), os(&build_wire())));
+    Some(env)
+}
 
 /// `env` without what one process hands the next (`HANDOVER`), without the run facts and without
 /// the grants' names (options.rs GRANTS): a `makepad run` host takes a grant from its words alone,
