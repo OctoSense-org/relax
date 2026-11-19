@@ -12617,10 +12617,29 @@ thread_local! {
     /// compile_tier1 builds the first code of a `#[relax(O3, always)]` slot (compile_o3_always)
     static O3_FIRST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static O3_FIRST_AT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// ... for the real-time reach, off the owner (reach_o3): Some(walked) -- its install walked
+    /// the new code (realtime_walk_out) and whether that asks for a step
+    static O3_REACH: std::cell::Cell<Option<Option<bool>>> = const { std::cell::Cell::new(None) };
 }
 
 fn o3_first() -> bool {
     O3_FIRST.try_with(|c| c.get()).unwrap_or(false)
+}
+
+/// O3_FIRST inside one of compile_tier1's publishes: they run on the owner in a frame of their
+/// own (frame_enter clears it there), and an O3-always first build runs on the owner
+/// (compile_o3_always) or off it (reach_o3). Restored after.
+struct O3FirstIn(bool, u64);
+impl O3FirstIn {
+    fn set(first: bool) -> O3FirstIn {
+        O3FirstIn(O3_FIRST.with(|c| c.replace(first)), O3_FIRST_AT.with(|c| c.get()))
+    }
+}
+impl Drop for O3FirstIn {
+    fn drop(&mut self) {
+        let _ = O3_FIRST.try_with(|c| c.set(self.0));
+        let _ = O3_FIRST_AT.try_with(|c| c.set(self.1));
+    }
 }
 
 /// `#[relax(O3, always)]`: the first call of slot `id` builds its O3 code on the calling thread
@@ -23564,6 +23583,12 @@ fn trace_tier1_phase(id: u32, phase: &str) {
 /// failed, or the slot changed meanwhile).
 pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
     let _site = FrontSite::enter(7);
+    // (an O3-always first build: its take and its install see it through `first`; the real-time
+    // reach's walks its install in the same publish, `walked`)
+    let first = o3_first();
+    let reach = first && O3_REACH.with(|c| c.get()).is_some();
+    let first_at = std::cell::Cell::new(0u64);
+    let walked = std::cell::Cell::new(None::<bool>);
     let _census_context = (&*up).exec_context(relax_codegen::exec_census::active() && crate::exec_profile::is_call(up as usize, id));
 
     let _cost = relax_codegen::fncost::Record::new(id, 1, "O3");
@@ -23714,6 +23739,7 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
     // a take (rule I-PUB): what needs a front the snapshot cannot hand back as `fronts` bails it
     // (the root's own front: fronted here once more; else the build is dropped)
     let taken = owner::publish_or_bail(|| {
+    let _first = O3FirstIn::set(first);
     // (the take runs on the owner: FRONTS_DONE is set there for this take only)
     struct FrontsDone;
     impl Drop for FrontsDone {
@@ -24379,6 +24405,9 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
     }
     // (an O3-always first build is a program thread's lazy compile: its finish is foreground)
     let ok = owner::publish(|| {
+        let _first = O3FirstIn::set(first);
+        // (the reach's build: its install is the walk's, which reads the new code below)
+        let _keep = reach.then(RtKeepOn::on);
         let rt = rt;
         let ti0 = cpu_ns();
         struct InstallTotal(u64);
@@ -24395,6 +24424,8 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
             Ok(Ok((code, map, relocs, (inlined, left_calls, cold_left, absent, frame_size, self_call, nounwind_used, o3_digest)))) if !rt.cut && PATCH_EPOCH.load(Ordering::SeqCst) == epoch && !PATCH_OPEN.load(Ordering::SeqCst) && u.fns[id as usize].version == version && (!crate::inspect::instrument::active(id) || inspect_o3_on()) && !inlined_rejected(u, &unverified_in, &inlined)
                 // (a lean code window keeps a slot's code: an O3-always build is a slot's first)
                 && (o3_first() || !u.code_lean())
+                // (the reach's: none came meanwhile -- a program thread's call built it)
+                && !(reach && u.fns[id as usize].compiled)
                 // (code of an invalidated group -- an unloaded module's -- is never built again)
                 && crate::invalid::group_of(u, id, 0, &inlined).map_or(true, |g| !crate::invalid::is_dead(u, g)) && {
                 let n = if relax_codegen::interp::blob::is_blob(&code) { code.len() } else { relax_backend::rir::split_unwind_info(&code).0 };
@@ -24613,6 +24644,10 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
                         c.note_digest(at, Some(o3_digest.clone()), crate::gate::DigestOrigin::O3First);
                     }
                     O3_FIRST_AT.with(|c| c.set(a));
+                    first_at.set(a);
+                    if reach {
+                        walked.set(Some(realtime_walk_out(up, id)));
+                    }
                     true
                 } else {
                 // an interpreted function's O3 build is its relocatable form (interp/blob.rs)
@@ -24774,6 +24809,7 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
                     Ok(Ok(_)) if u.fns[id as usize].version != version => "slot changed meanwhile",
                     Ok(Ok((_, _, _, (inlined, ..)))) if inlined_rejected(u, &unverified_in, inlined) => "inlined a rejected callee",
                     Ok(Ok(_)) if !o3_first() && u.lean_now() => "the code window is lean",
+                    Ok(Ok(_)) if reach && u.fns[id as usize].compiled => "compiled meanwhile",
                     Ok(Ok(_)) => "link check failed",
                 };
                 if why == "the code window is lean" {
@@ -24833,6 +24869,12 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
         }
         ok
     });
+    if first {
+        O3_FIRST_AT.with(|c| c.set(first_at.get()));
+    }
+    if reach {
+        O3_REACH.with(|c| c.set(Some(walked.get())));
+    }
     if let Some(m) = measure.as_mut() { m.installed = ok; }
     drop(measure);
     ok
@@ -32406,8 +32448,8 @@ static RT_OFF: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 static RT_STEP_MAX: AtomicU64 = AtomicU64::new(0);
 /// Why reach builds went back to the owner (RT_GIVE_NAMES), and how many gave way to a front
 /// writer or a busy owner and were queued again.
-static RT_GIVE: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
-const RT_GIVE_NAMES: [&str; 5] = ["take bailed", "busy", "front failed", "patched", "panic"];
+static RT_GIVE: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+const RT_GIVE_NAMES: [&str; 6] = ["take bailed", "busy", "front failed", "patched", "panic", "no O3 code"];
 static RT_REQUEUED: AtomicU64 = AtomicU64::new(0);
 /// The reach builds' publishes on the owner: [count, wall ns, thread CPU ns] of the first look,
 /// the take and the install, and the longest one (wall ns).
@@ -32906,7 +32948,7 @@ unsafe fn realtime_step_for(up: *mut Unit, budget: u64) {
                 }
                 let Some((way, origin)) = realtime_take(id) else { continue };
                 // its build goes off the owner; its walk is that build's install
-                item.at(id, 9);
+                item.at(id, 8);
                 if !sync {
                     match realtime_send(up, id) {
                         Ok(()) => {
@@ -32926,7 +32968,7 @@ unsafe fn realtime_step_for(up: *mut Unit, budget: u64) {
             Next::Given(id) => {
                 // (a build off the owner gave it back, or this reach runs whole here)
                 let Some((way, origin)) = with_rt(|rt| rt.out.remove(&id)) else { continue };
-                item.at(id, with_rt(|rt| rt.give_why.remove(&id)).map_or(9, |w| 10 + w));
+                item.at(id, with_rt(|rt| rt.give_why.remove(&id)).map_or(8, |w| 9 + w));
                 let was = (&*up).fns[id as usize].compiled;
                 if realtime_walked(up, id, way, origin) && !was {
                     compiled += 1;
@@ -33904,12 +33946,12 @@ unsafe fn realtime_walked(up: *mut Unit, id: u32, way: RtWay, origin: u32) -> bo
 /// (owner step) Reached slot `id`'s build goes off the owner (queue::reach, reach_build) unless a
 /// link installs its code now (the disk cache, a speculative build's code: the owner's
 /// microseconds) or its build is the owner's own as the walk made it before: a slot on the plain
-/// path, an always-O3 one, one in flight or building here, one whose build failed. True: queued.
+/// path, one in flight or building here, one whose build failed. True: queued.
 unsafe fn realtime_send(up: *mut Unit, id: u32) -> Result<(), u8> {
     let u = &*up;
     let f = &u.fns[id as usize];
     let why = if f.compiled { 0 } else if f.inflight { 1 } else if f.building { 2 } else if f.build_err.is_some() { 3 } else if !pipelined() { 4 }
-        else if relax_level(u, id) == 4 { 5 } else if plain_path(u, id) { 6 } else if !queue::takes_jobs() { 7 } else { u8::MAX };
+        else if plain_path(u, id) { 5 } else if !queue::takes_jobs() { 6 } else { u8::MAX };
     if why != u8::MAX {
         return Err(why);
     }
@@ -33918,7 +33960,7 @@ unsafe fn realtime_send(up: *mut Unit, id: u32) -> Result<(), u8> {
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| ready_code_locked(up, id).is_some())).unwrap_or(true)
     };
     if linked {
-        return Err(8);
+        return Err(7);
     }
     SPEC_UNIT.store(up, Ordering::Release);
     RT_OFF[0].fetch_add(1, Ordering::Relaxed);
@@ -33926,10 +33968,10 @@ unsafe fn realtime_send(up: *mut Unit, id: u32) -> Result<(), u8> {
     Ok(())
 }
 
-/// (trace) Why a step item ran on the owner: realtime_send's refusals (0-8), the whole reach
-/// at once (9), a give-back's reason (10 + RT_GIVE_NAMES), the earlier runs' set (15).
-const RT_WHY_NAMES: [&str; 16] = ["compiled", "in flight", "building", "build error", "no pipeline", "level 4", "plain path", "no workers", "linked",
-    "whole reach", "take bailed", "busy", "front failed", "patched", "panic", "earlier set"];
+/// (trace) Why a step item ran on the owner: realtime_send's refusals (0-7), the whole reach
+/// at once (8), a give-back's reason (9 + RT_GIVE_NAMES), the earlier runs' set (15).
+const RT_WHY_NAMES: [&str; 16] = ["compiled", "in flight", "building", "build error", "no pipeline", "plain path", "no workers", "linked",
+    "whole reach", "take bailed", "busy", "front failed", "patched", "panic", "no O3 code", "earlier set"];
 
 /// (any thread) Reached slot `id`, out for a build off the owner, goes back to the owner's steps.
 unsafe fn realtime_give_back(up: *mut Unit, id: u32) {
@@ -33969,7 +34011,9 @@ unsafe fn reach_build(up: *mut Unit, id: u32) -> Result<(), usize> {
         let f = &(&*up).fns[id as usize];
         !SPEC_STOP.load(Ordering::SeqCst) && !(f.inflight || f.building || f.build_err.is_some())
     };
-    enum Take { Walked(bool), Owner, Build, Begin(Begin) }
+    enum Take { Walked(bool), Owner, Build, Begin(Begin), Rir(bool) }
+    // (an always-O3 slot: its RIR in the take, its O3 build here, reach_o3)
+    let mut o3 = false;
     // (publish) installed meanwhile (a link, a lazy compile): only the walk is left
     let first = owner::publish(|| {
         let _pub = RtPub::start(0, id, 0);
@@ -33979,11 +34023,12 @@ unsafe fn reach_build(up: *mut Unit, id: u32) -> Result<(), usize> {
         if (&*up).fns[id as usize].compiled {
             return Take::Walked(realtime_walk_out(up, id));
         }
+        o3 = relax_level(&*up, id) == 4 && (&*up).tier1.is_some();
         if free(up) { Take::Build } else { Take::Owner }
     });
     let post = match first {
         Take::Walked(post) => post,
-        Take::Owner | Take::Begin(_) => return Err(1),
+        Take::Owner | Take::Begin(_) | Take::Rir(_) => return Err(1),
         Take::Build => {
             let front = (&*up).front.clone();
             prefront_slot(&front, id);
@@ -34006,6 +34051,9 @@ unsafe fn reach_build(up: *mut Unit, id: u32) -> Result<(), usize> {
                     return Take::Owner;
                 }
                 COMPILE_LAST.store(wall_ns(), Ordering::Relaxed);
+                if o3 {
+                    return Take::Rir(build_rir_mode(up, id, RirMode::Normal).is_ok());
+                }
                 Take::Begin(split_begin(up, id, false))
             });
             drop(front);
@@ -34045,7 +34093,30 @@ unsafe fn reach_build(up: *mut Unit, id: u32) -> Result<(), usize> {
                     }
                     return Err(0);
                 }
-                Some(Take::Begin(_)) => return Err(2),
+                Some(Take::Rir(true)) => {
+                    let r = reach_o3(up, id);
+                    COMPILE_LAST.store(wall_ns(), Ordering::Relaxed);
+                    match r {
+                        Some(post) => {
+                            RT_OFF[1].fetch_add(1, Ordering::Relaxed);
+                            post
+                        }
+                        // no O3 code: code a program thread's call installed meanwhile is walked;
+                        // else the owner builds it as the walk did before (compile_o3_always)
+                        None => {
+                            let r = owner::publish(|| {
+                                let _pub = RtPub::start(2, id, 0);
+                                if !with_rt(|rt| rt.out.contains_key(&id)) {
+                                    return Some(false);
+                                }
+                                (&*up).fns[id as usize].compiled.then(|| realtime_walk_out(up, id))
+                            });
+                            let Some(post) = r else { return Err(5) };
+                            post
+                        }
+                    }
+                }
+                Some(Take::Begin(_) | Take::Rir(false)) => return Err(2),
                 Some(Take::Owner | Take::Build) => return Err(1),
             }
         }
@@ -34055,6 +34126,34 @@ unsafe fn reach_build(up: *mut Unit, id: u32) -> Result<(), usize> {
         owner::post_queued(owner::Class::Program, move || unsafe { realtime_step(upn as *mut Unit) });
     }
     Ok(())
+}
+
+/// The O3 build of reached `#[relax(O3, always)]` slot `id` on this thread, off the owner, its RIR
+/// built (reach_build's take): compile_o3_always's build, whose install walks the new code in the
+/// same publish (compile_tier1: O3_REACH). Some: installed and walked (true: post a step); None:
+/// no O3 code (dropped, failed, code came meanwhile).
+unsafe fn reach_o3(up: *mut Unit, id: u32) -> Option<bool> {
+    // (cleared however the build ends: a preemption unwinds through it)
+    struct Scope;
+    impl Drop for Scope {
+        fn drop(&mut self) {
+            let _ = O3_FIRST.try_with(|c| c.set(false));
+            let _ = O3_FIRST_AT.try_with(|c| c.set(0));
+            let _ = O3_REACH.try_with(|c| c.set(None));
+        }
+    }
+    let _scope = Scope;
+    let w0 = wall_ns();
+    O3_FIRST.with(|c| c.set(true));
+    O3_FIRST_AT.with(|c| c.set(0));
+    O3_REACH.with(|c| c.set(Some(None)));
+    let ok = compile_tier1(up, id);
+    let at = O3_FIRST_AT.with(|c| c.get());
+    let walked = O3_REACH.with(|c| c.get()).flatten();
+    if rt_trace() || crate::run::VERBOSE.load(Ordering::Relaxed) {
+        eprintln!("relax O3 always: {} built off the owner for the real-time reach in {:.1} ms{}", (&*up).fns[id as usize].name, (wall_ns() - w0) as f64 / 1e6, if ok && at != 0 { "" } else { " (no O3 code)" });
+    }
+    if ok && at != 0 { walked } else { None }
 }
 
 /// Runs a queued reach build (Job::Reach) of unit `unit`'s slot `id`: a worker's job, or a thread
@@ -35166,7 +35265,7 @@ pub(crate) unsafe fn reset_statics() {
     reset(&RT_HOLES, AtomicU64::new(0));
     reset(&RT_OFF, [const { AtomicU64::new(0) }; 4]);
     reset(&RT_STEP_MAX, AtomicU64::new(0));
-    reset(&RT_GIVE, [const { AtomicU64::new(0) }; 5]);
+    reset(&RT_GIVE, [const { AtomicU64::new(0) }; 6]);
     reset(&RT_REQUEUED, AtomicU64::new(0));
     reset(&RT_PUB, [const { [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)] }; 3]);
     reset(&RT_PUB_MAX, AtomicU64::new(0));
