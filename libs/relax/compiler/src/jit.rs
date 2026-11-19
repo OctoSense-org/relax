@@ -9645,6 +9645,12 @@ impl Unit {
                 (Some(c), Some(k)) => c.borrowck_stored(k),
                 _ => None,
             };
+            // a body no earlier run of the program checked clean (the one just edited, after a
+            // start or a restart in place) is checked ahead of the startup's other checks: every
+            // body misses the verdict cache after a Relax update, and an edited per-frame body's
+            // error waited 228 s behind them (W14431, 11-19)
+            let edited = c.as_mut().is_some_and(|c| c.edited_body(self, d, key, cached.as_ref()));
+            let rank = if edited { Some(rank.map_or(crate::borrowck::lazy::RANK_EDITED, |r| r.min(crate::borrowck::lazy::RANK_EDITED))) } else { rank };
             self.cache = c;
             if let Some(c) = &self.cache {
                 let epoch = self.tcx.collect_epoch.load(Ordering::SeqCst);

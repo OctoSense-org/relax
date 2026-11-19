@@ -303,8 +303,14 @@ struct Wanted { src: Arc<dyn FrontSource>, args: Vec<TyId>, groups: Vec<u32> }
 /// promoted keeping their place among the startup's checks, so a first edit after a cold start,
 /// at rank 0 with them, waited 9 s behind 362 promoted after it (an app, 11-04).
 pub const RANK_EDIT: u32 = 0;
+/// A body no earlier run of the program checked clean, after a start or a restart in place (the
+/// driver's seen-bodies index): the one the person just edited. Ahead of hot code's and the
+/// startup's checks, run while compiles go on: after a Relax update every body misses the
+/// verdict cache, and an edited per-frame body's error waited 228 s behind the startup's
+/// thousands (W14431, 11-19).
+pub const RANK_EDITED: u32 = 1;
 /// Hot code waiting for its verdict (SPEC-V twins and callers).
-pub const RANK_HOT: u32 = 1;
+pub const RANK_HOT: u32 = 2;
 pub const RANK_DEFAULT: u32 = 1 << 31;
 const RANK_DISCOVER: u32 = u32::MAX - 1;
 const RANK_OWNER: u32 = u32::MAX;

@@ -164,6 +164,31 @@ fn a_live_edits_check_goes_ahead_of_hot_code() {
     unsubscribe(id); stop();
 }
 
+/// After a start, a body no earlier run checked clean (RANK_EDITED: the one just edited) is
+/// checked while compiles go on, ahead of hot code's checks; the startup's other checks wait
+/// for the compiles to go quiet (an edited per-frame body's error came 228 s after its app's
+/// start, behind them, W14431, 11-19).
+#[test]
+fn an_edited_bodys_check_goes_ahead_of_the_startups_while_compiles_go_on() {
+    if child("an_edited_bodys_check_goes_ahead_of_the_startups_while_compiles_go_on") { return; }
+    let front = TestFront::new(0);
+    let (id, rx) = subscribe();
+    // the startup queued a, b and c; the edited bad compiles after them, and hot code promotes b
+    let (a, b) = (front.enqueue("a", false), front.enqueue("b", false));
+    front.enqueue("c", false);
+    let bad = named(&front.prog, "bad");
+    let src: Arc<dyn FrontSource> = front.clone();
+    note_compiled(&front.prog.session.options, &src, NoteFn { def: bad, args: Vec::new(), cache_key: None, epoch: front.epoch(), rank: Some(RANK_EDITED), cached: None });
+    set_ranks(front.identity(), front.epoch(), &[(b, vec![], RANK_HOT)]);
+    // (compiles go on: the quiet gate stays shut)
+    let events = [event(&rx), event(&rx)];
+    assert_eq!(events.each_ref().map(|e| e.error.owner), [bad, b], "the edited body first, then hot code, while compiles go on");
+    assert_eq!(verdict(front.identity(), a, &[], front.epoch()), FnVerdict::Pending, "the startup's other checks wait for quiet");
+    front.ungate();
+    assert_eq!(event(&rx).error.owner, a, "and run once it is quiet");
+    unsubscribe(id); stop();
+}
+
 #[test]
 fn gate_returns_app_errors() {
     if child("gate_returns_app_errors") { return; }

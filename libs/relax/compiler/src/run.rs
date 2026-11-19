@@ -5386,6 +5386,7 @@ fn mid_flush(wait: bool) -> Option<(usize, usize)> {
         for (k, v) in crate::borrowck::lazy::take_verdict_keys() {
             c.record_borrowck(k, v);
         }
+        c.flush_seen_bodies();
         probe.tick("borrowck keys");
         if front_recordable() {
             yield_section("front images");
@@ -5536,6 +5537,7 @@ fn summary_inner(why: &str) {
                 for (k, v) in crate::borrowck::lazy::take_verdict_keys() {
                     c.record_borrowck(k, v);
                 }
+                c.flush_seen_bodies();
 
                 // front images of the files the store does not have yet (front.rs) and the crate
                 // records: a run quit before its first mid-run write has all of them left

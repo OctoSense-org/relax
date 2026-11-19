@@ -46,6 +46,7 @@ mod image;
 use image::{ManifestImage, IMAGE_MAGIC};
 pub(crate) use image::{prelink_unit, PrelinkedSlot};
 mod items;
+pub(crate) mod seen_bodies;
 pub(crate) use items::{owner_body_hash, FileDigest};
 mod deps;
 pub(crate) use deps::{user_names, CheckNode, Name, UserNames};
@@ -908,6 +909,12 @@ pub struct Cache {
     digests: Vec<Option<std::sync::Arc<items::FileDigest>>>,
     /// per definition: its body (when a hole) and position digest, hashed (code keys)
     def_bodies: HashMap<DefId, u128>,
+    /// per definition: its key in the seen-bodies index ([`seen_bodies::key`]; None: no body text)
+    seen_body_keys: HashMap<DefId, Option<u128>>,
+    /// the bodies earlier runs of this program checked clean (opened on the first need)
+    seen_bodies: Option<seen_bodies::SeenBodies>,
+    /// a verdict key's body in the seen-bodies index: marked seen when its clean verdict is recorded
+    seen_of: HashMap<u128, u128>,
     /// per crate: its code store (named by the interface fingerprint), and whether that file's
     /// contents are stale (a late input changed)
     code_path: Vec<PathBuf>,
@@ -1415,6 +1422,9 @@ impl Cache {
             body_names: HashMap::new(),
             digests: Vec::new(),
             def_bodies: HashMap::new(),
+            seen_body_keys: HashMap::new(),
+            seen_bodies: None,
+            seen_of: HashMap::new(),
             code_path: Vec::new(),
             code_stale: Vec::new(),
             cert_rejected: HashSet::new(),
@@ -3708,8 +3718,56 @@ impl Cache {
         OwnerVerdicts::new(self.cfg, self.fps.clone(), self.iface.clone(), epoch, store)
     }
 
+    /// borrowck lane: definition `d`'s body in the seen-bodies index (its path and its text,
+    /// not its place). None: a body that is no hole of its file (an interface body), or none.
+    fn seen_body_key(&mut self, u: &Unit, d: DefId) -> Option<u128> {
+        if let Some(k) = self.seen_body_keys.get(&d) {
+            return *k;
+        }
+        let def = u.prog.def(d);
+        let k = self.digest_of(u, def.file as usize).and_then(|dg| items::body_hash(&u.prog.files[def.file as usize], &dg, def.item)).map(|b| seen_bodies::key(&u.prog.def_path(d), b));
+        self.seen_body_keys.insert(d, k);
+        k
+    }
+
+    /// borrowck lane: whether the background check of slot `id` (definition `d`, verdict key
+    /// `key`, its stored verdict `cached`) goes ahead of the startup's other checks: its body is
+    /// not one an earlier run of this program checked clean ([`seen_bodies`]). A reused clean
+    /// verdict marks it seen now; a check's is marked as it is recorded ([`Self::record_borrowck`]).
+    pub fn edited_body(&mut self, u: &Unit, d: DefId, key: Option<u128>, cached: Option<&StoredVerdict>) -> bool {
+        let Some(seen) = self.seen_body_key(u, d) else { return false };
+        let index = self.seen_bodies.get_or_insert_with(|| {
+            let root = crate::layout::root_crate() as usize;
+            let name = self.crate_names.get(root).map_or("program", String::as_str);
+            let ident = self.crate_ident.get(root).copied().unwrap_or(0);
+            seen_bodies::SeenBodies::open(crate::gitstore::relax_home().join("seen-bodies"), &format!("{name}-{:016x}", ident as u64))
+        });
+        match cached {
+            Some(StoredVerdict::Failed(_)) => index.edited(seen),
+            Some(_) => { index.clean(seen); false }
+            // (a body with no verdict key is never marked seen: it would rank first every start)
+            None => {
+                let Some(k) = key else { return false };
+                self.seen_of.insert(k, seen);
+                index.edited(seen)
+            }
+        }
+    }
+
+    /// Writes the bodies checked clean since the last write to the seen-bodies index.
+    pub fn flush_seen_bodies(&mut self) {
+        if let Some(index) = self.seen_bodies.as_mut() {
+            if let Err(e) = index.flush() {
+                eprintln!("relax cache: the seen-bodies index is not written ({e}): this run's clean bodies rank first again at the next start");
+            }
+        }
+    }
+
     /// Records a completed verdict (written with the next flush).
     pub fn record_borrowck(&mut self, key: u128, v: StoredVerdict) {
+        if let Some(seen) = self.seen_of.remove(&key).filter(|_| !matches!(v, StoredVerdict::Failed(_))) {
+            if let Some(index) = self.seen_bodies.as_mut() { index.clean(seen); }
+        }
         if self.pending_keys.insert(key) {
             let kc = self.key_crate.get(&key).copied().unwrap_or(0);
             let kc = self.verdict_store(key, kc);
@@ -12542,6 +12600,7 @@ impl Cache {
         self.name_memo.clear();
         self.body_names.clear();
         self.def_bodies.clear();
+        self.seen_body_keys.clear();
         self.slot_keys.clear();
         self.const_body_keys.clear();
         self.keys_moved += 1;
