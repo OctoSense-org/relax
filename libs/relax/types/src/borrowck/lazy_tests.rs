@@ -49,12 +49,12 @@ impl TestFront {
         Arc::new(Self { prog, tcx, quiet: AtomicU64::new(0), calls: AtomicU64::new(0), block_call,
             entered: Barrier::new(2), release: Barrier::new(2), panic_stored: AtomicBool::new(false), lock: std::sync::RwLock::new(()) })
     }
-    /// A live patch: the next collect epoch, with `keep`'s owners carried, under the front end's
-    /// write lock as the driver does it (no check runs meanwhile, none sees the new epoch early).
-    fn patch(&self, keep: &dyn Fn(DefId) -> bool) {
+    /// A live patch: the next collect epoch, each owner carried as `owner` says, under the front
+    /// end's write lock as the driver does it (no check runs meanwhile, none sees the new epoch early).
+    fn patch(&self, owner: &dyn Fn(DefId) -> Carry) {
         let _w = self.lock.write().unwrap();
         let from = self.tcx.collect_epoch.fetch_add(1, Ordering::SeqCst);
-        carry_epoch(self.identity(), from, from + 1, keep);
+        carry_epoch(self.identity(), from, from + 1, owner);
     }
     fn epoch(&self) -> u64 { self.tcx.collect_epoch.load(Ordering::SeqCst) }
     fn enqueue(self: &Arc<Self>, name: &str, cached_clean: bool) -> DefId {
@@ -388,7 +388,7 @@ fn live_epoch_carries_verdicts_of_unreached_owners() {
     // queued (or already running) when the patch lands: its check counts at the new epoch
     let queued = front.enqueue("c", false);
     // a live patch of `a`: every other owner reads what it read before
-    front.patch(&|d| d != edited);
+    front.patch(&|d| if d == edited { Carry::Drop } else { Carry::Keep });
     assert_eq!(verdict(front.identity(), clean, &[], front.epoch()), FnVerdict::Clean);
     assert_eq!(verdict(front.identity(), fail, &[], front.epoch()), FnVerdict::Unchecked("typeck".into()));
     assert_eq!(verdict(front.identity(), edited, &[], front.epoch()), FnVerdict::Unchecked("not queued".into()));
@@ -399,6 +399,42 @@ fn live_epoch_carries_verdicts_of_unreached_owners() {
     assert!(matches!(wait_verdict(&front, edited), FnVerdict::Errors(_)));
     assert!(matches!(wait_verdict(&front, queued), FnVerdict::Errors(_)));
     assert_eq!(wait_checked(checked0 + 2) - checked0, 2, "the carried clean owner was checked again");
+    stop();
+}
+
+/// A live patch that lands while the background pass still has checks queued: those of the owners
+/// whose text it did not change stay queued, and each gets its verdict, stored under the key it was
+/// queued with, or under none when the patch changed a declaration its owner may read. Dropped
+/// with their file's changed fn, they were never queued again (no discovery below the aot levels):
+/// the rest of an edited file went unchecked for the session, and the next start checked it (60
+/// of a fixture's 95 fns, 11-19).
+#[test]
+fn a_patch_mid_pass_keeps_the_queued_checks_of_unchanged_owners() {
+    if child("a_patch_mid_pass_keeps_the_queued_checks_of_unchanged_owners") { return; }
+    let front = TestFront::new(0);
+    // queued behind the quiet gate: none is checked before the patch
+    let note = |name: &str, key: u128| {
+        let def = named(&front.prog, name);
+        let src: Arc<dyn FrontSource> = front.clone();
+        note_compiled(&front.prog.session.options, &src, NoteFn { def, args: Vec::new(), cache_key: Some(key), epoch: front.epoch(), rank: None, cached: None });
+        def
+    };
+    let (edited, same, clean, reads) = (note("a", 1), note("b", 2), note("clean", 3), note("typefail", 4));
+    // a body edit of `a`: `b` and `clean` are its file's unchanged text; `typefail` stands for an
+    // owner that reads a declaration the patch changed
+    front.patch(&|d| if d == edited { Carry::Drop } else if d == reads { Carry::Again { keyed: false } } else { Carry::Again { keyed: true } });
+    assert_eq!(verdict(front.identity(), edited, &[], front.epoch()), FnVerdict::Unchecked("not queued".into()), "the changed owner's check goes (the patch notes its code again)");
+    for d in [same, clean, reads] {
+        assert_eq!(verdict(front.identity(), d, &[], front.epoch()), FnVerdict::Pending, "{}: an unchanged owner's queued check stays queued", front.prog.def_path(d));
+    }
+    front.ungate();
+    assert!(matches!(wait_verdict(&front, same), FnVerdict::Errors(_)), "the kept check reports its error");
+    assert_eq!(wait_verdict(&front, clean), FnVerdict::Clean);
+    assert_eq!(wait_verdict(&front, reads), FnVerdict::Unchecked("typeck".into()));
+    assert_eq!(wait_checked(3), 3, "the dropped owner is not checked");
+    let keys = take_verdict_keys();
+    assert!(keys.contains(&(3, StoredVerdict::Clean)), "kept keyed: stored under the key it was queued with: {keys:?}");
+    assert!(keys.iter().all(|(k, _)| *k != 4), "kept over a declaration it may read: stored under no key: {keys:?}");
     stop();
 }
 

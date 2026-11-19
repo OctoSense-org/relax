@@ -2810,14 +2810,25 @@ pub(crate) fn crates_seeing_edit(prog: &crate::program::Program, files: impl Ite
 
 /// A scope-preserving edit moved the program from collect epoch `from` to `from + 1`: Gandalf
 /// keeps the verdicts (and queued checks) of owners in crates that cannot see the edited files
-/// instead of re-checking the whole program (borrowck::lazy::carry_epoch). Front-end write
-/// lock held (on the owner thread).
-fn carry_gandalf(u: &Unit, from: u64, visible: &[bool], files: Option<&[u32]>) {
+/// instead of re-checking the whole program (borrowck::lazy::carry_epoch). `files`: a body-only
+/// edit's versions (None: one of declarations, seen by the `visible` crates). Of the owners that
+/// can see it, those whose text it did not change (`changed`: its bodies, consts and statics; a
+/// removed item's def stays in a version no longer current) keep their queued checks: nothing
+/// queues an unchanged fn again (it does not compile again). Under the key they were queued with
+/// after a body-only edit (the same text reads the same declarations), under none after another.
+/// Front-end write lock held (on the owner thread).
+fn carry_gandalf(u: &Unit, from: u64, visible: &[bool], files: Option<&[u32]>, changed: &[DefId]) {
+    use crate::borrowck::lazy::Carry;
     let src = u.front.checker_id;
     let prog = &u.prog;
     crate::borrowck::lazy::carry_epoch(src, from, u.tcx.collect_epoch.load(std::sync::atomic::Ordering::SeqCst), &|d: DefId| {
-        if let Some(files) = files { !files.contains(&prog.def(d).file) }
-        else { gandalf_keeps(prog, visible, d) }
+        let kept = match files {
+            Some(files) => !files.contains(&prog.def(d).file),
+            None => gandalf_keeps(prog, visible, d),
+        };
+        if kept { Carry::Keep }
+        else if (d.0 as usize) >= prog.defs.len() || changed.contains(&d) || !prog.is_current_version(prog.def(d).file) { Carry::Drop }
+        else { Carry::Again { keyed: files.is_some() } }
     });
 }
 
@@ -6565,6 +6576,8 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
         }
     }
     let carry = gandalf_carries(&changes, versions.iter().map(|(_, p)| p));
+    // (the owners whose text the edit changes: carry_gandalf drops their checks, the others' stay)
+    let changed_owners: Vec<DefId> = body_defs.iter().chain(&const_defs).chain(&static_defs).chain(&layout_defs).copied().collect();
     let mut use_undo: Vec<crate::program::UseUndo> = Vec::new();
     let mut removed_errs: Vec<String> = Vec::new();
     // fns declared again: a type their unchanged signature names moved (decls_naming_removed)
@@ -6763,7 +6776,7 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
         trace_sub("publish_inputs");
         if carry && !ctfe_relevant {
             let files: Vec<u32> = news.iter().flat_map(|&(a, b)| [a, b]).collect();
-            carry_gandalf(u, from, &visible_crates, if full_inputs { None } else { Some(&files) });
+            carry_gandalf(u, from, &visible_crates, if full_inputs { None } else { Some(&files) }, &changed_owners);
         }
         trace_sub("publish_collected");
         // the added items' signatures, types and impl tables: before the layout edits, whose
@@ -7981,7 +7994,7 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
         publish_reload(u, &news, full_inputs, scope.as_deref());
         if carry && !ctfe_relevant {
             let files: Vec<u32> = news.iter().flat_map(|&(a, b)| [a, b]).collect();
-            carry_gandalf(u, from, &visible_crates, if full_inputs { None } else { Some(&files) });
+            carry_gandalf(u, from, &visible_crates, if full_inputs { None } else { Some(&files) }, &changed_owners);
         }
         unsafe { u.prog.reclaim_caches(); }
         // the running enum variants and struct layouts come back with the versions, under the

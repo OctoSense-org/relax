@@ -1,7 +1,7 @@
 //! Gandalf, Relax's lazy borrow checker. Named by Kevin Boos: never early, nor late, but precisely when he means to.
 
 use super::event::{admit, BorrowError, GandalfEvent, Origin, APP_CRATES_ONLY};
-use crate::fxhash::HashMap;
+use crate::fxhash::{HashMap, HashSet};
 use crate::program::{DefId, Program};
 use crate::tcx::Tcx;
 use crate::types::TyId;
@@ -127,15 +127,35 @@ fn front_trace() -> bool {
     *ON.get_or_init(|| std::env::var_os("RELAX_FRONT_TRACE").is_some())
 }
 
+/// What a live patch's epoch move ([`carry_epoch`]) does with an owner's verdicts and queued checks.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Carry {
+    /// it reads what it read before (outside the edited crates and their dependents): kept
+    Keep,
+    /// its text is the edit's (changed, removed): dropped; the patch notes what it rebuilds again
+    Drop,
+    /// it can see the edit, and its text is unchanged: its verdicts go (an error's place may have
+    /// moved), and a check of it that is queued, or ran when the patch came, stays queued: no one
+    /// else queues it again (an unchanged fn does not compile again, and only the aot levels'
+    /// discovery walks the program). `keyed`: the check stores its verdict under the key it was
+    /// queued with (a body-only edit of another fn: the same text reads the same declarations);
+    /// otherwise under none (an edit of a declaration it may read).
+    Again { keyed: bool },
+}
+
 /// A live patch moved the program from collect epoch `from` to `to` without changing what
 /// owners outside the edited crates and their dependents read: `to` becomes an alias of
-/// `from`'s epoch for `src`, so the verdicts, seen marks and queued checks of owners `keep`
-/// accepts stay valid (they are not checked again); the other owners' entries and the
-/// discovery pass are dropped (discovery runs again and queues those owners). Without this
-/// every live edit re-checked the whole program in the background, and the patch's commit
-/// waited for whichever long check (seconds) happened to hold the front end's read lock.
+/// `from`'s epoch for `src`, so the verdicts, seen marks and queued checks of the owners `owner`
+/// keeps stay valid (they are not checked again); the other owners' entries and the discovery
+/// pass are dropped (discovery runs again and queues those owners), except the queued checks of
+/// owners it checks again ([`Carry::Again`]). Without the carry every live edit re-checked the
+/// whole program in the background, and the patch's commit waited for whichever long check
+/// (seconds) happened to hold the front end's read lock. Without the checks kept again, an edit
+/// made before the background pass ended left the rest of its file's fns unchecked for the
+/// session (an error in one went unreported) and checked at the next start (60 of a fixture's 95
+/// fns, 11-19).
 /// Call with the front end's write lock held (no check is running).
-pub fn carry_epoch(src: usize, from: u64, to: u64, keep: &dyn Fn(DefId) -> bool) {
+pub fn carry_epoch(src: usize, from: u64, to: u64, owner: &dyn Fn(DefId) -> Carry) {
     let mut guard = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
     let Some(q) = guard.as_mut() else { return };
     let base = q.canon(src, from);
@@ -146,12 +166,26 @@ pub fn carry_epoch(src: usize, from: u64, to: u64, keep: &dyn Fn(DefId) -> bool)
     // the dropped keys are found from the verdicts of the dropped owners: no pass over the
     // queue or the seen set (they hold the whole program)
     let mut verdicts = VERDICTS.lock().unwrap_or_else(|e| e.into_inner());
-    let dropped: Vec<DefId> = verdicts.keys().copied().filter(|d| *d == crate::program::NO_DEF || !keep(*d)).collect();
+    let moved: Vec<(DefId, Carry)> = verdicts.keys().copied().filter_map(|d| {
+        let how = if d == crate::program::NO_DEF { Carry::Drop } else { owner(d) };
+        (how != Carry::Keep).then_some((d, how))
+    }).collect();
     let mut gone: Vec<ItemKey> = vec![(src, crate::program::NO_DEF, base)];
-    for d in dropped {
+    for (d, how) in moved {
         let Some(instances) = verdicts.get_mut(&d) else { continue };
         let keys: Vec<ItemKey> = instances.keys().filter(|k| k.0 == src).cloned().collect();
         for k in keys {
+            // (a Pending entry is a queued check, or the one a writer preempted: the worker queues
+            // that one again after this, [`still_wanted`])
+            if let (Carry::Again { keyed }, Some(FnVerdict::Pending)) = (how, instances.get(&k)) {
+                if !keyed {
+                    match q.rank_of.get(&k).and_then(|at| q.items.get_mut(at)) {
+                        Some(item) => item.cache_key = None,
+                        None => { UNKEYED.lock().unwrap_or_else(|e| e.into_inner()).insert(k); }
+                    }
+                }
+                continue;
+            }
             instances.remove(&k);
             gone.push(k);
         }
@@ -171,10 +205,25 @@ pub fn carry_epoch(src: usize, from: u64, to: u64, keep: &dyn Fn(DefId) -> bool)
             STALE.fetch_add(1, Ordering::Relaxed);
         }
     }
-    q.pending_ranks.retain(|k, _| k.0 != src || keep(k.1));
-    q.pending_order.retain(|k| k.0 != src || keep(k.1));
+    q.pending_ranks.retain(|k, _| k.0 != src || owner(k.1) != Carry::Drop);
+    q.pending_order.retain(|k| k.0 != src || owner(k.1) != Carry::Drop);
     // the dropped owners a waiting patch group wants: checked again at the carried epoch
     if q.requeue_wanted(src, base, Some(&gone_defs)) > 0 { WAKE.notify_one(); }
+}
+
+/// The preempted checks [`carry_epoch`] kept over an edit of a declaration their owner may read
+/// ([`Carry::Again`] unkeyed): out of the queue then (the worker queues them again), their items
+/// lose their keys there ([`still_wanted`]).
+static UNKEYED: LazyLock<Mutex<HashSet<ItemKey>>> = LazyLock::new(|| Mutex::new(HashSet::default()));
+
+/// Whether a check a front-end writer preempted is still wanted after that writer: its owner's
+/// verdict entry is still Pending (a live patch's carry dropped the owner, [`Carry::Drop`]: the
+/// patch notes what it rebuilds again, with its new body's key). Its item stores under no key
+/// when the carry said so.
+fn still_wanted(item: &mut Item) -> bool {
+    let pending = matches!(VERDICTS.lock().unwrap_or_else(|e| e.into_inner()).get(&item.key.1).and_then(|i| i.get(&item.key)), Some(FnVerdict::Pending));
+    if UNKEYED.lock().unwrap_or_else(|e| e.into_inner()).remove(&item.key) { item.cache_key = None; }
+    pending
 }
 
 /// The program behind `src` was rebuilt unchanged (the settle rebuild: a restored program and
@@ -950,7 +999,9 @@ fn worker(mut src: Arc<dyn FrontSource>, verbose: bool) {
             let mut guard = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
             if crate::preempt::is_stopped() { return; }
             if let Some(q) = guard.as_mut() {
-                if !q.epoch.get(identity).is_some_and(|e| *e > *epoch) { q.insert(item, rank); }
+                if !q.epoch.get(identity).is_some_and(|e| *e > *epoch) {
+                    if still_wanted(&mut item) { q.insert(item, rank); } else { STALE.fetch_add(1, Ordering::Relaxed); }
+                }
             }
             drop(guard);
             // the writer runs; checking again at once would only meet it again (a live edit's
