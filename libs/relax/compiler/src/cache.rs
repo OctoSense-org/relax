@@ -4594,17 +4594,36 @@ impl Cache {
         // positions naming this entry's file table by index
         let mut files: Vec<u32> = Vec::new();
         let mut local = Vec::with_capacity(pc_map.len());
+        // (the variable table's entries after its length entry are raw bytes, four per entry, as
+        // PcMap::encode_to writes them: no position, nothing to map. A large body's table is
+        // hundreds of thousands of them.)
+        let mut raw = 0usize;
+        // (the last entry's file, and its index: consecutive positions are mostly in one file)
+        let mut last = (u32::MAX, 0usize);
         for (o, pos) in pc_map {
+            if raw > 0 && *o == relax_backend::dbgloc::PC_VARS {
+                local.push((*o, *pos));
+                raw -= raw.min(4);
+                continue;
+            }
+            raw = 0;
             let f = relax_backend::rir::pos_file(*pos);
-            let fi = match files.iter().position(|x| *x == f) {
-                Some(i) => i,
-                None => {
-                    files.push(f);
-                    files.len() - 1
-                }
+            let fi = if f == last.0 { last.1 } else {
+                let fi = match files.iter().position(|x| *x == f) {
+                    Some(i) => i,
+                    None => {
+                        files.push(f);
+                        files.len() - 1
+                    }
+                };
+                last = (f, fi);
+                fi
             };
             // (the inline context in the top bits stays)
             local.push((*o, (fi as u64) << 32 | (*pos & 0xffff_ffff) | (*pos & !relax_backend::rir::pos_plain(u64::MAX))));
+            if *o == relax_backend::dbgloc::PC_VARS {
+                raw = *pos as u32 as usize;
+            }
         }
         let mut pcb = Vec::new();
         crate::jit::PcMap::encode_to(&mut pcb, local.into_iter());
