@@ -168,9 +168,21 @@ pub fn observer_closed() {
     retry_update();
 }
 
-/// Retry boundaries are worth setting while someone may resume a panic with `retry`.
+/// Retry boundaries are worth setting while someone may resume a panic with `retry`: a watcher,
+/// an agent, devhub, the Run panel, or a person at the terminal of an attended run.
 fn retry_update() {
-    RELAX_RETRY_ON.store(watched() || OBSERVERS.load(Relaxed) > 0 || RUN_STATE_AVAILABLE.load(Relaxed), Relaxed);
+    let terminal = std::io::stdin().is_terminal() && crate::tui::stderr_is_terminal();
+    let on = retry_wanted(watched() || OBSERVERS.load(Relaxed) > 0 || RUN_STATE_AVAILABLE.load(Relaxed),
+        terminal, UNATTENDED.load(Relaxed), super::TEST_RUN.load(Relaxed));
+    RELAX_RETRY_ON.store(on, Relaxed);
+}
+
+/// Whether retry boundaries are set: someone who can resume a panic with `retry` follows the run
+/// (`followed`), or a person attends it at an interactive terminal (stdin and stderr both TTYs:
+/// a contained panic parks at its site for them to decide). Never for a terminal of a non-TTY
+/// run (scripts, CI, a background lease) or of a test's run, and `--unattended` always wins.
+fn retry_wanted(followed: bool, terminal: bool, unattended: bool, test_run: bool) -> bool {
+    !unattended && (followed || terminal && !test_run)
 }
 
 fn wanted(on: &Option<Vec<String>>, kind: &str) -> bool {
@@ -391,6 +403,7 @@ static UNATTENDED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool
 /// Marks this run as one no one attends ([`UNATTENDED`]).
 pub fn unattended() {
     UNATTENDED.store(true, Relaxed);
+    retry_update();
 }
 
 fn park_secs_unwatched() -> u64 {
@@ -977,6 +990,17 @@ pub fn start() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retry_boundaries_follow_an_attended_terminal_and_never_an_unattended_run() {
+        // (followed, terminal, unattended, test run)
+        assert!(retry_wanted(false, true, false, false), "a run attended at an interactive terminal sets them");
+        assert!(!retry_wanted(false, false, false, false), "a run without a terminal (a script, CI, a background lease) does not");
+        assert!(!retry_wanted(false, true, false, true), "a test's run at a terminal does not: its panics are the test's");
+        assert!(!retry_wanted(false, true, true, false), "--unattended wins over a terminal");
+        assert!(!retry_wanted(true, true, true, false), "--unattended wins over a watcher too");
+        assert!(retry_wanted(true, false, false, false), "a watcher without a terminal sets them, as before");
+    }
 
     #[test]
     fn the_recent_events_end_at_the_newest_and_arrive_whole() {
