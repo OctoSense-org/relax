@@ -32203,6 +32203,10 @@ struct RealTime {
     /// The index's catch-up (realtime_sig_open): the slots installed code had taken when the index
     /// started, still to index (Next::Taken, a budget at a time).
     taken_backlog: Vec<u32>,
+    /// The earlier runs' set (realtime_step_for): its keys still to resolve, last first, and the
+    /// slots resolved so far (they go to `link` together, in the set's order, Next::Load)
+    load_keys: Vec<Vec<u8>>,
+    load_found: Vec<u32>,
     /// the running reach's step items so far (with `ns`: its mean item time, realtime_step_for)
     items: u64,
     /// (trace) when the running reach began (wall ns): its line says mark to done
@@ -32672,7 +32676,7 @@ fn realtime_pending() -> u64 {
         // (the thunk scan runs once a signature is both called and crossing: RT_SIGS)
         let symbols = RT_SIGS.load(Ordering::Acquire) && unsafe { cur_unit().as_ref() }.is_some_and(|u| rt.thunks_scanned < u.syms.thunk_count());
         (rt.todo.len() + rt.link.len() + rt.out.len() + rt.new_notes.len() + rt.new_statics.len() + rt.new_named.len() + rt.x_todo.len() + rt.x_vts.len() + rt.held.len() + rt.failed.len()) as u64
-            + rt.scheduled as u64 + symbols as u64 + !rt.taken_backlog.is_empty() as u64
+            + rt.scheduled as u64 + symbols as u64 + !rt.taken_backlog.is_empty() as u64 + !rt.load_keys.is_empty() as u64
     })
 }
 
@@ -32836,14 +32840,17 @@ unsafe fn realtime_step_for(up: *mut Unit, budget: u64) {
             }
             None => Default::default(),
         };
-        let earlier: Vec<u32> = keys.iter().filter_map(|k| crate::cache::slot_for_bytes_unit(up, k)).collect();
         let u = &*up;
         if rt_trace() {
-            eprintln!("relax rt: earlier runs: {} keys, {} resolved, {} call-site notes", keys.len(), earlier.len(), notes.len());
+            eprintln!("relax rt: earlier runs: {} keys, {} call-site notes", keys.len(), notes.len());
         }
         let notes: Vec<_> = notes.into_iter().map(|name| u.syms.note(name).id).collect();
+        // (its keys resolve to slots in the steps, a budget at a time: Next::Load. A warm launch's
+        // 5.4k keys resolved in one go held the owner 12-13 ms, 11-19/20.)
+        let mut keys = keys;
+        keys.reverse();
         with_rt(|rt| {
-            rt.link.extend(earlier.into_iter().rev());
+            rt.load_keys = keys;
             rt.new_notes.extend(notes);
         });
     }
@@ -32891,6 +32898,7 @@ unsafe fn realtime_step_for(up: *mut Unit, budget: u64) {
         }
         items += 1;
         enum Next {
+            Load,
             Link(u32),
             Given(u32),
             Walk(u32),
@@ -32904,6 +32912,9 @@ unsafe fn realtime_step_for(up: *mut Unit, budget: u64) {
             Done,
         }
         let next = with_rt(|rt| {
+            if !rt.load_keys.is_empty() {
+                return Next::Load;
+            }
             if let Some(id) = rt.link.pop() {
                 return Next::Link(id);
             }
@@ -32926,6 +32937,7 @@ unsafe fn realtime_step_for(up: *mut Unit, budget: u64) {
             Next::Done
         });
         let mut item = RtItem::new(match &next {
+            Next::Load => 0,
             Next::Link(_) => 1,
             Next::Given(_) => 2,
             Next::Walk(_) => 3,
@@ -32938,6 +32950,32 @@ unsafe fn realtime_step_for(up: *mut Unit, budget: u64) {
             Next::Taken => 10,
         });
         match next {
+            Next::Load => {
+                let mut keys = with_rt(|rt| std::mem::take(&mut rt.load_keys));
+                let mut found = Vec::new();
+                while let Some(k) = keys.pop() {
+                    if let Some(id) = crate::cache::slot_for_bytes_unit(up, &k) {
+                        found.push(id);
+                    }
+                    if over(items) {
+                        break;
+                    }
+                }
+                let all = with_rt(|rt| {
+                    rt.load_keys = keys;
+                    rt.load_found.extend(found);
+                    if !rt.load_keys.is_empty() {
+                        return None;
+                    }
+                    let all = std::mem::take(&mut rt.load_found);
+                    let n = all.len();
+                    rt.link.extend(all.into_iter().rev());
+                    Some(n)
+                });
+                if let Some(n) = all.filter(|_| rt_trace()) {
+                    eprintln!("relax rt: earlier runs: {} slots resolved", n);
+                }
+            }
             Next::Link(id) => {
                 item.at(id, 15);
                 // compiled ahead only (the walk reads its references from that code)
