@@ -11725,7 +11725,15 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
         log_edit(up, &what, &paths, &o, saved, seen);
         if crate::harness::live::enabled() {
             drop(_reloading);
-            let back = test_edit(up, which.iter().map(|&k| files[k].0.clone()).collect(), &mut o, &mut undos);
+            // the verdict names what was saved: an included file (a fixture's data an item reads
+            // with include_str!) as well as the code that includes it, whose items the patch
+            // changed; naming the includer alone, the round read as one that took none of the
+            // saved files (organ8.blocks.splash, W14539, 11-19)
+            let mut tested: Vec<String> = which.iter().map(|&k| files[k].0.clone()).collect();
+            for &k in &moved {
+                if !tested.contains(&files[k].0) { tested.push(files[k].0.clone()); }
+            }
+            let back = test_edit(up, tested, &mut o, &mut undos);
             for (old, new) in back { for f in &mut files { if f.1 == new { f.1 = old; } } }
             continue;
         }
