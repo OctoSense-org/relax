@@ -32857,26 +32857,32 @@ unsafe fn realtime_step_for(up: *mut Unit, budget: u64) {
     }
     let mut compiled = 0u64;
     // the step ends at its budget, or after an item when the main thread asks the owner and every
-    // ticket not done still makes its due without this step's time: main's request goes first
-    // (the next step is posted behind it). What the reach still needs is its items left at this
-    // reach's mean item time, its builds out at the mean publish time per build, and one step.
+    // ticket not done still makes its due at the reach's pace: main's request goes first (the
+    // next step is posted behind it). What the reach still needs is its items left at its pace so
+    // far -- wall time since it began per item, the owner's other work between its steps
+    // included, so the gives slow the projection that allows them -- its builds out at the mean
+    // publish time per build, and one step. A step that keeps the owner for a due keeps it to its
+    // budget (no projection per item: a warm launch's reach asked 50k times).
     // (Yielding at every request held a warm launch's ticket to 380-407 ms, past its 300 ms due;
-    // running to the budget held main 103-108 times, 255 ms in all, 11-19.)
+    // running to the budget held main 103-108 times, 255 ms in all; the mean item time without the
+    // gives let one launch of 5.3k links give 297 times and slip to 373 ms, 11-19/20.)
     let mut items = 0u32;
-    let (ns0, items0) = with_rt(|rt| (rt.ns, rt.items));
-    let over = |items: u32| {
+    let (began, items0) = with_rt(|rt| (rt.began, rt.items));
+    let mut kept = false;
+    let mut over = |items: u32| {
         let now = wall_ns();
         if now - t0 >= budget { return true; }
-        if sync || items == 0 || !owner::main_waiting() { return false; }
-        let mean = (ns0 + (now - t0)) / (items0 + items as u64).max(1);
+        if sync || items == 0 || kept || !owner::main_waiting() { return false; }
+        let pace = now.saturating_sub(began) / (items0 + items as u64).max(1);
         let installs = RT_PUB[2][0].load(Ordering::Relaxed);
-        let per_build = if installs == 0 { mean } else { (0..3).map(|k| RT_PUB[k][1].load(Ordering::Relaxed)).sum::<u64>() / installs };
+        let per_build = if installs == 0 { pace } else { (0..3).map(|k| RT_PUB[k][1].load(Ordering::Relaxed)).sum::<u64>() / installs };
         let (left, out) = with_rt(|rt| ((rt.link.len() + rt.todo.len() + rt.given.len()) as u64, rt.out.len() as u64));
-        let need = left * mean + out * per_build + RT_STEP_NS;
+        let need = left * pace + out * per_build + RT_STEP_NS;
         let done = RT_DONE.load(Ordering::Acquire);
         let due = RT_DUE.lock().unwrap_or_else(|e| e.into_inner()).iter().filter(|&&(t, _)| t > done).map(|&(_, at)| at).min();
         let give = due.is_none_or(|d| now + need < d);
         RT_MAIN_ASKED[give as usize].fetch_add(1, Ordering::Relaxed);
+        kept = !give;
         give
     };
     let done = loop {
