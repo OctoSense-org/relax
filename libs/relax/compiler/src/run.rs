@@ -45,6 +45,9 @@ static PHASES: relax_session::sync::Mutex<Vec<(String, f64)>> = relax_session::s
 static MAIN_START_MS: AtomicU64 = AtomicU64::new(0);
 static ERRORS_SEEN: AtomicU64 = AtomicU64::new(0);
 static QUIET: AtomicBool = AtomicBool::new(false);
+/// `--quit-after-present`: the run quits once its startup went quiet after the first present (a
+/// warm-up run: its cache is committed by the quit write as for any quit)
+static QUIT_AFTER_PRESENT: AtomicBool = AtomicBool::new(false);
 
 /// `--silent`: nothing of Relax's own on stderr but errors (a program re-running itself, a
 /// binary's wrapper script). The switch is relax-base's (`progress::silent`), which every layer
@@ -1160,6 +1163,12 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
             }
             "--quiet" => QUIET.store(true, Ordering::Relaxed),
             "--no-live" => no_live = true,
+            // unix: the run sends itself SIGTERM, which takes the platform's termination path;
+            // Windows has no signal for that path, so the run goes on there
+            "--quit-after-present" => {
+                if cfg!(windows) { eprintln!("makepad: --quit-after-present is not supported on Windows; the run goes on") }
+                else { QUIT_AFTER_PRESENT.store(true, Ordering::Relaxed) }
+            }
             // a run no one attends (an app a test starts, makepad_test launch_package): no live
             // session, and nothing parks -- a compile error is its call's panic, a panic unwinds at
             // once, a crash ends the run -- so the test fails with the text instead of waiting
@@ -4083,6 +4092,9 @@ fn start_monitor(runtime: &crate::options::RuntimeOptions, options: &crate::opti
         let settle_on = runtime.settle_drop;
         let mut memos_pending = true;
         let mut settle_watch = SettleWatch::default();
+        // --quit-after-present: the run's own quiet-after-present watch (the settle's is off with
+        // RELAX_SETTLE_DROP=0)
+        let mut quit_watch = QUIT_AFTER_PRESENT.load(Ordering::Relaxed).then(SettleWatch::default);
         let mut settle_present = 0;
         let mut drops = jit::SettleDrops::default();
         let mut reclaimed = None;
@@ -4310,6 +4322,16 @@ fn start_monitor(runtime: &crate::options::RuntimeOptions, options: &crate::opti
                             crate::memstat::print("after the settle and the adoption", &crate::memreport::unit_sizes(unsafe { &*up }));
                         });
                     }
+                }
+            }
+            // the startup's first compiles went quiet after the first present (1 s without one, or
+            // a trickle 5 s on): the run ends as an outside SIGTERM would end it, through the
+            // platform's termination path and the quit write, so its cache is committed
+            if let Some(watch) = quit_watch.as_mut() {
+                if watch.ready(jit::wall_ns(), latest_present(), jit::demand_compiled()) {
+                    quit_watch = None;
+                    eprintln!("makepad: quitting after the first present (--quit-after-present)");
+                    crate::serve_os::stop(std::process::id());
                 }
             }
             // one rebuild per first present (the run's, then each domain's) once its compiles have
