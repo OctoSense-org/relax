@@ -4528,12 +4528,30 @@ impl Cache {
         // each callee's key once: a later relocation to it names the key's position (RELOC_KEY_REF).
         // A key is the callee's whole instance identity, and a fn calls the same callees many times.
         let mut keyed = HashMap::new();
+        // each symbol's bytes once: code names the same symbol at many places (a loop counter's
+        // or a thunk's key at each use: thousands in a large body), and its bytes are the same
+        // each time -- a key's types are trees of their own (enc_ty), and a block's place in
+        // `rw` is fixed by its first write. A later relocation to it copies them.
+        let mut syms: HashMap<(u32, i64), (usize, usize)> = HashMap::new();
         for rl in relocs {
             e.u32(rl.at);
             e.u8(kind_code(rl.kind));
             let r = &rl.target;
             let ok = match r {
-                Reloc::Sym(s) => self.enc_sym(u, *s, &mut e, &mut rw).is_some(),
+                Reloc::Sym(s) => match syms.get(&(s.id, s.off)) {
+                    Some(&(a, b)) => {
+                        e.0.extend_from_within(a..b);
+                        true
+                    }
+                    None => {
+                        let a = e.0.len();
+                        let ok = self.enc_sym(u, *s, &mut e, &mut rw).is_some();
+                        if ok {
+                            syms.insert((s.id, s.off), (a, e.0.len()));
+                        }
+                        ok
+                    }
+                },
                 Reloc::Slot(x) | Reloc::Thunk(x) | Reloc::Call(x) => {
                     let tag = match r { Reloc::Slot(_) => 20, Reloc::Call(_) => 25, _ => 21 };
                     let ok = write_callee(&mut e, tag, *x, &mut keyed, || self.slot_bytes(u, *x));
