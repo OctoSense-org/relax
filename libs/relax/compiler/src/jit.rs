@@ -32235,6 +32235,19 @@ struct RealTime {
     /// slots resolved so far (they go to `link` together, in the set's order, Next::Load)
     load_keys: Vec<Vec<u8>>,
     load_found: Vec<u32>,
+    /// (trace) the missed slots' keys the load took
+    load_n: usize,
+    /// The earlier runs' other slots (RtSet::marked): keys still to link ahead once no ticket waits,
+    /// last first (realtime_prefetch), whether its step is posted, and its counts for the trace:
+    /// keys, resolved, linked, owner ns, steps, steps that ended for a waiting request, the longest
+    /// item's ns, and that item's slot.
+    pre_keys: Vec<Vec<u8>>,
+    pre_posted: bool,
+    pre: [u64; 7],
+    pre_top: u32,
+    /// The slots of the set that joined through a counted miss, an audit's hole or an earlier run's
+    /// such slot (cache::RtSet: the next run walks them before the tickets).
+    missed: crate::fxhash::HashSet<u32>,
     /// Back ends of given-back slots whose fronts the owner made (realtime_split): the slot's
     /// reach build runs it (reach_build), or the owner's step when the whole reach runs there
     backs: crate::fxhash::HashMap<u32, RtBack>,
@@ -32881,18 +32894,20 @@ unsafe fn realtime_step_for(up: *mut Unit, budget: u64) {
             rt.gave_at = 0;
         }
     });
-    // the earlier runs' set, once, first: on a warm run most of it links from the disk cache. It is
-    // only what to compile ahead: the reach is what the walk from the roots takes. A slot's key names
-    // its identity, not its body, so a set an older program recorded still resolves where the bodies
-    // call other code now; a set walked no further kept its hole for good (the land gate's recorded
-    // 5182 slots of which 3 resolved, its root among them: that run reached 1934 of 8250, and every
-    // run after linked those 1934, meeting 27 to 67 lazy compiles on the cell's loop thread, 11-10).
-    // The notes are names, read again as this run's code would read them.
+    // the earlier runs' set, once, first: on a warm run most of it links from the disk cache. A
+    // slot's key names its identity, not its body, so a set an older program recorded still
+    // resolves where the bodies call other code now; a set walked no further kept its hole for good
+    // (the land gate's recorded 5182 slots of which 3 resolved, its root among them: that run
+    // reached 1934 of 8250, and every run after linked those 1934, meeting 27 to 67 lazy compiles on
+    // the cell's loop thread, 11-10). The notes are names, read again as this run's code would read
+    // them. Its missed slots (RtSet) are walked before the tickets, as roots: nothing announces
+    // that code, and walked it joins this run's set and record again. The rest is what marks
+    // reached, which walk again when they come: it is linked after the tickets (realtime_prefetch).
     if with_rt(|rt| !std::mem::replace(&mut rt.loaded, true)) {
         let _item = RtItem::new(0);
         let root = crate::layout::root_crate();
         let u = &mut *up;
-        let (keys, notes) = match u.cache.take() {
+        let set = match u.cache.take() {
             Some(mut c) => {
                 let record = c.rt_set_load(u, root);
                 u.cache = Some(c);
@@ -32902,15 +32917,21 @@ unsafe fn realtime_step_for(up: *mut Unit, budget: u64) {
         };
         let u = &*up;
         if rt_trace() {
-            eprintln!("relax rt: earlier runs: {} keys, {} call-site notes", keys.len(), notes.len());
+            eprintln!("relax rt: earlier runs: {} keys, {} call-site notes ({} keys of missed slots, walked before the tickets; {} linked after them)",
+                set.miss.len() + set.marked.len(), set.notes.len(), set.miss.len(), set.marked.len());
         }
-        let notes: Vec<_> = notes.into_iter().map(|name| u.syms.note(name).id).collect();
+        let notes: Vec<_> = set.notes.into_iter().map(|name| u.syms.note(name).id).collect();
         // (its keys resolve to slots in the steps, a budget at a time: Next::Load. A warm launch's
         // 5.4k keys resolved in one go held the owner 12-13 ms, 11-19/20.)
-        let mut keys = keys;
+        let mut keys = set.miss;
         keys.reverse();
+        let mut pre = set.marked;
+        pre.reverse();
         with_rt(|rt| {
+            rt.load_n = keys.len();
             rt.load_keys = keys;
+            rt.pre[0] = pre.len() as u64;
+            rt.pre_keys = pre;
             rt.new_notes.extend(notes);
         });
     }
@@ -33044,11 +33065,14 @@ unsafe fn realtime_step_for(up: *mut Unit, budget: u64) {
                     }
                     let all = std::mem::take(&mut rt.load_found);
                     let n = all.len();
+                    // linked first, then walked as roots
+                    let origin = rt.origin("earlier miss");
+                    for &id in &all { rt.queue(id, RtWay::Direct, origin); }
                     rt.link.extend(all.into_iter().rev());
-                    Some(n)
+                    Some((n, rt.load_n))
                 });
-                if let Some(n) = all.filter(|_| rt_trace()) {
-                    eprintln!("relax rt: earlier runs: {} slots resolved", n);
+                if let Some((n, of)) = all.filter(|_| rt_trace()) {
+                    eprintln!("relax rt: earlier runs: {} of {} keys of missed slots resolved", n, of);
                 }
             }
             Next::Link(id) => {
@@ -33217,6 +33241,7 @@ unsafe fn realtime_step_for(up: *mut Unit, budget: u64) {
             eprintln!("relax rt: {}: nothing new ({} such completions), tail {}; {:.1} ms on the owner in all; {}", why, quiet, t, RT_AHEAD[1].load(Ordering::Relaxed) as f64 / 1e6, waits);
         }
         realtime_done();
+        realtime_prefetch_post(up);
         return;
     }
     // the top tier for what is new since the last completion: the set's new slots and the slots
@@ -33235,7 +33260,7 @@ unsafe fn realtime_step_for(up: *mut Unit, budget: u64) {
     let u = &mut *up;
     if let Some(mut c) = u.cache.take_if(|c| grew && c.mode != crate::cache::Mode::ReadOnly) {
         let (ids, notes, part) = with_rt(|rt| {
-            let ids = rt.set[rt.stored..].to_vec();
+            let ids: Vec<(u32, bool)> = rt.set[rt.stored..].iter().map(|&id| (id, rt.missed.contains(&id))).collect();
             let notes = rt.note_order[rt.notes_stored..].iter().map(|&s| {
                 let Some(crate::syms::SymKind::Note(name)) = u.syms.kind(s) else { unreachable!("call-site note") };
                 name
@@ -33271,6 +33296,77 @@ unsafe fn realtime_step_for(up: *mut Unit, budget: u64) {
         eprintln!("relax rt: {}: real-time code reaches {} slots ({} new), {} compiled now, {:.1} ms on the owner ({:.1} ms in all), mark to done {:.1} ms; tail {}; {}; {}", why, set_len, new, total_compiled, ns as f64 / 1e6, RT_AHEAD[1].load(Ordering::Relaxed) as f64 / 1e6, wall_ns().saturating_sub(began) as f64 / 1e6, tail, waits, rt_off_summary(u));
     }
     realtime_done();
+    realtime_prefetch_post(up);
+}
+
+/// Posts realtime_prefetch once the earlier runs' marked slots have keys left and it is not posted.
+unsafe fn realtime_prefetch_post(up: *mut Unit) {
+    if with_rt(|rt| rt.pre_keys.is_empty() || std::mem::replace(&mut rt.pre_posted, true)) {
+        return;
+    }
+    let upn = up as usize;
+    owner::post_queued(owner::Class::Program, move || unsafe { realtime_prefetch(upn as *mut Unit) });
+}
+
+/// Links the earlier runs' marked slots (RtSet) ahead, on an idle owner: only while no reach runs
+/// and no ticket waits (a reach that starts goes first; its completion posts this again), and a
+/// step ends after any item when a program request or the main thread waits, or after
+/// RT_STEP_NS (the rest is posted behind them). A linked slot does not join the set: a walk that
+/// reaches it takes it (realtime_take), and the link is the certificate-checked one every link is.
+unsafe fn realtime_prefetch(up: *mut Unit) {
+    let t0 = wall_ns();
+    let mut asked = false;
+    let more = loop {
+        let next = with_rt(|rt| {
+            if rt.scheduled || !rt.out.is_empty() || !rt.held.is_empty() || RT_DONE.load(Ordering::Acquire) < rt.added {
+                rt.pre_posted = false;
+                return None;
+            }
+            let k = rt.pre_keys.pop();
+            if k.is_none() {
+                rt.pre_posted = false;
+            }
+            Some(k)
+        });
+        let Some(Some(k)) = next else { break false };
+        let t = wall_ns();
+        let id = crate::cache::slot_for_bytes_unit(up, &k);
+        let link = id.filter(|&id| (id as usize) < (&*up).fns.len() && !(&*up).fns[id as usize].compiled);
+        if let Some(id) = link {
+            let _ = compile_slot_locked(up, id, false);
+        }
+        let dt = wall_ns() - t;
+        with_rt(|rt| {
+            rt.pre[1] += id.is_some() as u64;
+            rt.pre[2] += link.is_some() as u64;
+            if dt > rt.pre[6] {
+                rt.pre[6] = dt;
+                rt.pre_top = id.unwrap_or(u32::MAX);
+            }
+        });
+        if owner::program_waiting() || owner::main_waiting() {
+            asked = true;
+            break true;
+        }
+        if wall_ns() - t0 >= RT_STEP_NS {
+            break true;
+        }
+    };
+    let end = with_rt(|rt| {
+        rt.pre[3] += wall_ns() - t0;
+        rt.pre[4] += 1;
+        rt.pre[5] += asked as u64;
+        (!more && rt.pre_keys.is_empty()).then_some((rt.pre, rt.pre_top))
+    });
+    if more {
+        let upn = up as usize;
+        owner::post_queued(owner::Class::Program, move || unsafe { realtime_prefetch(upn as *mut Unit) });
+    } else if let Some((p, top)) = end.filter(|_| rt_trace()) {
+        let u = &*up;
+        let name = if (top as usize) < u.fns.len() { short_name(&u.fns[top as usize].name) } else { "-" };
+        eprintln!("relax rt: prefetch: {} of {} keys of the earlier runs' marked slots resolved, {} linked, {:.1} ms on the owner in {} steps ({} ended for a waiting request); longest item {:.1} ms: `{}`",
+            p[1], p[0], p[2], p[3] as f64 / 1e6, p[4], p[5], p[6] as f64 / 1e6, name);
+    }
 }
 
 /// Adds the audit, new slots, top tier and disk record times to RT_TAIL after a reach's walk.
@@ -34053,6 +34149,9 @@ fn realtime_take(id: u32) -> Option<(RtWay, u32)> {
         let (way, origin) = rt.queued.remove(&id)?;
         rt.seen.insert(id);
         rt.set.push(id);
+        if rt.origins.get(origin as usize).is_some_and(|o| matches!(o.as_str(), "miss" | "audit" | "earlier miss")) {
+            rt.missed.insert(id);
+        }
         rt.joined[way as usize] += 1;
         *rt.by_origin.entry(origin).or_default() += 1;
         Some((way, origin))

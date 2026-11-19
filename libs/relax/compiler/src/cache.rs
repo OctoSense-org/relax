@@ -258,12 +258,29 @@ const LEDGER_KEY: u128 = 0;
 // reverted). 41: the notes again, and the real-time set they gate (a 39 set, taken ungated, is
 // never read: the configuration key carries the version).
 const ENTRY_VERSION: u32 = 41;
+/// The real-time set earlier runs recorded (Cache::rt_set_load), by why each slot joined. Nothing
+/// announces a missed slot's code (a handoff through a static met once as a counted miss, what an
+/// audit's hole reached): the next run walks those slots before the tickets, as roots, so the
+/// real-time thread does not miss them again and the walk takes what they call. The rest is what
+/// marks reached (the roots, a new vtable, a fn pointer, new code): each such mark walks its own
+/// code again, so it is only linked ahead, after the tickets (a warm launch whose set held another
+/// launch's late mark, 5.4k slots, linked them all before its first ticket: 382-414 ms against
+/// 80-106 ms, 11-19).
+#[derive(Default)]
+pub struct RtSet {
+    pub miss: Vec<Vec<u8>>,
+    pub marked: Vec<Vec<u8>>,
+    pub notes: Vec<String>,
+}
+
 /// The real-time reach's rule (jit::realtime_*): it moves with every change of the rule, so a set
 /// a record holds was taken under the rule that reads it (a later rule's set is not read).
 /// 2: statics are no crossing source; a type crosses behind a vtable whose method word joined.
 /// 3: a marked trait object crosses its own type, not its trait's; a crossing dyn Any opens nothing.
 /// 4: the type behind a vtable crosses only when the vtable joined through crossing, not named only.
-const RT_SET_RULE: u32 = 4;
+/// 5: each key says why its slot joined (RtSet): through a counted miss or an audit's hole, it is
+/// walked before the tickets; the others are linked after them.
+const RT_SET_RULE: u32 = 5;
 /// enc_ty's tag for "the n-th type this tree wrote in full" (a u32 n follows): written for a type
 /// whose first write was longer than this back-reference.
 const TY_BACKREF: u8 = 63;
@@ -2997,39 +3014,43 @@ impl Cache {
 
     /// Slots and call-site notes from earlier runs under this program and cache configuration.
     /// The slot keys resolve against the current unit. The note strings are stable across runs.
-    pub fn rt_set_load(&mut self, u: &Unit, root: u32) -> (Vec<Vec<u8>>, Vec<String>) {
+    pub fn rt_set_load(&mut self, u: &Unit, root: u32) -> RtSet {
         let key = self.rt_set_key(u, root);
         let Some(store) = Store::open(&self.rt_set_path(key)) else { return Default::default() };
         let Some((KIND_RT_SET, b)) = store.get(key) else { return Default::default() };
         let Ok(head) = b.try_into() else { return Default::default() };
-        let (mut keys, mut notes) = (Vec::new(), Vec::new());
+        let mut set = RtSet::default();
         for part in 0..u32::from_le_bytes(head) {
             let Some((KIND_RT_SET_PART, b)) = store.get(Self::rt_set_part_key(key, part)) else { break };
             let mut d = D { b, p: 0 };
             for _ in 0..d.u32().unwrap_or(0) {
+                let Some(miss) = d.u8() else { break };
                 let Some(k) = d.bytes() else { break };
-                keys.push(k.to_vec());
+                if miss == 0 { set.marked.push(k.to_vec()) } else { set.miss.push(k.to_vec()) }
             }
             for _ in 0..d.u32().unwrap_or(0) {
                 let Some(note) = d.str() else { break };
-                notes.push(note.to_string());
+                set.notes.push(note.to_string());
             }
         }
-        (keys, notes)
+        set
     }
 
     /// Writes slots and notes in one part and publishes the part count in the same append.
     /// Part zero starts the record. A failed write leaves its entries for the next append.
-    pub fn rt_set_store(&mut self, u: &Unit, root: u32, ids: &[u32], notes: &[String], part: u32) -> bool {
+    /// Each slot with whether it joined through a counted miss or an audit's hole (RtSet).
+    pub fn rt_set_store(&mut self, u: &Unit, root: u32, ids: &[(u32, bool)], notes: &[String], part: u32) -> bool {
         if self.mode == Mode::ReadOnly {
             return false;
         }
         let mut keys = E::default();
-        let mut n = 0;
-        for &id in ids {
+        let (mut n, mut misses) = (0, 0);
+        for &(id, miss) in ids {
             if let Some(b) = self.slot_bytes(u, id) {
+                keys.u8(miss as u8);
                 keys.bytes(&b);
                 n += 1;
+                misses += miss as u32;
             }
         }
         let mut e = E::default();
@@ -3044,7 +3065,7 @@ impl Cache {
         ];
         let stored = crate::store::append(&self.rt_set_path(key), entries, part == 0).is_ok();
         if stored && crate::jit::rt_trace() {
-            eprintln!("relax rt: recorded part {}: {} of {} slots, {} call-site notes", part, n, ids.len(), notes.len());
+            eprintln!("relax rt: recorded part {}: {} of {} slots ({} through misses), {} call-site notes", part, n, ids.len(), misses, notes.len());
         }
         stored
     }
@@ -9851,16 +9872,16 @@ mod data_tests {
         let notes = ["v:3:app::Route#12345678".to_string(), "hs:0123456789abcdef:fn(u32)".to_string()];
         assert!(cache.rt_set_store(&u, 0, &[], &notes[..1], 0));
         assert!(cache.rt_set_store(&u, 0, &[], &notes[1..], 1));
-        assert_eq!(cache.rt_set_load(&u, 0).1, notes, "both parts read back in order");
+        assert_eq!(cache.rt_set_load(&u, 0).notes, notes, "both parts read back in order");
         let cfg = cache.cfg;
         cache.cfg ^= 1;
-        let (keys, other_notes) = cache.rt_set_load(&u, 0);
-        assert!(keys.is_empty() && other_notes.is_empty(), "another configuration (another compiler or std) reads no set");
+        let other = cache.rt_set_load(&u, 0);
+        assert!(other.miss.is_empty() && other.marked.is_empty() && other.notes.is_empty(), "another configuration (another compiler or std) reads no set");
         drop(cache);
         let v = load("#![no_std] pub struct S<T, U = u8>(T, U); pub struct R<T>(T);");
         let mut cache = open_test_cache(&v, &root.join("cache"));
         assert_eq!(cache.cfg, cfg, "an edit keeps the configuration");
-        assert_eq!(cache.rt_set_load(&v, 0).1, notes, "notes survive a generic parameter edit");
+        assert_eq!(cache.rt_set_load(&v, 0).notes, notes, "notes survive a generic parameter edit");
         drop(cache);
         std::fs::remove_dir_all(root).unwrap();
     }

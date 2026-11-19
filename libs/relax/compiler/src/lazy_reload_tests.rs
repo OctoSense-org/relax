@@ -2583,6 +2583,103 @@ fn realtime_reach_follows_calls_through_statics_and_fn_pointers() {
     std::fs::remove_dir_all(dir).unwrap();
 }
 
+/// A handoff through a static that nothing marks is met once as a counted miss: the first run's
+/// real-time thread compiles `<Ded as Route>::next` lazily, and the miss's reach records it as a
+/// missed slot of the set (Cache::rt_set_store). The next run walks it before its first ticket
+/// (cache::RtSet): the method is in the set at the ticket, before the program hands the object
+/// over, and the real-time thread meets no lazy compile. (Recorded as a mark's slot, it would be
+/// linked only after the tickets, and would not be in the set at the ticket.)
+#[test]
+fn realtime_recorded_miss_is_walked_before_the_next_runs_ticket() {
+    const PHASE: &str = "RELAX_RT_RECORDED_MISS_TEST";
+    const DIR: &str = "RELAX_RT_RECORDED_MISS_TEST_DIR";
+    let Ok(phase) = std::env::var(PHASE) else {
+        let dir = std::env::temp_dir().join(format!("relax-rt-recorded-miss-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("app/src")).unwrap();
+        std::fs::write(dir.join("Cargo.toml"), "[workspace]\nmembers = [\"app\"]\n").unwrap();
+        std::fs::write(dir.join("app/Cargo.toml"), "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n").unwrap();
+        std::fs::write(dir.join("app/src/lib.rs"), "use std::sync::Mutex;\n\
+            pub trait Route { fn next(&mut self) -> u32; }\n\
+            pub struct Ded(pub u32);\n\
+            impl Route for Ded { fn next(&mut self) -> u32 { self.0 += 3; self.0 } }\n\
+            pub static ROUTE: Mutex<Option<Box<dyn Route + Send>>> = Mutex::new(None);\n\
+            #[repr(C)]\n\
+            pub struct Cell { pub out: u32 }\n\
+            pub fn run(c: &mut Cell) { c.out = match ROUTE.lock() { Ok(mut r) => r.as_mut().map_or(0, |r| r.next()), Err(_) => 0 }; }\n\
+            pub fn later() { if let Ok(mut slot) = ROUTE.lock() { *slot = Some(Box::new(Ded(1))); } }\n").unwrap();
+        let mut said = String::new();
+        for phase in ["first", "next"] {
+            let output = crate::test_child::output(std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "lazy_reload_tests::realtime_recorded_miss_is_walked_before_the_next_runs_ticket", "--nocapture", "--test-threads=1", "--format=terse"])
+                .env(PHASE, phase).env(DIR, &dir).env("RELAX_GANDALF_ALL", "0"));
+            let out = String::from_utf8_lossy(&output.stdout);
+            said += &format!("{phase} run: {out}\n{}\n", String::from_utf8_lossy(&output.stderr));
+            assert!(output.status.success() && out.contains("1 passed"), "{said}");
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+        return;
+    };
+    crate::jit::CHECK_FIRST.store(false, std::sync::atomic::Ordering::Relaxed);
+    std::env::set_var("RELAX_STD", concat!(env!("CARGO_MANIFEST_DIR"), "/std"));
+    let dir = std::path::PathBuf::from(std::env::var_os(DIR).unwrap());
+    std::env::set_var("RELAX_CACHE_DIR", dir.join("cache"));
+    let app = dir.join("app/src/lib.rs").to_string_lossy().into_owned();
+    let session = Arc::new(crate::Session::default());
+    let (prog, core, app_crate) = crate::load_with_std(&session, &app, "rt_recorded_miss_app", false).unwrap();
+    let def = |name: &str| prog.defs.iter().enumerate().find_map(|(i, d)| {
+        let id = crate::program::DefId(i as u32);
+        (d.krate == app_crate && prog.name(id) == name).then_some(id)
+    }).unwrap();
+    let [run_d, later_d] = ["run", "later"].map(def);
+    let mut tcx = crate::tcx::Tcx::new();
+    tcx.collect(&prog);
+    let mut u = crate::jit::Unit::new(prog, tcx, core);
+    let up = &mut *u as *mut crate::jit::Unit;
+    let upn = up as usize;
+    let (root, [run_e, later_e]) = crate::owner::call(crate::owner::Class::Program, || {
+        let mut cache = crate::cache::Cache::open(&u, crate::cache::Mode::ReadOnly).unwrap();
+        cache.mode = crate::cache::Mode::On;
+        u.cache = Some(Box::new(crate::cache::CacheCell::new(cache)));
+        let ids = [run_d, later_d].map(|d| u.fn_id(crate::jit::FnKey::Inst(d, vec![])));
+        (ids[0], ids.map(|id| u.entry(id)))
+    });
+    let next = || crate::owner::call(crate::owner::Class::Program, || u.fns.iter().position(|f| f.name.contains("Ded as") && f.name.ends_with("::next")).map(|n| n as u32));
+    let ticket = crate::owner::call(crate::owner::Class::Program, || unsafe { crate::jit::realtime_mark_slots(up, vec![root]) });
+    wait_realtime_compiled(ticket);
+    if phase == "next" {
+        assert!(next().is_some_and(crate::jit::realtime_reached), "the first run's missed slot is walked before the ticket: `<Ded as Route>::next` is not in the set at the ticket");
+    }
+    unsafe { crate::jit::call_jit(up, later_e, 0) }.unwrap_or_else(|p| panic!("JIT call panicked: {}", p.message));
+    let mut cell = [0u32; 1];
+    let cp = cell.as_mut_ptr() as u64;
+    let (out, misses) = std::thread::spawn(move || {
+        crate::jit::__relax_realtime_thread();
+        let before = crate::jit::__relax_realtime_misses();
+        unsafe { crate::jit::call_jit(upn as *mut crate::jit::Unit, run_e, cp) }.unwrap_or_else(|p| panic!("JIT call panicked: {}", p.message));
+        (unsafe { *(cp as *const u32) }, crate::jit::__relax_realtime_misses() - before)
+    }).join().unwrap();
+    assert_eq!(out, 4, "the real-time call went through the object in the static");
+    if phase == "first" {
+        assert!(misses >= 1, "nothing marks the handoff through the static: the first run meets it as a miss");
+        // the miss's reach, and its part of the record
+        wait_realtime_compiled(ticket);
+        let method = next();
+        let (miss, marked) = crate::owner::call(crate::owner::Class::Program, || {
+            let mut c = u.cache.take().unwrap();
+            let set = c.rt_set_load(&u, crate::layout::root_crate());
+            u.cache = Some(c);
+            let has = |keys: &[Vec<u8>]| keys.iter().any(|k| method.is_some() && unsafe { crate::cache::slot_for_bytes_unit(up, k) } == method);
+            (has(&set.miss), has(&set.marked))
+        });
+        assert!(miss && !marked, "the miss's slot is recorded as missed (as missed: {miss}, as a mark's: {marked})");
+    } else {
+        assert_eq!(misses, 0, "the real-time thread met lazy compiles (RELAX_RT_TRACE=1 names them)");
+    }
+    assert_eq!(crate::jit::__relax_realtime_holes(), 0, "the real-time set had holes (said on stderr)");
+    // (process exit owns the runtime's teardown)
+    std::mem::forget(u);
+}
+
 /// The reach takes in only what real-time code can call (11-18: a call-site rule took 356,121 slots
 /// into a game's set, against 1,816, and its cold start spent the owner on walking them). The root
 /// fills a HashMap, inits a OnceLock and a thread-local. Other code does the same for its own type:
