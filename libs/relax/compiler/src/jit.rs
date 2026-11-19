@@ -32912,8 +32912,13 @@ unsafe fn realtime_step_for(up: *mut Unit, budget: u64) {
     // (Yielding at every request held a warm launch's ticket to 380-407 ms, past its 300 ms due;
     // running to the budget held main 103-108 times, 255 ms in all; the mean item time without the
     // gives let one launch of 5.3k links give 297 times and slip to 373 ms; the pace alone, with
-    // gives of up to 18 ms in a few ms of slack, 356-402 ms, 11-19/20.)
+    // gives of up to 18 ms in a few ms of slack, 356-402 ms, 11-19/20.) The earlier set's keys still
+    // to resolve and the slots they resolved to are links to come: counted as items left (not
+    // counting them, a warm launch of 5.3k links gave 664 times while its 5.4k keys loaded, 0
+    // items left, and its ticket came 385 ms after its mark, 11-19).
     let mut items = 0u32;
+    // (the keys a Load item holds while it resolves them, and the slots found so far)
+    let loading = std::cell::Cell::new(0u64);
     let (began, items0) = with_rt(|rt| (rt.began, rt.items));
     let mut kept = false;
     let mut gave = false;
@@ -32924,7 +32929,7 @@ unsafe fn realtime_step_for(up: *mut Unit, budget: u64) {
         let pace = now.saturating_sub(began) / (items0 + items as u64).max(1);
         let installs = RT_PUB[2][0].load(Ordering::Relaxed);
         let per_build = if installs == 0 { pace } else { (0..3).map(|k| RT_PUB[k][1].load(Ordering::Relaxed)).sum::<u64>() / installs };
-        let (left, out, longest) = with_rt(|rt| ((rt.link.len() + rt.todo.len() + rt.given.len()) as u64, rt.out.len() as u64, rt.give_gap_max));
+        let (left, out, longest) = with_rt(|rt| ((rt.link.len() + rt.todo.len() + rt.given.len() + rt.load_keys.len() + rt.load_found.len()) as u64 + loading.get(), rt.out.len() as u64, rt.give_gap_max));
         let reserve = match RT_GIVE_GAP[0].load(Ordering::Relaxed) {
             0 => longest.max(RT_STEP_NS),
             n => longest.max(RT_GIVE_GAP[1].load(Ordering::Relaxed) / n),
@@ -33003,10 +33008,12 @@ unsafe fn realtime_step_for(up: *mut Unit, budget: u64) {
                     if let Some(id) = crate::cache::slot_for_bytes_unit(up, &k) {
                         found.push(id);
                     }
+                    loading.set((keys.len() + found.len()) as u64);
                     if over(items) {
                         break;
                     }
                 }
+                loading.set(0);
                 let all = with_rt(|rt| {
                     rt.load_keys = keys;
                     rt.load_found.extend(found);
