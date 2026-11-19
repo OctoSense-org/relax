@@ -32147,9 +32147,9 @@ struct RealTime {
     /// Vtables reached code names (directly or under data it names), and those still to apply.
     named: crate::fxhash::HashSet<u64>,
     new_named: Vec<(u64, String)>,
-    /// Source types still to close over (TyId, origin), vtables a method word of which joined
-    /// whose concrete type is still to walk, the vtables queued so, the types walked, and the
-    /// walk's time.
+    /// Source types still to close over (TyId, origin), crossing vtables a method word of which
+    /// joined whose concrete type is still to walk, the vtables queued so, the types walked, and
+    /// the walk's time.
     x_todo: Vec<(u32, u32)>,
     x_vts: Vec<(u64, u32)>,
     x_vt_seen: crate::fxhash::HashSet<u64>,
@@ -32222,33 +32222,47 @@ impl RealTime {
     fn called_words(&mut self, u: &Unit, addr: u64, key: &str, shared: bool, own: &str) -> usize {
         let Some(c) = self.called.get(key) else { return 0 };
         let (words, all, host, all_origin) = (c.words.clone(), c.all, c.host, c.all_origin);
-        let open = self.vt_open(addr, own, shared);
+        let crossed = self.vt_crossed(own, shared);
+        let open = crossed || self.named.contains(&addr);
         let way = if shared { RtWay::Share } else { RtWay::Word };
         let mut n = 0;
-        // a method word joined: its body is reached code and receives `self`, whose fields other
-        // code filled, so the concrete type behind the vtable crosses (not for a drop word alone,
-        // nor behind dyn Any, whose methods only name the type)
         let mut method = None;
         if open {
             for (w, o) in words {
                 n += self.vtable_word(u, addr, w, way, o);
-                if w >= RT_FIRST_METHOD_WORD { method.get_or_insert(o); }
+                if crossed && w >= RT_FIRST_METHOD_WORD { method.get_or_insert(o); }
             }
         }
         if all && (open || host) {
             n += self.vtable_word(u, addr, u32::MAX, if host && !shared { RtWay::Host } else { way }, all_origin);
-            method.get_or_insert(all_origin);
+            if crossed || host { method.get_or_insert(all_origin); }
         }
-        if let Some(o) = method {
-            if !own.starts_with(RT_ANY_KEY) && self.x_vt_seen.insert(addr) { self.x_vts.push((addr, o)); }
-        }
+        if let Some(o) = method { self.vt_self_crosses(addr, own, o); }
         n
+    }
+
+    /// A method word of a vtable that joined through crossing (or a host call's every word):
+    /// its body is reached code and receives `self`, whose fields other code filled, so the
+    /// concrete type behind the vtable crosses. Not for a vtable that joined only as named: it
+    /// belongs to a value reached code built, so its captures are values reached code held,
+    /// each made by reached code (its vtable named) or read from a stored place whose type
+    /// already crosses; if other code builds the same type for real-time code, that store is
+    /// typed and the vtable's key crosses. Not for a drop word alone, nor behind dyn Any, whose
+    /// methods only name the type.
+    fn vt_self_crosses(&mut self, addr: u64, own: &str, origin: u32) {
+        if !own.starts_with(RT_ANY_KEY) && self.x_vt_seen.insert(addr) { self.x_vts.push((addr, origin)); }
+    }
+
+    /// Whether vtable keys `own` cross into real-time code through a stored value (`shared`: under
+    /// the shared key "-" too). A crossing dyn Any stands for any type at all and opens nothing.
+    fn vt_crossed(&self, own: &str, shared: bool) -> bool {
+        !own.starts_with(RT_ANY_KEY) && (self.cross.contains_key(own) || shared && self.cross.contains_key("-"))
     }
 
     /// The gate: whether a called word of vtable `addr` (own key `own`) joins. dyn Any's vtables
     /// open only where reached code names them: a crossing `dyn Any` stands for any type at all.
     fn vt_open(&self, addr: u64, own: &str, shared: bool) -> bool {
-        self.named.contains(&addr) || !own.starts_with(RT_ANY_KEY) && (self.cross.contains_key(own) || shared && self.cross.contains_key("-"))
+        self.named.contains(&addr) || self.vt_crossed(own, shared)
     }
 
     fn sig_way(&self, hash: u64) -> RtWay {
@@ -33451,7 +33465,14 @@ fn realtime_called(u: &Unit, key: &str, word: u32, host: bool) -> (usize, usize)
         if !(host && word == u32::MAX) && !rt.vt_open(*a, own, key == "-") { return 0; }
         let c = &rt.called[key];
         let origin = if word == u32::MAX { c.all_origin } else { c.words.iter().find(|&&(w, _)| w == word).map_or(0, |&(_, o)| o) };
-        rt.vtable_word(u, *a, word, way, origin)
+        let n = rt.vtable_word(u, *a, word, way, origin);
+        // as called_words: a method word (or all of them) of a crossing vtable, or a host call's
+        // every word, crosses the concrete type, whichever of the call and the vtable came first
+        let all = word == u32::MAX;
+        if (all || word >= RT_FIRST_METHOD_WORD) && (host && all || rt.vt_crossed(own, key == "-")) {
+            rt.vt_self_crosses(*a, own, origin);
+        }
+        n
     })).sum();
     (tables.len(), n)
 }

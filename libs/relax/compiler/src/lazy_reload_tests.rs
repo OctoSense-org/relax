@@ -1975,6 +1975,86 @@ fn realtime_reach_skips_trait_objects_it_only_makes_itself() {
     std::fs::remove_dir_all(dir).unwrap();
 }
 
+/// The type behind a vtable crosses only when the vtable joined through crossing, not when reached
+/// code only names it. Here the root calls a closure it makes itself, as `&mut dyn FnMut(u32)`,
+/// and the closure calls `show` on a `&dyn Show` of the root's own value; other code made a
+/// `Box<dyn Show>` of another type before the mark. The closure's captures are values the root
+/// held, so its type does not cross and `dyn Show` does not either: the other type's `show` and
+/// its callee stay out of the reach (before rule 4 they joined, as every `dyn Debug` vtable of a
+/// program joined behind a formatting closure), and the real-time thread meets no lazy compile.
+#[test]
+fn realtime_reach_does_not_cross_through_a_closure_it_makes_itself() {
+    const CHILD: &str = "RELAX_RT_NAMED_CLOSURE_TEST";
+    if std::env::var(CHILD).is_err() {
+        let output = crate::test_child::output(std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "lazy_reload_tests::realtime_reach_does_not_cross_through_a_closure_it_makes_itself", "--nocapture", "--test-threads=1", "--format=terse"])
+            .env(CHILD, "1").env("RELAX_GANDALF_ALL", "0"));
+        let out = String::from_utf8_lossy(&output.stdout);
+        assert!(output.status.success() && out.contains("1 passed"), "{out}\n{}", String::from_utf8_lossy(&output.stderr));
+        return;
+    }
+    crate::jit::CHECK_FIRST.store(false, std::sync::atomic::Ordering::Relaxed);
+    std::env::set_var("RELAX_STD", concat!(env!("CARGO_MANIFEST_DIR"), "/std"));
+    let dir = std::env::temp_dir().join(format!("relax-rt-named-closure-{}", std::process::id()));
+    std::fs::create_dir_all(dir.join("app/src")).unwrap();
+    std::fs::write(dir.join("Cargo.toml"), "[workspace]\nmembers = [\"app\"]\n").unwrap();
+    std::fs::write(dir.join("app/Cargo.toml"), "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n").unwrap();
+    std::fs::write(dir.join("app/src/lib.rs"), "pub trait Show { fn show(&self) -> u32; }\n\
+        pub struct Mine(pub u32);\n\
+        impl Show for Mine {\n\
+            #[inline(never)]\n\
+            fn show(&self) -> u32 { self.0 + 2 }\n\
+        }\n\
+        pub struct Other(pub u32);\n\
+        impl Show for Other {\n\
+            #[inline(never)]\n\
+            fn show(&self) -> u32 { helper(self.0) }\n\
+        }\n\
+        #[inline(never)]\n\
+        pub fn helper(i: u32) -> u32 { i * 9 }\n\
+        #[inline(never)]\n\
+        pub fn each(f: &mut dyn FnMut(u32), n: u32) { for i in 0..n { f(i) } }\n\
+        #[repr(C)]\n\
+        pub struct Cell { pub out: u32 }\n\
+        pub fn run(c: &mut Cell) { let m = Mine(1); let d: &dyn Show = &m; let mut s = 0; each(&mut |i| s += i + d.show(), 3); c.out = s; }\n\
+        pub fn make(c: &mut Cell) { let o: Box<dyn Show> = Box::new(Other(3)); c.out = 1; std::mem::forget(o); }\n").unwrap();
+    let app = dir.join("app/src/lib.rs").to_string_lossy().into_owned();
+    let session = Arc::new(crate::Session::default());
+    let (prog, core, app_crate) = crate::load_with_std(&session, &app, "rt_named_closure_app", false).unwrap();
+    let def = |name: &str| prog.defs.iter().enumerate().find_map(|(i, d)| {
+        let id = crate::program::DefId(i as u32);
+        (d.krate == app_crate && prog.name(id) == name).then_some(id)
+    }).unwrap();
+    let (run_d, make_d, helper_d) = (def("run"), def("make"), def("helper"));
+    let mut tcx = crate::tcx::Tcx::new();
+    tcx.collect(&prog);
+    let mut u = crate::jit::Unit::new(prog, tcx, core);
+    let up = &mut *u as *mut crate::jit::Unit;
+    let upn = up as usize;
+    let (root, run_e, make_e, helper) = crate::owner::call(crate::owner::Class::Program, || {
+        let [r, m, h] = [run_d, make_d, helper_d].map(|d| u.fn_id(crate::jit::FnKey::Inst(d, vec![])));
+        (r, u.entry(r), u.entry(m), h)
+    });
+    let mut cell = [0u32];
+    let cp = cell.as_mut_ptr() as u64;
+    // the other type's `Box<dyn Show>`: its vtable exists before the mark
+    unsafe { crate::jit::call_jit(up, make_e, cp) }.unwrap_or_else(|p| panic!("JIT call panicked: {}", p.message));
+    assert_eq!(cell[0], 1);
+    let ticket = crate::owner::call(crate::owner::Class::Program, || unsafe { crate::jit::realtime_mark_slots(up, vec![root]) });
+    wait_realtime_compiled(ticket);
+    assert!(!crate::jit::realtime_reached(helper), "the reach took in `helper`, which only `Other::show` calls: the closure the root made itself crossed its captured `&dyn Show`");
+    let (out, misses) = std::thread::spawn(move || {
+        crate::jit::__relax_realtime_thread();
+        let before = crate::jit::__relax_realtime_misses();
+        unsafe { crate::jit::call_jit(upn as *mut crate::jit::Unit, run_e, cp) }.unwrap_or_else(|p| panic!("JIT call panicked: {}", p.message));
+        (unsafe { *(cp as *const u32) }, crate::jit::__relax_realtime_misses() - before)
+    }).join().unwrap();
+    assert_eq!((out, misses), (12, 0), "the real-time thread met lazy compiles (RELAX_RT_TRACE=1 names them)");
+    assert_eq!(crate::jit::__relax_realtime_holes(), 0, "the real-time set had holes (said on stderr)");
+    std::mem::forget(u);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
 /// An app run's misses on a node (24 lazy compiles on the real-time thread, drop glue of generic
 /// containers and core::fmt's float path): code ran before the mark (the planner's simulation), so
 /// the reach found slots compiled already whose RIR was dropped after their install. A drop glue's

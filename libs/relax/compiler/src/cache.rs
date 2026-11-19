@@ -261,7 +261,8 @@ const ENTRY_VERSION: u32 = 41;
 /// a record holds was taken under the rule that reads it (a later rule's set is not read).
 /// 2: statics are no crossing source; a type crosses behind a vtable whose method word joined.
 /// 3: a marked trait object crosses its own type, not its trait's; a crossing dyn Any opens nothing.
-const RT_SET_RULE: u32 = 3;
+/// 4: the type behind a vtable crosses only when the vtable joined through crossing, not named only.
+const RT_SET_RULE: u32 = 4;
 /// enc_ty's tag for "the n-th type this tree wrote in full" (a u32 n follows): written for a type
 /// whose first write was longer than this back-reference.
 const TY_BACKREF: u8 = 63;
