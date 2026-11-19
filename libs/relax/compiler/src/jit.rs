@@ -32412,8 +32412,6 @@ static RT_PUB_MAX: AtomicU64 = AtomicU64::new(0);
 /// (trace) The reach builds' bailed takes by the drop's cause (TD_NAMES), the front's failure
 /// (PREFRONT_FAIL_NAMES), whose front (the root's own or a candidate's) and its slot's kind.
 static RT_BAILS: std::sync::Mutex<std::collections::BTreeMap<(u8, u8, &'static str, &'static str), u64>> = std::sync::Mutex::new(std::collections::BTreeMap::new());
-/// Steps that gave the owner back to a main-thread request before their budget.
-static RT_MAIN_YIELDS: AtomicU64 = AtomicU64::new(0);
 /// The takes by outcome (completed, bailed) and round (the first, a later one): [count, wall ns].
 static RT_TAKE: [[[AtomicU64; 2]; 2]; 2] = [const { [const { [AtomicU64::new(0), AtomicU64::new(0)] }; 2] }; 2];
 /// The publishes' phases (RT_PH_NAMES): wall ns in all.
@@ -32809,21 +32807,10 @@ unsafe fn realtime_step_for(up: *mut Unit, budget: u64) {
         });
     }
     let mut compiled = 0u64;
-    // the step ends at its budget, or after an item when the main thread asks the owner: its
-    // request goes first (the next step is posted behind it), so main waits for one item, not a
-    // step (a warm launch's 5.4k links held main 103-108 times, 255 ms in all, 11-19)
-    let mut items = 0u32;
-    let over = |items: u32| {
-        if wall_ns() - t0 >= budget { return true; }
-        let main = !sync && items > 0 && owner::main_waiting();
-        if main { RT_MAIN_YIELDS.fetch_add(1, Ordering::Relaxed); }
-        main
-    };
     let done = loop {
-        if over(items) {
+        if wall_ns() - t0 >= budget {
             break false;
         }
-        items += 1;
         enum Next {
             Link(u32),
             Given(u32),
@@ -32919,7 +32906,7 @@ unsafe fn realtime_step_for(up: *mut Unit, budget: u64) {
                 let mut notes = notes.into_iter();
                 while let Some(id) = notes.next() {
                     realtime_note(&*up, id);
-                    if over(items) {
+                    if wall_ns() - t0 >= budget {
                         with_rt(|rt| rt.new_notes.extend(notes));
                         break;
                     }
@@ -32955,7 +32942,7 @@ unsafe fn realtime_step_for(up: *mut Unit, budget: u64) {
                 let u = &*up;
                 while let Some(id) = with_rt(|rt| rt.taken_backlog.pop()) {
                     realtime_index_candidates(u, std::slice::from_ref(&id));
-                    if over(items) { break; }
+                    if wall_ns() - t0 >= budget { break; }
                 }
             }
             Next::Symbols(cursor) => {
@@ -32967,7 +32954,7 @@ unsafe fn realtime_step_for(up: *mut Unit, budget: u64) {
                         thunks += 1;
                     }
                     end = i + 1;
-                    if over(items) { break; }
+                    if wall_ns() - t0 >= budget { break; }
                 }
                 with_rt(|rt| {
                     rt.sym_cursor = end;
@@ -34111,10 +34098,10 @@ fn rt_off_summary(u: &Unit) -> String {
     let kinds: Vec<String> = RT_KIND_NAMES.iter().enumerate().filter(|(i, _)| RT_KIND_MAX[*i].load(Ordering::Relaxed) != 0).map(|(i, n)| format!("{} {:.1}", n, ms(RT_KIND_MAX[i].load(Ordering::Relaxed)))).collect();
     format!("builds off the owner {} of {} sent ({} given back: {}; {} queued again), {} compiled on the owner; publishes {} (longest {:.1} ms); \
         takes {}; take bails by why: {}; publish phases (ms) {}; longest publish {:.1} ms (cpu {:.1}): {} of `{}`, round {}{}, phases {}; \
-        longest owner step {:.1} ms ({} gave the owner to main), longest item by kind (ms): {}; longest item {:.1} ms: {} of `{}` ({})",
+        longest owner step {:.1} ms, longest item by kind (ms): {}; longest item {:.1} ms: {} of `{}` ({})",
         built, sent, given, why.join(", "), RT_REQUEUED.load(Ordering::Relaxed), owner, pubs.join(", "), ms(RT_PUB_MAX.load(Ordering::Relaxed)),
         takes.join(", "), bails, phases(&sum), ms(top.wall), ms(top.cpu), ["look", "take", "install"][top.kind], name(top.id), top.round, if top.bailed { ", bailed" } else { "" }, phases(&top.ph),
-        ms(RT_STEP_MAX.load(Ordering::Relaxed)), RT_MAIN_YIELDS.load(Ordering::Relaxed), kinds.join(", "), ms(item.0), RT_KIND_NAMES[item.1], name(item.2), RT_WHY_NAMES.get(item.3 as usize).copied().unwrap_or("-"))
+        ms(RT_STEP_MAX.load(Ordering::Relaxed)), kinds.join(", "), ms(item.0), RT_KIND_NAMES[item.1], name(item.2), RT_WHY_NAMES.get(item.3 as usize).copied().unwrap_or("-"))
 }
 
 /// Compiles everything `roots` reach, now (owner): a real-time thread met a lazy stub (`why`).
@@ -35151,7 +35138,6 @@ pub(crate) unsafe fn reset_statics() {
     reset(&RT_REQUEUED, AtomicU64::new(0));
     reset(&RT_PUB, [const { [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)] }; 3]);
     reset(&RT_PUB_MAX, AtomicU64::new(0));
-    reset(&RT_MAIN_YIELDS, AtomicU64::new(0));
     RT_BAILS.lock().unwrap_or_else(|e| e.into_inner()).clear();
     reset(&RT_KIND_MAX, [const { AtomicU64::new(0) }; 11]);
     *RT_ITEM_TOP.lock().unwrap_or_else(|e| e.into_inner()) = (0, 0, u32::MAX, u8::MAX);
