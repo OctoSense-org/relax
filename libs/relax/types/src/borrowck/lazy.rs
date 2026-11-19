@@ -1208,6 +1208,7 @@ pub(crate) unsafe fn reset_statics() {
     reset(&WITHHELD, AtomicU64::new(0));
     reset(&SUBS, Mutex::new(Vec::new()));
     reset(&VERDICTS, LazyLock::new(|| Mutex::new(HashMap::default())));
+    reset(&UNKEYED, LazyLock::new(|| Mutex::new(HashSet::default())));
     reset(&DISJOINT, LazyLock::new(|| Mutex::new(HashMap::default())));
     reset(&RECORDED_OWNERS, Mutex::new(None));
     reset(&VERDICT_KEYS, Mutex::new(Vec::new()));
