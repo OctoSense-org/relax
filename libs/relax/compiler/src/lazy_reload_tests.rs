@@ -1891,10 +1891,13 @@ fn realtime_reach_follows_trait_objects_held_deep_in_the_roots_value() {
 /// An app's red present in the fast bucket (`<ScriptErrorRecord as Debug>` built ahead, not provided):
 /// the reach followed every vtable of every trait-object type real-time code calls through, and
 /// std's own are the whole program (a formatter's `dyn Write`, derived Debug's `dyn Debug`, a
-/// `Once`'s `dyn FnMut`, a table's hasher, a thread's `dyn FnOnce`). Here the root passes its own
-/// closure as `&mut dyn FnMut(u32)`, and other code made a `Box<dyn FnMut(u32)>` of another
-/// closure before the mark: that closure is no real-time code (its callee stays out of the reach),
-/// and the real-time thread still meets no lazy compile.
+/// `Once`'s `dyn FnMut`, a table's hasher, a thread's `dyn FnOnce`). A virtual call takes only its
+/// own word of the vtables of its own trait-object type (its call-site note). Here the root passes
+/// its own closure as `&mut dyn FnMut(u32)` and calls one method of a `&dyn Op` it makes; other code
+/// made a `Box<dyn FnMut(u64)>` of another closure before the mark. Neither that closure (another
+/// trait-object type) nor `Op::b` (a word no call names) is real-time code, so their callees stay
+/// out of the reach, and the real-time thread still meets no lazy compile. (A closure other code
+/// made as a `dyn FnMut(u32)` is taken: a call site cannot tell who made the object it is handed.)
 #[test]
 fn realtime_reach_skips_trait_objects_it_only_makes_itself() {
     const CHILD: &str = "RELAX_RT_OWN_DYN_TEST";
@@ -1918,8 +1921,20 @@ fn realtime_reach_skips_trait_objects_it_only_makes_itself() {
         pub fn helper(i: u32) -> u32 { i * 9 }\n\
         #[repr(C)]\n\
         pub struct Cell { pub out: u32 }\n\
-        pub fn run(c: &mut Cell) { let mut s = 0; each(&mut |i| s += i, 4); c.out = s; }\n\
-        pub fn make(c: &mut Cell) { let f: Box<dyn FnMut(u32)> = Box::new(|i| { c_out(helper(i)); }); c.out = 1; std::mem::forget(f); }\n\
+        pub trait Op { fn a(&self) -> u32; fn b(&self) -> u32; }\n\
+        pub struct Two(pub u32);\n\
+        impl Op for Two {\n\
+            #[inline(never)]\n\
+            fn a(&self) -> u32 { self.0 + 1 }\n\
+            #[inline(never)]\n\
+            fn b(&self) -> u32 { helper2(self.0) }\n\
+        }\n\
+        #[inline(never)]\n\
+        pub fn helper2(i: u32) -> u32 { i * 7 }\n\
+        #[inline(never)]\n\
+        pub fn first(o: &dyn Op) -> u32 { o.a() }\n\
+        pub fn run(c: &mut Cell) { let mut s = 0; each(&mut |i| s += i, 4); c.out = s + first(&Two(1)); }\n\
+        pub fn make(c: &mut Cell) { let f: Box<dyn FnMut(u64)> = Box::new(|i| { c_out(helper(i as u32)); }); c.out = 1; std::mem::forget(f); }\n\
         #[inline(never)]\n\
         pub fn c_out(_: u32) {}\n").unwrap();
     let app = dir.join("app/src/lib.rs").to_string_lossy().into_owned();
@@ -1929,15 +1944,15 @@ fn realtime_reach_skips_trait_objects_it_only_makes_itself() {
         let id = crate::program::DefId(i as u32);
         (d.krate == app_crate && prog.name(id) == name).then_some(id)
     }).unwrap();
-    let (run_d, make_d, helper_d) = (def("run"), def("make"), def("helper"));
+    let (run_d, make_d, helper_d, helper2_d) = (def("run"), def("make"), def("helper"), def("helper2"));
     let mut tcx = crate::tcx::Tcx::new();
     tcx.collect(&prog);
     let mut u = crate::jit::Unit::new(prog, tcx, core);
     let up = &mut *u as *mut crate::jit::Unit;
     let upn = up as usize;
-    let (root, run_e, make_e, helper) = crate::owner::call(crate::owner::Class::Program, || {
-        let [r, m, h] = [run_d, make_d, helper_d].map(|d| u.fn_id(crate::jit::FnKey::Inst(d, vec![])));
-        (r, u.entry(r), u.entry(m), h)
+    let (root, run_e, make_e, helper, helper2) = crate::owner::call(crate::owner::Class::Program, || {
+        let [r, m, h, h2] = [run_d, make_d, helper_d, helper2_d].map(|d| u.fn_id(crate::jit::FnKey::Inst(d, vec![])));
+        (r, u.entry(r), u.entry(m), h, h2)
     });
     let mut cell = [0u32];
     let cp = cell.as_mut_ptr() as u64;
@@ -1946,14 +1961,15 @@ fn realtime_reach_skips_trait_objects_it_only_makes_itself() {
     assert_eq!(cell[0], 1);
     let ticket = crate::owner::call(crate::owner::Class::Program, || unsafe { crate::jit::realtime_mark_slots(up, vec![root]) });
     wait_realtime_compiled(ticket);
-    assert!(!crate::jit::realtime_reached(helper), "the reach took in `helper`, which only a closure of other code calls (every vtable of `dyn FnMut(u32)` followed)");
+    assert!(!crate::jit::realtime_reached(helper), "the reach took in `helper`, which only a closure other code made as a `dyn FnMut(u64)` calls (vtables of a trait-object type no call names followed)");
+    assert!(!crate::jit::realtime_reached(helper2), "the reach took in `helper2`, which only `Op::b` calls (a vtable word no call names followed)");
     let (out, misses) = std::thread::spawn(move || {
         crate::jit::__relax_realtime_thread();
         let before = crate::jit::__relax_realtime_misses();
         unsafe { crate::jit::call_jit(upn as *mut crate::jit::Unit, run_e, cp) }.unwrap_or_else(|p| panic!("JIT call panicked: {}", p.message));
         (unsafe { *(cp as *const u32) }, crate::jit::__relax_realtime_misses() - before)
     }).join().unwrap();
-    assert_eq!((out, misses), (6, 0), "the real-time thread met lazy compiles (RELAX_RT_TRACE=1 names them)");
+    assert_eq!((out, misses), (8, 0), "the real-time thread met lazy compiles (RELAX_RT_TRACE=1 names them)");
     assert_eq!(crate::jit::__relax_realtime_holes(), 0, "the real-time set had holes (said on stderr)");
     std::mem::forget(u);
     std::fs::remove_dir_all(dir).unwrap();
@@ -2334,12 +2350,10 @@ fn realtime_reach_reads_the_installed_code() {
     std::mem::forget(u);
 }
 
-/// Calls the root's code makes through data other code filled: a trait object in a static (an app's
-/// slicer `FAN_OUT`, set by the app, read on the cell's loop), filled after the mark, and a fn
-/// pointer in the root's value, filled before it. Neither target is named by code the reach
-/// walks; the static's type (the code names the static) and the fn pointer's signature (every
-/// slot whose address code took with it) close them over, and the real-time thread meets no lazy
-/// compile.
+/// The root calls a method on the object in a static, the fn pointer in its argument, and
+/// the fn pointer in a static table. All three callees must be ready before the first call. No
+/// static is a crossing source (its type names neither the direction nor the value), so the trait
+/// object handed over through the static is marked where it is installed (std::relax::realtime).
 #[test]
 fn realtime_reach_follows_calls_through_statics_and_fn_pointers() {
     const CHILD: &str = "RELAX_RT_DATA_CALLS_TEST";
@@ -2363,15 +2377,17 @@ fn realtime_reach_follows_calls_through_statics_and_fn_pointers() {
         impl Route for Ded { fn next(&mut self) -> u32 { self.0 += 3; self.0 } }\n\
         pub static ROUTE: Mutex<Option<Box<dyn Route + Send>>> = Mutex::new(None);\n\
         #[inline(never)] pub fn more(x: u32) -> u32 { x * 5 + 1 }\n\
+        #[inline(never)] pub fn triple(x: u32) -> u32 { x * 3 }\n\
+        pub static TABLE: [fn(u32) -> u32; 1] = [triple];\n\
         #[repr(C)]\n\
         pub struct Cell { pub x: u32, pub out: u32, pub f: Option<fn(u32) -> u32> }\n\
         pub fn run(c: &mut Cell) {\n\
             let n = match ROUTE.lock() { Ok(mut r) => r.as_mut().map_or(0, |r| r.next()), Err(_) => 0 };\n\
             let m = match c.f { Some(f) => f(c.x), None => 0 };\n\
-            c.out = n * 100 + m;\n\
+            c.out = n * 100 + m + TABLE[0](c.x);\n\
         }\n\
         pub fn start(c: &mut Cell) { c.f = Some(more); }\n\
-        pub fn later() { if let Ok(mut r) = ROUTE.lock() { *r = Some(Box::new(Ded(1))); } }\n").unwrap();
+        pub fn later() {\n            let r: Box<dyn Route + Send> = Box::new(Ded(1));\n            let _ = std::relax::realtime(&*r, None);\n            if let Ok(mut slot) = ROUTE.lock() { *slot = Some(r); }\n        }\n").unwrap();
     let app = dir.join("app/src/lib.rs").to_string_lossy().into_owned();
     let session = Arc::new(crate::Session::default());
     let (prog, core, app_crate) = crate::load_with_std(&session, &app, "rt_data_calls_app", false).unwrap();
@@ -2379,30 +2395,32 @@ fn realtime_reach_follows_calls_through_statics_and_fn_pointers() {
         let id = crate::program::DefId(i as u32);
         (d.krate == app_crate && prog.name(id) == name).then_some(id)
     }).unwrap();
-    let (run_d, start_d, later_d, more_d) = (def("run"), def("start"), def("later"), def("more"));
+    let [run_d, start_d, later_d, more_d, triple_d] = ["run", "start", "later", "more", "triple"].map(def);
     let mut tcx = crate::tcx::Tcx::new();
     tcx.collect(&prog);
     let mut u = crate::jit::Unit::new(prog, tcx, core);
     let up = &mut *u as *mut crate::jit::Unit;
     let upn = up as usize;
-    let (root, more, [run_e, start_e, later_e]) = crate::owner::call(crate::owner::Class::Program, || {
-        let ids = [run_d, start_d, later_d, more_d].map(|d| u.fn_id(crate::jit::FnKey::Inst(d, vec![])));
-        (ids[0], ids[3], [ids[0], ids[1], ids[2]].map(|id| u.entry(id)))
+    let (root, more, triple, [run_e, start_e, later_e]) = crate::owner::call(crate::owner::Class::Program, || {
+        let ids = [run_d, start_d, later_d, more_d, triple_d].map(|d| u.fn_id(crate::jit::FnKey::Inst(d, vec![])));
+        (ids[0], ids[3], ids[4], [ids[0], ids[1], ids[2]].map(|id| u.entry(id)))
     });
     // the Cell (#[repr(C)]: `x`, `out`, then the fn pointer)
     let mut cell = [0u64; 2];
     cell[0] = 2;
     let cp = cell.as_mut_ptr() as u64;
-    // the fn pointer is stored before the mark, the trait object after it (other code, both)
+    // the fn pointer is stored before the mark, the trait object after it (other code, both); the
+    // trait object's mark is the next ticket
     unsafe { crate::jit::call_jit(up, start_e, cp) }.unwrap_or_else(|p| panic!("JIT call panicked: {}", p.message));
     let ticket = crate::owner::call(crate::owner::Class::Program, || unsafe { crate::jit::realtime_mark_slots(up, vec![root]) });
     unsafe { crate::jit::call_jit(up, later_e, 0) }.unwrap_or_else(|p| panic!("JIT call panicked: {}", p.message));
-    wait_realtime_compiled(ticket);
+    wait_realtime_compiled(ticket + 1);
     let next = crate::owner::call(crate::owner::Class::Program, || u.fns.iter().position(|f| f.name.contains("Ded as") && f.name.ends_with("::next")));
-    // (each hole on its own: both are said when both are open)
+    // Report each missing target before running any of them.
     let holes: Vec<&str> = [
-        (!next.is_some_and(|n| crate::jit::realtime_reached(n as u32))).then_some("the trait object in the static: `<Ded as Route>::next` not reached"),
+        (!next.is_some_and(|n| crate::jit::realtime_reached(n as u32))).then_some("the trait object marked as it went into the static: `<Ded as Route>::next` not reached"),
         (!crate::jit::realtime_reached(more)).then_some("the fn pointer in the root's value: `more` not reached"),
+        (!crate::jit::realtime_reached(triple)).then_some("the fn pointer in TABLE: triple not reached"),
     ].into_iter().flatten().collect();
     assert!(holes.is_empty(), "{}", holes.join("; "));
     let (out, misses) = std::thread::spawn(move || {
@@ -2411,7 +2429,7 @@ fn realtime_reach_follows_calls_through_statics_and_fn_pointers() {
         unsafe { crate::jit::call_jit(upn as *mut crate::jit::Unit, run_e, cp) }.unwrap_or_else(|p| panic!("JIT call panicked: {}", p.message));
         (unsafe { *((cp + 4) as *const u32) }, crate::jit::__relax_realtime_misses() - before)
     }).join().unwrap();
-    assert_eq!((out, misses), (4 * 100 + 11, 0), "the real-time thread met lazy compiles (RELAX_RT_TRACE=1 names them)");
+    assert_eq!((out, misses), (4 * 100 + 11 + 6, 0), "the real-time thread met lazy compiles (RELAX_RT_TRACE=1 names them)");
     assert_eq!(crate::jit::__relax_realtime_holes(), 0, "the real-time set had holes (said on stderr)");
     std::mem::forget(u);
     std::fs::remove_dir_all(dir).unwrap();
@@ -2422,8 +2440,9 @@ fn realtime_reach_follows_calls_through_statics_and_fn_pointers() {
 /// fills a HashMap, inits a OnceLock and a thread-local. Other code does the same for its own type:
 /// the same erased helpers (a table's rehash drop and a slot's destructor are `fn(*mut u8)`,
 /// a once init is `dyn FnMut(&OnceState)`) and a `fn(*mut u8)` of its own in a static the root
-/// never names. None of the other code's slots joins the set, and the real-time thread still
-/// meets no lazy compile.
+/// never names. The root's value holds a slot for the other code's trait object, which the root
+/// never calls (its key crosses, no word of it is called: a hub type's case). None of the other
+/// code's slots joins the set, and the real-time thread still meets no lazy compile.
 #[test]
 fn realtime_reach_leaves_out_other_codes_erased_helpers() {
     const CHILD: &str = "RELAX_RT_ERASED_TEST";
@@ -2447,8 +2466,14 @@ fn realtime_reach_leaves_out_other_codes_erased_helpers() {
         use std::sync::OnceLock;\n\
         static RT_ONCE: OnceLock<u32> = OnceLock::new();\n\
         thread_local! { static RT_LOCAL: RefCell<Vec<u32>> = RefCell::new(Vec::new()); }\n\
+        pub trait OtherTrait { fn other_poke(&self) -> u64; }\n\
+        pub struct OtherImpl(pub u64);\n\
+        impl OtherTrait for OtherImpl {\n\
+            #[inline(never)]\n\
+            fn other_poke(&self) -> u64 { other_dropped(self.0); self.0 }\n\
+        }\n\
         #[repr(C)]\n\
-        pub struct Cell { pub out: u32 }\n\
+        pub struct Cell { pub out: u32, pub hold: Option<Box<dyn OtherTrait>> }\n\
         pub fn run(c: &mut Cell) {\n\
             let mut m: HashMap<u32, Vec<u32>> = HashMap::new();\n\
             for i in 0..40 { m.insert(i, vec![i]); }\n\
@@ -2476,6 +2501,9 @@ fn realtime_reach_leaves_out_other_codes_erased_helpers() {
             let s = OTHER_ONCE.get_or_init(other_init);\n\
             OTHER_LOCAL.with(|v| v.borrow_mut().push(OtherState { name: s.clone(), n: 1 }));\n\
             OTHER_HOOK.store(other_erased as unsafe fn(*mut u8) as usize, Ordering::Relaxed);\n\
+            let held: Box<dyn OtherTrait> = Box::new(OtherImpl(2));\n\
+            OTHER_SEEN.fetch_add(held.other_poke(), Ordering::Relaxed);\n\
+            std::mem::forget(held);\n\
         }\n").unwrap();
     let app = dir.join("app/src/lib.rs").to_string_lossy().into_owned();
     let session = Arc::new(crate::Session::default());
@@ -2501,12 +2529,13 @@ fn realtime_reach_leaves_out_other_codes_erased_helpers() {
     let (reached, other): (usize, Vec<String>) = crate::owner::call(crate::owner::Class::Program, || {
         let reached = (0..u.fns.len() as u32).filter(|&i| crate::jit::realtime_reached(i)).count();
         let other = u.fns.iter().enumerate()
-            .filter(|(i, f)| crate::jit::realtime_reached(*i as u32) && ["OtherState", "other_dropped", "other_init", "other_erased"].iter().any(|n| f.name.contains(n)))
+            .filter(|(i, f)| crate::jit::realtime_reached(*i as u32) && ["OtherState", "OtherImpl", "other_poke", "other_dropped", "other_init", "other_erased"].iter().any(|n| f.name.contains(n)))
             .map(|(_, f)| f.name.to_string()).collect();
         (reached, other)
     });
-    assert!(other.is_empty(), "{} of the {reached} slots in the set belong to the other code (its erased helpers' instances or the fn pointer it stored): {}", other.len(), other.join(", "));
-    let mut cell = [0u32];
+    assert!(other.is_empty(), "{} of the {reached} slots in the set belong to the other code (its erased helpers' instances, the fn pointer it stored, or the methods of its trait object the root's value can hold but the root never calls): {}", other.len(), other.join(", "));
+    // the Cell (#[repr(C)]: `out`, then the trait object's slot, None)
+    let mut cell = [0u64; 3];
     let cp = cell.as_mut_ptr() as u64;
     let (out, misses) = std::thread::spawn(move || {
         crate::jit::__relax_realtime_thread();
