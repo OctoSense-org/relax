@@ -11406,7 +11406,9 @@ unsafe fn install_compiled(up: *mut Unit, id: u32, code: &[u8], map: Vec<(u32, u
                     // a program thread waits for this install (the main thread's before the first
                     // present, every program thread's after it): its entry (slot keys, dependency
                     // certificate) is encoded later, in background batches (drain_cache_records)
-                    let foreground = if FIRST_PRESENT.load(Ordering::Acquire) {
+                    // (and the real-time reach's installs: the audio thread's start waits for them, and
+                    // a large body's record encodes for tens of ms: 63 ms at a crossing, 11-19)
+                    let foreground = RT_KEEP.with(|k| k.get()) || if FIRST_PRESENT.load(Ordering::Acquire) {
                         owner::serving().0 == owner::Class::Program || owner::serving().0 == owner::Class::Publish && !owner::serving_background()
                     } else {
                         startup_phase() && owner::for_main()
