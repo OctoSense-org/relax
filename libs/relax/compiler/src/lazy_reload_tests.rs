@@ -1795,16 +1795,17 @@ fn realtime_strict_ready_counts_the_reach_builds_off_the_owner() {
 
 /// A given-back reached slot's fronts are made on the owner and its back end goes off it again, to
 /// its reach build (realtime_split); its inline candidates stay in its flight until that back end
-/// ends. The owner never waits for such a back end while no reach build has taken it: a front of its
-/// own that needs a candidate of that flight (another given-back slot's, here) runs the back end
-/// itself. (11-19: a Fab run's owner waited 2,300 s on a candidate its own split had put in flight,
-/// the reach build that would end it held back by the pool, main waiting on the owner.)
+/// ends. Nobody waits for such a back end while no reach build has taken it: whoever waits for that
+/// flight runs it -- the owner's front that needs a candidate of it (another given-back slot's,
+/// here), and an O2 job polling for one of its slots. (11-19: a Fab run's owner waited 2,300 s on a
+/// candidate its own split had put in flight, the reach build that would end it held back by the
+/// pool, main waiting on the owner; a job sleeping so holds its worker the same way.)
 #[test]
-fn realtime_split_back_end_is_never_waited_for_by_its_owner() {
+fn realtime_split_back_end_runs_on_its_waiter() {
     const CHILD: &str = "RELAX_RT_SPLIT_WAIT_TEST";
     if std::env::var(CHILD).is_err() {
         let output = crate::test_child::output(std::process::Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", "lazy_reload_tests::realtime_split_back_end_is_never_waited_for_by_its_owner", "--nocapture", "--test-threads=1", "--format=terse"])
+            .args(["--exact", "lazy_reload_tests::realtime_split_back_end_runs_on_its_waiter", "--nocapture", "--test-threads=1", "--format=terse"])
             .env(CHILD, "1").env("RELAX_GANDALF_ALL", "0"));
         let out = String::from_utf8_lossy(&output.stdout);
         assert!(output.status.success() && out.contains("1 passed"), "{out}\n{}", String::from_utf8_lossy(&output.stderr));
@@ -1816,7 +1817,7 @@ fn realtime_split_back_end_is_never_waited_for_by_its_owner() {
     std::fs::create_dir_all(dir.join("app/src")).unwrap();
     std::fs::write(dir.join("Cargo.toml"), "[workspace]\nmembers = [\"app\"]\n").unwrap();
     std::fs::write(dir.join("app/Cargo.toml"), "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n").unwrap();
-    std::fs::write(dir.join("app/src/lib.rs"), "#[inline]\npub fn gain(x: u32) -> u32 { x * 3 + 1 }\npub fn first(out: &mut u32) { *out = gain(*out); }\npub fn second(out: &mut u32) { *out = gain(*out) + 2; }\n").unwrap();
+    std::fs::write(dir.join("app/src/lib.rs"), "#[inline]\npub fn gain(x: u32) -> u32 { x * 3 + 1 }\npub fn first(out: &mut u32) { *out = gain(*out); }\npub fn second(out: &mut u32) { *out = gain(*out) + 2; }\n#[inline]\npub fn trim(x: u32) -> u32 { x + 5 }\npub fn third(out: &mut u32) { *out = trim(*out) * 2; }\n").unwrap();
     let app = dir.join("app/src/lib.rs").to_string_lossy().into_owned();
     let session = Arc::new(crate::Session::default());
     let (prog, core, app_crate) = crate::load_with_std(&session, &app, "rt_split_wait_app", false).unwrap();
@@ -1824,7 +1825,7 @@ fn realtime_split_back_end_is_never_waited_for_by_its_owner() {
         let id = crate::program::DefId(i as u32);
         (d.krate == app_crate && prog.name(id) == name).then_some(id)
     }).unwrap();
-    let (gain, first, second) = (def("gain"), def("first"), def("second"));
+    let (gain, first, second, trim, third) = (def("gain"), def("first"), def("second"), def("trim"), def("third"));
     let mut tcx = crate::tcx::Tcx::new();
     tcx.collect(&prog);
     let mut u = crate::jit::Unit::new(prog, tcx, core);
@@ -1837,6 +1838,11 @@ fn realtime_split_back_end_is_never_waited_for_by_its_owner() {
         let b = u.fn_id(crate::jit::FnKey::Inst(second, vec![]));
         (cand, a, b, u.entry(a), u.entry(b))
     });
+    let (cand2, c, c_entry) = crate::owner::call(crate::owner::Class::Program, || {
+        let cand2 = u.fn_id(crate::jit::FnKey::Inst(trim, vec![]));
+        let c = u.fn_id(crate::jit::FnKey::Inst(third, vec![]));
+        (cand2, c, u.entry(c))
+    });
     // the reach builds stay queued, as the pool's reserve held them
     crate::jit::hold_reach_builds(true);
     let upn = up as usize;
@@ -1845,26 +1851,41 @@ fn realtime_split_back_end_is_never_waited_for_by_its_owner() {
     // the owner's next split needs that candidate: it must not wait for the held back end
     let split = std::thread::spawn(move || crate::owner::call(crate::owner::Class::Program, || unsafe { crate::jit::realtime_split_now(upn as *mut crate::jit::Unit, b) }));
     let owner = crate::owner::owner_tid();
+    // (a failure leaves the owner or the job reading the unit: it is not dropped under them)
     while !split.is_finished() {
-        if let Some(w) = crate::waits::of(owner) {
-            assert!(!(w.kind == crate::waits::Kind::Build && w.object == cand as u64), "the owner waits for the candidate's flight, whose back end only the held reach build runs: it waits for itself");
+        if crate::waits::of(owner).is_some_and(|w| w.kind == crate::waits::Kind::Build && w.object == cand as u64) {
+            std::mem::forget(u);
+            panic!("the owner waits for the candidate's flight, whose back end only the held reach build runs: it waits for itself");
         }
         std::thread::sleep(std::time::Duration::from_millis(2));
     }
     assert!(split.join().unwrap(), "second's fronts were not split from its back end");
-    assert_eq!(crate::jit::realtime_split_counts(), [2, 0, 1], "split, back ends run by reach builds, run by the owner's wait");
-    // the reach builds run: the one whose back end the owner ran walks the installed code
-    crate::jit::hold_reach_builds(false);
-    while crate::jit::realtime_out(a) || crate::jit::realtime_out(b) {
+    assert_eq!(crate::jit::realtime_split_counts(), [2, 0, 1], "split, back ends run by reach builds, run by a wait");
+    // an O2 job polling for a slot of such a flight runs the back end too, not sleeping on its worker
+    assert!(crate::owner::call(crate::owner::Class::Program, || unsafe { crate::jit::realtime_split_now(upn as *mut crate::jit::Unit, c) }), "third's fronts were not split from its back end");
+    assert!(crate::owner::call(crate::owner::Class::Program, || unsafe { (&*up).fns[cand2 as usize].inflight }), "the inline candidate is not in third's flight");
+    let o2 = std::thread::spawn(move || crate::jit::run_o2_now(upn, cand2));
+    while !o2.is_finished() {
+        if crate::jit::FLIGHT_SLEEPS.load(std::sync::atomic::Ordering::SeqCst) != 0 {
+            std::mem::forget(u);
+            panic!("the O2 job sleeps for the candidate's flight, whose back end only the held reach build runs");
+        }
         std::thread::sleep(std::time::Duration::from_millis(2));
     }
-    assert_eq!(crate::jit::realtime_split_counts(), [2, 1, 1]);
+    o2.join().unwrap();
+    assert_eq!(crate::jit::realtime_split_counts(), [3, 0, 2], "split, back ends run by reach builds, run by a wait");
+    // the reach builds run: the ones whose back end a waiter ran walk the installed code
+    crate::jit::hold_reach_builds(false);
+    while crate::jit::realtime_out(a) || crate::jit::realtime_out(b) || crate::jit::realtime_out(c) {
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    assert_eq!(crate::jit::realtime_split_counts(), [3, 1, 2]);
     let run = |entry| {
         let mut out = 5u32;
         unsafe { crate::jit::call_jit(up, entry, &mut out as *mut u32 as u64) }.unwrap_or_else(|p| panic!("JIT call panicked: {}", p.message));
         out
     };
-    assert_eq!((run(a_entry), run(b_entry)), (16, 18));
+    assert_eq!((run(a_entry), run(b_entry), run(c_entry)), (16, 18, 20));
     assert_eq!(crate::jit::__relax_realtime_holes(), 0, "the real-time set had holes (said on stderr)");
     std::mem::forget(u);
     std::fs::remove_dir_all(dir).unwrap();

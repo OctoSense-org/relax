@@ -13542,7 +13542,14 @@ fn run_o2(unit: usize, id: u32, kind: queue::O2Kind) {
                 }
                 Some((inflight, front)) => {
                     if inflight {
-                        while owner::publish(|| live().is_some_and(|up| (&*up).fns[id as usize].inflight)) {
+                        // (the flight's root: a back end the owner split off for the reach that no
+                        // reach build took yet runs here, realtime_back_off_owner)
+                        while let Some(root) = owner::publish(|| live().and_then(|up| (&*up).fns[id as usize].inflight.then(|| (&*up).flights.get(&id).map_or(u32::MAX, |f| f.root)))) {
+                            if root != u32::MAX && live().is_some_and(|up| realtime_back_off_owner(up, root)) {
+                                continue;
+                            }
+                            #[cfg(test)]
+                            FLIGHT_SLEEPS.fetch_add(1, Ordering::SeqCst);
                             job_sleep(TIER1_POLL);
                         }
                     }
@@ -32514,8 +32521,8 @@ impl Drop for RtKeepOn {
 static RT_OFF: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 /// Given-back slots whose take bailed: fronts made on the owner and back ends sent off it again
 /// (realtime_split), the owner's thread CPU ns for those fronts, back ends finished off it, and
-/// back ends the owner ran itself because a front of its own waited for their flight
-/// (realtime_back_for_wait).
+/// back ends a thread that waited for their flight ran itself before any reach build took them (the
+/// owner's front, realtime_back_for_wait; a job's poll, realtime_back_off_owner).
 static RT_SPLIT: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 /// the longest owner step of the reach so far (wall ns)
 static RT_STEP_MAX: AtomicU64 = AtomicU64::new(0);
@@ -32857,10 +32864,20 @@ pub(crate) unsafe fn realtime_split_now(up: *mut Unit, id: u32) -> bool {
 }
 
 /// (unit tests) RT_SPLIT's counts: slots split, back ends run by their reach builds, back ends run
-/// by a wait of the owner.
+/// by a thread that waited for their flight.
 #[cfg(test)]
 pub(crate) fn realtime_split_counts() -> [u64; 3] {
     [0, 2, 3].map(|i| RT_SPLIT[i].load(Ordering::Relaxed))
+}
+
+/// (unit tests) The sleeps of an O2 job polling for a slot in flight (run_o2).
+#[cfg(test)]
+pub(crate) static FLIGHT_SLEEPS: AtomicU64 = AtomicU64::new(0);
+
+/// (unit tests) An O2 build of slot `id` of unit `unit` on this thread, as a worker runs one.
+#[cfg(test)]
+pub(crate) fn run_o2_now(unit: usize, id: u32) {
+    run_o2(unit, id, queue::O2Kind::Normal);
 }
 
 /// (unit tests) No build is queued or running: the next back end is the one a test starts.
@@ -34480,6 +34497,24 @@ unsafe fn realtime_back_for_wait(up: *mut Unit, id: u32) -> bool {
     true
 }
 
+/// realtime_back_for_wait's rule off the owner, for a job that waits for the flight of root slot
+/// `root` by polling (an O2 build of one of its slots): a back end the owner's step split off for the
+/// reach that no reach build has taken yet runs on this thread as that build would run it (reach_back:
+/// the back end here, its install a publish that walks it), instead of the job holding its worker
+/// until the pool lets the reach build in (every worker waiting so would be the owner's deadlock in
+/// another place). A live patch landing meanwhile leaves the slot to that queued reach build, which
+/// builds it from the new source. True: it ran here.
+unsafe fn realtime_back_off_owner(up: *mut Unit, root: u32) -> bool {
+    let back = crate::zone_alloc::kept_with(|| REALTIME.lock().unwrap_or_else(|e| e.into_inner()).as_mut().and_then(|rt| rt.backs.remove(&root)));
+    let Some(RtBack(w)) = back else { return false };
+    RT_SPLIT[3].fetch_add(1, Ordering::Relaxed);
+    if reach_back(up, root, w) == Some(true) {
+        let upn = up as usize;
+        owner::post_queued(owner::Class::Program, move || unsafe { realtime_step(upn as *mut Unit) });
+    }
+    true
+}
+
 /// The O3 build of reached `#[relax(O3, always)]` slot `id` on this thread, off the owner, its RIR
 /// built (reach_build's take): compile_o3_always's build, whose install walks the new code in the
 /// same publish (compile_tier1: O3_REACH). Some: installed and walked (true: post a step); None:
@@ -34584,7 +34619,7 @@ fn rt_off_summary(u: &Unit) -> String {
         v.iter().take(6).map(|(n, w)| format!("{w} {n}")).collect::<Vec<_>>().join(", ")
     };
     let kinds: Vec<String> = RT_KIND_NAMES.iter().enumerate().filter(|(i, _)| RT_KIND_MAX[*i].load(Ordering::Relaxed) != 0).map(|(i, n)| format!("{} {:.1}", n, ms(RT_KIND_MAX[i].load(Ordering::Relaxed)))).collect();
-    format!("builds off the owner {} of {} sent ({} given back: {}; {} queued again; {} split: fronts on the owner {:.1} ms cpu, {} back ends off it, {} run by an owner's wait), {} compiled on the owner; publishes {} (longest {:.1} ms); \
+    format!("builds off the owner {} of {} sent ({} given back: {}; {} queued again; {} split: fronts on the owner {:.1} ms cpu, {} back ends off it, {} run by a wait), {} compiled on the owner; publishes {} (longest {:.1} ms); \
         takes {}; take bails by why: {}; publish phases (ms) {}; longest publish {:.1} ms (cpu {:.1}): {} of `{}`, round {}{}, phases {}; \
         longest owner step {:.1} ms (main asked {}x: given {}, kept for a due {}), longest item by kind (ms): {}; longest item {:.1} ms: {} of `{}` ({})",
         built, sent, given, why.join(", "), RT_REQUEUED.load(Ordering::Relaxed), RT_SPLIT[0].load(Ordering::Relaxed), ms(RT_SPLIT[1].load(Ordering::Relaxed)), RT_SPLIT[2].load(Ordering::Relaxed), RT_SPLIT[3].load(Ordering::Relaxed), owner, pubs.join(", "), ms(RT_PUB_MAX.load(Ordering::Relaxed)),
