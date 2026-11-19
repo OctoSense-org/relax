@@ -20,9 +20,11 @@ pub(super) enum Job {
     O3(TierEntry),
     Spec(usize, u32),
     /// the real-time reach's build of a slot it reached (jit.rs reach_build): installed at once,
-    /// its references walked at the install. Spec's tier (its gates and widths), above every build
-    /// of its class nobody waits for (REACH_KEY)
-    Reach(usize, u32),
+    /// its references walked at the install. Spec's tier. True: a ticket waits for the reach (a
+    /// device's start, a tier-up's install): Interactive, behind everything a program thread
+    /// waits for (REACH_WAITED_KEY); else a build nobody waits for, before the rest of its class
+    /// (REACH_KEY)
+    Reach(usize, u32, bool),
     Tick,
     /// a slice of a check beside the program (check.rs CheckBatch): below every build until
     /// something waits for it
@@ -33,7 +35,7 @@ impl Job {
         match self {
             Self::Ahead(f, AheadWork::Slot(id)) => Some((f.unit.load(Ordering::Acquire) as usize, *id)),
             Self::Ahead(_, AheadWork::Body(..) | AheadWork::Look(..)) | Self::Tick | Self::Check(..) => None,
-            Self::O2(u, id, _) | Self::Spec(u, id) | Self::Reach(u, id) => Some((*u, *id)),
+            Self::O2(u, id, _) | Self::Spec(u, id) | Self::Reach(u, id, _) => Some((*u, *id)),
             Self::O3(e) => Some((TIER_UNIT.load(Ordering::Acquire) as usize, e.0)),
         }
     }
@@ -412,6 +414,7 @@ fn measured_hot(job: &Job, now: &HeatNow) -> bool {
     match job {
         Job::O3(e) => e.1 != super::Q_MARKED,
         Job::O2(u, id, O2Kind::Normal) => now.heat(*u, *id).0 > 0,
+        Job::Reach(_, _, waited) => *waited,
         _ => false,
     }
 }
@@ -425,6 +428,7 @@ fn job_class(job: &Job, _now: &HeatNow) -> u8 {
     match job {
         Job::Ahead(..) if startup_phase() || ui_burst() => budget::INTERACTIVE,
         Job::Check(..) if crate::check::check_waited() => budget::INTERACTIVE,
+        Job::Reach(_, _, true) => budget::INTERACTIVE,
         _ => budget::BACKGROUND,
     }
 }
@@ -435,15 +439,20 @@ pub(super) fn heat_key(heat: u64, ui: bool, waited_ns: u64) -> u64 {
 /// A check that something waits for goes before every build of its class: the first frame and the
 /// run's exit wait for nothing else.
 const CHECK_WAITED_KEY: i64 = i64::MAX - 1;
-/// The reach's builds go before every build of their class nobody waits for (tier-ups,
-/// speculation): real-time code waits for them, and the frontier grows only as they install, which
-/// bounds how many are queued. Behind a waited check.
+/// A reach build no ticket waits for (a late crossing) goes before every build of its class
+/// (tier-ups, speculation): real-time code may call what it builds; the frontier grows only as
+/// they install, which bounds how many are queued. Behind a waited check.
 const REACH_KEY: i64 = i64::MAX - 2;
+/// One a ticket waits for (Interactive) goes behind everything there a program thread waits for
+/// or will (a slot made, a body's inline candidates: their age and heat keep them far above it) and before
+/// the startup's look-ahead (-LOOK_BEHIND). Through the startup's UI burst a background build ran
+/// one at a time: a cold launch's mark took 590-700 ms on workers against 280 ms on the owner.
+const REACH_WAITED_KEY: i64 = -(1 << 39);
 fn key(e: &Entry, now: &HeatNow) -> i64 {
     if matches!(e.job, Job::Tick) { return i64::MAX; }
     // (a check beside the program goes behind every build of its class, until it is waited for)
     if matches!(e.job, Job::Check(..)) { return if crate::check::check_waited() { CHECK_WAITED_KEY } else { i64::MIN }; }
-    if matches!(e.job, Job::Reach(..)) { return REACH_KEY; }
+    if let Job::Reach(_, _, waited) = e.job { return if waited { REACH_WAITED_KEY } else { REACH_KEY }; }
     let (heat, ui) = match &e.job {
         Job::O2(u, id, _) => now.heat(*u, *id),
         Job::O3(t) => now.tier_heat(t),
@@ -760,7 +769,7 @@ pub(super) fn o2(unit: usize, id: u32, kind: O2Kind, at: u64) {
 /// Speculative compile of unit `unit`'s slot `id` (a slot id means something only in its own unit).
 pub(super) fn spec(unit: usize, id: u32) { push(Job::Spec(unit, id), wall_ns()); }
 /// The real-time reach's build of unit `unit`'s slot `id` (jit.rs reach_build).
-pub(super) fn reach(unit: usize, id: u32) { push(Job::Reach(unit, id), wall_ns()); }
+pub(super) fn reach(unit: usize, id: u32, waited: bool) { push(Job::Reach(unit, id, waited), wall_ns()); }
 /// Reach builds queued (Queue::push, Queue::remove): a thread waiting for the reach takes them.
 static REACH_QUEUED: AtomicUsize = AtomicUsize::new(0);
 pub(super) fn reach_queued() -> bool { REACH_QUEUED.load(Ordering::SeqCst) != 0 }
@@ -769,14 +778,14 @@ pub(super) fn takes_jobs() -> bool { !FORKED.load(Ordering::Relaxed) }
 /// A queued reach build out of the queue, for a thread whose wait is the reach's to run it itself
 /// (jit.rs realtime_before_install: a tier-up build of real-time code waits for the reach on a
 /// worker; with every worker waiting so, the reach's builds would stay queued). The oldest one of
-/// the most urgent class (every reach build has the key REACH_KEY).
+/// the most urgent class (a reach build's key is REACH_KEY or REACH_WAITED_KEY).
 pub(super) fn take_reach() -> Option<(usize, u32)> {
     if FORKED.load(Ordering::Relaxed) || !reach_queued() { return None; }
     let mut q = lock();
-    let serial = q.plan[3].iter().find_map(|bucket| bucket.range(order(REACH_KEY, 0)..=order(REACH_KEY, u64::MAX))
-        .map(|&(_, serial)| serial).find(|serial| matches!(q.entries[q.indices[serial]].job, Job::Reach(..))))?;
+    let serial = q.plan[3].iter().find_map(|bucket| [REACH_KEY, REACH_WAITED_KEY].into_iter().find_map(|key| bucket.range(order(key, 0)..=order(key, u64::MAX))
+        .map(|&(_, serial)| serial).find(|serial| matches!(q.entries[q.indices[serial]].job, Job::Reach(..)))))?;
     let i = q.indices[&serial];
-    match q.remove(i).job { Job::Reach(unit, id) => Some((unit, id)), _ => None }
+    match q.remove(i).job { Job::Reach(unit, id, _) => Some((unit, id)), _ => None }
 }
 /// Slot `id` to check and lower ahead. Every slot made goes: one whose body a check ahead already
 /// checked (an inline candidate, the look-ahead) is still lowered here, off the owner.

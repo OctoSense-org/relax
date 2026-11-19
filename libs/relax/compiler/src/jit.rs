@@ -18976,7 +18976,7 @@ pub unsafe fn retire_unit(up: *mut Unit) {
         }
         // its queued ids and its slots in the build state, also when speculation is on another
         // unit: a unit allocated at its address later must not take them
-        queue::retain(|job| !matches!(job, queue::Job::Spec(unit, _) | queue::Job::Reach(unit, _) | queue::Job::O2(unit, _, _) if *unit == up as usize));
+        queue::retain(|job| !matches!(job, queue::Job::Spec(unit, _) | queue::Job::Reach(unit, _, _) | queue::Job::O2(unit, _, _) if *unit == up as usize));
         forget_unit_slots(up as usize);
         if UNIT == up {
             UNIT = std::ptr::null_mut();
@@ -33899,7 +33899,9 @@ fn run_reach(unit: usize, id: u32) -> bool {
 /// Queues the reach build of slot `id` (queue::reach) and wakes the threads waiting for the reach
 /// (they run reach builds while they wait).
 unsafe fn reach_queue(up: *mut Unit, id: u32) {
-    queue::reach(up as usize, id);
+    // (a ticket not done waits for this reach: a device's start, a tier-up's install)
+    let waited = with_rt(|rt| RT_DONE.load(Ordering::Acquire) < rt.added);
+    queue::reach(up as usize, id, waited);
     if RT_WAITERS.load(Ordering::SeqCst) != 0 {
         drop(RT_DONE_WAKE.0.lock().unwrap_or_else(|e| e.into_inner()));
         RT_DONE_WAKE.1.notify_all();
@@ -34656,7 +34658,7 @@ fn run_job(job: queue::Job) {
         queue::Job::O2(unit, id, kind) => { let _mem = crate::memstat::tag(crate::memstat::Tag::Opt); run_o2(unit, id, kind); }
         queue::Job::O3(entry) => { let _mem = crate::memstat::tag(crate::memstat::Tag::Tier1); run_o3(entry); }
         queue::Job::Spec(unit, id) => { let _mem = crate::memstat::tag(crate::memstat::Tag::Codegen); run_spec(unit, id); },
-        queue::Job::Reach(unit, id) => {
+        queue::Job::Reach(unit, id, _) => {
             let _mem = crate::memstat::tag(crate::memstat::Tag::Codegen);
             set_worker(true);
             if !run_reach(unit, id) {
