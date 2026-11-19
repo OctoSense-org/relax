@@ -32214,6 +32214,10 @@ struct RealTime {
     items: u64,
     /// (trace) when the running reach began (wall ns): its line says mark to done
     began: u64,
+    /// When the last step gave the owner to the main thread (wall ns, 0: it did not), and the
+    /// longest such give in the running reach: until the next step began (the due bound's reserve)
+    gave_at: u64,
+    give_gap_max: u64,
     /// (trace) why a build off the owner gave a slot back (RT_GIVE_NAMES), until its item
     give_why: crate::fxhash::HashMap<u32, u8>,
     /// The thunk symbols that scan has met (Syms::thunk_count says when there are new ones).
@@ -32478,6 +32482,8 @@ static RT_PUB_MAX: AtomicU64 = AtomicU64::new(0);
 static RT_BAILS: std::sync::Mutex<std::collections::BTreeMap<(u8, u8, &'static str, &'static str), u64>> = std::sync::Mutex::new(std::collections::BTreeMap::new());
 /// Main-thread requests a step saw after an item: [kept the owner (a ticket's due), gave it].
 static RT_MAIN_ASKED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+/// The run's gives of the owner to the main thread: [count, wall ns until the reach's next step]
+static RT_GIVE_GAP: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 /// The takes by outcome (completed, bailed) and round (the first, a later one): [count, wall ns].
 static RT_TAKE: [[[AtomicU64; 2]; 2]; 2] = [const { [const { [AtomicU64::new(0), AtomicU64::new(0)] }; 2] }; 2];
 /// The publishes' phases (RT_PH_NAMES): wall ns in all.
@@ -32808,6 +32814,8 @@ pub(crate) unsafe fn realtime_reach_queued(up: *mut Unit, roots: Vec<u32>, why: 
             rt.compiled = 0;
             rt.ns = 0;
             rt.items = 0;
+            rt.gave_at = 0;
+            rt.give_gap_max = 0;
             rt.why = why;
             rt.began = wall_ns();
         }
@@ -32835,6 +32843,16 @@ unsafe fn realtime_step(up: *mut Unit) {
 unsafe fn realtime_step_for(up: *mut Unit, budget: u64) {
     let _on = RtStepOn::enter();
     let t0 = wall_ns();
+    // (the step before gave the owner to main: what that give took, the reserve the next needs)
+    with_rt(|rt| {
+        if rt.gave_at != 0 {
+            let g = t0.saturating_sub(rt.gave_at);
+            rt.give_gap_max = rt.give_gap_max.max(g);
+            RT_GIVE_GAP[0].fetch_add(1, Ordering::Relaxed);
+            RT_GIVE_GAP[1].fetch_add(g, Ordering::Relaxed);
+            rt.gave_at = 0;
+        }
+    });
     // the earlier runs' set, once, first: on a warm run most of it links from the disk cache. It is
     // only what to compile ahead: the reach is what the walk from the roots takes. A slot's key names
     // its identity, not its body, so a set an older program recorded still resolves where the bodies
@@ -32878,18 +32896,21 @@ unsafe fn realtime_step_for(up: *mut Unit, budget: u64) {
     }
     let mut compiled = 0u64;
     // the step ends at its budget, or after an item when the main thread asks the owner and every
-    // ticket not done still makes its due at the reach's pace: main's request goes first (the
-    // next step is posted behind it). What the reach still needs is its items left at its pace so
-    // far -- wall time since it began per item, the owner's other work between its steps
-    // included, so the gives slow the projection that allows them -- its builds out at the mean
-    // publish time per build, and one step. A step that keeps the owner for a due keeps it to its
-    // budget (no projection per item: a warm launch's reach asked 50k times).
+    // ticket not done still makes its due at the reach's pace with this give's time to spare:
+    // main's request goes first (the next step is posted behind it). What the reach still needs is
+    // its items left at its pace so far -- wall time since it began per item, the owner's other
+    // work between its steps included, so the gives slow the projection that allows them -- its
+    // builds out at the mean publish time per build, and one step; a give takes what the longest
+    // one of this reach took (the run's mean before its first). A step that keeps the owner for a
+    // due keeps it to its budget (no projection per item: a warm launch's reach asked 50k times).
     // (Yielding at every request held a warm launch's ticket to 380-407 ms, past its 300 ms due;
     // running to the budget held main 103-108 times, 255 ms in all; the mean item time without the
-    // gives let one launch of 5.3k links give 297 times and slip to 373 ms, 11-19/20.)
+    // gives let one launch of 5.3k links give 297 times and slip to 373 ms; the pace alone, with
+    // gives of up to 18 ms in a few ms of slack, 356-402 ms, 11-19/20.)
     let mut items = 0u32;
     let (began, items0) = with_rt(|rt| (rt.began, rt.items));
     let mut kept = false;
+    let mut gave = false;
     let mut over = |items: u32| {
         let now = wall_ns();
         if now - t0 >= budget { return true; }
@@ -32897,13 +32918,18 @@ unsafe fn realtime_step_for(up: *mut Unit, budget: u64) {
         let pace = now.saturating_sub(began) / (items0 + items as u64).max(1);
         let installs = RT_PUB[2][0].load(Ordering::Relaxed);
         let per_build = if installs == 0 { pace } else { (0..3).map(|k| RT_PUB[k][1].load(Ordering::Relaxed)).sum::<u64>() / installs };
-        let (left, out) = with_rt(|rt| ((rt.link.len() + rt.todo.len() + rt.given.len()) as u64, rt.out.len() as u64));
-        let need = left * pace + out * per_build + RT_STEP_NS;
+        let (left, out, longest) = with_rt(|rt| ((rt.link.len() + rt.todo.len() + rt.given.len()) as u64, rt.out.len() as u64, rt.give_gap_max));
+        let reserve = match RT_GIVE_GAP[0].load(Ordering::Relaxed) {
+            0 => longest.max(RT_STEP_NS),
+            n => longest.max(RT_GIVE_GAP[1].load(Ordering::Relaxed) / n),
+        };
+        let need = left * pace + out * per_build + RT_STEP_NS + reserve;
         let done = RT_DONE.load(Ordering::Acquire);
         let due = RT_DUE.lock().unwrap_or_else(|e| e.into_inner()).iter().filter(|&&(t, _)| t > done).map(|&(_, at)| at).min();
         let give = due.is_none_or(|d| now + need < d);
         RT_MAIN_ASKED[give as usize].fetch_add(1, Ordering::Relaxed);
         kept = !give;
+        gave = give;
         give
     };
     let done = loop {
@@ -33117,6 +33143,9 @@ unsafe fn realtime_step_for(up: *mut Unit, budget: u64) {
         rt.compiled += compiled;
         rt.ns += dt;
         rt.items += items as u64;
+        if gave {
+            rt.gave_at = wall_ns();
+        }
         (rt.n0, rt.notes0, rt.compiled, rt.ns, rt.why)
     });
     // all that is left is held (slots whose tier-up build is about to be installed) or out (slots
@@ -35392,6 +35421,7 @@ pub(crate) unsafe fn reset_statics() {
     reset(&RT_PUB, [const { [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)] }; 3]);
     reset(&RT_PUB_MAX, AtomicU64::new(0));
     reset(&RT_MAIN_ASKED, [const { AtomicU64::new(0) }; 2]);
+    reset(&RT_GIVE_GAP, [const { AtomicU64::new(0) }; 2]);
     RT_BAILS.lock().unwrap_or_else(|e| e.into_inner()).clear();
     reset(&RT_KIND_MAX, [const { AtomicU64::new(0) }; 11]);
     *RT_ITEM_TOP.lock().unwrap_or_else(|e| e.into_inner()) = (0, 0, u32::MAX, u8::MAX);
