@@ -34537,6 +34537,7 @@ pub(crate) unsafe fn reset_statics() {
     reset(&RT_PENDING, relax_session::sync::Mutex::new(Vec::new()));
     reset(&RT_AHEAD, [AtomicU64::new(0), AtomicU64::new(0)]);
     reset(&RT_TAIL, [const { AtomicU64::new(0) }; 5]);
+    reset(&RT_QUIET, AtomicU64::new(0));
     reset(&RT_TICKET, AtomicU64::new(0));
     reset(&RT_DONE, AtomicU64::new(0));
     reset(&RT_ARMED, std::sync::atomic::AtomicU32::new(0));
