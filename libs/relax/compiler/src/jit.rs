@@ -32504,7 +32504,8 @@ pub(crate) extern "C" fn __relax_realtime_arm(on: bool) {
             if !up.is_null() && RT_ANY.load(Ordering::Acquire) {
                 let upn = up as usize;
                 owner::call(owner::Class::Program, move || unsafe {
-                    if !with_rt(|rt| rt.scheduled) && realtime_audit(upn as *mut Unit, "arm", true) {
+                    // (a reach whose builds are out runs too, with no step posted)
+                    if !with_rt(|rt| rt.scheduled || !rt.out.is_empty()) && realtime_audit(upn as *mut Unit, "arm", true) {
                         realtime_reach_queued(upn as *mut Unit, Vec::new(), "hole");
                     }
                 });
@@ -32519,8 +32520,8 @@ pub(crate) extern "C" fn __relax_realtime_arm(on: bool) {
 static RT_ARMED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 /// What real-time code can reach that a call would still compile: the reach's work left (slots to
-/// link or walk, call-site notes and matching vtable words to follow, the new callees of new code) and the
-/// set's slots whose compile failed. The reach is one walk for every mark (a slot two roots reach is
+/// link or walk, slots whose build is out, call-site notes and matching vtable words to follow, the
+/// new callees of new code) and the set's slots whose compile failed. The reach is one walk for every mark (a slot two roots reach is
 /// walked once; a warm run compiles the earlier runs' set ahead and walks from the roots all the
 /// same), so this is the whole real-time set's answer: never 0 while something on any root's path is lazy.
 ///
@@ -32532,7 +32533,7 @@ fn realtime_pending() -> u64 {
     queued + with_rt(|rt| {
         // (the thunk scan runs once a signature is both called and crossing: RT_SIGS)
         let symbols = RT_SIGS.load(Ordering::Acquire) && unsafe { cur_unit().as_ref() }.is_some_and(|u| rt.thunks_scanned < u.syms.thunk_count());
-        (rt.todo.len() + rt.link.len() + rt.new_notes.len() + rt.new_statics.len() + rt.new_named.len() + rt.x_todo.len() + rt.x_vts.len() + rt.held.len() + rt.failed.len()) as u64
+        (rt.todo.len() + rt.link.len() + rt.out.len() + rt.new_notes.len() + rt.new_statics.len() + rt.new_named.len() + rt.x_todo.len() + rt.x_vts.len() + rt.held.len() + rt.failed.len()) as u64
             + rt.scheduled as u64 + symbols as u64
     })
 }
@@ -32611,6 +32612,34 @@ pub(crate) unsafe fn realtime_mark_slots(up: *mut Unit, roots: Vec<u32>) -> u64 
 #[cfg(test)]
 pub(crate) fn realtime_reached(id: u32) -> bool {
     with_rt(|rt| rt.seen.contains(&id))
+}
+
+/// Whether reached slot `id`'s build is out, off the owner (reach_build). (Unit tests.)
+#[cfg(test)]
+pub(crate) fn realtime_out(id: u32) -> bool {
+    with_rt(|rt| rt.out.contains_key(&id))
+}
+
+/// (unit tests) No build is queued or running: the next back end is the one a test starts.
+#[cfg(test)]
+pub(crate) fn builds_idle() -> bool {
+    queue::counts().iter().chain(queue::running().iter()).all(|&n| n == 0)
+}
+
+/// (unit tests) On: the next back end stops at its start until it is off (BACK_END_GATE); the
+/// call with `on` returns at once, `wait_back_end_held` waits for the stop.
+#[cfg(test)]
+pub(crate) fn hold_back_ends(on: bool) {
+    BACK_END_GATE.store(on as u32, Ordering::SeqCst);
+}
+
+/// (unit tests) Blocks until a back end stopped at the gate `hold_back_ends` set.
+#[cfg(test)]
+pub(crate) fn wait_back_end_held() {
+    let mut seen = BACK_END_STOPPED.0.lock().unwrap_or_else(|e| e.into_inner());
+    while BACK_END_GATE.load(Ordering::SeqCst) != 2 {
+        seen = BACK_END_STOPPED.1.wait(seen).unwrap_or_else(|e| e.into_inner());
+    }
 }
 
 /// Adds `roots` to the reach and schedules its next owner step.

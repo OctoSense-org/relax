@@ -1725,6 +1725,74 @@ fn realtime_strict_ready_lazy_and_patch_freeze() {
     std::fs::remove_dir_all(dir).unwrap();
 }
 
+/// The reach's builds run off the owner (`makepad run` pipelines): while a reached slot's build is
+/// out, nothing real-time code can reach is "compiled" for an earlier mark's strict ready, and its
+/// lazy count is not 0. (11-19: the pending count left out the builds that were out, and a late
+/// crossing's compiled() said true while one was still building.)
+#[test]
+fn realtime_strict_ready_counts_the_reach_builds_off_the_owner() {
+    const CHILD: &str = "RELAX_RT_OUT_TEST";
+    if std::env::var(CHILD).is_err() {
+        let output = crate::test_child::output(std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "lazy_reload_tests::realtime_strict_ready_counts_the_reach_builds_off_the_owner", "--nocapture", "--test-threads=1", "--format=terse"])
+            .env(CHILD, "1").env("RELAX_GANDALF_ALL", "0"));
+        let out = String::from_utf8_lossy(&output.stdout);
+        assert!(output.status.success() && out.contains("1 passed"), "{out}\n{}", String::from_utf8_lossy(&output.stderr));
+        return;
+    }
+    crate::jit::CHECK_FIRST.store(false, std::sync::atomic::Ordering::Relaxed);
+    std::env::set_var("RELAX_STD", concat!(env!("CARGO_MANIFEST_DIR"), "/std"));
+    let dir = std::env::temp_dir().join(format!("relax-rt-out-{}", std::process::id()));
+    std::fs::create_dir_all(dir.join("app/src")).unwrap();
+    std::fs::write(dir.join("Cargo.toml"), "[workspace]\nmembers = [\"app\"]\n").unwrap();
+    std::fs::write(dir.join("app/Cargo.toml"), "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n").unwrap();
+    std::fs::write(dir.join("app/src/lib.rs"), "pub fn value(out: &mut u32) { *out = 11; }\npub fn later(out: &mut u32) { *out = 5; }\n").unwrap();
+    let app = dir.join("app/src/lib.rs").to_string_lossy().into_owned();
+    let session = Arc::new(crate::Session::default());
+    let (prog, core, app_crate) = crate::load_with_std(&session, &app, "rt_out_app", false).unwrap();
+    let def = |name: &str| prog.defs.iter().enumerate().find_map(|(i, d)| {
+        let id = crate::program::DefId(i as u32);
+        (d.krate == app_crate && prog.name(id) == name).then_some(id)
+    }).unwrap();
+    let (value, later) = (def("value"), def("later"));
+    let mut tcx = crate::tcx::Tcx::new();
+    tcx.collect(&prog);
+    let mut u = crate::jit::Unit::new(prog, tcx, core);
+    let up = &mut *u as *mut crate::jit::Unit;
+    // as `makepad run` builds: a reached slot's build goes off the owner
+    crate::jit::enable_pipelining(&u.prog.session.options);
+    let (root, late, late_entry) = crate::owner::call(crate::owner::Class::Program, || {
+        let root = u.fn_id(crate::jit::FnKey::Inst(value, vec![]));
+        let late = u.fn_id(crate::jit::FnKey::Inst(later, vec![]));
+        (root, late, u.entry(late))
+    });
+    let ticket = crate::owner::call(crate::owner::Class::Program, || unsafe { crate::jit::realtime_mark_slots(up, vec![root]) });
+    while !crate::jit::__relax_realtime_compiled(ticket) {
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    // nothing else builds now: the next back end is the new root's reach build, held at its start
+    while !crate::jit::builds_idle() {
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    crate::jit::hold_back_ends(true);
+    let late_ticket = crate::owner::call(crate::owner::Class::Program, || unsafe { crate::jit::realtime_mark_slots(up, vec![late]) });
+    crate::jit::wait_back_end_held();
+    assert!(crate::jit::realtime_out(late), "the new root's build did not go off the owner");
+    assert!(!crate::jit::__relax_realtime_compiled(ticket), "compiled() while a reached slot's build was out");
+    assert!(crate::jit::__relax_realtime_lazy(ticket) > 0, "nothing lazy while a reached slot's build was out");
+    crate::jit::hold_back_ends(false);
+    while !crate::jit::__relax_realtime_compiled(late_ticket) {
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    assert!(crate::jit::__relax_realtime_compiled(ticket));
+    let mut result = 0u32;
+    unsafe { crate::jit::call_jit(up, late_entry, &mut result as *mut u32 as u64) }.unwrap_or_else(|p| panic!("JIT call panicked: {}", p.message));
+    assert_eq!(result, 5);
+    assert_eq!(crate::jit::__relax_realtime_holes(), 0, "the real-time set had holes (said on stderr)");
+    std::mem::forget(u);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
 /// std::relax::realtime_thread marks the calling thread only, for good: is_realtime_thread
 /// (what counts a lazy compile in realtime_misses) answers so there, not on other threads.
 #[test]
