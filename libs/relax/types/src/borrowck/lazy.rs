@@ -475,6 +475,8 @@ fn rehomed(dead: &Arc<dyn FrontSource>) -> Option<Arc<dyn FrontSource>> {
 static WAKE: Condvar = Condvar::new();
 static STARTED: AtomicBool = AtomicBool::new(false);
 static STOP: AtomicBool = AtomicBool::new(false);
+/// The worker waits on WAKE for work (set before its wait and cleared after it, under QUEUE).
+static WORKER_PARKED: AtomicBool = AtomicBool::new(false);
 
 fn stopping() -> bool { STOP.load(Ordering::SeqCst) || crate::preempt::is_stopped() }
 /// The worker paces itself (`ms`) on WAKE, not in a sleep: a check queued at rank `rank` or
@@ -653,6 +655,14 @@ pub fn queue_place(src: usize, def: DefId, epoch: u64) -> Option<(u32, usize)> {
 /// Checks queued (0 also before the worker started); the aot levels' completion line reads it.
 pub fn queued() -> usize {
     QUEUE.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map_or(0, |q| q.order.len())
+}
+
+/// Whether the worker waits for work with none queued: no check runs, nor is one about to. (A
+/// check it took from the queue runs before it waits again: `running` reads None between its pop
+/// and its start.) Read under QUEUE, against which the worker sets its wait and pops.
+pub fn worker_parked() -> bool {
+    let guard = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
+    WORKER_PARKED.load(Ordering::Relaxed) && guard.as_ref().is_none_or(|q| q.order.is_empty())
 }
 
 /// Bodies checked so far this run.
@@ -841,7 +851,9 @@ fn worker(mut src: Arc<dyn FrontSource>, verbose: bool) {
                 let parked = Arc::downgrade(&src);
                 let identity = src.identity();
                 src = Arc::new(Parked(identity));
+                WORKER_PARKED.store(true, Ordering::Relaxed);
                 guard = WAKE.wait(guard).unwrap_or_else(|e| e.into_inner());
+                WORKER_PARKED.store(false, Ordering::Relaxed);
                 if let Some(s) = parked.upgrade().filter(|s| s.alive()).or_else(|| rehomed(&src)) {
                     src = s;
                 }
@@ -1224,6 +1236,7 @@ pub(crate) unsafe fn reset_statics() {
     reset(&REHOMED, Mutex::new(Vec::new()));
     reset(&STARTED, AtomicBool::new(false));
     reset(&STOP, AtomicBool::new(false));
+    reset(&WORKER_PARKED, AtomicBool::new(false));
     reset(&CHECKED, AtomicU64::new(0));
     reset(&PANICS, AtomicU64::new(0));
     reset(&STALE, AtomicU64::new(0));

@@ -784,11 +784,26 @@ fn specv_a_patched_twin_s_verdict_arrives() {
         std::thread::sleep(std::time::Duration::from_millis(5));
     }
     // the epoch moves on and nothing tells the checker (a newer group's rollback moves it so): mid's
-    // verdict is of the epoch before. The watcher's settle asks for the check again
-    u.tcx.collect_epoch.fetch_add(1, Ordering::SeqCst);
-    crate::jit::specv_release();
+    // verdict is of the epoch before. The watcher's settle asks for the check again. (The move, the
+    // release and the first settle are one owner call made while the checker waits for work: no
+    // install publishes meanwhile, and no check runs to see the move. A check running then saw it
+    // and queued mid's wanted check again itself; the first settle found its verdict in, with no
+    // wait to name, the 17:00 full run of 11-19.)
     let t0 = std::time::Instant::now();
     let mut why = String::new();
+    while !crate::owner::call(crate::owner::Class::Program, || {
+        if !crate::borrowck::lazy::worker_parked() { return false; }
+        u.tcx.collect_epoch.fetch_add(1, Ordering::SeqCst);
+        crate::jit::specv_release();
+        crate::reload::settle_verdicts(up, &mut pending, &mut undos);
+        why = crate::reload::unverified_why();
+        true
+    }) {
+        assert!(t0.elapsed().as_secs() < 10, "the checker goes idle: {:?} runs, {} queued", crate::borrowck::lazy::running(), crate::borrowck::lazy::queued());
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert!(!pending.is_empty(), "the group waits for mid's check at the new epoch");
+    let t0 = std::time::Instant::now();
     while !pending.is_empty() && t0.elapsed().as_secs() < 10 {
         crate::reload::settle_verdicts(up, &mut pending, &mut undos);
         if !pending.is_empty() { why = crate::reload::unverified_why(); }
