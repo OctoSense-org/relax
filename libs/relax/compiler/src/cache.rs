@@ -974,6 +974,8 @@ pub struct Cache {
     file_ids: HashMap<u128, u32>,
     file_ids_n: usize,
     file_hash: HashMap<u32, u128>,
+    /// per session file: its ident as enc_file last wrote it, with what it hashed (enc_file)
+    file_idents: Vec<Option<FileIdent>>,
     /// data entry key -> address in this run
     data_addr: HashMap<u128, u64>,
     /// data object key -> its per-domain copy this run (link_symbol tag 10)
@@ -1458,6 +1460,7 @@ impl Cache {
             file_ids: HashMap::new(),
             file_ids_n: 0,
             file_hash: HashMap::new(),
+            file_idents: Vec::new(),
             data_addr: HashMap::new(),
             const_copy: HashMap::new(),
             data_key: HashMap::new(),
@@ -2203,7 +2206,7 @@ impl Cache {
     /// text, and a key naming them would mean other expressions in a run that booted from it
     /// (an app ran cached code on a warm run, calling `{closure#175197}`, which was no closure there:
     /// SIGILL). Code that names such a file's closures, sites or types is not cached.
-    fn enc_file(&self, u: &Unit, file: u32, e: &mut E) -> Option<()> {
+    fn enc_file(&mut self, u: &Unit, file: u32, e: &mut E) -> Option<()> {
         if u.prog.is_edit_version(file) {
             return None;
         }
@@ -2214,7 +2217,23 @@ impl Cache {
                 // enums) make their code differ. The owner is part of the identity.
                 let owner = u.prog.file_crate.get(file as usize).and_then(|&c| self.crate_ident.get(c as usize)).copied().unwrap_or(0);
                 let pf = &u.prog.files[file as usize];
-                e.u128(file_ident(p, pf.source_hash(p), owner, pf.numbering()));
+                let (source, numbering) = (pf.source_hash(p), pf.numbering());
+                // The ident hashes the anchored path with the three: a file's last one is used
+                // again while all four are what it hashed (every record names its files, and a
+                // cold launch's 87k records name the same files again and again).
+                let i = file as usize;
+                if let Some(Some(f)) = self.file_idents.get(i) {
+                    if f.source == source && f.owner == owner && f.numbering == numbering && f.path == *p {
+                        e.u128(f.id);
+                        return Some(());
+                    }
+                }
+                let id = file_ident(p, source, owner, numbering);
+                if self.file_idents.len() <= i {
+                    self.file_idents.resize_with(i + 1, || None);
+                }
+                self.file_idents[i] = Some(FileIdent { path: p.clone(), source, owner, numbering, id });
+                e.u128(id);
             }
             None => e.u128(0),
         }
@@ -3074,6 +3093,7 @@ impl Cache {
             map("def_keys", &self.def_keys, |_| 0),
             map("file_ids", &self.file_ids, |_| 0),
             map("file_hash", &self.file_hash, |_| 0),
+            (format!("cache file_idents ({})", self.file_idents.len()), (self.file_idents.iter().flatten().map(|f| f.path.capacity()).sum::<usize>() + self.file_idents.capacity() * std::mem::size_of::<Option<FileIdent>>()) as u64),
             map("data_addr", &self.data_addr, |_| 0),
             map("data_key", &self.data_key, |_| 0),
             set("linked", &self.linked), set("missed", &self.missed),
@@ -7162,6 +7182,15 @@ pub(crate) fn closure_identity_ok(u: &Unit, file: u32, expr: u32) -> bool {
     }
 }
 
+
+/// A file's ident and what it was hashed from (Cache::enc_file).
+struct FileIdent {
+    path: String,
+    source: u128,
+    owner: u128,
+    numbering: u128,
+    id: u128,
+}
 
 /// Reads the nounwind inputs and the dependency certificate; returns the nounwind section (for
 /// verification).
