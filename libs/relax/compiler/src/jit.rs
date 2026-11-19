@@ -32142,6 +32142,9 @@ struct RealTime {
     sig_slots: crate::fxhash::HashMap<u64, Vec<u32>>,
     sig_indexed: crate::fxhash::HashSet<u32>,
     sym_cursor: usize,
+    /// The index's catch-up (realtime_sig_open): the slots installed code had taken when the index
+    /// started, still to index (Next::Taken, a budget at a time).
+    taken_backlog: Vec<u32>,
     /// The thunk symbols that scan has met (Syms::thunk_count says when there are new ones).
     thunks_scanned: usize,
     /// The gate (called AND (named OR crossing)): a called word joins from a vtable reached code
@@ -32387,8 +32390,8 @@ static RT_PUB: [[AtomicU64; 2]; 3] = [const { [AtomicU64::new(0), AtomicU64::new
 static RT_PUB_MAX: AtomicU64 = AtomicU64::new(0);
 /// The longest single item of a reach step by kind (wall ns, RT_KIND_NAMES): the earlier runs'
 /// set load, then each kind of step item.
-static RT_KIND_MAX: [AtomicU64; 10] = [const { AtomicU64::new(0) }; 10];
-const RT_KIND_NAMES: [&str; 10] = ["load", "link", "given", "walk", "notes", "vtables", "static", "named", "cross", "symbols"];
+static RT_KIND_MAX: [AtomicU64; 11] = [const { AtomicU64::new(0) }; 11];
+const RT_KIND_NAMES: [&str; 11] = ["load", "link", "given", "walk", "notes", "vtables", "static", "named", "cross", "symbols", "taken"];
 /// Times one item of a reach step into RT_KIND_MAX (on drop: an item that `continue`s counts).
 struct RtItem(usize, u64);
 impl Drop for RtItem {
@@ -32534,7 +32537,7 @@ fn realtime_pending() -> u64 {
         // (the thunk scan runs once a signature is both called and crossing: RT_SIGS)
         let symbols = RT_SIGS.load(Ordering::Acquire) && unsafe { cur_unit().as_ref() }.is_some_and(|u| rt.thunks_scanned < u.syms.thunk_count());
         (rt.todo.len() + rt.link.len() + rt.out.len() + rt.new_notes.len() + rt.new_statics.len() + rt.new_named.len() + rt.x_todo.len() + rt.x_vts.len() + rt.held.len() + rt.failed.len()) as u64
-            + rt.scheduled as u64 + symbols as u64
+            + rt.scheduled as u64 + symbols as u64 + !rt.taken_backlog.is_empty() as u64
     })
 }
 
@@ -32729,6 +32732,7 @@ unsafe fn realtime_step_for(up: *mut Unit, budget: u64) {
             Static(u32),
             Named(Vec<(u64, String)>),
             Cross,
+            Taken,
             Symbols(usize),
             Done,
         }
@@ -32750,6 +32754,7 @@ unsafe fn realtime_step_for(up: *mut Unit, budget: u64) {
             if let Some(d) = rt.new_statics.pop() { return Next::Static(d); }
             if !rt.new_named.is_empty() { return Next::Named(std::mem::take(&mut rt.new_named)); }
             if !rt.x_todo.is_empty() || !rt.x_vts.is_empty() { return Next::Cross; }
+            if !rt.taken_backlog.is_empty() { return Next::Taken; }
             if RT_SIGS.load(Ordering::Acquire) && rt.thunks_scanned < syms.thunk_count() { return Next::Symbols(rt.sym_cursor); }
             Next::Done
         });
@@ -32763,6 +32768,7 @@ unsafe fn realtime_step_for(up: *mut Unit, budget: u64) {
             Next::Named(_) => 7,
             Next::Cross => 8,
             Next::Symbols(_) | Next::Done => 9,
+            Next::Taken => 10,
         }, wall_ns());
         match next {
             Next::Link(id) => {
@@ -32835,6 +32841,13 @@ unsafe fn realtime_step_for(up: *mut Unit, budget: u64) {
                 });
             }
             Next::Cross => { realtime_cross_step(&*up); }
+            Next::Taken => {
+                let u = &*up;
+                while let Some(id) = with_rt(|rt| rt.taken_backlog.pop()) {
+                    realtime_index_candidates(u, std::slice::from_ref(&id));
+                    if wall_ns() - t0 >= budget { break; }
+                }
+            }
             Next::Symbols(cursor) => {
                 let u = &*up;
                 let (mut end, mut thunks) = (cursor, 0);
@@ -33564,11 +33577,14 @@ fn realtime_sig_hits(u: &Unit, taken: &[u32]) -> usize {
 
 /// A signature both called and crossing: its slots taken so far join. The first such signature
 /// starts the index (installed code's taken addresses, then the thunk scan and each install's):
-/// most programs never have one, and their cold start never builds it.
+/// most programs never have one, and their cold start never builds it. The installed code's
+/// taken slots are indexed by the steps, a budget at a time (Next::Taken): a warm start's are
+/// tens of thousands, and indexing them in one go held the owner for a frame. Each joins as it is
+/// indexed (realtime_index_candidates queues a slot of an open signature).
 fn realtime_sig_open(u: &Unit, hash: u64) -> usize {
     if !RT_SIGS.swap(true, Ordering::AcqRel) {
         let taken = u.code.read().unwrap_or_else(|e| e.into_inner()).taken_slots();
-        realtime_index_candidates(u, &taken);
+        with_rt(|rt| rt.taken_backlog = taken);
     }
     with_rt(|rt| {
         let origin = rt.sig_origin.get(&hash).copied().unwrap_or(0);
@@ -34982,7 +34998,7 @@ pub(crate) unsafe fn reset_statics() {
     reset(&RT_REQUEUED, AtomicU64::new(0));
     reset(&RT_PUB, [const { [AtomicU64::new(0), AtomicU64::new(0)] }; 3]);
     reset(&RT_PUB_MAX, AtomicU64::new(0));
-    reset(&RT_KIND_MAX, [const { AtomicU64::new(0) }; 10]);
+    reset(&RT_KIND_MAX, [const { AtomicU64::new(0) }; 11]);
     reset(&RT_WAITERS, AtomicU32::new(0));
     reset(&RT_DUE, std::sync::Mutex::new(Vec::new()));
     reset(&CONSTS_WANTED, relax_session::sync::Mutex::new(Vec::new()));
