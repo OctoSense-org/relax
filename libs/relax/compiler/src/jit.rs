@@ -11193,6 +11193,17 @@ pub(crate) enum Compiled {
     Back(BackWork),
 }
 
+/// Slot `id` builds whole on the owner, never split off it (compile_slot_locked): a foreign fn, a
+/// sandbox wrapper's, a twin, a constant's evaluation.
+fn plain_path(u: &Unit, id: u32) -> bool {
+    match &u.fns[id as usize].key {
+        FnKey::Inst(d, _) => u.prog.def(*d).kind == DefKind::ForeignFn || crate::sandbox::is_wrapper_crate(u, u.prog.def(*d).krate),
+        // twins (and wrappers) take the plain path: their code is made from other slots' RIR
+        FnKey::Sandbox(_) | FnKey::Ctfe(_) => true,
+        _ => false,
+    }
+}
+
 /// Compiles slot `id` (unit call). `outer`: the outermost compile of a program thread's request
 /// (it may wait for an in-flight build, load deferred modules and split off its back end); a
 /// nested one (a constant's initializer running code) builds everything here.
@@ -11222,12 +11233,7 @@ unsafe fn compile_slot_locked(up: *mut Unit, id: u32, outer: bool) -> Compiled {
         // nested inside a compile (CTFE running code): build it here; the other build's
         // result is dropped when it finds the slot compiled
     }
-    let is_foreign = match &u.fns[id as usize].key {
-        FnKey::Inst(d, _) => u.prog.def(*d).kind == DefKind::ForeignFn || crate::sandbox::is_wrapper_crate(u, u.prog.def(*d).krate),
-        // twins (and wrappers) take the plain path: their code is made from other slots' RIR
-        FnKey::Sandbox(_) | FnKey::Ctfe(_) => true,
-        _ => false,
-    };
+    let is_foreign = plain_path(u, id);
     main_how(if outer && !is_foreign && pipelined() { 4 } else { 5 });
     if outer && !is_foreign && pipelined() {
         // the unit is needed only for type check + lower: optimisation and code generation
@@ -18970,7 +18976,7 @@ pub unsafe fn retire_unit(up: *mut Unit) {
         }
         // its queued ids and its slots in the build state, also when speculation is on another
         // unit: a unit allocated at its address later must not take them
-        queue::retain(|job| !matches!(job, queue::Job::Spec(unit, _) | queue::Job::O2(unit, _, _) if *unit == up as usize));
+        queue::retain(|job| !matches!(job, queue::Job::Spec(unit, _) | queue::Job::Reach(unit, _) | queue::Job::O2(unit, _, _) if *unit == up as usize));
         forget_unit_slots(up as usize);
         if UNIT == up {
             UNIT = std::ptr::null_mut();
@@ -28264,8 +28270,8 @@ thread_local! {
     static FRONT_SITE: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
 }
 /// (instrument) fronts run off the owner by job: [count, cpu ns] per PREFRONT_SITE_NAMES
-pub static PREFRONT_SITE: [[AtomicU64; 2]; 8] = [const { [AtomicU64::new(0), AtomicU64::new(0)] }; 8];
-pub const PREFRONT_SITE_NAMES: [&str; 8] = ["other", "O2", "O1v", "borrow", "O2 base", "counted", "spec", "O3"];
+pub static PREFRONT_SITE: [[AtomicU64; 2]; 9] = [const { [AtomicU64::new(0), AtomicU64::new(0)] }; 9];
+pub const PREFRONT_SITE_NAMES: [&str; 9] = ["other", "O2", "O1v", "borrow", "O2 base", "counted", "spec", "O3", "reach"];
 /// A background job's fronts (the checks and lowerings ahead its build makes off the owner for its
 /// own takes), from before the first to the job's end: the job they count under (instrument,
 /// PREFRONT_SITE_NAMES), and held (FRONTS_HELD): queue::cleanup_ahead sweeps none while one is.
@@ -32162,6 +32168,11 @@ struct RealTime {
     /// each when its build is installed or dropped (RtBuild), and reads that code's references
     building: crate::fxhash::HashMap<u32, u32>,
     held: Vec<u32>,
+    /// Reached slots whose build runs off the owner (queue::reach, reach_build), with the way and
+    /// origin each was taken by: the reach is not done while one is out. Those of them given back
+    /// to the owner, whose steps compile them.
+    out: crate::fxhash::HashMap<u32, (RtWay, u32)>,
+    given: Vec<u32>,
     /// a step is posted to the owner
     scheduled: bool,
     /// the newest ticket whose roots are in the reach, and the wakes of tickets not done yet
@@ -32344,6 +32355,30 @@ thread_local! {
     /// their references next)
     static RT_KEEP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
+
+/// RT_KEEP for a scope (the reach's builds off the owner set it in their take and install, which
+/// run on the owner).
+struct RtKeepOn(bool);
+impl RtKeepOn {
+    fn on() -> Self {
+        RtKeepOn(RT_KEEP.with(|k| k.replace(true)))
+    }
+}
+impl Drop for RtKeepOn {
+    fn drop(&mut self) {
+        let _ = RT_KEEP.try_with(|k| k.set(self.0));
+    }
+}
+
+/// The reach's builds (reach_build): queued off the owner, built and installed there, given back
+/// to the owner, and compiled by the owner in its steps (a link of a slot it took, a slot whose
+/// build is the owner's own, a given-back one, a whole reach run on the owner).
+static RT_OFF: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+/// the longest owner step of the reach so far (wall ns)
+static RT_STEP_MAX: AtomicU64 = AtomicU64::new(0);
+/// threads waiting in realtime_before_install for a ticket: a reach build queued wakes them, and
+/// they run it (every worker may be waiting so)
+static RT_WAITERS: AtomicU32 = AtomicU32::new(0);
 
 /// Holes in the real-time set: real-time code replaced by code whose references the walk had not
 /// compiled (realtime_installed: an install site without its walk ahead), and what the audit
@@ -32547,7 +32582,7 @@ pub(crate) fn realtime_reached(id: u32) -> bool {
 pub(crate) unsafe fn realtime_reach_queued(up: *mut Unit, roots: Vec<u32>, why: &'static str) {
     RT_ANY.store(true, Ordering::Release);
     let post = with_rt(|rt| {
-        if !rt.scheduled && rt.held.is_empty() {
+        if !rt.scheduled && rt.held.is_empty() && rt.out.is_empty() {
             rt.n0 = rt.set.len();
             rt.notes0 = rt.notes.len();
             rt.compiled = 0;
@@ -32607,6 +32642,14 @@ unsafe fn realtime_step_for(up: *mut Unit, budget: u64) {
             rt.new_notes.extend(notes);
         });
     }
+    // the whole reach now (a build the owner installs waits for it): what is out is built here
+    let sync = budget == u64::MAX;
+    if sync {
+        with_rt(|rt| {
+            let out: Vec<u32> = rt.out.keys().copied().collect();
+            rt.given.extend(out);
+        });
+    }
     let mut compiled = 0u64;
     let done = loop {
         if wall_ns() - t0 >= budget {
@@ -32614,6 +32657,7 @@ unsafe fn realtime_step_for(up: *mut Unit, budget: u64) {
         }
         enum Next {
             Link(u32),
+            Given(u32),
             Walk(u32),
             Notes(Vec<u32>),
             Vtables,
@@ -32626,6 +32670,9 @@ unsafe fn realtime_step_for(up: *mut Unit, budget: u64) {
         let next = with_rt(|rt| {
             if let Some(id) = rt.link.pop() {
                 return Next::Link(id);
+            }
+            if let Some(id) = rt.given.pop() {
+                return Next::Given(id);
             }
             if let Some(id) = rt.todo.pop() {
                 return Next::Walk(id);
@@ -32656,21 +32703,25 @@ unsafe fn realtime_step_for(up: *mut Unit, budget: u64) {
                     continue;
                 }
                 let Some((way, origin)) = realtime_take(id) else { continue };
-                let was = (&*up).fns[id as usize].compiled;
-                let (slots, statics, notes, named) = realtime_refs(up, id);
-                let partner = realtime_partner(&*up, id);
-                let now = (&*up).fns[id as usize].compiled;
-                if !was && now {
-                    compiled += 1;
+                // its build goes off the owner; its walk is that build's install
+                if !sync && realtime_send(up, id) {
+                    with_rt(|rt| rt.out.insert(id, (way, origin)));
+                    continue;
                 }
-                with_rt(|rt| {
-                    if now { rt.failed.remove(&id); } else { rt.failed.insert(id); }
-                    for slot in slots { rt.queue(slot, RtWay::Direct, origin); }
-                    if let Some(id) = partner { rt.queue(id, way, origin); }
-                    rt.new_notes.extend(notes.into_iter().filter(|id| !rt.notes.contains(id)));
-                    rt.new_statics.extend(statics.into_iter().filter(|d| !rt.statics.contains(d)));
-                    rt.new_named.extend(named.into_iter().filter(|v| !rt.named.contains(&v.0)));
-                });
+                let was = (&*up).fns[id as usize].compiled;
+                if realtime_walked(up, id, way, origin) && !was {
+                    compiled += 1;
+                    RT_OFF[3].fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            Next::Given(id) => {
+                // (a build off the owner gave it back, or this reach runs whole here)
+                let Some((way, origin)) = with_rt(|rt| rt.out.remove(&id)) else { continue };
+                let was = (&*up).fns[id as usize].compiled;
+                if realtime_walked(up, id, way, origin) && !was {
+                    compiled += 1;
+                    RT_OFF[3].fetch_add(1, Ordering::Relaxed);
+                }
             }
             Next::Notes(notes) => {
                 let mut notes = notes.into_iter();
@@ -32728,6 +32779,9 @@ unsafe fn realtime_step_for(up: *mut Unit, budget: u64) {
         }
     };
     let dt = wall_ns() - t0;
+    if !sync {
+        RT_STEP_MAX.fetch_max(dt, Ordering::Relaxed);
+    }
     RT_AHEAD[0].fetch_add(compiled, Ordering::Relaxed);
     RT_AHEAD[1].fetch_add(dt, Ordering::Relaxed);
     let (n0, notes0, total_compiled, ns, why) = with_rt(|rt| {
@@ -32735,10 +32789,11 @@ unsafe fn realtime_step_for(up: *mut Unit, budget: u64) {
         rt.ns += dt;
         (rt.n0, rt.notes0, rt.compiled, rt.ns, rt.why)
     });
-    // all that is left is held: slots whose tier-up build is about to be installed. The reach
-    // goes on when the last of them is (RtBuild's drop posts the step); not done until then.
+    // all that is left is held (slots whose tier-up build is about to be installed) or out (slots
+    // built off the owner). The reach goes on when the last of them is (RtBuild's drop, the reach
+    // build's install or give-back posts the step); not done until then.
     if done && with_rt(|rt| {
-        let wait = !rt.held.is_empty();
+        let wait = !rt.held.is_empty() || !rt.out.is_empty();
         if wait {
             rt.scheduled = false;
         }
@@ -32818,7 +32873,7 @@ unsafe fn realtime_step_for(up: *mut Unit, budget: u64) {
     }
     let (_, waits) = rt_main_wait_take();
     if crate::run::VERBOSE.load(Ordering::Relaxed) || rt_trace() {
-        eprintln!("relax rt: {}: real-time code reaches {} slots ({} new), {} compiled now, {:.1} ms on the owner ({:.1} ms in all); tail {}; {}", why, set_len, new, total_compiled, ns as f64 / 1e6, RT_AHEAD[1].load(Ordering::Relaxed) as f64 / 1e6, tail, waits);
+        eprintln!("relax rt: {}: real-time code reaches {} slots ({} new), {} compiled now, {:.1} ms on the owner ({:.1} ms in all); tail {}; {}; {}", why, set_len, new, total_compiled, ns as f64 / 1e6, RT_AHEAD[1].load(Ordering::Relaxed) as f64 / 1e6, tail, waits, rt_off_summary());
     }
     realtime_done();
 }
@@ -33606,6 +33661,184 @@ fn realtime_take(id: u32) -> Option<(RtWay, u32)> {
     })
 }
 
+/// The walk of reached slot `id` (taken by `way` from `origin`): compiled first unless it has
+/// code (realtime_refs: on the owner, as the walk's own build), its references then join the
+/// reach. True: it has code. In a publish only for a slot with code (nothing compiles there).
+unsafe fn realtime_walked(up: *mut Unit, id: u32, way: RtWay, origin: u32) -> bool {
+    let (slots, statics, notes, named) = realtime_refs(up, id);
+    let partner = realtime_partner(&*up, id);
+    let now = (&*up).fns[id as usize].compiled;
+    with_rt(|rt| {
+        if now { rt.failed.remove(&id); } else { rt.failed.insert(id); }
+        for slot in slots { rt.queue(slot, RtWay::Direct, origin); }
+        if let Some(id) = partner { rt.queue(id, way, origin); }
+        rt.new_notes.extend(notes.into_iter().filter(|id| !rt.notes.contains(id)));
+        rt.new_statics.extend(statics.into_iter().filter(|d| !rt.statics.contains(d)));
+        rt.new_named.extend(named.into_iter().filter(|v| !rt.named.contains(&v.0)));
+    });
+    now
+}
+
+/// (owner step) Reached slot `id`'s build goes off the owner (queue::reach, reach_build) unless a
+/// link installs its code now (the disk cache, a speculative build's code: the owner's
+/// microseconds) or its build is the owner's own as the walk made it before: a slot on the plain
+/// path, an always-O3 one, one in flight or building here, one whose build failed. True: queued.
+unsafe fn realtime_send(up: *mut Unit, id: u32) -> bool {
+    let u = &*up;
+    let f = &u.fns[id as usize];
+    if f.compiled || f.inflight || f.building || f.build_err.is_some() || !pipelined() || relax_level(u, id) == 4 || plain_path(u, id) || !queue::takes_jobs() {
+        return false;
+    }
+    let linked = {
+        let _keep = RtKeepOn::on();
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| ready_code_locked(up, id).is_some())).unwrap_or(true)
+    };
+    if linked {
+        return false;
+    }
+    SPEC_UNIT.store(up, Ordering::Release);
+    RT_OFF[0].fetch_add(1, Ordering::Relaxed);
+    queue::reach(up as usize, id);
+    if RT_WAITERS.load(Ordering::SeqCst) != 0 {
+        drop(RT_DONE_WAKE.0.lock().unwrap_or_else(|e| e.into_inner()));
+        RT_DONE_WAKE.1.notify_all();
+    }
+    true
+}
+
+/// (any thread) Reached slot `id`, out for a build off the owner, goes back to the owner's steps.
+unsafe fn realtime_give_back(up: *mut Unit, id: u32) {
+    let post = with_rt(|rt| {
+        if !rt.out.contains_key(&id) {
+            return false;
+        }
+        rt.given.push(id);
+        RT_OFF[2].fetch_add(1, Ordering::Relaxed);
+        !std::mem::replace(&mut rt.scheduled, true)
+    });
+    if post {
+        let upn = up as usize;
+        owner::post_queued(owner::Class::Program, move || unsafe { realtime_step(upn as *mut Unit) });
+    }
+}
+
+/// (publish) Reached slot `id`, out for a build off the owner, has code: the walk reads its
+/// references. True: post a step (none is): the reach goes on, or completes.
+unsafe fn realtime_walk_out(up: *mut Unit, id: u32) -> bool {
+    let Some((way, origin)) = with_rt(|rt| rt.out.remove(&id)) else { return false };
+    realtime_walked(up, id, way, origin);
+    with_rt(|rt| !std::mem::replace(&mut rt.scheduled, true))
+}
+
+/// The real-time reach's build of reached slot `id` (Job::Reach) on this thread, off the owner, as
+/// a speculative build runs (spec_build): its type check and lowering here (prefront_slot), the
+/// take of that RIR a publish, the back end here, and the install a publish that walks the new
+/// code's references (realtime_walk_out), all as the walk's own build (RT_KEEP: never baseline
+/// code, its RIR kept, the install the walk's). A slot that needs what only the owner does goes
+/// back to the owner, whose steps compile it as the walk did before: a front the take bails for,
+/// a build in flight elsewhere or failed, a live patch landing meanwhile, a stop.
+/// True: its walk is done (or nothing waits for it); false: give it back.
+unsafe fn reach_build(up: *mut Unit, id: u32) -> bool {
+    let _site = FrontSite::enter(8);
+    let free = |up: *mut Unit| {
+        let f = &(&*up).fns[id as usize];
+        !SPEC_STOP.load(Ordering::SeqCst) && !(f.inflight || f.building || f.build_err.is_some())
+    };
+    enum Take { Walked(bool), Owner, Build, Begin(Begin) }
+    // (publish) installed meanwhile (a link, a lazy compile): only the walk is left
+    let first = owner::publish(|| {
+        if !with_rt(|rt| rt.out.contains_key(&id)) {
+            return Take::Walked(false);
+        }
+        if (&*up).fns[id as usize].compiled {
+            return Take::Walked(realtime_walk_out(up, id));
+        }
+        if free(up) { Take::Build } else { Take::Owner }
+    });
+    let post = match first {
+        Take::Walked(post) => post,
+        Take::Build => {
+            let front = (&*up).front.clone();
+            prefront_slot(&front, id);
+            let b = take_prefronted(&front, None, || {
+                let _keep = RtKeepOn::on();
+                if !with_rt(|rt| rt.out.contains_key(&id)) {
+                    return Take::Walked(false);
+                }
+                if (&*up).fns[id as usize].spec.is_some() {
+                    // built ahead meanwhile by a speculative worker: installed as a call would
+                    let _ = ready_code_locked(up, id);
+                }
+                if (&*up).fns[id as usize].compiled {
+                    return Take::Walked(realtime_walk_out(up, id));
+                }
+                if !free(up) {
+                    return Take::Owner;
+                }
+                COMPILE_LAST.store(wall_ns(), Ordering::Relaxed);
+                Take::Begin(split_begin(up, id, false))
+            });
+            drop(front);
+            match b {
+                Some(Take::Walked(post)) => post,
+                Some(Take::Begin(Begin::Back(w))) => {
+                    let d = w.run();
+                    let r = owner::publish(|| {
+                        let _keep = RtKeepOn::on();
+                        match split_finish(up, d) {
+                            Split::Installed(_) if (&*up).fns[id as usize].compiled => Some(realtime_walk_out(up, id)),
+                            // a live patch landed meanwhile: the owner builds it from the new source
+                            _ => None,
+                        }
+                    });
+                    COMPILE_LAST.store(wall_ns(), Ordering::Relaxed);
+                    let Some(post) = r else { return false };
+                    RT_OFF[1].fetch_add(1, Ordering::Relaxed);
+                    post
+                }
+                // a front the take bails for, a failed front, a slot taken meanwhile: the owner's
+                _ => return false,
+            }
+        }
+        Take::Owner | Take::Begin(_) => return false,
+    };
+    if post {
+        let upn = up as usize;
+        owner::post_queued(owner::Class::Program, move || unsafe { realtime_step(upn as *mut Unit) });
+    }
+    true
+}
+
+/// Runs a queued reach build (Job::Reach) of unit `unit`'s slot `id`: a worker's job, or a thread
+/// waiting for the reach that takes it (realtime_before_install). What it cannot build goes back
+/// to the owner.
+fn run_reach(unit: usize, id: u32) {
+    let _job = compile_job();
+    let up = SPEC_UNIT.load(Ordering::Acquire);
+    // the unit the reach was for was retired (retire_unit): its reach went with it
+    if up.is_null() || up as usize != unit {
+        return;
+    }
+    let _census_context = unsafe { (&*up).exec_context(false) };
+    let _cost = relax_codegen::fncost::Record::new(id, 0, "reach");
+    let _startup = StartupCompile::new();
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { reach_build(up, id) }));
+    if !matches!(r, Ok(true)) {
+        if let Err(p) = &r {
+            if rt_trace() {
+                eprintln!("relax rt: a panic escaped the reach build of slot {}: {}; the owner builds it", id, payload_text(&**p));
+            }
+        }
+        unsafe { realtime_give_back(up, id) };
+    }
+}
+
+/// The reach's builds so far (RT_OFF) and its longest owner step, for the trace.
+fn rt_off_summary() -> String {
+    let [sent, built, given, owner] = std::array::from_fn::<u64, 4, _>(|i| RT_OFF[i].load(Ordering::Relaxed));
+    format!("builds off the owner {} of {} sent ({} given back), {} compiled on the owner; longest owner step {:.1} ms", built, sent, given, owner, RT_STEP_MAX.load(Ordering::Relaxed) as f64 / 1e6)
+}
+
 /// Compiles everything `roots` reach, now (owner): a real-time thread met a lazy stub (`why`).
 pub(crate) unsafe fn realtime_reach(up: *mut Unit, roots: Vec<u32>, why: &'static str) {
     realtime_reach_queued(up, roots, why);
@@ -33788,13 +34021,24 @@ pub(crate) unsafe fn realtime_before_install(up: *mut Unit, id: u32, relocs: &[r
         realtime_step_for(up, u64::MAX);
         return RtBuild::NONE;
     }
-    let _budget = crate::pool::suspend();
-    let _idle = JobIdle::enter();
-    let mut g = RT_DONE_WAKE.0.lock().unwrap_or_else(|e| e.into_inner());
     // (a stop ends the wait: the process is ending, or the tiers stopped for a cache write)
-    while RT_DONE.load(Ordering::Acquire) < ticket && !TIER_STOP.load(Ordering::SeqCst) && !SPEC_STOP.load(Ordering::SeqCst) {
-        g = RT_DONE_WAKE.1.wait_timeout(g, TIER1_POLL).unwrap_or_else(|e| e.into_inner()).0;
+    let waiting = || RT_DONE.load(Ordering::Acquire) < ticket && !TIER_STOP.load(Ordering::SeqCst) && !SPEC_STOP.load(Ordering::SeqCst);
+    RT_WAITERS.fetch_add(1, Ordering::SeqCst);
+    while waiting() {
+        // the reach's builds run on the threads waiting for it too: every worker may wait here
+        if let Some((unit, rid)) = queue::take_reach() {
+            run_reach(unit, rid);
+            continue;
+        }
+        let _budget = crate::pool::suspend();
+        let _idle = JobIdle::enter();
+        let g = RT_DONE_WAKE.0.lock().unwrap_or_else(|e| e.into_inner());
+        // (a reach build queued after the take above notifies under this lock)
+        if waiting() && !queue::reach_queued() {
+            drop(RT_DONE_WAKE.1.wait_timeout(g, TIER1_POLL));
+        }
     }
+    RT_WAITERS.fetch_sub(1, Ordering::SeqCst);
     let cut = RT_DONE.load(Ordering::Acquire) < ticket;
     if cut && rt_trace() {
         eprintln!("relax rt: the tiers stopped before the new references of `{}` were walked: its build is dropped", short_name(&(&*up).fns[id as usize].name));
@@ -34326,6 +34570,7 @@ fn run_job(job: queue::Job) {
         queue::Job::O2(unit, id, kind) => { let _mem = crate::memstat::tag(crate::memstat::Tag::Opt); run_o2(unit, id, kind); }
         queue::Job::O3(entry) => { let _mem = crate::memstat::tag(crate::memstat::Tag::Tier1); run_o3(entry); }
         queue::Job::Spec(unit, id) => { let _mem = crate::memstat::tag(crate::memstat::Tag::Codegen); run_spec(unit, id); },
+        queue::Job::Reach(unit, id) => { let _mem = crate::memstat::tag(crate::memstat::Tag::Codegen); set_worker(true); run_reach(unit, id); },
         queue::Job::Tick => run_tick(),
         queue::Job::Check(batch) => { let _mem = crate::memstat::tag(crate::memstat::Tag::Typeck); crate::check::run_check_slice(batch); }
     }
@@ -34577,7 +34822,7 @@ pub(crate) unsafe fn reset_statics() {
     reset(&BG_PAUSER, AtomicU64::new(0));
     reset(&PAUSE_HOLDER, AtomicU64::new(0));
     reset(&BG_ACTIVE, std::sync::atomic::AtomicU32::new(0));
-    reset(&PREFRONT_SITE, [const { [AtomicU64::new(0), AtomicU64::new(0)] }; 8]);
+    reset(&PREFRONT_SITE, [const { [AtomicU64::new(0), AtomicU64::new(0)] }; 9]);
     reset(&PREFRONTS, [const { AtomicU64::new(0) }; 5]);
     reset(&PREFRONTED, std::sync::Mutex::new(None));
     reset(&LAST_FRONT, relax_session::sync::Mutex::new(None));
@@ -34608,6 +34853,9 @@ pub(crate) unsafe fn reset_statics() {
     reset(&RT_DONE, AtomicU64::new(0));
     reset(&RT_ARMED, std::sync::atomic::AtomicU32::new(0));
     reset(&RT_HOLES, AtomicU64::new(0));
+    reset(&RT_OFF, [const { AtomicU64::new(0) }; 4]);
+    reset(&RT_STEP_MAX, AtomicU64::new(0));
+    reset(&RT_WAITERS, AtomicU32::new(0));
     reset(&RT_DUE, std::sync::Mutex::new(Vec::new()));
     reset(&CONSTS_WANTED, relax_session::sync::Mutex::new(Vec::new()));
     reset(&TICK_STATE, relax_session::sync::Mutex::new(([0; 8], 0)));
