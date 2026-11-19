@@ -2829,8 +2829,13 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
     // test. Its check ran beside the boot until here (check.rs start_test_deps); the tests wait for
     // its verdict. (They ran beside it: one met a compile error in its call and the others passed on
     // code that does not build, 11-08.)
-    // (a run that is no test started no such check: 0)
-    if crate::check::finish_test_deps(0) != 0 {
+    // (a run that is no test started no such check: 0) (Its wait is no quiet of the program's
+    // start: jit::MainHeld.)
+    let deps = {
+        let _held = jit::MainHeld::new();
+        crate::check::finish_test_deps(0)
+    };
+    if deps != 0 {
         eprintln!("error: no test ran: a path dependency does not compile (`{tool} test` fails as `cargo test` does on code rustc rejects)", tool = crate::tool_name());
         return 101;
     }

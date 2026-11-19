@@ -25052,12 +25052,35 @@ pub(crate) fn demand_compile_age() -> (bool, u64) {
 }
 
 /// What is left (ns) of the quiet that counts from `from` (a `wall_ns`): 0 once no demand compile
-/// has run for STARTUP_QUIET_NS.
+/// has run for STARTUP_QUIET_NS, nor main waited for the JIT's own work before its program (MainHeld).
 pub(crate) fn quiet_left(from: u64) -> u64 {
-    if DEMAND_COMPILES.load(Ordering::SeqCst) != 0 {
+    let held = MAIN_HELD.load(Ordering::SeqCst);
+    if DEMAND_COMPILES.load(Ordering::SeqCst) != 0 || held == u64::MAX {
         return STARTUP_QUIET_NS;
     }
-    STARTUP_QUIET_NS.saturating_sub(wall_ns().saturating_sub(DEMAND_LAST.load(Ordering::SeqCst).max(from)))
+    STARTUP_QUIET_NS.saturating_sub(wall_ns().saturating_sub(DEMAND_LAST.load(Ordering::SeqCst).max(from).max(held)))
+}
+
+/// Main's wait for the JIT's own work before its program runs (a test's dependency check,
+/// run.rs): u64::MAX while it lasts, then when it ended (wall_ns); 0 before.
+static MAIN_HELD: AtomicU64 = AtomicU64::new(0);
+
+/// Main waits for the JIT's own work before its program runs: no quiet start counts meanwhile,
+/// and the quiet counts from the wait's end. A live test session went quiet 2 s into its cold
+/// 20 s dependency check, before its test ran: its startup manifest was recorded empty, and the
+/// session, ended by a signal as sessions are, never wrote another, so the next session started
+/// with no manifest to prelink (11-19).
+pub(crate) struct MainHeld;
+impl MainHeld {
+    pub(crate) fn new() -> Self {
+        MAIN_HELD.store(u64::MAX, Ordering::SeqCst);
+        MainHeld
+    }
+}
+impl Drop for MainHeld {
+    fn drop(&mut self) {
+        MAIN_HELD.store(wall_ns(), Ordering::SeqCst);
+    }
 }
 
 /// A live test session's first pass is done (harness_live::complete), its present: the boot's
@@ -35438,6 +35461,7 @@ pub(crate) unsafe fn reset_statics() {
     reset(&WATCHDOG_START, std::sync::Once::new());
     reset(&QUIT_SEEN, AtomicBool::new(false));
     reset(&ORDER_UNTIL_NS, AtomicU64::new(0));
+    reset(&MAIN_HELD, AtomicU64::new(0));
     reset(&ORDER_PRESENT_LEN, std::sync::atomic::AtomicUsize::new(0));
     for p in &PRELINKED_ORDER {
         p.store(0, Ordering::Relaxed);
