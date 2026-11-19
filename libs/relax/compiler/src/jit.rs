@@ -11299,20 +11299,31 @@ unsafe fn compile_slot_locked(up: *mut Unit, id: u32, outer: bool) -> Compiled {
 }
 
 impl Unit {
-    /// Encodes every deferred cache record (owner thread).
-    pub(crate) fn flush_cache_records(&mut self) {
-        self.record_cache_batch(usize::MAX);
+    /// Queues a record for the record batches (records_due), in install order.
+    pub(crate) fn defer_cache_record(&mut self, p: crate::cache::PendingRecord) {
+        self.pending_cache_records.push(Some(p));
+        PENDING_RECORDS.fetch_add(1, Ordering::Relaxed);
+        crate::cache::warm_count::add(crate::cache::warm_count::RECORDS_WAITING, 1);
     }
 
-    /// Encodes up to `count` deferred cache records, in install order (owner thread). True: more are left.
-    fn record_cache_batch(&mut self, count: usize) -> bool {
+    /// Encodes every deferred cache record (owner thread).
+    pub(crate) fn flush_cache_records(&mut self) {
+        self.record_cache_batch(u64::MAX);
+    }
+
+    /// Encodes deferred cache records in install order (owner thread): at least one, then until
+    /// `budget` ns have passed or a program thread asks the owner. True: more are left.
+    fn record_cache_batch(&mut self, budget: u64) -> bool {
         if self.pending_cache_records.is_empty() { return false; }
         let Some(mut cache) = self.cache.take() else { return false };
-        let end = self.pending_cache_cursor.saturating_add(count).min(self.pending_cache_records.len());
-        while self.pending_cache_cursor < end {
+        let t0 = wall_ns();
+        while self.pending_cache_cursor < self.pending_cache_records.len() {
             let record = self.pending_cache_records[self.pending_cache_cursor].take().unwrap();
             self.pending_cache_cursor += 1;
             cache.record_pending(self, &record);
+            if budget != u64::MAX && (wall_ns() - t0 >= budget || owner::main_waiting() || owner::program_waiting()) {
+                break;
+            }
         }
         self.cache = Some(cache);
         PENDING_RECORDS.store(self.pending_cache_records.len() - self.pending_cache_cursor, Ordering::Relaxed);
@@ -11336,10 +11347,10 @@ static PENDING_RECORDS: std::sync::atomic::AtomicUsize = std::sync::atomic::Atom
 /// a lazy compile's install ran just before that thread's next request and delayed it (a large app's
 /// cold start: the UI queued behind 736 of 1279 drains)
 pub(crate) fn records_due() -> bool {
-    FIRST_PRESENT.load(Ordering::Acquire) && PENDING_RECORDS.load(Ordering::Relaxed) >= RECORD_BATCH
+    FIRST_PRESENT.load(Ordering::Acquire) && PENDING_RECORDS.load(Ordering::Relaxed) >= RECORD_DUE
 }
 
-/// Encodes every deferred cache record in publishes of RECORD_BATCH, from a thread that is not
+/// Encodes every deferred cache record in publishes of RECORD_BATCH_NS, from a thread that is not
 /// the owner (the startup release, the run monitor, the cache writer, the settle): what a program
 /// thread waits for is one batch, never the whole backlog (OWNERARCH.DESIGN.md §6.1, step 4).
 pub(crate) fn drain_records_bounded() {
@@ -11356,7 +11367,7 @@ pub(crate) fn drain_records_bounded() {
                 wc::N[wc::DRAIN_WHY].store(why, Ordering::Relaxed);
                 if !up.is_null() { wc::N[wc::DRAIN_LEN].store(unsafe { (&*up).pending_cache_records.len() - (&*up).pending_cache_cursor } as u64, Ordering::Relaxed); }
             }
-            (!SPEC_STOP.load(Ordering::SeqCst) || DRAIN_ANYWAY.load(Ordering::SeqCst)) && !up.is_null() && unsafe { (&mut *up).record_cache_batch(RECORD_BATCH) }
+            (!SPEC_STOP.load(Ordering::SeqCst) || DRAIN_ANYWAY.load(Ordering::SeqCst)) && !up.is_null() && unsafe { (&mut *up).record_cache_batch(RECORD_BATCH_NS) }
         });
         if !more { break; }
         batches += 1;
@@ -11365,7 +11376,7 @@ pub(crate) fn drain_records_bounded() {
         use crate::cache::warm_count as wc;
         let (why, len) = (wc::N[wc::DRAIN_WHY].load(Ordering::Relaxed), wc::N[wc::DRAIN_LEN].load(Ordering::Relaxed));
         if batches > 0 || len > 0 {
-            eprintln!("relax cache: record drain: {batches} batches of {RECORD_BATCH}; stopped {why} (1 spec stop, 2 no unit, 3 cache out, 4 other unit, 5 ran), backlog {len}, waiting {} (t={:.0} ms)", PENDING_RECORDS.load(Ordering::Relaxed), crate::clock::ms_since_start());
+            eprintln!("relax cache: record drain: {batches} batches; stopped {why} (1 spec stop, 2 no unit, 3 cache out, 4 other unit, 5 ran), backlog {len}, waiting {} (t={:.0} ms)", PENDING_RECORDS.load(Ordering::Relaxed), crate::clock::ms_since_start());
         }
     }
 }
@@ -11408,29 +11419,22 @@ unsafe fn install_compiled(up: *mut Unit, id: u32, code: &[u8], map: Vec<(u32, u
             let u = &mut *up;
             if record {
                 let _ph = rt_ph(4);
-                if let Some(mut c) = u.cache.take() {
-                    // a program thread waits for this install (the main thread's before the first
-                    // present, every program thread's after it): its entry (slot keys, dependency
-                    // certificate) is encoded later, in background batches (drain_cache_records)
-                    // (and the real-time reach's installs: the audio thread's start waits for them, and
-                    // a large body's record encodes for tens of ms: 63 ms at a crossing, 11-19)
+                if let Some(c) = u.cache.take() {
+                    // its entry (slot keys, dependency certificate) is encoded later, in the record
+                    // batches (records_due): a publish that runs long holds whatever thread asks the
+                    // owner next, and a background install's publish did that as well as one a
+                    // program thread waits for (a large body's record encodes for tens of ms: 63
+                    // ms at a real-time crossing, 59-100 ms for one body at a cold launch, 11-19)
                     let foreground = RT_KEEP.with(|k| k.get()) || if FIRST_PRESENT.load(Ordering::Acquire) {
                         owner::serving().0 == owner::Class::Program || owner::serving().0 == owner::Class::Publish && !owner::serving_background()
                     } else {
                         startup_phase() && owner::for_main()
                     };
                     if foreground { crate::cache::trace_lookup(u, id, "fg-compile"); }
-                    let deferred = if foreground {
-                        c.defer_record(u, id, code, relocs, &map)
-                    } else {
-                        c.record(u, id, code, relocs, &map);
-                        None
-                    };
+                    let deferred = c.defer_record(u, id, code, relocs, &map);
                     u.cache = Some(c);
                     if let Some(p) = deferred {
-                        u.pending_cache_records.push(Some(p));
-                        PENDING_RECORDS.fetch_add(1, Ordering::Relaxed);
-                        crate::cache::warm_count::add(crate::cache::warm_count::RECORDS_WAITING, 1);
+                        u.defer_cache_record(p);
                     }
                 }
             }
@@ -13763,9 +13767,13 @@ unsafe fn o2_finish(up: *mut Unit, d: O2Done, cut: bool) {
     if o1 {
         wc::add(wc::O1V_BUILT, 1);
         // (O3 code installed meanwhile: its own entry; record_o1_verified never goes below it)
-        if let Some(mut cache) = u.cache.take() {
-            cache.record_o1_verified(u, id, &c.code, &c.relocs, &c.pc_map);
+        // (encoded in the record batches, as every install's record is)
+        if let Some(cache) = u.cache.take() {
+            let p = cache.defer_record_as(u, id, &c.code, &c.relocs, &c.pc_map, crate::cache::RecKind::O1Up);
             u.cache = Some(cache);
+            if let Some(p) = p {
+                u.defer_cache_record(p);
+            }
         }
         let standalone = O1V_STANDALONE.lock().unwrap_or_else(|e| e.into_inner()).as_ref().is_some_and(|s| s.contains(&(up as usize, id)));
         enqueue_uncompiled_callees(up, id, &c.relocs, standalone);
@@ -13778,8 +13786,11 @@ unsafe fn o2_finish(up: *mut Unit, d: O2Done, cut: bool) {
         crate::zone_alloc::kept_with(|| O2_LATER.lock().unwrap_or_else(|e| e.into_inner()).push((up as usize, id)));
     } else if let Some(mut cache) = u.cache.take() {
         cache.note_retier_over(u, id, crate::cache::warm_count::RETIER_O2_OVER);
-        cache.record_o2(u, id, &c.code, &c.relocs, &c.pc_map);
+        let p = cache.defer_record_as(u, id, &c.code, &c.relocs, &c.pc_map, crate::cache::RecKind::O2);
         u.cache = Some(cache);
+        if let Some(p) = p {
+            u.defer_cache_record(p);
+        }
         enqueue_uncompiled_callees(up, id, &c.relocs, false);
     }
     // an O3 build of the slot is running (queued with this one: tier1_thread's o2_hot): this install
@@ -24586,9 +24597,7 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
                         let p = c.defer_record_o3(u, id, &code, &relocs, &map, &inlined, &nounwind_used, o3_digest.clone()).map(|p| p.with_kept(kept_calls));
                         u.cache = Some(c);
                         if let Some(p) = p {
-                            u.pending_cache_records.push(Some(p));
-                            PENDING_RECORDS.fetch_add(1, Ordering::Relaxed);
-                        crate::cache::warm_count::add(crate::cache::warm_count::RECORDS_WAITING, 1);
+                            u.defer_cache_record(p);
                             // the slots this code inlined that have no standalone code: each gets a
                             // standalone O1 entry the first time (a warm launch's lower-tier callers
                             // call them before this O3 code is installed)
@@ -25168,10 +25177,15 @@ pub extern "C" fn relax_first_present() {
     })
 }
 
-/// Deferred cache records encoded per publish (rule I-PUB: bounded by an item count). A publish is
-/// not interrupted, so a program thread's next request waits for the batch that is running
-/// (~10 us per record on an app); the owner serves the program's requests between two batches.
-const RECORD_BATCH: usize = 8;
+/// Deferred cache records that make a drain due (records_due).
+const RECORD_DUE: usize = 8;
+
+/// A record batch's publish ends after this long, or as soon as a program thread asks the owner,
+/// always after one record. A publish is not interrupted, so a program thread's next request waits
+/// for the record that is encoding; the owner serves it between two batches. (A count of 8 records
+/// assumed ~10 us each: a cold launch's records average ~25 us and one body's took 59-100 ms,
+/// 11-19.)
+const RECORD_BATCH_NS: u64 = 2_000_000;
 
 /// Releases speculation, O1 inline candidates and O3 at the first present, never on wall
 /// time (a large app needs 40-58 s from main to present; a clock released speculation in the middle
@@ -28227,11 +28241,15 @@ unsafe fn split_finish(up: *mut Unit, d: BackDone) -> Split {
             COMPILED_FNS.fetch_add(1, Ordering::Relaxed);
             crate::boot_stats::fn_installed(boot_arm(u, id));
             if spec {
-                // a speculative build is valid code whether or not it gets called: cache it now
-                // (a marked slot's too: its O2 build replaces the entry, install_compiled)
-                if let Some(mut c) = u.cache.take() {
-                    c.record(u, id, &code, &relocs, &map);
+                // a speculative build is valid code whether or not it gets called: its record now,
+                // encoded in the record batches as every install's is (a marked slot's too: its
+                // O2 build replaces the entry, install_compiled)
+                if let Some(c) = u.cache.take() {
+                    let p = c.defer_record(u, id, &code, &relocs, &map);
                     u.cache = Some(c);
+                    if let Some(p) = p {
+                        u.defer_cache_record(p);
+                    }
                 }
                 let u = &mut *up;
                 if u.fns[id as usize].spec.is_none() {

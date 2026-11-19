@@ -739,6 +739,8 @@ pub(crate) struct PendingRecord {
     o3: Option<(Vec<u32>, Vec<(u32, bool)>)>,
     /// what the code was built from (gate.rs), taken at the install
     digest: Option<std::sync::Arc<crate::gate::CodeDigest>>,
+    /// the code's place among the slot's entries: a first record, O2 code, verified O1 code
+    kind: RecKind,
 }
 
 /// Is a deferred record still describing the sources its code was built from?
@@ -4102,7 +4104,13 @@ impl Cache {
     /// the tier and the dependency slots can change or be reclaimed before the encoding runs.
     /// None: `record` would store nothing.
     pub(crate) fn defer_record(&self, u: &Unit, id: u32, code: &[u8], relocs: &[RelocAt], pc_map: &[(u32, u64)]) -> Option<PendingRecord> {
-        if self.mode == Mode::ReadOnly || u.fns[id as usize].patch_gen != 0 || self.linked.contains(&id) {
+        self.defer_record_as(u, id, code, relocs, pc_map, RecKind::First)
+    }
+
+    /// `defer_record` for O2 code (`record_o2`'s) or verified O1 code (`record_o1_verified`'s):
+    /// they replace the slot's entry, so a slot whose code came from the cache gets them too.
+    pub(crate) fn defer_record_as(&self, u: &Unit, id: u32, code: &[u8], relocs: &[RelocAt], pc_map: &[(u32, u64)], kind: RecKind) -> Option<PendingRecord> {
+        if self.mode == Mode::ReadOnly || u.fns[id as usize].patch_gen != 0 || kind == RecKind::First && self.linked.contains(&id) {
             return None;
         }
         if u.fns[id as usize].unverified.load(std::sync::atomic::Ordering::Relaxed) { warm_count::add(warm_count::REC_UNVERIFIED, 1); }
@@ -4121,6 +4129,7 @@ impl Cache {
             epoch: crate::jit::patch_epoch(),
             o3: None,
             digest: rir.map(|r| crate::gate::of_func(r)),
+            kind,
         })
     }
 
@@ -4146,6 +4155,7 @@ impl Cache {
             epoch: crate::jit::patch_epoch(),
             o3: Some((inlined.to_vec(), nounwind.to_vec())),
             digest: Some(digest),
+            kind: RecKind::First,
         })
     }
 
@@ -4157,9 +4167,14 @@ impl Cache {
             if p.o3.is_some() { warm_count::add(warm_count::O3_STALE, 1); }
             return;
         }
+        // O2 and verified O1 code never go below the slot's O3 code (record_o2, record_o1_verified),
+        // installed since or linked from the cache
+        if p.kind != RecKind::First && u.fns[p.id as usize].o3.load(std::sync::atomic::Ordering::Relaxed) {
+            return;
+        }
         let previous = std::mem::replace(&mut self.recording_pending, true);
         let o3 = p.o3.as_ref().map(|(i, n)| (i.as_slice(), n.as_slice()));
-        self.record_entry(u, p.id, &p.code, &p.relocs, &p.pc_map, o3, RecKind::First, Some(p));
+        self.record_entry(u, p.id, &p.code, &p.relocs, &p.pc_map, o3, p.kind, Some(p));
         self.recording_pending = previous;
     }
 
@@ -5901,7 +5916,7 @@ impl Cache {
 /// What a code record is: a first record (O1 / baseline / O3: recorded once, O3 replaces), an O2
 /// build (replaces), a verified O1 rebuild (replaces only an entry below O1)
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum RecKind { First, O2, O1Up }
+pub(crate) enum RecKind { First, O2, O1Up }
 
 /// A stored tier's order (the tier bytes are not in tier order): baseline < O1 < O2 < O3, and
 /// within a level provisional code below complete code (2 * level, + 1 when complete).
