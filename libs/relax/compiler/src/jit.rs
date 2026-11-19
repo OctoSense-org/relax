@@ -11401,6 +11401,7 @@ unsafe fn install_compiled(up: *mut Unit, id: u32, code: &[u8], map: Vec<(u32, u
         {
             let u = &mut *up;
             if record {
+                let _ph = rt_ph(4);
                 if let Some(mut c) = u.cache.take() {
                     // a program thread waits for this install (the main thread's before the first
                     // present, every program thread's after it): its entry (slot keys, dependency
@@ -11466,7 +11467,11 @@ unsafe fn install_compiled(up: *mut Unit, id: u32, code: &[u8], map: Vec<(u32, u
                 CodeKind::new(t, origin::CACHE)
             };
             let _as = code_as(kind);
-            let a = match u.install_unchecked(id, code, relocs, map, 0) {
+            let a = {
+                let _ph = rt_ph(5);
+                u.install_unchecked(id, code, relocs, map, 0)
+            };
+            let a = match a {
                 Ok(a) => a,
                 Err(e) => return install_error(up, id, &format!("link: {}", e)),
             };
@@ -11505,6 +11510,7 @@ unsafe fn install_compiled(up: *mut Unit, id: u32, code: &[u8], map: Vec<(u32, u
             }
             note_entered(&*up, id);
             if !INSTALLING_MANIFEST.with(|f| f.get()) {
+                let _ph = rt_ph(6);
                 spec_enqueue(up, id, 0);
             }
             drop_completed_body(&mut *up, id);
@@ -27939,7 +27945,11 @@ unsafe fn split_begin(up: *mut Unit, id: u32, spec: bool) -> Begin {
     let w0 = wall_ns();
     let c0 = if spec { 0 } else { cpu_ns() };
     let k = if spec { 4 } else { 0 };
-    let front = match split_front(up, id) {
+    let front = {
+        let _ph = rt_ph(0);
+        split_front(up, id)
+    };
+    let front = match front {
         Ok(f) => f,
         Err(e) => return Begin::Done(Split::Failed(e)),
     };
@@ -27952,9 +27962,11 @@ unsafe fn split_begin(up: *mut Unit, id: u32, spec: bool) -> Begin {
         skip.extend(p.deferred.iter().map(|x| x.0));
         let depth = if spec { (&*up).fns[id as usize].spec_depth } else { 0 };
         if !pipelined() || !defer_startup_root(up, id, depth) {
+            let _ph = rt_ph(1);
             spec_enqueue_calls(up, id, &p.func, &skip, depth);
         }
     }
+    let _ph = rt_ph(2);
     // (its back end runs on the thread the front is served for)
     let holder = match owner::serving().1 {
         0 => owner::owner_tid(),
@@ -28118,6 +28130,7 @@ unsafe fn split_finish(up: *mut Unit, d: BackDone) -> Split {
     let _cost_install = relax_codegen::fncost::phase(6);
     let stale = PATCH_EPOCH.load(Ordering::SeqCst) != epoch;
     {
+        let _ph = rt_ph(3);
         // the deferred inline candidates' RIR; then the slots are no longer in flight
         let done = if stale { Vec::new() } else { done };
         for (c, r) in done {
@@ -28145,6 +28158,7 @@ unsafe fn split_finish(up: *mut Unit, d: BackDone) -> Split {
             let u = &mut *up;
             if let Some((f, inl, ns)) = opt {
                 if u.fns[id as usize].rir.is_none() {
+                    let _ph = rt_ph(3);
                     let f = std::sync::Arc::try_unwrap(f).unwrap_or_else(|a| (*a).clone());
                     store_rir(up, id, f, inl, ns, RIR_OWN);
                 }
@@ -32145,6 +32159,10 @@ struct RealTime {
     /// The index's catch-up (realtime_sig_open): the slots installed code had taken when the index
     /// started, still to index (Next::Taken, a budget at a time).
     taken_backlog: Vec<u32>,
+    /// (trace) when the running reach began (wall ns): its line says mark to done
+    began: u64,
+    /// (trace) why a build off the owner gave a slot back (RT_GIVE_NAMES), until its item
+    give_why: crate::fxhash::HashMap<u32, u8>,
     /// The thunk symbols that scan has met (Syms::thunk_count says when there are new ones).
     thunks_scanned: usize,
     /// The gate (called AND (named OR crossing)): a called word joins from a vtable reached code
@@ -32301,12 +32319,13 @@ static RT_PENDING: relax_session::sync::Mutex<Vec<u64>> = relax_session::sync::M
 pub static RT_AHEAD: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
 /// Reach completions that found nothing new (the trace counts them).
 static RT_QUIET: AtomicU64 = AtomicU64::new(0);
-/// Reach steps running on the owner now (a count: realtime_before_install runs a whole reach on
-/// the owner, inside a step or not).
+/// Reach steps and reach builds' publishes running on the owner now (a count:
+/// realtime_before_install runs a whole reach on the owner, inside a step or not).
 pub(crate) static RT_STEPS_ON: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-/// The main thread's queue delay for its requests asked while a reach step ran: [count, sum ns,
-/// max ns] since the last completion, and the run's max (the trace's line per reach).
-static RT_MAIN_WAIT: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+/// The main thread's queue delay for its requests asked while a reach step or a reach build's
+/// publish ran: [count, sum ns, max ns] since the last completion, and the run's max, count and
+/// sum (the trace's line per reach).
+static RT_MAIN_WAIT: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
 
 /// A main-thread request to the owner was asked while a reach step ran and queued `ns`.
 pub(crate) fn rt_main_waited(ns: u64) {
@@ -32314,6 +32333,8 @@ pub(crate) fn rt_main_waited(ns: u64) {
     RT_MAIN_WAIT[1].fetch_add(ns, Ordering::Relaxed);
     RT_MAIN_WAIT[2].fetch_max(ns, Ordering::Relaxed);
     RT_MAIN_WAIT[3].fetch_max(ns, Ordering::Relaxed);
+    RT_MAIN_WAIT[4].fetch_add(1, Ordering::Relaxed);
+    RT_MAIN_WAIT[5].fetch_add(ns, Ordering::Relaxed);
 }
 
 /// The main thread's waits behind the steps since the last completion, from 0 again: the max (ns)
@@ -32323,7 +32344,7 @@ fn rt_main_wait_take() -> (u64, String) {
     let sum = RT_MAIN_WAIT[1].swap(0, Ordering::Relaxed);
     let max = RT_MAIN_WAIT[2].swap(0, Ordering::Relaxed);
     let ms = |v: u64| v as f64 / 1e6;
-    (max, format!("main waited behind its steps {n}x, max {:.2} ms, sum {:.1} ms (run max {:.2} ms)", ms(max), ms(sum), ms(RT_MAIN_WAIT[3].load(Ordering::Relaxed))))
+    (max, format!("main waited behind its steps and publishes {n}x, max {:.2} ms, sum {:.1} ms (run max {:.2} ms, run {}x {:.1} ms)", ms(max), ms(sum), ms(RT_MAIN_WAIT[3].load(Ordering::Relaxed)), RT_MAIN_WAIT[4].load(Ordering::Relaxed), ms(RT_MAIN_WAIT[5].load(Ordering::Relaxed))))
 }
 
 /// Counts a reach step on the owner while it lives (RT_STEPS_ON).
@@ -32384,34 +32405,97 @@ static RT_STEP_MAX: AtomicU64 = AtomicU64::new(0);
 static RT_GIVE: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
 const RT_GIVE_NAMES: [&str; 5] = ["take bailed", "busy", "front failed", "patched", "panic"];
 static RT_REQUEUED: AtomicU64 = AtomicU64::new(0);
-/// The reach builds' publishes on the owner: [count, wall ns] of the first look, the take and
-/// the install, and the longest one (wall ns).
-static RT_PUB: [[AtomicU64; 2]; 3] = [const { [AtomicU64::new(0), AtomicU64::new(0)] }; 3];
+/// The reach builds' publishes on the owner: [count, wall ns, thread CPU ns] of the first look,
+/// the take and the install, and the longest one (wall ns).
+static RT_PUB: [[AtomicU64; 3]; 3] = [const { [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)] }; 3];
 static RT_PUB_MAX: AtomicU64 = AtomicU64::new(0);
+/// The takes by outcome (completed, bailed) and round (the first, a later one): [count, wall ns].
+static RT_TAKE: [[[AtomicU64; 2]; 2]; 2] = [const { [const { [AtomicU64::new(0), AtomicU64::new(0)] }; 2] }; 2];
+/// The publishes' phases (RT_PH_NAMES): wall ns in all.
+static RT_PH_SUM: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+const RT_PH_NAMES: [&str; 8] = ["prepare", "enqueue", "flight", "rir", "record", "install", "spec enqueue", "walk"];
+/// The longest publish: wall ns, CPU ns, kind, slot, round, bailed, its phases.
+#[derive(Clone, Copy)]
+struct RtPubTop { wall: u64, cpu: u64, kind: usize, id: u32, round: u32, bailed: bool, ph: [u64; 8] }
+static RT_PUB_TOP: std::sync::Mutex<RtPubTop> = std::sync::Mutex::new(RtPubTop { wall: 0, cpu: 0, kind: 0, id: u32::MAX, round: 0, bailed: false, ph: [0; 8] });
+thread_local! {
+    /// (trace) The running publish's phases on this thread (wall ns); None outside a reach publish.
+    static RT_PH: std::cell::Cell<Option<[u64; 8]>> = const { std::cell::Cell::new(None) };
+}
+/// Times a phase of a reach build's publish (RT_PH_NAMES `i`) into RT_PH.
+struct RtPh(usize, u64);
+impl Drop for RtPh {
+    fn drop(&mut self) {
+        let dt = wall_ns() - self.1;
+        let _ = RT_PH.try_with(|p| if let Some(mut a) = p.get() {
+            a[self.0] += dt;
+            p.set(Some(a));
+        });
+    }
+}
+/// Phase `i` of a reach build's publish, timed while the guard lives (nothing outside one).
+fn rt_ph(i: usize) -> Option<RtPh> {
+    RT_PH.try_with(|p| p.get().is_some()).unwrap_or(false).then(|| RtPh(i, wall_ns()))
+}
 /// The longest single item of a reach step by kind (wall ns, RT_KIND_NAMES): the earlier runs'
 /// set load, then each kind of step item.
 static RT_KIND_MAX: [AtomicU64; 11] = [const { AtomicU64::new(0) }; 11];
 const RT_KIND_NAMES: [&str; 11] = ["load", "link", "given", "walk", "notes", "vtables", "static", "named", "cross", "symbols", "taken"];
-/// Times one item of a reach step into RT_KIND_MAX (on drop: an item that `continue`s counts).
-struct RtItem(usize, u64);
-impl Drop for RtItem {
-    fn drop(&mut self) {
-        RT_KIND_MAX[self.0].fetch_max(wall_ns() - self.1, Ordering::Relaxed);
+/// Times one item of a reach step into RT_KIND_MAX (on drop: an item that `continue`s counts),
+/// and the longest item of all with its slot and why the owner ran it (RT_ITEM_TOP).
+struct RtItem { kind: usize, t0: u64, id: u32, why: u8 }
+impl RtItem {
+    fn new(kind: usize) -> RtItem {
+        RtItem { kind, t0: wall_ns(), id: u32::MAX, why: u8::MAX }
+    }
+    fn at(&mut self, id: u32, why: u8) {
+        (self.id, self.why) = (id, why);
     }
 }
-/// Times a reach build's publish body (RT_PUB `k`) on the owner.
-struct RtPub(usize, u64);
+impl Drop for RtItem {
+    fn drop(&mut self) {
+        let dt = wall_ns() - self.t0;
+        RT_KIND_MAX[self.kind].fetch_max(dt, Ordering::Relaxed);
+        let mut top = RT_ITEM_TOP.lock().unwrap_or_else(|e| e.into_inner());
+        if dt > top.0 {
+            *top = (dt, self.kind, self.id, self.why);
+        }
+    }
+}
+/// The longest step item: (wall ns, kind, slot, why).
+static RT_ITEM_TOP: std::sync::Mutex<(u64, usize, u32, u8)> = std::sync::Mutex::new((0, 0, u32::MAX, u8::MAX));
+/// Times a reach build's publish body (RT_PUB `k`) on the owner: wall, CPU and phases, and the
+/// main thread's requests asked meanwhile count as waits behind the reach (RT_STEPS_ON).
+struct RtPub { k: usize, w0: u64, c0: u64, id: u32, round: u32 }
 impl RtPub {
-    fn start(k: usize) -> RtPub {
-        RtPub(k, wall_ns())
+    fn start(k: usize, id: u32, round: u32) -> RtPub {
+        RT_STEPS_ON.fetch_add(1, Ordering::Relaxed);
+        let _ = RT_PH.try_with(|p| p.set(Some([0; 8])));
+        RtPub { k, w0: wall_ns(), c0: cpu_ns(), id, round }
     }
 }
 impl Drop for RtPub {
     fn drop(&mut self) {
-        let dt = wall_ns() - self.1;
-        RT_PUB[self.0][0].fetch_add(1, Ordering::Relaxed);
-        RT_PUB[self.0][1].fetch_add(dt, Ordering::Relaxed);
-        RT_PUB_MAX.fetch_max(dt, Ordering::Relaxed);
+        let (dt, cpu) = (wall_ns() - self.w0, cpu_ns().saturating_sub(self.c0));
+        RT_STEPS_ON.fetch_sub(1, Ordering::Relaxed);
+        let ph = RT_PH.try_with(|p| p.take()).ok().flatten().unwrap_or([0; 8]);
+        for (i, &v) in ph.iter().enumerate() {
+            RT_PH_SUM[i].fetch_add(v, Ordering::Relaxed);
+        }
+        let k = self.k;
+        RT_PUB[k][0].fetch_add(1, Ordering::Relaxed);
+        RT_PUB[k][1].fetch_add(dt, Ordering::Relaxed);
+        RT_PUB[k][2].fetch_add(cpu, Ordering::Relaxed);
+        // (a take that bails unwinds: publish_or_bail)
+        let bailed = std::thread::panicking();
+        if k == 1 {
+            let t = &RT_TAKE[bailed as usize][(self.round > 1) as usize];
+            t[0].fetch_add(1, Ordering::Relaxed);
+            t[1].fetch_add(dt, Ordering::Relaxed);
+        }
+        if RT_PUB_MAX.fetch_max(dt, Ordering::Relaxed) < dt {
+            *RT_PUB_TOP.lock().unwrap_or_else(|e| e.into_inner()) = RtPubTop { wall: dt, cpu, kind: k, id: self.id, round: self.round, bailed, ph };
+        }
     }
 }
 /// threads waiting in realtime_before_install for a ticket: a reach build queued wakes them, and
@@ -32655,6 +32739,7 @@ pub(crate) unsafe fn realtime_reach_queued(up: *mut Unit, roots: Vec<u32>, why: 
             rt.compiled = 0;
             rt.ns = 0;
             rt.why = why;
+            rt.began = wall_ns();
         }
         let origin = rt.origin(why);
         for id in roots { rt.queue(id, RtWay::Direct, origin); }
@@ -32688,7 +32773,7 @@ unsafe fn realtime_step_for(up: *mut Unit, budget: u64) {
     // run after linked those 1934, meeting 27 to 67 lazy compiles on the cell's loop thread, 11-10).
     // The notes are names, read again as this run's code would read them.
     if with_rt(|rt| !std::mem::replace(&mut rt.loaded, true)) {
-        let _item = RtItem(0, wall_ns());
+        let _item = RtItem::new(0);
         let root = crate::layout::root_crate();
         let u = &mut *up;
         let (keys, notes) = match u.cache.take() {
@@ -32758,7 +32843,7 @@ unsafe fn realtime_step_for(up: *mut Unit, budget: u64) {
             if RT_SIGS.load(Ordering::Acquire) && rt.thunks_scanned < syms.thunk_count() { return Next::Symbols(rt.sym_cursor); }
             Next::Done
         });
-        let _item = RtItem(match &next {
+        let mut item = RtItem::new(match &next {
             Next::Link(_) => 1,
             Next::Given(_) => 2,
             Next::Walk(_) => 3,
@@ -32769,9 +32854,10 @@ unsafe fn realtime_step_for(up: *mut Unit, budget: u64) {
             Next::Cross => 8,
             Next::Symbols(_) | Next::Done => 9,
             Next::Taken => 10,
-        }, wall_ns());
+        });
         match next {
             Next::Link(id) => {
+                item.at(id, 15);
                 // compiled ahead only (the walk reads its references from that code)
                 if (id as usize) < (&*up).fns.len() && !(&*up).fns[id as usize].compiled {
                     let _ = compile_slot_locked(up, id, false);
@@ -32786,9 +32872,16 @@ unsafe fn realtime_step_for(up: *mut Unit, budget: u64) {
                 }
                 let Some((way, origin)) = realtime_take(id) else { continue };
                 // its build goes off the owner; its walk is that build's install
-                if !sync && realtime_send(up, id) {
-                    with_rt(|rt| rt.out.insert(id, (way, origin)));
-                    continue;
+                item.at(id, 9);
+                if !sync {
+                    match realtime_send(up, id) {
+                        Ok(()) => {
+                            with_rt(|rt| rt.out.insert(id, (way, origin)));
+                            item.at(u32::MAX, u8::MAX);
+                            continue;
+                        }
+                        Err(why) => item.at(id, why),
+                    }
                 }
                 let was = (&*up).fns[id as usize].compiled;
                 if realtime_walked(up, id, way, origin) && !was {
@@ -32799,6 +32892,7 @@ unsafe fn realtime_step_for(up: *mut Unit, budget: u64) {
             Next::Given(id) => {
                 // (a build off the owner gave it back, or this reach runs whole here)
                 let Some((way, origin)) = with_rt(|rt| rt.out.remove(&id)) else { continue };
+                item.at(id, with_rt(|rt| rt.give_why.remove(&id)).map_or(9, |w| 10 + w));
                 let was = (&*up).fns[id as usize].compiled;
                 if realtime_walked(up, id, way, origin) && !was {
                     compiled += 1;
@@ -32962,7 +33056,8 @@ unsafe fn realtime_step_for(up: *mut Unit, budget: u64) {
     }
     let (_, waits) = rt_main_wait_take();
     if crate::run::VERBOSE.load(Ordering::Relaxed) || rt_trace() {
-        eprintln!("relax rt: {}: real-time code reaches {} slots ({} new), {} compiled now, {:.1} ms on the owner ({:.1} ms in all); tail {}; {}; {}", why, set_len, new, total_compiled, ns as f64 / 1e6, RT_AHEAD[1].load(Ordering::Relaxed) as f64 / 1e6, tail, waits, rt_off_summary());
+        let began = with_rt(|rt| rt.began);
+        eprintln!("relax rt: {}: real-time code reaches {} slots ({} new), {} compiled now, {:.1} ms on the owner ({:.1} ms in all), mark to done {:.1} ms; tail {}; {}; {}", why, set_len, new, total_compiled, ns as f64 / 1e6, RT_AHEAD[1].load(Ordering::Relaxed) as f64 / 1e6, wall_ns().saturating_sub(began) as f64 / 1e6, tail, waits, rt_off_summary(u));
     }
     realtime_done();
 }
@@ -33775,24 +33870,31 @@ unsafe fn realtime_walked(up: *mut Unit, id: u32, way: RtWay, origin: u32) -> bo
 /// link installs its code now (the disk cache, a speculative build's code: the owner's
 /// microseconds) or its build is the owner's own as the walk made it before: a slot on the plain
 /// path, an always-O3 one, one in flight or building here, one whose build failed. True: queued.
-unsafe fn realtime_send(up: *mut Unit, id: u32) -> bool {
+unsafe fn realtime_send(up: *mut Unit, id: u32) -> Result<(), u8> {
     let u = &*up;
     let f = &u.fns[id as usize];
-    if f.compiled || f.inflight || f.building || f.build_err.is_some() || !pipelined() || relax_level(u, id) == 4 || plain_path(u, id) || !queue::takes_jobs() {
-        return false;
+    let why = if f.compiled { 0 } else if f.inflight { 1 } else if f.building { 2 } else if f.build_err.is_some() { 3 } else if !pipelined() { 4 }
+        else if relax_level(u, id) == 4 { 5 } else if plain_path(u, id) { 6 } else if !queue::takes_jobs() { 7 } else { u8::MAX };
+    if why != u8::MAX {
+        return Err(why);
     }
     let linked = {
         let _keep = RtKeepOn::on();
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| ready_code_locked(up, id).is_some())).unwrap_or(true)
     };
     if linked {
-        return false;
+        return Err(8);
     }
     SPEC_UNIT.store(up, Ordering::Release);
     RT_OFF[0].fetch_add(1, Ordering::Relaxed);
     reach_queue(up, id);
-    true
+    Ok(())
 }
+
+/// (trace) Why a step item ran on the owner: realtime_send's refusals (0-8), the whole reach
+/// at once (9), a give-back's reason (10 + RT_GIVE_NAMES), the earlier runs' set (15).
+const RT_WHY_NAMES: [&str; 16] = ["compiled", "in flight", "building", "build error", "no pipeline", "level 4", "plain path", "no workers", "linked",
+    "whole reach", "take bailed", "busy", "front failed", "patched", "panic", "earlier set"];
 
 /// (any thread) Reached slot `id`, out for a build off the owner, goes back to the owner's steps.
 unsafe fn realtime_give_back(up: *mut Unit, id: u32) {
@@ -33835,7 +33937,7 @@ unsafe fn reach_build(up: *mut Unit, id: u32) -> Result<(), usize> {
     enum Take { Walked(bool), Owner, Build, Begin(Begin) }
     // (publish) installed meanwhile (a link, a lazy compile): only the walk is left
     let first = owner::publish(|| {
-        let _pub = RtPub::start(0);
+        let _pub = RtPub::start(0, id, 0);
         if !with_rt(|rt| rt.out.contains_key(&id)) {
             return Take::Walked(false);
         }
@@ -33850,8 +33952,10 @@ unsafe fn reach_build(up: *mut Unit, id: u32) -> Result<(), usize> {
         Take::Build => {
             let front = (&*up).front.clone();
             prefront_slot(&front, id);
+            let mut round = 0;
             let b = take_prefronted(&front, None, || {
-                let _pub = RtPub::start(1);
+                round += 1;
+                let _pub = RtPub::start(1, id, round);
                 let _keep = RtKeepOn::on();
                 if !with_rt(|rt| rt.out.contains_key(&id)) {
                     return Take::Walked(false);
@@ -33875,10 +33979,13 @@ unsafe fn reach_build(up: *mut Unit, id: u32) -> Result<(), usize> {
                 Some(Take::Begin(Begin::Back(w))) => {
                     let d = w.run();
                     let r = owner::publish(|| {
-                        let _pub = RtPub::start(2);
+                        let _pub = RtPub::start(2, id, 0);
                         let _keep = RtKeepOn::on();
                         match split_finish(up, d) {
-                            Split::Installed(_) if (&*up).fns[id as usize].compiled => Some(realtime_walk_out(up, id)),
+                            Split::Installed(_) if (&*up).fns[id as usize].compiled => {
+                                let _ph = rt_ph(7);
+                                Some(realtime_walk_out(up, id))
+                            }
                             // a live patch landed meanwhile: the owner builds it from the new source
                             _ => None,
                         }
@@ -33936,6 +34043,7 @@ fn run_reach(unit: usize, id: u32) -> bool {
     };
     if with_rt(|rt| rt.out.contains_key(&id)) {
         RT_GIVE[why].fetch_add(1, Ordering::Relaxed);
+        with_rt(|rt| rt.give_why.insert(id, why as u8));
     }
     unsafe { realtime_give_back(up, id) };
     true
@@ -33954,14 +34062,24 @@ unsafe fn reach_queue(up: *mut Unit, id: u32) {
 }
 
 /// The reach's builds so far (RT_OFF) and its longest owner step, for the trace.
-fn rt_off_summary() -> String {
+fn rt_off_summary(u: &Unit) -> String {
     let [sent, built, given, owner] = std::array::from_fn::<u64, 4, _>(|i| RT_OFF[i].load(Ordering::Relaxed));
     let ms = |v: u64| v as f64 / 1e6;
+    let name = |id: u32| if (id as usize) < u.fns.len() { u.fns[id as usize].name.to_string() } else { "-".to_string() };
     let why: Vec<String> = RT_GIVE_NAMES.iter().enumerate().filter(|(i, _)| RT_GIVE[*i].load(Ordering::Relaxed) != 0).map(|(i, n)| format!("{} {}", n, RT_GIVE[i].load(Ordering::Relaxed))).collect();
-    let pubs: Vec<String> = ["look", "take", "install"].iter().enumerate().map(|(i, n)| format!("{} {}x {:.1} ms", n, RT_PUB[i][0].load(Ordering::Relaxed), ms(RT_PUB[i][1].load(Ordering::Relaxed)))).collect();
+    let pubs: Vec<String> = ["look", "take", "install"].iter().enumerate().map(|(i, n)| format!("{} {}x {:.1} ms (cpu {:.1})", n, RT_PUB[i][0].load(Ordering::Relaxed), ms(RT_PUB[i][1].load(Ordering::Relaxed)), ms(RT_PUB[i][2].load(Ordering::Relaxed)))).collect();
+    let takes: Vec<String> = [(0, 0, "first done"), (1, 0, "first bailed"), (0, 1, "later done"), (1, 1, "later bailed")].iter().map(|&(b, r, n)| format!("{} {}x {:.1} ms", n, RT_TAKE[b][r][0].load(Ordering::Relaxed), ms(RT_TAKE[b][r][1].load(Ordering::Relaxed)))).collect();
+    let phases = |ph: &[u64; 8]| RT_PH_NAMES.iter().zip(ph).filter(|(_, &v)| v != 0).map(|(n, &v)| format!("{} {:.2}", n, ms(v))).collect::<Vec<_>>().join(", ");
+    let sum: [u64; 8] = std::array::from_fn(|i| RT_PH_SUM[i].load(Ordering::Relaxed));
+    let top = *RT_PUB_TOP.lock().unwrap_or_else(|e| e.into_inner());
+    let item = *RT_ITEM_TOP.lock().unwrap_or_else(|e| e.into_inner());
     let kinds: Vec<String> = RT_KIND_NAMES.iter().enumerate().filter(|(i, _)| RT_KIND_MAX[*i].load(Ordering::Relaxed) != 0).map(|(i, n)| format!("{} {:.1}", n, ms(RT_KIND_MAX[i].load(Ordering::Relaxed)))).collect();
-    format!("builds off the owner {} of {} sent ({} given back: {}; {} queued again), {} compiled on the owner; publishes {} (longest {:.1} ms); longest owner step {:.1} ms, longest item by kind (ms): {}",
-        built, sent, given, why.join(", "), RT_REQUEUED.load(Ordering::Relaxed), owner, pubs.join(", "), ms(RT_PUB_MAX.load(Ordering::Relaxed)), ms(RT_STEP_MAX.load(Ordering::Relaxed)), kinds.join(", "))
+    format!("builds off the owner {} of {} sent ({} given back: {}; {} queued again), {} compiled on the owner; publishes {} (longest {:.1} ms); \
+        takes {}; publish phases (ms) {}; longest publish {:.1} ms (cpu {:.1}): {} of `{}`, round {}{}, phases {}; \
+        longest owner step {:.1} ms, longest item by kind (ms): {}; longest item {:.1} ms: {} of `{}` ({})",
+        built, sent, given, why.join(", "), RT_REQUEUED.load(Ordering::Relaxed), owner, pubs.join(", "), ms(RT_PUB_MAX.load(Ordering::Relaxed)),
+        takes.join(", "), phases(&sum), ms(top.wall), ms(top.cpu), ["look", "take", "install"][top.kind], name(top.id), top.round, if top.bailed { ", bailed" } else { "" }, phases(&top.ph),
+        ms(RT_STEP_MAX.load(Ordering::Relaxed)), kinds.join(", "), ms(item.0), RT_KIND_NAMES[item.1], name(item.2), RT_WHY_NAMES.get(item.3 as usize).copied().unwrap_or("-"))
 }
 
 /// Compiles everything `roots` reach, now (owner): a real-time thread met a lazy stub (`why`).
@@ -34987,7 +35105,7 @@ pub(crate) unsafe fn reset_statics() {
     reset(&RT_TAIL, [const { AtomicU64::new(0) }; 5]);
     reset(&RT_QUIET, AtomicU64::new(0));
     reset(&RT_STEPS_ON, std::sync::atomic::AtomicU32::new(0));
-    reset(&RT_MAIN_WAIT, [const { AtomicU64::new(0) }; 4]);
+    reset(&RT_MAIN_WAIT, [const { AtomicU64::new(0) }; 6]);
     reset(&RT_TICKET, AtomicU64::new(0));
     reset(&RT_DONE, AtomicU64::new(0));
     reset(&RT_ARMED, std::sync::atomic::AtomicU32::new(0));
@@ -34996,9 +35114,13 @@ pub(crate) unsafe fn reset_statics() {
     reset(&RT_STEP_MAX, AtomicU64::new(0));
     reset(&RT_GIVE, [const { AtomicU64::new(0) }; 5]);
     reset(&RT_REQUEUED, AtomicU64::new(0));
-    reset(&RT_PUB, [const { [AtomicU64::new(0), AtomicU64::new(0)] }; 3]);
+    reset(&RT_PUB, [const { [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)] }; 3]);
     reset(&RT_PUB_MAX, AtomicU64::new(0));
     reset(&RT_KIND_MAX, [const { AtomicU64::new(0) }; 11]);
+    *RT_ITEM_TOP.lock().unwrap_or_else(|e| e.into_inner()) = (0, 0, u32::MAX, u8::MAX);
+    reset(&RT_TAKE, [const { [const { [AtomicU64::new(0), AtomicU64::new(0)] }; 2] }; 2]);
+    reset(&RT_PH_SUM, [const { AtomicU64::new(0) }; 8]);
+    *RT_PUB_TOP.lock().unwrap_or_else(|e| e.into_inner()) = RtPubTop { wall: 0, cpu: 0, kind: 0, id: u32::MAX, round: 0, bailed: false, ph: [0; 8] };
     reset(&RT_WAITERS, AtomicU32::new(0));
     reset(&RT_DUE, std::sync::Mutex::new(Vec::new()));
     reset(&CONSTS_WANTED, relax_session::sync::Mutex::new(Vec::new()));
