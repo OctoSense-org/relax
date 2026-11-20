@@ -506,16 +506,25 @@ fn a_panic_parks_only_where_it_leaves_the_program() {
     use std::sync::atomic::{AtomicBool, Ordering};
     std::env::remove_var("RELAX_INSPECT");
     std::env::set_var("RELAX_PANIC_PARK", "600");
+    // the parks are this test's own, and it releases them itself: a devhub node's observer releases
+    // a park in a run of a lease nobody attends unless its process says so, and released before the
+    // watcher looked, a park went uncounted (11-20: 183 of 240 runs under load failed)
+    std::env::set_var("RELAX_EXPECTED_CRASH", "a_panic_parks_only_where_it_leaves_the_program parks its panics and releases them");
     crate::inspect::start("panic_park");
     let stop = std::sync::Arc::new(AtomicBool::new(false));
     let watcher = {
         let stop = stop.clone();
         std::thread::spawn(move || {
+            // each park counted once, by its id, and released only once counted: a park released
+            // stays listed until its thread wakes, and the program's next panic parks only after
+            // that release. Counted again, the released one parked twice; released by a later look
+            // that still listed it, the next park went with it unseen
             let mut seen: Vec<(String, String)> = Vec::new();
+            let mut ids = std::collections::HashSet::new();
             while !stop.load(Ordering::Relaxed) {
-                let now = crate::inspect::events::parked_now();
-                if !now.is_empty() {
-                    seen.extend(now.into_iter().map(|p| (p.3, p.4)));
+                let new: Vec<_> = crate::inspect::events::parked_now().into_iter().filter(|p| ids.insert(p.0)).collect();
+                if !new.is_empty() {
+                    seen.extend(new.into_iter().map(|p| (p.3, p.4)));
                     crate::inspect::events::quit_releases();
                 }
                 std::thread::sleep(std::time::Duration::from_millis(2));
