@@ -734,6 +734,10 @@ fn a_panic_through_a_restartable_fn_restarts_returns_or_unwinds_as_decided() {
     use std::sync::atomic::{AtomicBool, Ordering};
     std::env::remove_var("RELAX_INSPECT");
     std::env::set_var("RELAX_PANIC_PARK", "600");
+    // the parks are this test's own, and its decider resumes them: a devhub node's observer releases a park
+    // in a run of a lease nobody attends unless its process says so, and released (`panic`) before the
+    // decider looked, an attempt unwound undecided (11-20 own-tests run: 3 attempts, decided [])
+    std::env::set_var("RELAX_EXPECTED_CRASH", "a_panic_through_a_restartable_fn_restarts_returns_or_unwinds_as_decided parks its panics and decides them");
     crate::inspect::start("restartable");
     let dir = std::env::temp_dir().join(format!("relax-restartable-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
