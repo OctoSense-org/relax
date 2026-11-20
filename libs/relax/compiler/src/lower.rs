@@ -14484,8 +14484,10 @@ leaf fn rt_wide_f64(signed: u64, lo: u64, hi: u64) -> f64 {
 
 rt_fn! {
 /// 128-bit quotient or remainder (mode bit 0: remainder, bit 1: signed). The caller has checked a
-/// zero divisor and signed MIN / -1. (A host helper for now; candidate for an Rt entry.)
-fn rt_divrem128(mode: u64, alo: u64, ahi: u64, blo: u64, bhi: u64) -> WideRet {
+/// zero divisor and signed MIN / -1 (wide_divrem), so it cannot panic: a leaf entry, without the
+/// panic guard each call paid (two divisions a crossing point in Fab's slicer). (A host helper
+/// for now; candidate for an Rt entry.)
+leaf fn rt_divrem128(mode: u64, alo: u64, ahi: u64, blo: u64, bhi: u64) -> WideRet {
     let a = ((ahi as u128) << 64) | alo as u128;
     let b = ((bhi as u128) << 64) | blo as u128;
     let r: u128 = if mode & 2 != 0 {

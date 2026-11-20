@@ -169,6 +169,104 @@ fn widened_128_bit_products_are_exact_and_overflow_only_where_they_can() {
     assert_eq!(o3, want, "the products and the one overflow at O3 (not built: {refused:?})");
 }
 
+/// 128-bit products of a full value and a factor of one word (a widened i64 or u64 either side, a
+/// literal), and 128-bit quotients and remainders, signed and unsigned, under the test profile's
+/// checks: each value, or (third word 1) the overflow or zero-divisor panic. The values are paired
+/// with the cases' constants in the test (rustc's checked_mul / checked_div / checked_rem).
+const BY_WORD: &str = r#"
+use std::hint::black_box;
+const XS: [i128; 10] = [0, 1, -1, 0xffff_ffff_ffff_ffff, 1 << 64, -(1 << 64), 1 << 126, -(1 << 126), i128::MAX, i128::MIN];
+const FS: [i64; 7] = [0, 1, -1, 2, -2, i64::MAX, i64::MIN];
+const XU: [u128; 6] = [0, 1, 0xffff_ffff_ffff_ffff, 1 << 64, u128::MAX / 3, u128::MAX];
+const FU: [u64; 5] = [0, 1, 2, 3, u64::MAX];
+const DS: [i128; 6] = [3, -7, -1, 0, 1 << 70, -(1 << 65) + 1];
+const DU: [u128; 3] = [3, 0, 1 << 70];
+fn by(x: i128, f: i64) -> i128 { x * f as i128 }
+fn by_rev(x: i128, f: i64) -> i128 { (f as i128) * x }
+fn two(x: i128) -> i128 { 2 * x }
+fn minus_two(x: i128) -> i128 { x * -2 }
+fn uby(x: u128, f: u64) -> u128 { x * f as u128 }
+fn three(x: u128) -> u128 { 3 * x }
+fn put(out: &mut [usize; 1056], k: &mut usize, r: Result<u128, Box<dyn std::any::Any + Send>>) {
+    match r {
+        Ok(v) => { out[*k] = v as u64 as usize; out[*k + 1] = (v >> 64) as u64 as usize; }
+        Err(_) => out[*k + 2] = 1,
+    }
+    *k += 3;
+}
+pub fn values(out: &mut [usize; 1056]) {
+    use std::panic::catch_unwind as c;
+    let k = &mut 0;
+    for x in XS {
+        for f in FS {
+            put(out, k, c(|| by(black_box(x), black_box(f)) as u128));
+            put(out, k, c(|| by_rev(black_box(x), black_box(f)) as u128));
+        }
+        put(out, k, c(|| two(black_box(x)) as u128));
+        put(out, k, c(|| minus_two(black_box(x)) as u128));
+    }
+    for x in XU {
+        for f in FU { put(out, k, c(|| uby(black_box(x), black_box(f)))); }
+        put(out, k, c(|| three(black_box(x))));
+    }
+    for x in XS {
+        for d in DS {
+            put(out, k, c(|| (black_box(x) / black_box(d)) as u128));
+            put(out, k, c(|| (black_box(x) % black_box(d)) as u128));
+        }
+    }
+    for x in XU {
+        for d in DU {
+            put(out, k, c(|| black_box(x) / black_box(d)));
+            put(out, k, c(|| black_box(x) % black_box(d)));
+        }
+    }
+}
+"#;
+
+#[test]
+fn a_128_bit_value_by_one_word_and_its_quotients_are_rustcs() {
+    isolated_test!(a_128_bit_value_by_one_word_and_its_quotients_are_rustcs);
+    const XS: [i128; 10] = [0, 1, -1, 0xffff_ffff_ffff_ffff, 1 << 64, -(1 << 64), 1 << 126, -(1 << 126), i128::MAX, i128::MIN];
+    const FS: [i64; 7] = [0, 1, -1, 2, -2, i64::MAX, i64::MIN];
+    const XU: [u128; 6] = [0, 1, 0xffff_ffff_ffff_ffff, 1 << 64, u128::MAX / 3, u128::MAX];
+    const FU: [u64; 5] = [0, 1, 2, 3, u64::MAX];
+    const DS: [i128; 6] = [3, -7, -1, 0, 1 << 70, -(1 << 65) + 1];
+    const DU: [u128; 3] = [3, 0, 1 << 70];
+    let mut want = Vec::new();
+    let mut put = |r: Option<u128>| want.extend(match r { Some(v) => [v as u64 as usize, (v >> 64) as u64 as usize, 0], None => [0, 0, 1] });
+    for x in XS {
+        for f in FS {
+            put(x.checked_mul(f as i128).map(|v| v as u128));
+            put((f as i128).checked_mul(x).map(|v| v as u128));
+        }
+        put(2i128.checked_mul(x).map(|v| v as u128));
+        put(x.checked_mul(-2).map(|v| v as u128));
+    }
+    for x in XU {
+        for f in FU { put(x.checked_mul(f as u128)); }
+        put(3u128.checked_mul(x));
+    }
+    for x in XS {
+        for d in DS {
+            put(x.checked_div(d).map(|v| v as u128));
+            put(x.checked_rem(d).map(|v| v as u128));
+        }
+    }
+    for x in XU {
+        for d in DU {
+            put(x.checked_div(d));
+            put(x.checked_rem(d));
+        }
+    }
+    assert_eq!(want.len(), 1056);
+    let (first, o3, refused): ([usize; 1056], [usize; 1056], _) = values_at_o3(BY_WORD, "by_word", CHECKED);
+    // the first case that differs: (case, the JIT's value lo / hi / panicked, rustc's)
+    let differs = |out: &[usize; 1056]| (0..352).find(|&i| out[3 * i..3 * i + 3] != want[3 * i..3 * i + 3]).map(|i| (i, out[3 * i..3 * i + 3].to_vec(), want[3 * i..3 * i + 3].to_vec()));
+    assert_eq!(differs(&first), None, "at the first tier");
+    assert_eq!(differs(&o3), None, "at O3 (not built: {refused:?})");
+}
+
 /// `IoSlice` / `IoSliceMut` (now real std's `iovec`-shaped wrappers, WARNZERO class 8): the
 /// slices they borrow, `advance_slices` across them, a vectored write, writes through a mutable
 /// one, and the `iovec` layout (base, then length) FFI code relies on.
