@@ -931,7 +931,7 @@ fn allocate_low(options: &relax_session::Options, f: &Func, cfg: &RegConfig, tho
     drop(live_in);
     let ranges = build_ranges(f, &reach, &tab, &block_start, &block_end, &live_out);
     drop(live_out);
-    let wts = block_weights(f, &reach, freq);
+    let wts = block_weights(options, f, &reach, freq);
     let aff = affinities(f, &reach, &block_start, &ranges, &wts);
     let (mut remat, base_only) = remat_values(options, f, &reach, cfg);
     // base + k is recomputed at its uses: the base must be live (hold its one value) at each of
@@ -3647,10 +3647,18 @@ fn remat_values(options: &relax_session::Options, f: &Func, reach: &[bool], cfg:
     (remat, base_only)
 }
 
-/// How often each block runs, relative: with measured frequencies (O3: samples of the code
-/// the block's instructions came from, 0..=1 of the hottest block) mostly those, a sliver of loop
-/// depth for blocks no sample hit; without, 8^loop depth (capped).
-fn block_weights(f: &Func, reach: &[bool], freq: Option<&[f32]>) -> Vec<f32> {
+/// How often each block runs, relative: a counted body's frequencies themselves
+/// (`profile::freqs`: the counts, and uncounted blocks estimated from counted predecessors; 0..=1
+/// of the hottest block, floored); other frequencies (structural estimates) raise the static
+/// weight up to 8x; without, 8^loop depth (capped).
+fn block_weights(options: &relax_session::Options, f: &Func, reach: &[bool], freq: Option<&[f32]>) -> Vec<f32> {
+    // counts rank a hot loop's blocks on their own: a never-run block of the loop is not 1/8 of
+    // its header, nor is a block of a deeper loop that ran less above one that ran more
+    if let Some(fr) = freq {
+        if fr.len() == f.blocks.len() && crate::profile::has_counts(f) && !crate::stats::opt_off(options, "-cntweights") {
+            return fr.to_vec();
+        }
+    }
     let depth = loop_depths(f, reach);
     let st = static_weights(f, reach, &depth);
     match freq {
