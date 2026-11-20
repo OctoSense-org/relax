@@ -4421,6 +4421,7 @@ fn split_cold_calls(f: &Func, freq: &[f32], cand: &[bool]) -> Option<Func> {
         if sites.is_empty() {
             continue;
         }
+        let (nv_blk, np_blk) = (g.vregs.len(), pieces.len());
         // sites are back to front: inserting at a later index keeps the earlier ones valid
         for (ii, across) in sites {
             let p = g.blocks[bi].pos[ii];
@@ -4452,9 +4453,14 @@ fn split_cold_calls(f: &Func, freq: &[f32], cand: &[bool]) -> Option<Func> {
         // a copy pair per value per cold call: a big loop with many cold calls made
         // thousands (an app's video editing store worker: 10.6k vregs -> 69k after both splits,
         // 7.4 s of allocation, 1.8 MB of code): past half again the function's values the
-        // split costs more than its spills, and the first allocation stands
+        // split costs more than its spills: this block stays as it was, and the blocks after it
         if g.vregs.len() - nv0 > SPLIT_GROWTH_MAX(nv0) / 2 {
-            return None;
+            g.blocks[bi] = f.blocks[bi].clone();
+            g.vregs.truncate(nv_blk);
+            pieces.truncate(np_blk);
+            changed = !pieces.is_empty();
+            eprintln!("relax ra: {}: cold-call pieces at the cap ({} over {} values): calls from b{} on left as they were", f.name, SPLIT_GROWTH_MAX(nv0) / 2, nv0, bi);
+            break;
         }
     }
     if changed {
@@ -4732,8 +4738,10 @@ fn split_loops(f: &mut Func, spilled: &[bool], inreg: Option<&[bool]>, hot: Opti
     let mut defd = vec![false; n_orig];
     let mut refall = vec![false; n_orig];
     let mut through_pieces: Vec<u32> = Vec::new();
+    let (mut capped, mut capped_at) = (0usize, None::<u32>);
     for li in 0..loops.len() {
         let header = loops[li].0;
+        let (nv_loop, nt_loop) = (f.vregs.len(), through_pieces.len());
         let inl = |b: u32, member: &Vec<Vec<u16>>| member[b as usize].contains(&(li as u16));
         // spilled originals referenced inside the loop (pieces made for inner loops are reached
         // through their originals' copies, which are split here too)
@@ -4837,9 +4845,15 @@ fn split_loops(f: &mut Func, spilled: &[bool], inreg: Option<&[bool]>, hot: Opti
                 k -= 1;
             }
         }
-        // (see split_cold_calls): too many pieces, no split
+        // (see split_cold_calls): past the cap this loop stays whole; the loops split before it
+        // (innermost first) keep their pieces
         if f.vregs.len() - n_orig > SPLIT_GROWTH_MAX(n_orig) {
-            return None;
+            f.vregs.truncate(nv_loop);
+            origin.truncate(nv_loop);
+            through_pieces.truncate(nt_loop);
+            split.clear();
+            capped += 1;
+            capped_at.get_or_insert(header);
         }
         for &bi in &blocks_of[li] {
             for i in &f.blocks[bi as usize].insts {
@@ -4993,6 +5007,9 @@ fn split_loops(f: &mut Func, spilled: &[bool], inreg: Option<&[bool]>, hot: Opti
             preds.push(vec![from]);
             placed.push((from, true, nbk));
         }
+    }
+    if capped > 0 {
+        eprintln!("relax ra: {}: live-range pieces at the cap ({} over {} values): {} loops left whole, the first headed b{}", f.name, SPLIT_GROWTH_MAX(n_orig), n_orig, capped, capped_at.unwrap_or(0));
     }
     if !changed {
         return None;
