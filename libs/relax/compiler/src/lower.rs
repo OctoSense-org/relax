@@ -9556,16 +9556,24 @@ impl<'a> Lcx<'a> {
                     if self.overflow_checks { self.shift_check(*op, self.int_ty(t).bits as u32, (y.0, Some(y.1))); }
                     return Val::L(vec![self.arith(*op, t, x.0, y.0, bt)]);
                 }
-                // `a as i128 * b as i128` of 64-bit (or narrower) signed values, or `a as u128 * b as u128`
-                // of unsigned ones: the 128-bit product never overflows, so it is one widening multiply
+                // A factor whose value fits one 64-bit word (`a as i128` of a 64-bit or narrower integer,
+                // a literal): `a as i128 * b as i128` never overflows, so it is one widening multiply
                 // (imul / smulh; mul / umulh) and no check -- rustc's, where a general 128-bit product
-                // and its overflow check take eleven 64-bit multiplies (exact geometry predicates:
-                // Fab's slicer cross and dot products, 18% of its segment splitting under the JIT)
+                // and its overflow check take eleven 64-bit multiplies (exact geometry predicates: Fab's
+                // slicer cross and dot products, 18% of its segment splitting under the JIT); a full
+                // 128-bit value by one word (`d as i128 * num`, `2 * n`) is four multiplies and the
+                // check of its third word (rustc's inline smulo of a sign-extended factor)
                 if *op == BinOp::Mul && self.is_wide(t) {
                     let signed = self.wide_signed(t);
-                    if self.widened_from(*a) == Some(signed) && self.widened_from(*b) == Some(signed) {
+                    let (wa, wb) = (self.fits_word(*a, signed), self.fits_word(*b, signed));
+                    if wa && wb {
                         let lo = self.ibin(IOp::Mul, false, x.0, y.0);
                         let hi = self.ibin(IOp::MulHi, signed, x.0, y.0);
+                        return Val::L(vec![lo, hi]);
+                    }
+                    if self.overflow_checks && (wa || wb) {
+                        let (full, word) = if wb { (x, y.0) } else { (y, x.0) };
+                        let (lo, hi) = self.checked_mul_by_word(signed, full, word);
                         return Val::L(vec![lo, hi]);
                     }
                 }
@@ -9908,19 +9916,68 @@ impl<'a> Lcx<'a> {
     // N:rustc_mir_build/src/builder/expr/as_rvalue.rs:103-123,457-541.
     // Round-30 design: checked arithmetic's flag is computed with existing RIR ops.
     // N:rustc_mir_build/src/thir/cx/expr.rs:676-683 lowers -literal as a literal.
-    /// `x as T` of an integer of at most 64 bits (parenthesized or not): whether that integer is
-    /// signed, so its 128-bit value is its 64-bit value extended by its sign (else by zero).
-    fn widened_from(&self, mut expr: ExprId) -> Option<bool> {
+    /// Does the value of the 128-bit operand `expr` fit one 64-bit word -- signed (i64) for a
+    /// signed type, unsigned (u64) for an unsigned one -- whatever it is at run time? Then its
+    /// high word is its low word's sign (zero). `x as T` of a narrower integer (a signed one into
+    /// a signed type, or one of fewer than 64 bits; an unsigned one into an unsigned type), an
+    /// integer literal in range, a negated literal in a signed type; parenthesized or not.
+    fn fits_word(&self, mut expr: ExprId, signed: bool) -> bool {
+        let mut negated = false;
         loop {
-            match self.ast().expr(expr).kind {
+            let ex = self.ast().expr(expr);
+            match ex.kind {
                 ExprKind::Paren(inner) => expr = inner,
-                ExprKind::Cast(inner, _) => {
-                    let xt = self.body_ty(inner);
-                    return (matches!(self.kind_ref(xt), TyKind::Int(_)) && !self.is_wide(xt)).then(|| self.int_ty(xt).signed);
+                ExprKind::Unary(UnOp::Neg, inner) if signed && !negated => {
+                    negated = true;
+                    expr = inner;
                 }
-                _ => return None,
+                ExprKind::Cast(inner, _) if !negated => {
+                    let xt = self.body_ty(inner);
+                    if !matches!(self.kind_ref(xt), TyKind::Int(_)) || self.is_wide(xt) {
+                        return false;
+                    }
+                    let it = self.int_ty(xt);
+                    return if signed { it.signed || it.bits < 64 } else { !it.signed };
+                }
+                ExprKind::Lit(LitKind::Int) => {
+                    let Some(v) = crate::const_fold::parse_int_lit(&self.src_text(ex.lo, ex.hi)) else { return false };
+                    return if negated { v <= 1u128 << 63 } else if signed { v <= i64::MAX as u128 } else { v <= u64::MAX as u128 };
+                }
+                _ => return false,
             }
         }
+    }
+
+    /// `full * word` under overflow checks, `word` a 64-bit value (its high word its sign, or zero
+    /// for unsigned): full = x1 * 2^64 + x0, so the product is x0 * word (x0 unsigned) plus
+    /// x1 * word shifted up a word. Its three words: the 128-bit result and a third, which must
+    /// be the result's sign (zero) for the product to fit.
+    fn checked_mul_by_word(&mut self, signed: bool, full: (VReg, VReg), word: VReg) -> (VReg, VReg) {
+        let lo = self.ibin(IOp::Mul, false, full.0, word);
+        let mut hi0 = self.ibin(IOp::MulHi, false, full.0, word);
+        if signed {
+            // the unsigned high product counts a negative word as word + 2^64: take x0 back off
+            let k63 = self.iconst(63);
+            let mask = self.ibin(IOp::Shr, true, word, k63);
+            let over = self.ibin(IOp::And, false, full.0, mask);
+            hi0 = self.ibin(IOp::Sub, false, hi0, over);
+        }
+        let lo1 = self.ibin(IOp::Mul, false, full.1, word);
+        let hi1 = self.ibin(IOp::MulHi, signed, full.1, word);
+        let hi = self.ibin(IOp::Add, false, hi0, lo1);
+        let carry = self.icmp(Cond::Lt, false, hi, hi0);
+        let mut third = self.ibin(IOp::Add, false, hi1, carry);
+        let expected = if signed {
+            let k63 = self.iconst(63);
+            let sign0 = self.ibin(IOp::Shr, true, hi0, k63);
+            third = self.ibin(IOp::Add, false, third, sign0);
+            self.ibin(IOp::Shr, true, hi, k63)
+        } else {
+            self.iconst(0)
+        };
+        let overflow = self.icmp(Cond::Ne, false, third, expected);
+        self.overflow_assert(overflow, arithmetic_overflow_message(BinOp::Mul));
+        (lo, hi)
     }
 
     fn negated_literal(&self, mut expr: ExprId) -> bool {
