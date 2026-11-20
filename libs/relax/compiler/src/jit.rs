@@ -25198,10 +25198,10 @@ pub(crate) fn solver_work_report_at_exit() {
 }
 
 /// The application is about to submit its first window frame (platform hal event loop): waits
-/// for the app check running beside main (check.rs wait_app_check); an error it finds ends the
+/// for the app check running beside main (check.rs first_frame_gate); an error it finds ends the
 /// run before the frame.
 pub extern "C" fn relax_before_first_frame() {
-    crate::jit::host_boundary("relax_before_first_frame", crate::check::wait_app_check)
+    crate::jit::host_boundary("relax_before_first_frame", crate::check::first_frame_gate)
 }
 
 /// The program enters `app_main!`'s entry (platform): it is an app, whose first frame has a

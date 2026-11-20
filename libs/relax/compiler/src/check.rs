@@ -226,6 +226,7 @@ pub struct AppCheck {
 pub fn prepare_check(up: *mut Unit, crates: &[u32]) -> Option<AppCheck> {
     let u = unsafe { &*up };
     let t0 = jit::wall_ns();
+    APP_CHECK_ASKED.store(true, std::sync::atomic::Ordering::Relaxed);
     let mut keys = Vec::new();
     let mut todo = Vec::new();
     for &k in crates {
@@ -282,7 +283,8 @@ impl BodyCheck {
         };
         let retry = |p: &(dyn std::any::Any + Send)| crate::preempt::is_preempted(p) || p.is::<crate::preempt::NeedsLoad>() || p.is::<crate::preempt::OwnerBusy>();
         let (strict, beside) = (self.strict, self.beside);
-        let _cpu = strict.then(|| Cpu(&self.cpu, relax_session::clock::cpu_ns()));
+        // (the app check beside main: its own counter, for the line at the first frame)
+        let _cpu = if strict { Some(Cpu(&self.cpu, relax_session::clock::cpu_ns())) } else if beside { Some(Cpu(&APP_CHECK_CPU, relax_session::clock::cpu_ns())) } else { None };
         let _quiet = strict.then(crate::lint::Suppress::new);
         let uu = unsafe { &*(self.upn as *const Unit) };
         let mut tries = 0;
@@ -426,6 +428,11 @@ pub(crate) struct CheckBatch {
 
 /// Something waits for the check beside the program (`waited`).
 static CHECK_WAITED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// The app check's body checks' CPU (ns): for the line at its first frame (`first_frame_gate`).
+static APP_CHECK_CPU: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// The check jobs beside the program: running now; most at once while something waited; slices
+/// started while something waited whose thread the OS raised to the waiter's class, and refused.
+static CHECK_SLICES: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 /// A job's slice: past it, the job gives its worker back to the queue after the item it is on.
 const CHECK_SLICE: std::time::Duration = std::time::Duration::from_millis(20);
 
@@ -464,6 +471,20 @@ fn queued_map(ctx: &std::sync::Arc<BodyCheck>, items: Vec<crate::program::DefId>
 pub(crate) fn run_check_slice(batch: std::sync::Arc<CheckBatch>) {
     use std::sync::atomic::Ordering;
     let start = std::time::Instant::now();
+    struct Running;
+    impl Drop for Running {
+        fn drop(&mut self) { CHECK_SLICES[0].fetch_sub(1, Ordering::Relaxed); }
+    }
+    let now = CHECK_SLICES[0].fetch_add(1, Ordering::Relaxed) + 1;
+    let _running = Running;
+    // something waits for the check (the first frame, the run's exit): the queue admits its jobs
+    // in the Interactive class (promote_checks), and the worker runs it at that class at the OS
+    // too. A Linux thread without CAP_SYS_NICE that ran Background work cannot be raised: counted.
+    if check_waited() {
+        CHECK_SLICES[1].fetch_max(now, Ordering::Relaxed);
+        let raised = makepad_cpu_budget::set_thread_class(makepad_cpu_budget::INTERACTIVE);
+        CHECK_SLICES[if raised { 2 } else { 3 }].fetch_add(1, Ordering::Relaxed);
+    }
     loop {
         let i = batch.next.fetch_add(1, Ordering::Relaxed);
         let Some(&d) = batch.items.get(i) else { return };
@@ -642,6 +663,38 @@ pub fn wait_app_check() {
         eprintln!("relax: the first frame waited {:.0} ms for the app check", t0.elapsed().as_secs_f64() * 1e3);
     }
 }
+
+/// The app's first window frame (jit relax_before_first_frame): waits for the app check beside main
+/// (wait_app_check), then says once per run how long it waited and what the check checked.
+pub fn first_frame_gate() {
+    use std::sync::atomic::Ordering::Relaxed;
+    let state = *BESIDE.0.lock().unwrap_or_else(|e| e.into_inner());
+    let (cpu0, t0) = (APP_CHECK_CPU.load(Relaxed), std::time::Instant::now());
+    wait_app_check();
+    let waited_ms = t0.elapsed().as_secs_f64() * 1e3;
+    // (a run whose app has no check, as a test's window, says nothing)
+    if !APP_CHECK_ASKED.load(Relaxed) || GATE_SAID.swap(true, std::sync::atomic::Ordering::AcqRel) { return; }
+    let n = |i: usize| RUN_CHECK[i].load(Relaxed);
+    let ms = |ns: u64| ns as f64 / 1e6;
+    let line = match state {
+        // no check beside main: every app crate's clean verdict was stored (prepare_check)
+        0 => "relax: app check: none needed (its crates' clean verdicts stored); the first frame waited 0 ms".to_string(),
+        2 => format!("relax: app check: {} crates, {} bodies in {:.0} ms ({:.0} ms cpu), done before the first frame (it waited 0 ms)",
+            n(0), n(1), ms(n(2)), ms(APP_CHECK_CPU.load(Relaxed))),
+        _ => {
+            let wait_cpu = ms(APP_CHECK_CPU.load(Relaxed).saturating_sub(cpu0));
+            format!("relax: app check: {} crates, {} bodies in {:.0} ms ({:.0} ms cpu); the first frame waited {:.0} ms for it, \
+                its checks {:.0} ms cpu meanwhile (at most {} jobs at once, CPU limit {}; {} slices raised to the frame's class at the OS, {} refused)",
+                n(0), n(1), ms(n(2)), ms(APP_CHECK_CPU.load(Relaxed)), waited_ms, wait_cpu,
+                CHECK_SLICES[1].load(Relaxed), makepad_cpu_budget::limit(), CHECK_SLICES[2].load(Relaxed), CHECK_SLICES[3].load(Relaxed))
+        }
+    };
+    eprintln!("{line}");
+}
+/// The first frame's line was said (`first_frame_gate`).
+static GATE_SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// This run looked for its app crates' stored verdicts (prepare_check): it has an app check.
+static APP_CHECK_ASKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// The last run_check_crates: crates checked, their body owners, wall ns, of it the stored verdicts'
 /// lookup and the skipped files' load.
@@ -2311,6 +2364,10 @@ pub(crate) unsafe fn reset_statics() {
     reset(&CHECK_WAITED, std::sync::atomic::AtomicBool::new(false));
     reset(&BESIDE, (relax_session::sync::Mutex::new(0), relax_session::sync::Condvar::new()));
     reset(&RUN_CHECK, [const { std::sync::atomic::AtomicU64::new(0) }; 5]);
+    reset(&APP_CHECK_CPU, std::sync::atomic::AtomicU64::new(0));
+    reset(&CHECK_SLICES, [const { std::sync::atomic::AtomicU64::new(0) }; 4]);
+    reset(&GATE_SAID, std::sync::atomic::AtomicBool::new(false));
+    reset(&APP_CHECK_ASKED, std::sync::atomic::AtomicBool::new(false));
 }
 
 #[cfg(test)]
