@@ -9382,7 +9382,11 @@ impl Unit {
         }
     }
 
+    #[track_caller]
     pub fn put_body(&mut self, id: u32, body: std::sync::Arc<Body>) {
+        if ahead_trace() && self.bodies.get(&id).is_some_and(|old| !std::sync::Arc::ptr_eq(old, &body)) {
+            eprintln!("body of #{} replaced at {}", id, std::panic::Location::caller());
+        }
         if let Some(old) = self.bodies.remove(&id) {
             if old.file != body.file {
                 self.old_bodies.insert((id, old.file), old);
@@ -23753,9 +23757,20 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
     // of the same callee takes it (a warm sort: sort_by_key, create_run, drift::sort and
     // quicksort turn hot together and share their callees), another snapshot's end drops the
     // ones it fronted, a front fails for a moment (a helper checking the body). Fronted once,
-    // the candidate needed it again every round and was left out for good.
+    // the candidate needed it again every round and was left out for good. Once a round each: a
+    // slot several candidates asked for (each instance of a generic fn inlining one closure) was
+    // fronted once per ask, its tries spent in one round, and a front a later round needed (its
+    // parent's body replaced by the parent's own take) never came: an O3 build of a Fab mesher left
+    // three closures out, asked 5 times in a round (11-20).
+    let mut this_round = std::collections::HashSet::new();
     for s in std::mem::take(&mut needs) {
+        if !this_round.insert(s) {
+            continue;
+        }
         let n = refronted.entry(s).or_insert(0);
+        if tier1_trace() {
+            eprintln!("O3 #{} round {} fronts #{}: try {} of {}", id, rounds, s, *n + 1, FRONT_TRIES);
+        }
         if *n >= FRONT_TRIES {
             continue;
         }
@@ -28560,6 +28575,7 @@ fn prefront_closure_as(front: &FrontShared, into: u32, id: u32, plain: Option<u3
     // from the disk cache): made again here, as lower_ahead_as makes an instance's. The closures of
     // a parent built long ago are what turns hot later (a benchmark's or a frame's callback): their
     // O3 builds bailed on this for the whole run and the closure ran baseline code
+    let from_parent = kept.is_some();
     let body = match kept {
         Some(b) => b,
         None => {
@@ -28590,6 +28606,18 @@ fn prefront_closure_as(front: &FrontShared, into: u32, id: u32, plain: Option<u3
     }
     {
         let mut pending = front.lowered.lock().unwrap_or_else(|e| e.into_inner());
+        // a lowering from a body its parent no longer has (the take of the parent's own lowering
+        // made ahead put the body that came from) is no front: its take refuses it (take_lowered_ahead: "closure parent body
+        // differs"). Counted as made, it spent the slot's FRONT_TRIES, and the O3 build left the
+        // closure out ("made, and needed again", with a front a round asked for more than once:
+        // 109 of the 114 left-out lines of a Fab roadster test's runs, 11-20). Lowered again from
+        // the body the parent has now.
+        if from_parent && matches!(pending.get(&into), Some(LoweredState::Ready(l)) if l.body.as_ref().is_some_and(|b| !std::sync::Arc::ptr_eq(b, &body))) {
+            if ahead_trace() {
+                eprintln!("ahead-lower of closure #{}: lowered from a body its parent no longer has, lowered again", id);
+            }
+            pending.remove(&into);
+        }
         if pending.contains_key(&into) {
             let ready = matches!(pending.get(&into), Some(LoweredState::Ready(_)));
             if ahead_trace() {
