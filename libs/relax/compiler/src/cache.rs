@@ -47,7 +47,7 @@ use image::{ManifestImage, IMAGE_MAGIC};
 pub(crate) use image::{prelink_unit, PrelinkedSlot};
 mod items;
 pub(crate) mod seen_bodies;
-pub(crate) use items::{owner_body_hash, FileDigest};
+pub(crate) use items::{check_extra, crate_check_extras, owner_body_hash, places_crates, FileDigest};
 mod deps;
 pub(crate) use deps::{user_names, CheckNode, Name, UserNames};
 mod demand;
@@ -3723,16 +3723,17 @@ impl Cache {
 
     /// The test dependency check's clean verdict for crate `c` (every body type- and
     /// borrow-checked, errors only: check.rs start_test_deps). What its bodies' verdicts rest on:
-    /// the Relax build and options (cfg), the crate's own text (`own`: as rustc is invoked on it
-    /// and the files the boot loaded, check.rs own_text_hashes; `skipped`: the files the boot
-    /// skipped) and, of each crate of its dependency `closure` (crate, its skipped files' text),
-    /// the interface (items.rs: its items outside the fn bodies that are holes -- a const fn's,
-    /// an `impl Trait` return's or an async fn's body is interface, a proc-macro crate's whole
-    /// text is) and the text of the files the boot skipped (they have no digest without a parse).
-    /// So a body edit in a dependency checks that dependency again, not every crate above it
-    /// (M51). Not covered: an include_str!/include_bytes! input of a dependency read by a const
-    /// that a type names. A borrowck-kind entry (record_borrowck). None: an interface unknown.
-    pub fn dep_check_key(&mut self, c: u32, own: u128, skipped: u128, closure: impl Iterator<Item = (u32, u128)>) -> Option<u128> {
+    /// the Relax build and options (cfg) and the crate's own text (`own` covers how rustc is
+    /// invoked and the files the boot loaded, `skipped` covers the files it skipped).
+    /// Each crate in its dependency `closure` contributes its interface (including const fn,
+    /// `impl Trait` return and async fn bodies, and a proc-macro crate's whole text), its check
+    /// extra (items.rs `check_extra`: its statics with their initializers, which a constant can
+    /// read, and each file's places where a constant can read a position), and the text of its
+    /// skipped files. So a body edit in a dependency checks that dependency again, not every crate
+    /// above it (M51). Late inputs (include_str!, include_bytes!, env!) need no key term because
+    /// `ledger_current` drops the whole store when its run read a different value.
+    /// A borrowck-kind entry (record_borrowck). Returns None for an unknown interface.
+    pub fn dep_check_key(&mut self, c: u32, own: u128, skipped: u128, closure: impl Iterator<Item = (u32, u128, u128)>) -> Option<u128> {
         let mut h = Sip128::new();
         h.str("test-deps-check-crate");
         // the worktree: payloads still hold its absolute paths (Target B removes this per payload)
@@ -3741,8 +3742,9 @@ impl Cache {
         h.u128(self.cfg);
         h.u128(own);
         h.u128(skipped);
-        for (d, text) in closure {
+        for (d, text, extra) in closure {
             h.u128(*self.iface.get(d as usize)?);
+            h.u128(extra);
             h.u128(text);
         }
         let k = h.finish128();

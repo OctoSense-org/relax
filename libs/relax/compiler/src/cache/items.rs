@@ -238,6 +238,155 @@ fn digest_into(pf: &ParsedFile, mut text: Option<&mut Vec<u8>>) -> FileDigest {
     FileDigest { iface, holes, nested_in, origins_sorted }
 }
 
+/// What another crate's type check can read of a file that its interface hash (`FileDigest::iface`,
+/// which the code keys share) leaves out; 0 when nothing. The check keys take it beside `iface`
+/// (cache.rs dep_check_key, check_reuse.rs): the code keys follow a static through the item graph,
+/// a crate's verdict does not.
+/// - Every static with its initializer, and what its macros expanded to: a constant can read a static,
+///   and a type above names the constant (`static S: usize = 3; pub const C: usize = S;`, then
+///   `[u8; x::C]`).
+/// - Where the file's text sits (`places`), when a constant can read a position: a `caller` token
+///   outside the plain fn bodies (`Location::caller()` in a constant or a const fn: caller_location
+///   evaluates to the call's line and column), or `crate_places` (its crate is above a
+///   `#[track_caller] const fn`: `places_crates`). A body that gains a line moves what follows it
+///   with no interface text changed. `line!()` and `column!()` need nothing: they expand to their
+///   value's text, which the interface hashes.
+pub(crate) fn check_extra(pf: &ParsedFile, crate_places: bool) -> u128 {
+    let ast = &pf.ast;
+    // most files have neither: a static is an item, `caller` a word of the text (std's search)
+    let any_static = ast.items.iter().any(|it| matches!(&it.kind, ItemKind::Static(_, _, e) if e.get().is_some()));
+    let any_caller = crate_places || std::str::from_utf8(&pf.src).map_or(true, |t| t.contains("caller"));
+    if !any_static && !any_caller { return 0; }
+    // the plain fn bodies (a fn that is not const: no constant evaluates its body), sorted, with the
+    // furthest end so far: a position is in one when a body starting before it ends after it
+    let mut bodies: Vec<(u32, u32)> = ast.items.iter().filter_map(|it| {
+        let ItemKind::Fn(sig, body, _) = &it.kind else { return None };
+        let s = ast.fn_sig(*sig);
+        if s.konst { return None; }
+        match (&body.get(), s.lazy_body.get()) {
+            (Some(b), _) => { let b = ast.block(*b); Some((b.lo, b.hi)) }
+            (None, Some(r)) if r.lo > 0 => Some((pf.tok(r.lo - 1).lo, pf.tok(r.hi).hi)),
+            _ => None,
+        }
+    }).collect();
+    bodies.sort_unstable();
+    let mut reach = Vec::with_capacity(bodies.len());
+    for &(_, b) in &bodies { reach.push(reach.last().copied().unwrap_or(0).max(b)); }
+    let in_body = |p: u32| { let k = bodies.partition_point(|b| b.0 < p); k > 0 && reach[k - 1] > p };
+    // the statics outside them with their initializers, as a set: each whole item, so that a value
+    // stays paired with its static's name (two statics trading initializers is a change)
+    let mut statics: Vec<(u32, u32)> = ast.items.iter().filter(|it| matches!(&it.kind, ItemKind::Static(_, _, e) if e.get().is_some()))
+        .map(|it| (it.lo, it.hi))
+        .filter(|&(a, b)| a < b && (b as usize) <= pf.src.len() && !in_body(pf.call_site(a))).collect();
+    statics.sort_unstable();
+    let reads_places = crate_places || (any_caller && (0..pf.toks.len()).any(|i| {
+        let t = pf.toks.at(i);
+        t.kind == T::Ident && pf.bytes(t.lo, t.hi) == b"caller" && !in_body(pf.call_site(t.lo))
+    }));
+    if statics.is_empty() && !reads_places { return 0; }
+    let mut h = Sip128::new();
+    h.str("check-extra");
+    // the file's expansions by call site (deps.rs region_closure), once for all its statics
+    let mut regions: Vec<(u32, u32, u32)> = pf.exp_map.iter().map(|(a, b, c)| (c, a, b)).collect();
+    regions.sort_unstable();
+    let mut hashed: Vec<u128> = statics.iter().map(|&(a, b)| span_hash(pf, &regions, a, b)).collect();
+    hashed.sort_unstable();
+    h.u32(hashed.len() as u32);
+    for x in hashed { h.u128(x); }
+    if reads_places {
+        // the start of each root item and attribute, and both ends of each plain body and static:
+        // every other position follows from one of them and the text the interface and the statics
+        // hash (a macro's expansion is placed at its call)
+        h.str("places");
+        let mut at = |p: u32| { let (l, c) = pf.location(p); h.u64(l as u64); h.u64(c as u64); };
+        for a in ast.root_attrs.iter() { if a.toks.hi > a.toks.lo { at(pf.tok(a.toks.lo).lo); } }
+        for &i in ast.root_items.iter() {
+            let it = ast.item(i);
+            for a in ast.list(it.attrs) { if a.toks.hi > a.toks.lo { at(pf.tok(a.toks.lo).lo); } }
+            at(it.lo);
+        }
+        for &(a, b) in bodies.iter().chain(&statics) { at(a); at(b); }
+    }
+    h.finish128()
+}
+
+/// The text of `lo..hi` and of the macro expansions called from it (and from those): `regions`,
+/// the file's expansions by call site.
+fn span_hash(pf: &ParsedFile, regions: &[(u32, u32, u32)], lo: u32, hi: u32) -> u128 {
+    let mut h = Sip128::new();
+    h.str("span");
+    h.write(&pf.src[lo as usize..hi as usize]);
+    if !regions.is_empty() {
+        let mut exp = super::deps::region_closure(regions, &[(lo, hi)]);
+        exp.sort_unstable();
+        for (ea, eb) in exp {
+            if ea < eb && (eb as usize) <= pf.src.len() {
+                h.u32(eb - ea);
+                h.write(&pf.src[ea as usize..eb as usize]);
+            }
+        }
+    }
+    h.finish128()
+}
+
+/// Per crate: whether a constant in it can read its own position with no `caller` token near it
+/// (`check_extra`'s `crate_places`): the crate, or a crate below it, defines a `#[track_caller]
+/// const fn`, which hands its caller's location to whatever it calls. The sysroot's (core, alloc,
+/// std, proc_macro, test) count for none: of them only Location::caller, a `caller` token where it
+/// is called, gives a location as a value; the others read it to panic, and an evaluation error
+/// stores no verdict.
+pub(crate) fn places_crates(prog: &crate::program::Program) -> Vec<bool> {
+    let n = prog.crates.len();
+    let sysroot = |c: usize| sysroot_crate(prog, c);
+    let mut own = vec![false; n];
+    for (f, pf) in prog.files.iter().enumerate() {
+        let Some(&c) = prog.file_crate.get(f) else { continue };
+        let c = c as usize;
+        if c >= n || own[c] || sysroot(c) { continue; }
+        let ast = &pf.ast;
+        own[c] = ast.items.iter().any(|it| matches!(&it.kind, ItemKind::Fn(sig, _, _) if ast.fn_sig(*sig).konst)
+            && ast.list(it.attrs).iter().any(|a| a.toks.hi > a.toks.lo && pf.tok_text(a.toks.lo) == "track_caller"));
+    }
+    // up the dependency edges, until nothing changes
+    let mut out = own;
+    loop {
+        let mut changed = false;
+        for c in 0..n {
+            if !out[c] && !sysroot(c) && prog.crates[c].deps.iter().any(|&(_, d)| out.get(d as usize).copied().unwrap_or(false)) {
+                out[c] = true;
+                changed = true;
+            }
+        }
+        if !changed { return out; }
+    }
+}
+
+/// Per crate of `want`: its files' `check_extra` in one hash (0: none), by path: the boot's files,
+/// as `crate_ifaces` takes them. The sysroot's are 0: its text is the Relax build's, which every
+/// check key holds (`cfg`).
+pub(crate) fn crate_check_extras(prog: &crate::program::Program, want: &[bool]) -> Vec<u128> {
+    let n = prog.crates.len();
+    let places = places_crates(prog);
+    let mut per: Vec<Option<Sip128>> = (0..n).map(|_| None).collect();
+    for f in 0..prog.boot_files.min(prog.files.len()) {
+        if prog.front_macro_fragments.contains(&f) { continue; }
+        let Some(&c) = prog.file_crate.get(f) else { continue };
+        let c = c as usize;
+        if c >= n || !want.get(c).copied().unwrap_or(false) || sysroot_crate(prog, c) { continue; }
+        let x = check_extra(&prog.files[f], places[c]);
+        if x == 0 { continue; }
+        let h = per[c].get_or_insert_with(|| { let mut h = Sip128::new(); h.str("crate-check-extra"); h });
+        h.str(&crate::dirs::anchored(prog.file_paths.get(f).map_or("", |p| p.as_str())));
+        h.u128(x);
+    }
+    per.into_iter().map(|h| h.map_or(0, |h| h.finish128())).collect()
+}
+
+/// The crates Relax's own sysroot holds.
+fn sysroot_crate(prog: &crate::program::Program, c: usize) -> bool {
+    matches!(prog.syms.str(prog.crates[c].name), "core" | "alloc" | "std" | "proc_macro" | "test")
+}
+
 /// The hash of fn item `item`'s body (a static's initializer) when it is a hole (not in the
 /// interface).
 pub(crate) fn body_hash(pf: &ParsedFile, d: &FileDigest, item: ItemId) -> Option<u128> {

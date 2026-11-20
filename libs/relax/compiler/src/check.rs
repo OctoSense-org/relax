@@ -533,14 +533,17 @@ pub fn start_test_deps(up: *mut Unit, select: impl FnOnce(&crate::program::Progr
         let (t0, cpu0) = (jit::wall_ns(), relax_session::clock::cpu_ns());
         let up = upn as *mut Unit;
         let front = unsafe { (*up).front.clone() };
-        // per crate: its own text (the boot's files) and its dependency closure
-        let (crates, own, closures) = {
+        // Each selected crate's own text and dependency closure, and each dependency's check extra.
+        let (crates, own, closures, extras) = {
             let r = jit::front_read("test dependency crates");
             let prog = r.of(&front).0;
             let crates = select(prog);
             let own = own_text_hashes(prog, &crates);
             let closures: Vec<Vec<u32>> = crates.iter().map(|&k| dependency_closure(prog, k)).collect();
-            (crates, own, closures)
+            let mut want = vec![false; prog.crates.len()];
+            for &d in closures.iter().flatten() { want[d as usize] = true; }
+            let extras = crate::cache::crate_check_extras(prog, &want);
+            (crates, own, closures, extras)
         };
         names.retain(|(k, _)| crates.contains(k));
         names.sort_unstable_by_key(|(k, _)| *k);
@@ -553,7 +556,7 @@ pub fn start_test_deps(up: *mut Unit, select: impl FnOnce(&crate::program::Progr
             let mut todo = Vec::new();
             let mut keys = Vec::new();
             for ((&k, &own), closure) in crates.iter().zip(&own).zip(&closures) {
-                let key = u.cache.as_ref().and_then(|c| unsafe { &mut *c.get() }.dep_check_key(k, own, skipped[&k], closure.iter().map(|d| (*d, skipped[d]))));
+                let key = u.cache.as_ref().and_then(|c| unsafe { &mut *c.get() }.dep_check_key(k, own, skipped[&k], closure.iter().map(|d| (*d, skipped[d], extras[*d as usize]))));
                 let stored = key.is_some_and(|key| u.cache.as_ref().is_some_and(|c| matches!(unsafe { &*c.get() }.borrowck_stored(key), Some(crate::borrowck::lazy::StoredVerdict::Clean))));
                 if !stored {
                     todo.push(k);
