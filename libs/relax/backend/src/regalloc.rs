@@ -6108,6 +6108,150 @@ pub fn compares_into_readers(options: &relax_session::Options, f: &Func, sel_ok:
     Some(g)
 }
 
+/// Overflow checks branch on the op's own overflow flag (`Cmp::O`: x64 `add; jo`, arm64 `cmn;
+/// b.vs`). `lower` makes rustc's checked signed arithmetic with plain RIR ops, which reach here as
+/// branches on `(a ^ d) & (b ^ d) < 0` for `d = a + b`, `(a ^ d) & (a ^ b) < 0` for `d = a - b`,
+/// the 64-bit product's high word against its low word's sign (`mulhi(a, b) != (a * b) >> 63`)
+/// and the 32-bit product against the 64-bit one; 4 to 6 instructions and a test each, a quarter
+/// of the instructions in Fab's hottest loop where native has the op's `jo`. A branch on one of
+/// these, its pieces all in the branch's block and the op's operands written by nothing from the
+/// op on, reads `O(op, ty, a, b)`, the op made again on the flags (at 32 or 64 bits); the pieces
+/// left without readers go. `mul`: the back end makes a multiply's overflow flag (x64 `imul`).
+/// RELAX_OPT=-ovfbr.
+pub fn overflows_into_branches(options: &relax_session::Options, f: &Func, mul: bool) -> Option<Func> {
+    if crate::stats::opt_off(options, "-ovfbr") {
+        return None;
+    }
+    let found: Vec<(usize, Cmp)> = f
+        .blocks
+        .iter()
+        .enumerate()
+        .filter_map(|(bi, b)| match b.term {
+            Term::BranchCmp(c, ..) => overflow_check(&b.insts, c, mul).map(|o| (bi, o)),
+            _ => None,
+        })
+        .collect();
+    if found.is_empty() {
+        return None;
+    }
+    let mut g = f.clone();
+    for &(bi, o) in &found {
+        if let Term::BranchCmp(c, ..) = &mut g.blocks[bi].term {
+            *c = o;
+        }
+    }
+    // the checks' pieces nothing reads any more (an xor, an and, a multiply's high word, a
+    // shift, a product), till none is left
+    loop {
+        let mut uses = vec![0u32; g.vregs.len()];
+        let mut tu = Vec::new();
+        for b in &g.blocks {
+            for i in &b.insts {
+                for_uses(i, |u| uses[u.0 as usize] += 1);
+            }
+            term_uses(&b.term, &mut tu);
+            for u in &tu {
+                uses[u.0 as usize] += 1;
+            }
+        }
+        let mut gone = false;
+        for &(bi, _) in &found {
+            let blk = &mut g.blocks[bi];
+            let keep_pos = blk.pos.len() == blk.insts.len();
+            let mut k = 0;
+            while k < blk.insts.len() {
+                let unread = match blk.insts[k] {
+                    Inst::IBin(IOp::Xor | IOp::And | IOp::Mul | IOp::MulHi, _, d, _, _) | Inst::IBinI(IOp::Shr, _, d, _, _) => uses[d.0 as usize] == 0,
+                    _ => false,
+                };
+                if unread {
+                    blk.insts.remove(k);
+                    if keep_pos {
+                        blk.pos.remove(k);
+                    }
+                    gone = true;
+                } else {
+                    k += 1;
+                }
+            }
+        }
+        if !gone {
+            break;
+        }
+    }
+    Some(g)
+}
+
+/// The overflow check a block's branch on `c` is (`overflows_into_branches`), as the `Cmp::O` it
+/// reads instead.
+fn overflow_check(insts: &[Inst], c: Cmp, mul: bool) -> Option<Cmp> {
+    // the last write of v before `at`: where, and what
+    let def = |v: VReg, at: usize| -> Option<(usize, Inst)> {
+        (0..at).rev().find(|&j| {
+            let mut w = false;
+            for_defs(&insts[j], |d| w |= d == v);
+            w
+        })
+        .map(|j| (j, insts[j].clone()))
+    };
+    // a and b hold at the branch what the op at k read: nothing from it on writes them
+    let held = |k: usize, a: VReg, b: VReg| {
+        !insts[k..].iter().any(|i| {
+            let mut w = false;
+            for_defs(i, |d| w |= d == a || d == b);
+            w
+        })
+    };
+    let same = |x: (VReg, VReg), y: (VReg, VReg)| x == y || x == (y.1, y.0);
+    let wide = |t: IntTy| t.signed && (t.bits == 32 || t.bits == 64);
+    match c {
+        // add / sub: (a ^ d) & (b ^ d) < 0, (a ^ d) & (a ^ b) < 0
+        Cmp::K(Cond::Lt, true, s, 0) => {
+            let n = insts.len();
+            let (ks, Inst::IBin(IOp::And, _, _, p, q)) = def(s, n)? else { return None };
+            let (kp, Inst::IBin(IOp::Xor, _, _, p1, p2)) = def(p, ks)? else { return None };
+            let (kq, Inst::IBin(IOp::Xor, _, _, q1, q2)) = def(q, ks)? else { return None };
+            for d in [p1, p2, q1, q2] {
+                let Some((kd, Inst::IBin(op @ (IOp::Add | IOp::Sub), t, _, a, b))) = def(d, kp.min(kq)) else { continue };
+                if !wide(t) || def(d, kp.max(kq)).map(|x| x.0) != Some(kd) || !held(kd, a, b) {
+                    continue;
+                }
+                let other = if op == IOp::Add { (b, d) } else { (a, b) };
+                let (x, y) = ((p1, p2), (q1, q2));
+                if (same(x, (a, d)) && same(y, other)) || (same(y, (a, d)) && same(x, other)) {
+                    return Some(Cmp::O(op, t, a, b));
+                }
+            }
+            None
+        }
+        // mul: mulhi(a, b) != (a * b) >> 63 (64 bits), a * b at 64 bits != a * b at 32
+        Cmp::R(Cond::Ne, _, x, y) if mul => {
+            let n = insts.len();
+            let (kx, ix) = def(x, n)?;
+            let (ky, iy) = def(y, n)?;
+            let pair = [(kx, ix.clone(), ky, iy.clone()), (ky, iy, kx, ix)];
+            for (k1, i1, k2, i2) in pair {
+                match (i1, i2) {
+                    (Inst::IBin(IOp::MulHi, t @ I64, _, a, b), Inst::IBinI(IOp::Shr, I64, _, m, 63)) => {
+                        let Some((km, Inst::IBin(IOp::Mul, I64, _, ma, mb))) = def(m, k2) else { continue };
+                        if same((ma, mb), (a, b)) && held(k1.min(km), a, b) {
+                            return Some(Cmp::O(IOp::Mul, t, a, b));
+                        }
+                    }
+                    (Inst::IBin(IOp::Mul, I64, _, a, b), Inst::IBin(IOp::Mul, t @ I32, _, a2, b2)) => {
+                        if same((a, b), (a2, b2)) && held(k1.min(k2), a, b) {
+                            return Some(Cmp::O(IOp::Mul, t, a, b));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
 /// The blocks whose start reads the running thread's domain base for a function that names domain
 /// symbols (`SymClass::Domain`), in block order: per block that names one, that block lifted to the
 /// shallowest loop depth on its chain of dominators (the base is the same on every iteration, so

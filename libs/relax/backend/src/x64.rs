@@ -3219,6 +3219,7 @@ impl<'a> Gen<'a> {
                             Some(icc(cond, signed))
                         }
                     },
+                    Some(cmp @ Cmp::O(..)) => Some(self.cmp_flags(options, cmp).0),
                     Some(Cmp::F(cond, f64_, x, y)) => {
                         let pfx = if f64_ { 0x66 } else { 0 };
                         if let Some((base, off, t)) = self.fload_cmp.take() {
@@ -5508,6 +5509,29 @@ impl<'a> Gen<'a> {
                 self.cmp_imm(rx, k);
                 (icc(cc, signed), None)
             }
+            Cmp::O(op, it, x, y) => {
+                // the op again in r11 for its overflow flag (its value is the one the code keeps)
+                let rx = self.use_i(options, x, R10);
+                self.a.mov_rr(R11, rx);
+                let ry = self.use_i(options, y, R10);
+                let wide = it.bits == 64;
+                match op {
+                    IOp::Add if wide => self.a.alu_rr(0x01, R11, ry),
+                    IOp::Add => self.a.alu_rr32(0x01, R11, ry),
+                    IOp::Sub if wide => self.a.alu_rr(0x29, R11, ry),
+                    IOp::Sub => self.a.alu_rr32(0x29, R11, ry),
+                    IOp::Mul if wide => self.a.imul_rr(R11, ry),
+                    IOp::Mul => {
+                        // imul r32, r/m32 (0F AF /r)
+                        self.a.rex(false, R11, 0, ry, false);
+                        self.a.byte(0x0f);
+                        self.a.byte(0xaf);
+                        self.a.modrm_rr(R11, ry);
+                    }
+                    _ => unreachable!("an overflow branch is an add, a sub or a mul"),
+                }
+                (CC_O, None)
+            }
             Cmp::F(cc, w, x, y) => {
                 let xa = self.use_f(x, XS);
                 let xb = self.use_f(y, XS2);
@@ -6772,6 +6796,9 @@ pub fn compile_freq(options: &relax_session::Options, f: &Func, env: &Env, freq:
     // branches and selects on their compares' flags (cmp + jcc, cmp + cmov)
     let cmps = if env.opt_regs || f.full { regalloc::compares_into_readers(options, f, x64_sel_ok) } else { None };
     let f = cmps.as_ref().unwrap_or(f);
+    // overflow checks on the op's own flag (mov; add / sub / imul; jo)
+    let ovfs = if env.opt_regs || f.full { regalloc::overflows_into_branches(options, f, true) } else { None };
+    let f = ovfs.as_ref().unwrap_or(f);
     // the backend-internal rewrites above run after the last pipeline verify
     f.verify_after("x64 backend rewrites (legalize/pair256/switch/hoist/sink)")?;
     let mut cfg = reg_config(options);

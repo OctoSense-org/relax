@@ -364,6 +364,7 @@ const NE: u8 = 1;
 const HS: u8 = 2;
 const LO: u8 = 3;
 const MI: u8 = 4;
+const VS: u8 = 6;
 const HI: u8 = 8;
 const LS: u8 = 9;
 const GE: u8 = 10;
@@ -3832,6 +3833,20 @@ impl<'a> Gen<'a> {
                 icc(c, signed)
             }
             Cmp::F(c, f64_, a, b) => fcc(self.fcmp_v(c, f64_, a, b)),
+            Cmp::O(op, it, a, b) => {
+                // adds / subs to the zero register (cmn / cmp) at the op's width: V is its overflow
+                let ra = self.use_i(a, S0);
+                let rb = self.use_i(b, S1);
+                let base = match (op, it.bits == 64) {
+                    (IOp::Add, true) => 0xAB00_001F,
+                    (IOp::Add, false) => 0x2B00_001F,
+                    (IOp::Sub, true) => 0xEB00_001F,
+                    (IOp::Sub, false) => 0x6B00_001F,
+                    _ => unreachable!("arm64 overflow branches are adds and subs (overflows_into_branches without mul)"),
+                };
+                self.a.e(base | (rb as u32) << 16 | (ra as u32) << 5);
+                VS
+            }
         }
     }
 
@@ -5662,6 +5677,9 @@ pub fn compile_freq(options: &relax_session::Options, f: &Func, env: &Env, freq:
     // branches and selects on their compares' flags (cmp + b.cond, cmp + csel)
     let cmps = if env.opt_regs || f.full { regalloc::compares_into_readers(options, f, arm64_sel_ok) } else { None };
     let f = cmps.as_ref().unwrap_or(f);
+    // add / sub overflow checks on the op's own flag (cmn / cmp; b.vs); no flag-setting multiply
+    let ovfs = if env.opt_regs || f.full { regalloc::overflows_into_branches(options, f, false) } else { None };
+    let f = ovfs.as_ref().unwrap_or(f);
     // the backend-internal rewrites above run after the last pipeline verify
     f.verify_after("arm64 backend rewrites (legalize/switch/folds/hoist/share/sink)")?;
     // v0-v7 are allocatable outside the instructions that name them (arm64_clobbers), except

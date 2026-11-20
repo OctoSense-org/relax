@@ -373,6 +373,11 @@ pub enum Cmp {
     K(Cond, bool, VReg, i64),
     /// `FCmp(cond, f64, _, a, b)`
     F(Cond, bool, VReg, VReg),
+    /// `a op b` overflows the signed type (Add, Sub or Mul at 32 or 64 bits): rustc's checked
+    /// arithmetic, branched on the op's own overflow flag. Made by
+    /// `regalloc::overflows_into_branches` for a `Term::BranchCmp` only, after every pass that
+    /// turns a compare back into an instruction (`inst`) or reads its condition (`cond`).
+    O(IOp, IntTy, VReg, VReg),
 }
 
 impl Cmp {
@@ -391,11 +396,13 @@ impl Cmp {
             Cmp::R(c, s, a, b) => Inst::ICmp(c, s, d, a, b),
             Cmp::K(c, s, a, k) => Inst::ICmpI(c, s, d, a, k),
             Cmp::F(c, w, a, b) => Inst::FCmp(c, w, d, a, b),
+            Cmp::O(..) => unreachable!("an overflow branch is made after every pass that makes a compare's instruction"),
         }
     }
     pub fn cond(self) -> Cond {
         match self {
             Cmp::R(c, ..) | Cmp::K(c, ..) | Cmp::F(c, ..) => c,
+            Cmp::O(..) => unreachable!("an overflow branch is made after every pass that reads a compare's condition"),
         }
     }
     /// The compare that is true exactly when this one is false (None: an ordered float compare,
@@ -406,6 +413,8 @@ impl Cmp {
             Cmp::K(c, s, a, k) => Some(Cmp::K(c.not(), s, a, k)),
             Cmp::F(c @ (Cond::Eq | Cond::Ne), w, a, b) => Some(Cmp::F(c.not(), w, a, b)),
             Cmp::F(..) => None,
+            // (no Cond says "does not overflow")
+            Cmp::O(..) => None,
         }
     }
     /// Whether it reads v.
@@ -417,7 +426,7 @@ impl Cmp {
     /// The registers it reads.
     pub fn uses(self, mut f: impl FnMut(VReg)) {
         match self {
-            Cmp::R(_, _, a, b) | Cmp::F(_, _, a, b) => {
+            Cmp::R(_, _, a, b) | Cmp::F(_, _, a, b) | Cmp::O(_, _, a, b) => {
                 f(a);
                 f(b);
             }
@@ -426,7 +435,7 @@ impl Cmp {
     }
     pub fn vregs_mut(&mut self, mut f: impl FnMut(&mut VReg)) {
         match self {
-            Cmp::R(_, _, a, b) | Cmp::F(_, _, a, b) => {
+            Cmp::R(_, _, a, b) | Cmp::F(_, _, a, b) | Cmp::O(_, _, a, b) => {
                 f(a);
                 f(b);
             }
@@ -2091,7 +2100,7 @@ impl Func {
     /// A compare's operands against its kind.
     fn check_cmp(&self, c: &Cmp, what: &str) -> Result<(), String> {
         let want = match c {
-            Cmp::R(..) | Cmp::K(..) => Cls::I,
+            Cmp::R(..) | Cmp::K(..) | Cmp::O(..) => Cls::I,
             Cmp::F(_, true, ..) => Cls::F64,
             Cmp::F(_, false, ..) => Cls::F32,
         };
