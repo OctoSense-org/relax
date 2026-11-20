@@ -2732,6 +2732,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
     }
     let platform = u.prog.crates.iter().any(|c| unitgraph::presents(&unitgraph::manifest_dir_of(c.root_path())));
     jit::live_needs_present(!live_tests && platform);
+    jit::live_tests_session(live_tests);
     // a test harness never presents, nor does a program without the platform: no startup to wait out
     jit::startup_main(platform && !HARNESS_RUN.load(Ordering::Acquire));
     if HAL_RUN.load(Ordering::Acquire) && platform && !HARNESS_RUN.load(Ordering::Acquire) && !live_tests {
@@ -4187,7 +4188,7 @@ fn start_monitor(runtime: &crate::options::RuntimeOptions, options: &crate::opti
             let start = MAIN_START_WALL.load(Ordering::Relaxed);
             let since = main_ms.saturating_sub(mid_last);
             // also with no new code: the manifest whose window closed, the collected program
-            let left = !MID_MANIFEST_DONE.load(Ordering::Relaxed) && jit::started() && jit::wall_ns() >= jit::ORDER_UNTIL_NS.load(Ordering::Relaxed)
+            let left = !MID_MANIFEST_DONE.load(Ordering::Relaxed) && jit::manifest_window_closed()
                 || !COLLECTED_CURRENT.load(Ordering::Relaxed) && !MID_COLLECTED_TRIED.load(Ordering::Relaxed)
                 || jit::live_startup_done() && crate::cache::front_graph_pending();
             // the warm record (manifest, front graph, collected program) is written as soon
@@ -5332,7 +5333,7 @@ fn mid_flush(wait: bool) -> Option<(usize, usize)> {
     let drain_ms = t_drain.elapsed().as_secs_f64() * 1e3;
     // the stores earlier spills wrote, opened here when the startup manifest may be recorded below
     // (cache.rs open_written): its image takes their entries, and the request only indexes them
-    if jit::started() && jit::wall_ns() >= jit::ORDER_UNTIL_NS.load(Ordering::Relaxed)
+    if jit::manifest_window_closed()
         && (!MID_MANIFEST_DONE.load(Ordering::Relaxed) || jit::QUIT_SEEN.load(Ordering::Relaxed) || IMAGE_REFRESH_WANTED.load(Ordering::Relaxed)) {
         let dir = MID_CACHE_DIR.lock().unwrap_or_else(|e| e.into_inner()).clone();
         if let Some(dir) = dir { crate::cache::open_written(&dir); }
@@ -5370,7 +5371,7 @@ fn mid_flush(wait: bool) -> Option<(usize, usize)> {
         let quit = jit::QUIT_SEEN.load(Ordering::Relaxed);
         let tail = quit && done && u.start_order.len() > MID_MANIFEST_LEN.load(Ordering::Relaxed);
         let refresh = !quit && done && u.cache.as_ref().is_some_and(|c| c.image_refresh_due());
-        if u.cache.is_some() && jit::started() && jit::wall_ns() >= jit::ORDER_UNTIL_NS.load(Ordering::Relaxed) && (!done || tail || refresh) {
+        if u.cache.is_some() && jit::manifest_window_closed() && (!done || tail || refresh) {
             MID_MANIFEST_DONE.store(true, Ordering::Relaxed);
             // the startup manifest: the install order as the first write past its window found it,
             // whichever try records it (a refresh and a manifest the quit records first included);

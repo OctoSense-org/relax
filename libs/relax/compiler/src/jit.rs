@@ -25030,6 +25030,24 @@ pub(crate) fn started() -> bool {
     FIRST_PRESENT.load(Ordering::Acquire) || QUIET_START_NS.load(Ordering::Acquire) != 0
 }
 
+/// The startup manifest's window has closed (run.rs's mid-run writer records it from here): the
+/// start ended and the installs of its first seconds are in (ORDER_UNTIL_NS). A live test session's
+/// window closes at its first pass (first_test_pass_done), as an app's at its first present: its
+/// quiet start can come in a quiet stretch of its tests, and a manifest recorded there missed what
+/// the rest of the pass ran (40503 slots of a cold pass's 69285, 11-19).
+pub(crate) fn manifest_window_closed() -> bool {
+    started()
+        && wall_ns() >= ORDER_UNTIL_NS.load(Ordering::Relaxed)
+        && (!LIVE_TESTS.load(Ordering::Acquire) || FIRST_TEST_PASS.load(Ordering::Acquire))
+}
+
+/// The run is a live test session (run.rs): its startup manifest waits for its first pass.
+static LIVE_TESTS: AtomicBool = AtomicBool::new(false);
+
+pub(crate) fn live_tests_session(on: bool) {
+    LIVE_TESTS.store(on, Ordering::Release);
+}
+
 /// When the program's start ended (wall_ns): its first present, or a program that never presents
 /// went quiet (QUIET_START_NS); 0 before.
 pub(crate) fn started_ns() -> u64 {
@@ -25087,12 +25105,22 @@ impl Drop for MainHeld {
 /// deferred records are written from here when no demand compile is in flight, as an app's are
 /// after its first present. A session ends by a signal, which no exit writer survives, and its
 /// quiet start (headless_started) came only once it had sat idle long enough. With a compile
-/// still in flight the quiet start writes them.
+/// still in flight the quiet start writes them. Its start ends here too (startup_main), and its
+/// startup manifest's window closes (manifest_window_closed): the manifest is recorded now, as an
+/// app's is after its first frame, not 2 s of idle later (a session stopped in between left the
+/// next one no warm start). A cold Fab session's is on disk 2.1-2.7 s after its verdict (the mid
+/// writer's next pass, its record and the spill after it).
 pub(crate) fn first_test_pass_done() {
     if DEMAND_COMPILES.load(Ordering::SeqCst) == 0 {
         crate::cache::start_deferred_front("the first test pass");
     }
+    ORDER_UNTIL_NS.fetch_min(wall_ns(), Ordering::Relaxed);
+    FIRST_TEST_PASS.store(true, Ordering::Release);
+    startup_wake();
 }
+
+/// A live test session's first pass is done (first_test_pass_done): its start ended.
+static FIRST_TEST_PASS: AtomicBool = AtomicBool::new(false);
 
 /// The program links the platform and its main went quiet without starting an app
 /// (first_frame::watch_app): a batch program. No present will come: it tiers as a program without
@@ -25244,7 +25272,7 @@ pub fn startup_main(presents: bool) {
         makepad_cpu_budget::set_thread_class(makepad_cpu_budget::BACKGROUND);
         let _ = STARTUP_THREAD.set(std::thread::current());
         crate::run_threads::on_end(startup_wake);
-        while !FIRST_PRESENT.load(Ordering::Acquire) {
+        while !FIRST_PRESENT.load(Ordering::Acquire) && !FIRST_TEST_PASS.load(Ordering::Acquire) {
             if crate::run_threads::ending() { return; }
             let left = quiet_left(main_at);
             // the live-edit gate (live_startup_done) waits for a present on its own: a
@@ -35609,6 +35637,8 @@ pub(crate) unsafe fn reset_statics() {
     reset(&FIRST_PRESENT, AtomicBool::new(false));
     reset(&HEADLESS, AtomicBool::new(false));
     reset(&LIVE_STARTUP_DONE, AtomicBool::new(false));
+    reset(&FIRST_TEST_PASS, AtomicBool::new(false));
+    reset(&LIVE_TESTS, AtomicBool::new(false));
     reset(&LIVE_NEEDS_PRESENT, AtomicBool::new(false));
     reset(&PRELINKED_START, AtomicBool::new(false));
     reset(&STARTUP_THREAD, std::sync::OnceLock::new());
