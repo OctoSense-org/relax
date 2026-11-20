@@ -9556,6 +9556,19 @@ impl<'a> Lcx<'a> {
                     if self.overflow_checks { self.shift_check(*op, self.int_ty(t).bits as u32, (y.0, Some(y.1))); }
                     return Val::L(vec![self.arith(*op, t, x.0, y.0, bt)]);
                 }
+                // `a as i128 * b as i128` of 64-bit (or narrower) signed values, or `a as u128 * b as u128`
+                // of unsigned ones: the 128-bit product never overflows, so it is one widening multiply
+                // (imul / smulh; mul / umulh) and no check -- rustc's, where a general 128-bit product
+                // and its overflow check take eleven 64-bit multiplies (exact geometry predicates:
+                // Fab's slicer cross and dot products, 18% of its segment splitting under the JIT)
+                if *op == BinOp::Mul && self.is_wide(t) {
+                    let signed = self.wide_signed(t);
+                    if self.widened_from(*a) == Some(signed) && self.widened_from(*b) == Some(signed) {
+                        let lo = self.ibin(IOp::Mul, false, x.0, y.0);
+                        let hi = self.ibin(IOp::MulHi, signed, x.0, y.0);
+                        return Val::L(vec![lo, hi]);
+                    }
+                }
                 match self.checked_wide_arith(*op, t, x, y) {
                     Some((lo, hi)) => Val::L(vec![lo, hi]),
                     None => {
@@ -9895,6 +9908,21 @@ impl<'a> Lcx<'a> {
     // N:rustc_mir_build/src/builder/expr/as_rvalue.rs:103-123,457-541.
     // Round-30 design: checked arithmetic's flag is computed with existing RIR ops.
     // N:rustc_mir_build/src/thir/cx/expr.rs:676-683 lowers -literal as a literal.
+    /// `x as T` of an integer of at most 64 bits (parenthesized or not): whether that integer is
+    /// signed, so its 128-bit value is its 64-bit value extended by its sign (else by zero).
+    fn widened_from(&self, mut expr: ExprId) -> Option<bool> {
+        loop {
+            match self.ast().expr(expr).kind {
+                ExprKind::Paren(inner) => expr = inner,
+                ExprKind::Cast(inner, _) => {
+                    let xt = self.body_ty(inner);
+                    return (matches!(self.kind_ref(xt), TyKind::Int(_)) && !self.is_wide(xt)).then(|| self.int_ty(xt).signed);
+                }
+                _ => return None,
+            }
+        }
+    }
+
     fn negated_literal(&self, mut expr: ExprId) -> bool {
         loop {
             match self.ast().expr(expr).kind {

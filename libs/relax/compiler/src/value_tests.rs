@@ -124,6 +124,51 @@ fn cfg_macro_is_the_crates_cfg_at_run_time_and_in_consts() {
     assert_eq!((first, o3), ([0, 0, 0, 0, 0, 0, 255], [0, 0, 0, 0, 0, 0, 255]), "the release profile's: no check, at the first tier and at O3");
 }
 
+/// Products of integers widened to 128 bits, under the test profile's overflow checks: signed
+/// values widened by their sign into i128 and unsigned ones by zero into u128 (one widening
+/// multiply, never an overflow), narrower ones, and the products that stay general: a signed by
+/// an unsigned value, and unsigned values widened into i128, whose product can overflow.
+const WIDENED: &str = r#"
+use std::hint::black_box;
+fn halves(v: i128, out: &mut [usize; 13], k: usize) { out[k] = v as u64 as usize; out[k + 1] = (v >> 64) as u64 as usize; }
+fn signed(a: i64, b: i64) -> i128 { a as i128 * b as i128 }
+fn narrow(a: i32, b: i8) -> i128 { (a as i128) * (b as i128) }
+fn unsigned(a: u64, b: u64) -> u128 { a as u128 * b as u128 }
+fn mixed(a: i64, b: u64) -> i128 { a as i128 * b as i128 }
+fn unsigned_into_signed(a: u64, b: u64) -> i128 { a as i128 * b as i128 }
+pub fn values(out: &mut [usize; 13]) {
+    halves(signed(black_box(i64::MIN), black_box(i64::MIN)), out, 0);
+    halves(signed(black_box(i64::MIN), black_box(i64::MAX)), out, 2);
+    halves(narrow(black_box(-3), black_box(-128)), out, 4);
+    halves(unsigned(black_box(u64::MAX), black_box(u64::MAX)) as i128, out, 6);
+    halves(mixed(black_box(i64::MIN), black_box(u64::MAX)), out, 8);
+    halves(unsigned_into_signed(black_box(1 << 63), black_box(3)), out, 10);
+    out[12] = std::panic::catch_unwind(|| unsigned_into_signed(black_box(u64::MAX), black_box(u64::MAX))).is_err() as usize;
+}
+"#;
+
+#[test]
+fn widened_128_bit_products_are_exact_and_overflow_only_where_they_can() {
+    isolated_test!(widened_128_bit_products_are_exact_and_overflow_only_where_they_can);
+    use std::hint::black_box;
+    let halves = |v: i128| [v as u64 as usize, (v >> 64) as u64 as usize];
+    let mut want = [0usize; 13];
+    for (k, v) in [
+        black_box(i64::MIN) as i128 * black_box(i64::MIN) as i128,
+        black_box(i64::MIN) as i128 * black_box(i64::MAX) as i128,
+        black_box(-3i32) as i128 * black_box(-128i8) as i128,
+        (black_box(u64::MAX) as u128 * black_box(u64::MAX) as u128) as i128,
+        black_box(i64::MIN) as i128 * black_box(u64::MAX) as i128,
+        black_box(1u64 << 63) as i128 * black_box(3u64) as i128,
+    ].into_iter().enumerate() {
+        want[2 * k..2 * k + 2].copy_from_slice(&halves(v));
+    }
+    want[12] = 1;
+    let (first, o3, refused): ([usize; 13], [usize; 13], _) = values_at_o3(WIDENED, "widened_products", CHECKED);
+    assert_eq!(first, want, "the products and the one overflow at the first tier");
+    assert_eq!(o3, want, "the products and the one overflow at O3 (not built: {refused:?})");
+}
+
 /// `IoSlice` / `IoSliceMut` (now real std's `iovec`-shaped wrappers, WARNZERO class 8): the
 /// slices they borrow, `advance_slices` across them, a vectored write, writes through a mutable
 /// one, and the `iovec` layout (base, then length) FFI code relies on.
